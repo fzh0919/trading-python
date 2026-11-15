@@ -145,8 +145,9 @@ class StrategySection(BaseModel):
 class UniverseSection(BaseModel):
     isa_long_term: list[str] = Field(default_factory=list)
     invest_tactical: list[str] = Field(default_factory=list)
+    etf_symbols: list[str] = Field(default_factory=list)
 
-    @field_validator("isa_long_term", "invest_tactical", mode="before")
+    @field_validator("isa_long_term", "invest_tactical", "etf_symbols", mode="before")
     @classmethod
     def _clean_universe_symbols(cls, v: Any) -> list[str]:
         return _normalize_symbol_list(v)

@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from src.agents.chat_agent import _format_chat_history_compact
-from src.agents.llm_client import GeminiClient, normalize_thinking_level
+from src.agents.llm_client import GeminiClient, _compact_tool_result, normalize_thinking_level
 from src.config import ModelsSection, StrategySection, load_config
+from src.ops_notifier import OpsNotifier
 from src.storage.db import AdvisorDatabase
 
 
@@ -201,6 +204,252 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(summary["by_model_nd"][0]["model"], "gemini-4-hydrogen")
 
         await asyncio.wait_for(_run(), timeout=10.0)
+
+    async def test_round_timeout_triggers_transient_retry_and_fallback(self) -> None:
+        class _RecordingOps:
+            def __init__(self) -> None:
+                self.events: list[dict] = []
+
+            async def notify(self, *, severity: str, source: str, alert_key: str, message: str) -> None:
+                self.events.append(
+                    {"severity": severity, "source": source, "alert_key": alert_key, "message": message}
+                )
+
+        ops = _RecordingOps()
+        usage_records: list[dict] = []
+
+        async def _record(rec: dict) -> None:
+            usage_records.append(rec)
+
+        client = GeminiClient(
+            api_key="dummy-key",
+            usage_recorder=_record,
+            ops_notifier=ops,  # type: ignore[arg-type]
+            fallback_model="gemini-4-hydrogen",
+            fallback_thinking_level="HIGH",
+            max_transient_retries=1,
+            retry_base_delay_s=0.0,
+            round_timeout_seconds=0.05,
+        )
+        attempts: list[str] = []
+
+        async def _slow_primary_fast_fallback(*, model, contents, config):
+            attempts.append(model)
+            if model == "gemini-4-argon":
+                await asyncio.sleep(0.25)
+            return SimpleNamespace(
+                text="超时后备援成功",
+                function_calls=[],
+                candidates=[],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=50,
+                    cached_content_token_count=0,
+                    candidates_token_count=20,
+                    thoughts_token_count=5,
+                    total_token_count=75,
+                ),
+            )
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_slow_primary_fast_fallback))
+        )
+        reply = await client.generate(model="gemini-4-argon", prompt="hi", usage_label="report_pm")
+        self.assertEqual(reply, "超时后备援成功")
+        self.assertEqual(attempts, ["gemini-4-argon", "gemini-4-argon", "gemini-4-hydrogen"])
+        self.assertEqual(len(usage_records), 2)
+        self.assertFalse(usage_records[0]["success"])
+        self.assertTrue(usage_records[1]["success"])
+        self.assertTrue(any(e["severity"] == "WARN" and "已自动降级" in e["message"] for e in ops.events))
+
+    async def test_concurrent_tool_calls_isolation_timeout_and_compaction(self) -> None:
+        client = GeminiClient(
+            api_key="dummy-key",
+            round_timeout_seconds=5.0,
+            tool_timeout_seconds=0.08,
+            max_concurrent_tools=4,
+            max_tool_result_chars=320,
+        )
+        round_contents: list[list] = []
+
+        async def _fake_generate_content(*, model, contents, config):
+            round_contents.append(list(contents))
+            if len(round_contents) == 1:
+                return SimpleNamespace(
+                    text="",
+                    function_calls=[
+                        SimpleNamespace(name="inspect_ticker", args={"symbol": "NVDA"}),
+                        SimpleNamespace(name="inspect_ticker", args={"symbol": "FAIL"}),
+                        SimpleNamespace(name="inspect_ticker", args={"symbol": "MSFT"}),
+                        SimpleNamespace(name="inspect_ticker", args={"symbol": "HANG"}),
+                    ],
+                    candidates=[SimpleNamespace(content=SimpleNamespace(role="model", parts=[]))],
+                    usage_metadata=None,
+                )
+            return SimpleNamespace(text="多工具并发完成", function_calls=[], candidates=[], usage_metadata=None)
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate_content))
+        )
+
+        active = 0
+        peak_active = 0
+
+        async def _tool_exec(name: str, args: dict) -> dict:
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            try:
+                sym = args["symbol"]
+                if sym == "HANG":
+                    await asyncio.sleep(0.3)
+                    return {"symbol": sym}
+                await asyncio.sleep(0.02)
+                if sym == "FAIL":
+                    raise RuntimeError("tool exploded")
+                if sym == "NVDA":
+                    return {
+                        "symbol": "NVDA",
+                        "summary": "A" * 500,
+                        "news": [f"headline {i}: " + ("X" * 80) for i in range(10)],
+                    }
+                return {"symbol": sym, "summary": "compact ok"}
+            finally:
+                active -= 1
+
+        reply = await client.generate(
+            model="gemini-4-hydrogen",
+            prompt="check all",
+            tool_executor=_tool_exec,
+            usage_label="report_analyst",
+        )
+        self.assertEqual(reply, "多工具并发完成")
+        self.assertGreaterEqual(peak_active, 2)
+        self.assertEqual(len(round_contents), 2)
+
+        tool_user_msg = round_contents[1][-1]
+        parts = tool_user_msg.parts
+        self.assertEqual(len(parts), 4)
+
+        nvda_res = parts[0].function_response.response["result"]
+        self.assertEqual(nvda_res["symbol"], "NVDA")
+        self.assertTrue(nvda_res.get("_truncated"))
+        self.assertLessEqual(len(json.dumps(nvda_res, ensure_ascii=False)), 320)
+
+        fail_res = parts[1].function_response.response["result"]
+        self.assertEqual(fail_res, {"error": "tool exploded"})
+
+        msft_res = parts[2].function_response.response["result"]
+        self.assertEqual(msft_res, {"symbol": "MSFT", "summary": "compact ok"})
+
+        hang_res = parts[3].function_response.response["result"]
+        self.assertIn("timeout", hang_res["error"])
+
+        # Direct unit check on normal-sized payloads remaining untouched
+        small = {"symbol": "AAPL", "summary": "normal"}
+        self.assertEqual(_compact_tool_result(small, 320), small)
+
+    async def test_monthly_search_quota_alerts_use_this_month_bucket(self) -> None:
+        class _StubTg:
+            def __init__(self) -> None:
+                self.bot_token = "tok"
+                self.sent: list[tuple[str, str]] = []
+
+            async def send_message(self, chat_id: str, text: str, **kwargs) -> bool:
+                self.sent.append((chat_id, text))
+                return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "quota.db")
+            await db.init()
+
+            # Insert a prior-month row to confirm this_month excludes prior-month search queries
+            uk_tz = ZoneInfo("Europe/London")
+            prev_month_dt = datetime.now(timezone.utc).astimezone(uk_tz).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            ) - timedelta(days=2)
+            prev_ms = int(prev_month_dt.timestamp() * 1000)
+            async with db._connect(write=True) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO llm_usage_logs (
+                        cycle_date, created_at_uk, created_at_ms, call_label, model,
+                        thinking_level, api_rounds, prompt_tokens, cached_tokens,
+                        output_tokens, thought_tokens, total_tokens, estimated_cost_usd,
+                        latency_ms, success, search_queries
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        prev_month_dt.strftime("%Y-%m-%d"),
+                        prev_month_dt.strftime("%Y-%m-%d %H:%M"),
+                        prev_ms,
+                        "report_grounding",
+                        "gemini-4-hydrogen",
+                        "LOW",
+                        1,
+                        100,
+                        0,
+                        20,
+                        0,
+                        120,
+                        0.0,
+                        50,
+                        1,
+                        999,
+                    ),
+                )
+                await conn.commit()
+
+            tg = _StubTg()
+            ops = OpsNotifier(
+                telegram=tg,  # type: ignore[arg-type]
+                chat_id="12345",
+                db=db,
+                warn_cooldown_seconds=1800,
+            )
+            client = GeminiClient(
+                api_key="dummy-key",
+                usage_recorder=db.log_llm_usage,
+                ops_notifier=ops,
+                usage_summary_provider=db.get_usage_summary,
+                search_free_quota_monthly=10,
+                search_warn_pct=80.0,
+            )
+
+            query_batches = [["q1", "q2", "q3", "q4", "q5", "q6", "q7"], ["q8"], ["q9", "q10"]]
+
+            async def _fake_search(*, model, contents, config):
+                queries = query_batches.pop(0)
+                return SimpleNamespace(
+                    text="检索完成",
+                    function_calls=[],
+                    candidates=[SimpleNamespace(grounding_metadata=SimpleNamespace(web_search_queries=queries))],
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=100,
+                        cached_content_token_count=0,
+                        candidates_token_count=20,
+                        thoughts_token_count=0,
+                        total_token_count=120,
+                    ),
+                )
+
+            client._client = SimpleNamespace(  # type: ignore[assignment]
+                aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_search))
+            )
+
+            # 1) 7 / 10 (70% < 80%): prior month 999 queries must not trigger alert
+            await client.generate(model="gemini-4-hydrogen", prompt="p1", use_google_search=True)
+            self.assertEqual(len(tg.sent), 0)
+
+            # 2) 8 / 10 (80%): warning alert triggered
+            await client.generate(model="gemini-4-hydrogen", prompt="p2", use_google_search=True)
+            self.assertEqual(len(tg.sent), 1)
+            self.assertIn("8 / 10", tg.sent[0][1])
+
+            # 3) 10 / 10 (100%): exceeded alert uses separate alert_key so it fires immediately
+            await client.generate(model="gemini-4-hydrogen", prompt="p3", use_google_search=True)
+            self.assertEqual(len(tg.sent), 2)
+            self.assertIn("10 / 10", tg.sent[1][1])
+            self.assertIn("免费额度上限", tg.sent[1][1])
 
 
 if __name__ == "__main__":

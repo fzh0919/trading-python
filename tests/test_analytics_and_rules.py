@@ -7,17 +7,29 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src.config import StrategySection
+from src.config import StrategySection, UniverseSection
 from src.data_providers.analytics import (
     compute_correlation_matrix,
     compute_rsi_wilder,
     compute_technical_snapshot,
     max_correlation_against_portfolio,
 )
-from src.data_providers.market_data import TickerMarketBundle
-from src.data_providers.t212_client import PositionItem
+from src.data_providers.market_data import MarketDataService, TickerMarketBundle
+from src.data_providers.t212_client import HistoricalOrderItem, PositionItem
 from src.engine.portfolio_rules import evaluate_holding, format_evaluations_text
-from src.engine.screener import score_candidate
+from src.engine.screener import (
+    compute_market_breadth,
+    compute_portfolio_risk_metrics,
+    compute_relative_strength,
+    compute_vpvr_profile,
+    detect_breakthrough_platform,
+    detect_low_atr_contraction,
+    detect_minervini_stage2,
+    detect_vcp_contraction,
+    detect_volume_ma_breakout,
+    run_quant_screener,
+    score_candidate,
+)
 
 
 def _make_hist(closes: list[float]) -> pd.DataFrame:
@@ -980,6 +992,864 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertEqual([a.symbol for a in res_pick.decision.selected_actions], ["INTC"])
         self.assertEqual(len(res_pick.decision.rejected_or_frozen), 2)
         self.assertIn("[🛡️风控护栏修正]", res_pick.decision.rejected_or_frozen[0])
+
+    def test_imp08_ref_breakout_patterns_and_volume_enter(self) -> None:
+        # 1) Platform breakthrough: 90 bars flat around 100 (so MA60 ~ 100), then volume breakout bar
+        n_plat = 100
+        dates_plat = pd.date_range("2025-10-01", periods=n_plat, freq="B")
+        opens_p = np.full(n_plat, 100.0)
+        closes_p = np.array([99.5 + (i % 3) * 0.4 for i in range(n_plat)], dtype=float)
+        highs_p = closes_p + 0.8
+        lows_p = closes_p - 0.8
+        vols_p = np.full(n_plat, 1_000_000.0)
+        # Breakthrough at index 88: open below MA60, close >= MA60 with +3.5% gain and 2.8x volume
+        opens_p[88] = 99.0
+        closes_p[88] = 103.5
+        highs_p[88] = 104.0
+        lows_p[88] = 98.8
+        vols_p[88] = 2_800_000.0
+        for j in range(89, n_plat):
+            opens_p[j] = 103.2
+            closes_p[j] = 103.6 + (j - 89) * 0.1
+            highs_p[j] = closes_p[j] + 0.6
+            lows_p[j] = closes_p[j] - 0.6
+        df_plat = pd.DataFrame(
+            {"Open": opens_p, "High": highs_p, "Low": lows_p, "Close": closes_p, "Volume": vols_p},
+            index=dates_plat,
+        )
+        self.assertTrue(detect_breakthrough_platform(df_plat))
+
+        # No-volume breakout should fail platform check
+        df_plat_novol = df_plat.copy()
+        df_plat_novol.iloc[88, df_plat_novol.columns.get_loc("Volume")] = 1_000_000.0
+        self.assertFalse(detect_breakthrough_platform(df_plat_novol))
+
+        # 2) Low-ATR volatility contraction: volatile uptrend then tight 12-day coil above MA50
+        n_atr = 140
+        dates_atr = pd.date_range("2025-09-01", periods=n_atr, freq="B")
+        rng = np.random.default_rng(7)
+        base_c = 100.0 + np.linspace(0, 22, n_atr) + np.sin(np.arange(n_atr) / 3.0) * 1.5
+        # Make last 14 bars very tight coiling near 123
+        base_c[-14:] = 123.0 + np.linspace(-0.2, 0.25, 14)
+        spread = np.full(n_atr, 3.2)
+        spread[-14:] = 0.35
+        df_atr = pd.DataFrame(
+            {
+                "Open": base_c - spread * 0.2,
+                "High": base_c + spread,
+                "Low": base_c - spread,
+                "Close": base_c,
+                "Volume": np.full(n_atr, 1_200_000.0),
+            },
+            index=dates_atr,
+        )
+        tech_atr = compute_technical_snapshot("LOWATR", df_atr)
+        assert tech_atr is not None
+        self.assertTrue(detect_low_atr_contraction(df_atr, tech_atr))
+
+        # 3) enter.py volume MA breakout: dips below MA20 then surges +3.5% on 2.5x volume above MA20
+        n_ent = 65
+        dates_ent = pd.date_range("2025-11-01", periods=n_ent, freq="B")
+        c_ent = np.linspace(100.0, 112.0, n_ent)
+        c_ent[-6:-1] = [109.5, 108.8, 108.2, 107.8, 107.6]
+        c_ent[-1] = 111.8
+        o_ent = c_ent.copy() - 0.3
+        o_ent[-1] = 108.0
+        v_ent = np.full(n_ent, 1_000_000.0)
+        v_ent[-1] = 2_600_000.0
+        df_ent = pd.DataFrame(
+            {
+                "Open": o_ent,
+                "High": np.maximum(o_ent, c_ent) + 0.4,
+                "Low": np.minimum(o_ent, c_ent) - 0.4,
+                "Close": c_ent,
+                "Volume": v_ent,
+            },
+            index=dates_ent,
+        )
+        tech_ent = compute_technical_snapshot("ENTER", df_ent)
+        assert tech_ent is not None
+        self.assertTrue(detect_volume_ma_breakout(df_ent, tech_ent))
+
+    def test_imp08_four_dimensional_scoring_cyq_fundamentals_and_etf_config(self) -> None:
+        strategy = StrategySection()
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        closes = np.linspace(100.0, 130.0, 220)
+        df = pd.DataFrame(
+            {
+                "Open": closes * 0.996,
+                "High": closes * 1.01,
+                "Low": closes * 0.99,
+                "Close": closes,
+                "Volume": np.full(220, 1_500_000.0),
+            },
+            index=dates,
+        )
+        tech_base = compute_technical_snapshot("AZN.L", df)
+        assert tech_base is not None
+
+        # Hardcoded ETF list removed: without quote_type="ETF" or configured etf_symbols, VWRP.L is EQUITY
+        cand_no_etf = score_candidate(
+            "VWRP.L", "ISA_LONG_TERM", tech_base, None, 0.35, "NVDA", False, False, strategy
+        )
+        self.assertEqual(cand_no_etf.asset_type, "EQUITY")
+        cand_cfg_etf = score_candidate(
+            "CUSTOM.L",
+            "ISA_LONG_TERM",
+            tech_base,
+            None,
+            0.35,
+            "NVDA",
+            False,
+            False,
+            strategy,
+            etf_symbols={"CUSTOM.L"},
+        )
+        self.assertEqual(cand_cfg_etf.asset_type, "ETF")
+        self.assertGreater(cand_cfg_etf.score, cand_no_etf.score)
+
+        # Fundamental valuation + GBp/GBP 100x target guard + CYQ bottom single peak + weekly resonance
+        tech_rich = tech_base.model_copy(
+            update={
+                "cyq_regime": "底部单峰密集",
+                "cyq_benefit_part_pct": 62.0,
+                "cyq_concentration_90_pct": 9.5,
+                "weekly_bullish": True,
+                "bb_squeeze": True,
+                "volume_ratio_20d": 1.8,
+                "ret_1d_pct": 1.4,
+            }
+        )
+        # UK stock priced in GBp (10000p) while analyst target is given in GBP (125) -> 100x guard normalizes to +25%
+        good_bundle = TickerMarketBundle(
+            symbol="AZN.L",
+            quote_type="EQUITY",
+            currency="GBp",
+            short_name="AstraZeneca",
+            current_price=10000.0,
+            forward_pe=17.5,
+            dividend_yield_pct=3.2,
+            target_mean_price=125.0,
+            analyst_count=12,
+        )
+        weak_bundle = TickerMarketBundle(
+            symbol="EXPENSIVE.L",
+            quote_type="EQUITY",
+            currency="GBp",
+            short_name="Expensive",
+            current_price=100.0,
+            forward_pe=68.0,
+            dividend_yield_pct=0.0,
+            target_mean_price=80.0,
+            analyst_count=10,
+        )
+        tech_weak = tech_base.model_copy(
+            update={"cyq_regime": "上方套牢峰", "weekly_bullish": False, "bb_squeeze": False}
+        )
+        c_good = score_candidate(
+            "AZN.L", "ISA_LONG_TERM", tech_rich, good_bundle, 0.30, "NVDA", False, False, strategy
+        )
+        c_bad = score_candidate(
+            "EXPENSIVE.L", "ISA_LONG_TERM", tech_weak, weak_bundle, 0.30, "NVDA", False, False, strategy
+        )
+        self.assertIn("目标价空间+25%", c_good.summary_line)
+        self.assertIn("CYQ底部单峰密集", c_good.reasons)
+        self.assertIn("周/日线多头共振", c_good.reasons)
+        self.assertGreater(c_good.score - c_bad.score, 35.0)
+
+    def test_imp08_two_stage_run_quant_screener_benchmarks_and_recent_trades(self) -> None:
+        import asyncio
+        import time
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+
+        def _make_ohlcv(seed: int, slope: float = 0.15) -> pd.DataFrame:
+            rng = np.random.default_rng(seed)
+            rets = rng.normal(0.0005, 0.012, 220)
+            c = 100.0 * np.cumprod(1.0 + rets) + np.linspace(0.0, slope * 220, 220)
+            return pd.DataFrame(
+                {
+                    "Open": c * 0.996,
+                    "High": c * 1.01,
+                    "Low": c * 0.99,
+                    "Close": c,
+                    "Volume": np.full(220, 1_500_000.0),
+                },
+                index=dates,
+            )
+
+        class _SpyMarketData(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hist_calls: list[list[str]] = []
+                self.bundle_calls: list[dict] = []
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                self.hist_calls.append(list(symbols))
+                return {s: _make_ohlcv(abs(hash(s)) % 1000) for s in symbols}
+
+            async def get_bundles(
+                self,
+                symbols: list[str],
+                include_news: bool = True,
+                include_earnings: bool = True,
+                include_info: bool = True,
+                isin_map: dict[str, str] | None = None,
+            ):
+                self.bundle_calls.append(
+                    {
+                        "symbols": list(symbols),
+                        "include_news": include_news,
+                        "include_earnings": include_earnings,
+                        "include_info": include_info,
+                        "isin_map": dict(isin_map or {}),
+                    }
+                )
+                hists = {s: _make_ohlcv(abs(hash(s)) % 1000) for s in symbols}
+                bundles = {
+                    s: TickerMarketBundle(
+                        symbol=s,
+                        quote_type="ETF" if s == "CUSTOMETF.L" else "EQUITY",
+                        currency="GBP" if s.endswith(".L") else "USD",
+                        short_name=s,
+                        isin=(isin_map or {}).get(s, ""),
+                        forward_pe=18.0,
+                        dividend_yield_pct=3.0 if s.endswith(".L") else 1.0,
+                        target_mean_price=float(hists[s]["Close"].iloc[-1]) * 1.25,
+                        analyst_count=8,
+                        days_to_ex_dividend=-1 if s == "AZN.L" else None,
+                        has_history=True,
+                    )
+                    for s in symbols
+                }
+                return hists, bundles
+
+        now_ms = int(time.time() * 1000)
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 10:00",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        inst_currency="USD",
+                        quantity=10,
+                        avg_price=120,
+                        cur_price=140,
+                        current_value=1100,
+                        total_cost=950,
+                        pnl=150,
+                        fx_impact=0,
+                        return_pct=15.8,
+                        weight_pct=50.0,
+                        isin="US67066G1040",
+                    ),
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="AZN_EQ",
+                        ticker="AZN",
+                        yahoo_symbol="AZN.L",
+                        name="AstraZeneca",
+                        inst_currency="GBp",
+                        quantity=10,
+                        avg_price=10000,
+                        cur_price=10500,
+                        current_value=1050,
+                        total_cost=1000,
+                        pnl=50,
+                        fx_impact=0,
+                        return_pct=5.0,
+                        weight_pct=50.0,
+                        isin=None,
+                    ),
+                ],
+                recent_orders=[
+                    HistoricalOrderItem(
+                        id="recent-1",
+                        account="ISA",
+                        raw_ticker="SNOW_US_EQ",
+                        ticker="SNOW",
+                        yahoo_symbol="SNOW",
+                        name="Snowflake",
+                        inst_currency="USD",
+                        side="BUY",
+                        order_type="MARKET",
+                        filled_at="2026-11-01T15:00:00Z",
+                        filled_at_ms=now_ms - 14 * 86400 * 1000,
+                        uk_time_str="2026-11-01 15:00",
+                        quantity=2,
+                        price=160.0,
+                        net_value=250.0,
+                        wallet_currency="GBP",
+                        realised_pnl=0.0,
+                        tax_total=0.0,
+                    ),
+                    HistoricalOrderItem(
+                        id="stale-95d",
+                        account="Invest",
+                        raw_ticker="OLD_EQ",
+                        ticker="OLD",
+                        yahoo_symbol="OLD.L",
+                        name="Old Stock",
+                        inst_currency="GBp",
+                        side="SELL",
+                        order_type="MARKET",
+                        filled_at="2026-07-01T15:00:00Z",
+                        filled_at_ms=now_ms - 120 * 86400 * 1000,
+                        uk_time_str="2026-07-01 15:00",
+                        quantity=2,
+                        price=100.0,
+                        net_value=200.0,
+                        wallet_currency="GBP",
+                        realised_pnl=10.0,
+                        tax_total=0.0,
+                    ),
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        universe = UniverseSection(
+            isa_long_term=[
+                "CUSTOMETF.L", "SAP.DE", "REL.L", "ULVR.L", "GSK.L", "HSBA.L",
+                "MSFT", "AAPL", "GOOGL", "AMZN", "V", "COST",
+            ],
+            invest_tactical=["AMD", "META", "CRM", "UBER", "MU", "PANW", "NFLX", "LLY", "JPM"],
+            etf_symbols=["CUSTOMETF.L"],
+        )
+        spy_md = _SpyMarketData()
+        existing = {"NVDA": _make_ohlcv(101)}
+
+        isa_res, inv_res = asyncio.run(
+            run_quant_screener(
+                portfolio=portfolio,
+                market_data=spy_md,
+                universe=universe,
+                watchlist=["TSM"],
+                strategy=StrategySection(),
+                existing_histories=existing,
+                top_n_per_track=2,
+            )
+        )
+        self.assertEqual(len(isa_res), 2)
+        self.assertEqual(len(inv_res), 2)
+        # Stage 1 fetched histories in a single batch, skipping preloaded NVDA and adding regional benchmarks
+        self.assertEqual(len(spy_md.hist_calls), 1)
+        fetched_syms = set(spy_md.hist_calls[0])
+        self.assertNotIn("NVDA", fetched_syms)
+        self.assertIn("SPY", fetched_syms)
+        self.assertIn("ISF.L", fetched_syms)
+        self.assertIn("EXS1.DE", fetched_syms)
+        self.assertIn("SNOW", fetched_syms)
+        self.assertNotIn("OLD.L", fetched_syms)
+
+        # Stage 2 called get_bundles ONLY for the shortlisted candidates (< total universe)
+        self.assertEqual(len(spy_md.bundle_calls), 1)
+        b_call = spy_md.bundle_calls[0]
+        self.assertFalse(b_call["include_news"])
+        self.assertTrue(b_call["include_earnings"])
+        self.assertTrue(b_call["include_info"])
+        self.assertEqual(b_call["isin_map"], {"NVDA": "US67066G1040"})
+        self.assertLess(len(b_call["symbols"]), len(fetched_syms))
+
+    def test_imp08_v2_minervini_vcp_rs_and_phase4(self) -> None:
+        strategy = StrategySection()
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        # 220-bar Stage 2 uptrend whose last 120 bars form 3 progressively tighter VCP contractions with drying volume
+        base = np.linspace(80.0, 130.0, 100)
+        seg1 = 130.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 12.0   # ~17% swing
+        seg2 = 132.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 5.5    # ~8% swing
+        seg3 = 133.5 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 2.0    # ~3% swing
+        closes_vcp = np.concatenate([base, seg1, seg2, seg3])
+        closes_vcp[-5:] = np.linspace(134.0, 136.5, 5)
+        vols_vcp = np.full(220, 2_000_000.0)
+        vols_vcp[-12:] = 850_000.0  # clear volume dry-up in final contraction
+
+        df_vcp = pd.DataFrame(
+            {
+                "Open": closes_vcp * 0.997,
+                "High": closes_vcp * 1.012,
+                "Low": closes_vcp * 0.988,
+                "Close": closes_vcp,
+                "Volume": vols_vcp,
+            },
+            index=dates,
+        )
+        # Benchmark lagging noticeably in recent 60 days
+        bench_closes = np.linspace(100.0, 118.0, 160).tolist() + np.linspace(118.0, 114.0, 60).tolist()
+        df_bench = pd.DataFrame(
+            {
+                "Open": np.array(bench_closes) * 0.998,
+                "High": np.array(bench_closes) * 1.005,
+                "Low": np.array(bench_closes) * 0.995,
+                "Close": bench_closes,
+                "Volume": np.full(220, 5_000_000.0),
+            },
+            index=dates,
+        )
+        tech_vcp = compute_technical_snapshot("AVGO", df_vcp)
+        assert tech_vcp is not None
+        rs = compute_relative_strength(df_vcp, df_bench)
+        self.assertIsNotNone(rs["rs_20d_pct"])
+        self.assertGreater(rs["rs_20d_pct"], 2.0)
+        self.assertIsNotNone(rs["rs_slope_20d"])
+        self.assertGreater(rs["rs_slope_20d"], 0.0)
+
+        m_res = detect_minervini_stage2(df_vcp, tech_vcp, rs_60d_pct=rs["rs_60d_pct"])
+        self.assertEqual(m_res["phase"], 2)
+        self.assertTrue(m_res["passes"])
+        self.assertTrue(detect_vcp_contraction(df_vcp, tech_vcp))
+
+        cand_vcp = score_candidate(
+            "AVGO",
+            "INVEST_TACTICAL",
+            tech_vcp,
+            None,
+            0.35,
+            "NVDA",
+            False,
+            False,
+            strategy,
+            hist=df_vcp,
+            benchmark_hist=df_bench,
+        )
+        self.assertIn("VCP收缩", cand_vcp.pattern_signals)
+        self.assertIn("Minervini阶段2", cand_vcp.pattern_signals)
+        self.assertLessEqual(cand_vcp.dimension_scores["trend_rs"], 30.0)
+        self.assertLessEqual(cand_vcp.dimension_scores["pattern_timing"], 25.0)
+        self.assertLessEqual(cand_vcp.dimension_scores["value_quality"], 25.0)
+        self.assertLessEqual(cand_vcp.dimension_scores["portfolio_fit"], 20.0)
+
+        # Phase 4 downtrend retains visibility with penalty + explicit warning tag (Option 2A)
+        down_closes = np.linspace(150.0, 90.0, 220)
+        df_down = pd.DataFrame(
+            {
+                "Open": down_closes * 1.002,
+                "High": down_closes * 1.01,
+                "Low": down_closes * 0.99,
+                "Close": down_closes,
+                "Volume": np.full(220, 1_000_000.0),
+            },
+            index=dates,
+        )
+        tech_down = compute_technical_snapshot("FALL.L", df_down)
+        assert tech_down is not None
+        m_down = detect_minervini_stage2(df_down, tech_down)
+        self.assertEqual(m_down["phase"], 4)
+        self.assertFalse(m_down["passes"])
+        cand_down = score_candidate(
+            "FALL.L",
+            "ISA_LONG_TERM",
+            tech_down,
+            None,
+            0.30,
+            "NVDA",
+            False,
+            False,
+            strategy,
+            hist=df_down,
+        )
+        self.assertGreater(cand_down.score, 0.0)
+        self.assertIn("[Phase4弱势]", cand_down.reasons)
+        self.assertLess(cand_down.score, cand_vcp.score)
+
+    def test_imp08_v2_linear_quality_and_portfolio_marginal_risk(self) -> None:
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        strategy = StrategySection()
+        dates = pd.date_range("2025-10-01", periods=100, freq="B")
+        rng = np.random.default_rng(42)
+        rets_a = rng.normal(0.001, 0.02, 100)
+        rets_hedge = -rets_a * 0.8 + rng.normal(0.0005, 0.005, 100)  # negatively correlated
+        rets_clone = rets_a * 0.95 + rng.normal(0.0, 0.004, 100)       # highly redundant
+
+        def _df_from_rets(r: np.ndarray) -> pd.DataFrame:
+            c = 100.0 * np.cumprod(1.0 + r)
+            return pd.DataFrame(
+                {"Open": c * 0.998, "High": c * 1.01, "Low": c * 0.99, "Close": c, "Volume": np.full(100, 1e6)},
+                index=dates,
+            )
+
+        hist_a = _df_from_rets(rets_a)
+        hist_hedge = _df_from_rets(rets_hedge)
+        hist_clone = _df_from_rets(rets_clone)
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 10:00",
+            fetched_at_ms=1794736800000,
+            isa=AccountSnapshot(
+                ok=True,
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="HELD_US_EQ",
+                        ticker="HELD",
+                        yahoo_symbol="HELD",
+                        name="Held",
+                        inst_currency="USD",
+                        quantity=10,
+                        avg_price=100,
+                        cur_price=110,
+                        current_value=5000.0,
+                        total_cost=4500.0,
+                        pnl=500.0,
+                        fx_impact=0.0,
+                        return_pct=11.1,
+                        weight_pct=100.0,
+                    )
+                ],
+            ),
+            invest=AccountSnapshot(ok=True),
+        )
+        risk = compute_portfolio_risk_metrics(
+            {"HELD": hist_a, "HEDGE": hist_hedge, "CLONE": hist_clone},
+            portfolio,
+            ["HEDGE", "CLONE"],
+            lookback_days=60,
+        )
+        self.assertIn("HEDGE", risk)
+        self.assertIn("CLONE", risk)
+        self.assertLess(risk["HEDGE"]["weighted_corr"], 0.0)
+        self.assertGreater(risk["CLONE"]["weighted_corr"], 0.7)
+        self.assertLess(risk["HEDGE"]["marginal_vol_delta_pct"], risk["CLONE"]["marginal_vol_delta_pct"])
+
+        # Quality factor linear differentiation (ROE, margins, revenue growth, debt/equity)
+        tech = compute_technical_snapshot("HEDGE", hist_hedge)
+        assert tech is not None
+        high_q = TickerMarketBundle(
+            symbol="HEDGE",
+            quote_type="EQUITY",
+            currency="USD",
+            forward_pe=19.0,
+            roe_pct=28.0,
+            profit_margin_pct=24.0,
+            revenue_growth_pct=22.0,
+            debt_to_equity=25.0,
+        )
+        low_q = TickerMarketBundle(
+            symbol="CLONE",
+            quote_type="EQUITY",
+            currency="USD",
+            forward_pe=48.0,
+            roe_pct=4.0,
+            profit_margin_pct=1.0,
+            revenue_growth_pct=-2.0,
+            debt_to_equity=250.0,
+        )
+        c_hq = score_candidate(
+            "HEDGE",
+            "ISA_LONG_TERM",
+            tech,
+            high_q,
+            0.10,
+            "HELD",
+            False,
+            False,
+            strategy,
+            weighted_corr=risk["HEDGE"]["weighted_corr"],
+            marginal_vol_delta_pct=risk["HEDGE"]["marginal_vol_delta_pct"],
+        )
+        c_lq = score_candidate(
+            "CLONE",
+            "ISA_LONG_TERM",
+            tech,
+            low_q,
+            0.85,
+            "HELD",
+            False,
+            False,
+            strategy,
+            weighted_corr=risk["CLONE"]["weighted_corr"],
+            marginal_vol_delta_pct=risk["CLONE"]["marginal_vol_delta_pct"],
+        )
+        self.assertGreater(c_hq.dimension_scores["value_quality"], c_lq.dimension_scores["value_quality"])
+        self.assertGreater(c_hq.dimension_scores["portfolio_fit"], c_lq.dimension_scores["portfolio_fit"])
+
+    def test_imp08_v2_market_breadth_and_multibucket_shortlist(self) -> None:
+        import asyncio
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        dates = pd.date_range("2025-10-01", periods=210, freq="B")
+
+        def _trend_df(step: float, pullback: bool = False) -> pd.DataFrame:
+            c = np.linspace(100.0, 100.0 + step * 210, 210)
+            if pullback:
+                c[-8:] = np.linspace(c[-9], c[-9] * 0.94, 8)
+            return pd.DataFrame(
+                {"Open": c * 0.998, "High": c * 1.008, "Low": c * 0.992, "Close": c, "Volume": np.full(210, 1e6)},
+                index=dates,
+            )
+
+        snaps = {f"B{i}": compute_technical_snapshot(f"B{i}", _trend_df(0.25)) for i in range(6)}
+        breadth_on = compute_market_breadth(snaps, snaps.keys())
+        self.assertEqual(breadth_on["regime_tag"], "RISK-ON")
+
+        weak_snaps = {f"W{i}": compute_technical_snapshot(f"W{i}", _trend_df(-0.2)) for i in range(6)}
+        breadth_off = compute_market_breadth(weak_snaps, weak_snaps.keys())
+        self.assertEqual(breadth_off["regime_tag"], "RISK-OFF")
+
+        # Build a large ISA pool (> preselect_n=8 for top_n_per_track=2) where WATCH_PB sits in Bucket 2/3
+        mom_syms = [f"MOM{i}" for i in range(14)]
+        hist_map = {s: _trend_df(0.28 + i * 0.01) for i, s in enumerate(mom_syms)}
+        hist_map["WATCH_PB"] = _trend_df(0.18, pullback=True)
+        hist_map["SPY"] = _trend_df(0.10)
+        hist_map["ISF.L"] = _trend_df(0.08)
+
+        class _BucketMarketData(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bundle_syms: list[str] = []
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                return {s: hist_map[s] for s in symbols if s in hist_map}
+
+            async def get_bundles(self, symbols: list[str], **_kwargs):
+                self.bundle_syms = list(symbols)
+                b = {
+                    s: TickerMarketBundle(
+                        symbol=s,
+                        quote_type="EQUITY",
+                        currency="USD",
+                        short_name=s,
+                        forward_pe=18.0,
+                        roe_pct=22.0,
+                    )
+                    for s in symbols
+                }
+                return {s: hist_map[s] for s in symbols if s in hist_map}, b
+
+        md = _BucketMarketData()
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 10:00",
+            fetched_at_ms=1794736800000,
+            isa=AccountSnapshot(ok=True),
+            invest=AccountSnapshot(ok=True),
+        )
+        universe = UniverseSection(isa_long_term=mom_syms, invest_tactical=["MOM0", "MOM1"])
+        isa_res, _ = asyncio.run(
+            run_quant_screener(
+                portfolio=portfolio,
+                market_data=md,
+                universe=universe,
+                watchlist=["WATCH_PB"],
+                strategy=StrategySection(),
+                top_n_per_track=2,
+            )
+        )
+        self.assertIn("WATCH_PB", md.bundle_syms)
+        self.assertLess(len(md.bundle_syms), len(mom_syms) + 3)
+        self.assertEqual(isa_res[0].regime_tag, "RISK-ON")
+        self.assertIsNotNone(isa_res[0].rs_20d_pct)
+        self.assertIn("trend_rs", isa_res[0].dimension_scores)
+
+    def test_imp08_v3_vpvr_cross_tz_asymmetric_weights_and_defensive_bucket(self) -> None:
+        import asyncio
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        strategy = StrategySection()
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+
+        # 1) ETF VPVR POC support + exemption from CYQ >=92% profit penalty & Stage 2 exemption
+        c_etf = np.concatenate([np.full(170, 100.0), np.linspace(100.0, 104.5, 50)])
+        v_etf = np.concatenate([np.full(195, 3_000_000.0), np.full(25, 400_000.0)])  # dense POC around ~100
+        df_etf = pd.DataFrame(
+            {"Open": c_etf * 0.998, "High": c_etf * 1.005, "Low": c_etf * 0.995, "Close": c_etf, "Volume": v_etf},
+            index=dates,
+        )
+        vpvr = compute_vpvr_profile(df_etf, window=60)
+        assert vpvr is not None
+        self.assertGreaterEqual(vpvr["poc_dist_pct"], 0.0)
+        self.assertLessEqual(vpvr["poc_dist_pct"], 8.0)
+
+        tech_base = compute_technical_snapshot("VWRP.L", df_etf)
+        assert tech_base is not None
+        tech_96pct = tech_base.model_copy(
+            update={"cyq_regime": "获利盘高企", "cyq_benefit_part_pct": 96.0}
+        )
+        etf_bundle = TickerMarketBundle(
+            symbol="VWRP.L", quote_type="ETF", currency="GBP", dividend_yield_pct=2.8
+        )
+        cand_etf = score_candidate(
+            "VWRP.L",
+            "ISA_LONG_TERM",
+            tech_96pct,
+            etf_bundle,
+            0.25,
+            "NVDA",
+            False,
+            False,
+            strategy,
+            hist=df_etf,
+        )
+        self.assertTrue(any("VPVR支撑单峰" in p for p in cand_etf.pros))
+        self.assertFalse(any("获利盘高企" in c for c in cand_etf.cons))
+
+        # Stage 2 equity with upward RS slope also exempt from >=92% CYQ penalty
+        c_leader = np.linspace(80.0, 150.0, 220)
+        df_leader = pd.DataFrame(
+            {
+                "Open": c_leader * 0.997,
+                "High": c_leader * 1.01,
+                "Low": c_leader * 0.99,
+                "Close": c_leader,
+                "Volume": np.full(220, 2_000_000.0),
+            },
+            index=dates,
+        )
+        df_bench_lag = pd.DataFrame(
+            {
+                "Open": np.full(220, 100.0),
+                "High": np.full(220, 101.0),
+                "Low": np.full(220, 99.0),
+                "Close": np.linspace(100.0, 105.0, 220),
+                "Volume": np.full(220, 4_000_000.0),
+            },
+            index=dates,
+        )
+        tech_leader = compute_technical_snapshot("NVDA", df_leader)
+        assert tech_leader is not None
+        tech_leader_96 = tech_leader.model_copy(
+            update={"cyq_regime": "获利盘高企", "cyq_benefit_part_pct": 96.0}
+        )
+        cand_leader = score_candidate(
+            "NVDA",
+            "INVEST_TACTICAL",
+            tech_leader_96,
+            TickerMarketBundle(symbol="NVDA", quote_type="EQUITY", currency="USD", forward_pe=35.0),
+            0.35,
+            "TSM",
+            False,
+            False,
+            strategy,
+            hist=df_leader,
+            benchmark_hist=df_bench_lag,
+        )
+        self.assertFalse(any("获利盘高企" in c for c in cand_leader.cons))
+
+        # 2) Cross-timezone 3-day overlapping covariance catches 1-day lagged UK/EU vs US co-movement
+        rng = np.random.default_rng(7)
+        us_rets = rng.normal(0.001, 0.02, 100)
+        uk_lag_rets = np.roll(us_rets, 1) * 0.95 + rng.normal(0.0, 0.002, 100)
+        dates_tz = pd.date_range("2025-10-01", periods=100, freq="B")
+        c_us = 100.0 * np.cumprod(1.0 + us_rets)
+        c_uk = 100.0 * np.cumprod(1.0 + uk_lag_rets)
+        h_us = pd.DataFrame(
+            {"Open": c_us, "High": c_us * 1.01, "Low": c_us * 0.99, "Close": c_us, "Volume": np.full(100, 1e6)},
+            index=dates_tz,
+        )
+        h_uk = pd.DataFrame(
+            {"Open": c_uk, "High": c_uk * 1.01, "Low": c_uk * 0.99, "Close": c_uk, "Volume": np.full(100, 1e6)},
+            index=dates_tz,
+        )
+        port_us = PortfolioData(
+            fetched_at_uk="2026-11-15 10:00",
+            fetched_at_ms=1794736800000,
+            isa=AccountSnapshot(
+                ok=True,
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        inst_currency="USD",
+                        quantity=10,
+                        avg_price=100,
+                        cur_price=110,
+                        current_value=5000.0,
+                        total_cost=4500.0,
+                        pnl=500.0,
+                        fx_impact=0.0,
+                        return_pct=11.1,
+                        weight_pct=100.0,
+                    )
+                ],
+            ),
+            invest=AccountSnapshot(ok=True),
+        )
+        tz_risk = compute_portfolio_risk_metrics(
+            {"NVDA": h_us, "UKLAG.L": h_uk},
+            port_us,
+            ["UKLAG.L"],
+            lookback_days=60,
+        )
+        self.assertGreater(tz_risk["UKLAG.L"]["weighted_corr"], 0.45)
+
+        # 3) Asymmetric dual-track weights + structured attribution pros/cons/dimension_pct
+        cand_isa_etf = score_candidate(
+            "VWRP.L", "ISA_LONG_TERM", tech_base, etf_bundle, 0.25, "NVDA", False, False, strategy, hist=df_etf
+        )
+        cand_inv_etf = score_candidate(
+            "VWRP.L", "INVEST_TACTICAL", tech_base, etf_bundle, 0.25, "NVDA", False, False, strategy, hist=df_etf
+        )
+        self.assertGreater(cand_isa_etf.score, cand_inv_etf.score)
+        self.assertEqual(set(cand_isa_etf.dimension_pct), {"trend_rs", "pattern_timing", "value_quality", "portfolio_fit"})
+        self.assertIn("优势:", cand_isa_etf.summary_line)
+
+        # 4) Dual-anchored breadth pulls neutral pool down when benchmarks are in downtrend
+        down_b = np.linspace(150.0, 95.0, 220)
+        df_bear_bench = pd.DataFrame(
+            {"Open": down_b, "High": down_b * 1.01, "Low": down_b * 0.99, "Close": down_b, "Volume": np.full(220, 1e6)},
+            index=dates,
+        )
+        breadth_bear = compute_market_breadth(
+            {"M1": tech_base, "M2": tech_base},
+            ["M1", "M2"],
+            histories={"SPY": df_bear_bench, "ISF.L": df_bear_bench},
+        )
+        self.assertEqual(breadth_bear["regime_tag"], "TRANSITIONAL")
+        self.assertLess(breadth_bear["combined_score"], 60.0)
+
+        # 5) Defensive bucket rescues a low-vol LSE ETF into Stage 2 enrichment despite 14 momentum equities
+        mom_syms = [f"FAST{i}" for i in range(14)]
+        hist_pool = {s: df_leader for s in mom_syms}
+        hist_pool["SAFEETF.L"] = df_etf
+        hist_pool["SPY"] = df_bench_lag
+        hist_pool["ISF.L"] = df_bench_lag
+
+        class _DefMarketData(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.stage2_syms: list[str] = []
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                return {s: hist_pool[s] for s in symbols if s in hist_pool}
+
+            async def get_bundles(self, symbols: list[str], **_kwargs):
+                self.stage2_syms = list(symbols)
+                b = {
+                    s: TickerMarketBundle(
+                        symbol=s,
+                        quote_type="ETF" if s == "SAFEETF.L" else "EQUITY",
+                        currency="GBP" if s.endswith(".L") else "USD",
+                        short_name=s,
+                    )
+                    for s in symbols
+                }
+                return {s: hist_pool[s] for s in symbols if s in hist_pool}, b
+
+        d_md = _DefMarketData()
+        asyncio.run(
+            run_quant_screener(
+                portfolio=port_us,
+                market_data=d_md,
+                universe=UniverseSection(
+                    isa_long_term=[*mom_syms, "SAFEETF.L"],
+                    invest_tactical=["FAST0"],
+                    etf_symbols=["SAFEETF.L"],
+                ),
+                watchlist=[],
+                strategy=strategy,
+                top_n_per_track=2,
+            )
+        )
+        self.assertIn("SAFEETF.L", d_md.stage2_syms)
 
 
 if __name__ == "__main__":

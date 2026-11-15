@@ -43,23 +43,46 @@ class _FakeT212(T212Client):
         return self._data
 
 
-# TODO(IMP-08 / IMP-19): [接自 IMP-05 & IMP-06] screener.py / tools.py 改用 get_histories() 时，
-# 须同步为 _FakeMarketData 补齐 async def get_histories(...) 并让测试 DataFrame 包含 Open/High/Low/Close/Volume。
+# TODO(IMP-11 / IMP-19): [接自 IMP-05 & IMP-06] tools.py 改用 get_histories() 与最终集成验收时复核 _FakeMarketData。
 class _FakeMarketData(MarketDataService):
-    async def get_bundles(self, symbols: list[str], include_news: bool = True, include_earnings: bool = True):
+    async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
         dates = pd.date_range("2025-10-01", periods=230, freq="B")
         histories = {}
-        bundles = {}
         for idx, sym in enumerate(symbols):
             base = 100.0 + np.linspace(0, 25, 230) + np.sin(np.arange(230) / 5 + idx) * 2.0
-            histories[sym] = pd.DataFrame({"Close": base}, index=dates)
+            histories[sym] = pd.DataFrame(
+                {
+                    "Open": base * 0.996,
+                    "High": base * 1.012,
+                    "Low": base * 0.988,
+                    "Close": base,
+                    "Volume": np.full(230, 1_500_000.0),
+                },
+                index=dates,
+            )
+        return histories
+
+    async def get_bundles(
+        self,
+        symbols: list[str],
+        include_news: bool = True,
+        include_earnings: bool = True,
+        include_info: bool = True,
+        isin_map: dict[str, str] | None = None,
+    ):
+        histories = await self.get_histories(symbols, period="1y")
+        bundles = {}
+        for sym in symbols:
             bundles[sym] = TickerMarketBundle(
                 symbol=sym,
                 quote_type="ETF" if sym.endswith(".L") and sym in {"VWRP.L", "VUAG.L"} else "EQUITY",
                 currency="GBP" if sym.endswith(".L") else "USD",
                 short_name=sym,
+                isin=(isin_map or {}).get(sym, ""),
                 forward_pe=20.0 if not sym.endswith(".L") else None,
-                news=[{"date": "2026-11-13", "source": "Reuters", "title": f"{sym} steady momentum"}],
+                news=[{"date": "2026-11-13", "source": "Reuters", "title": f"{sym} steady momentum"}]
+                if include_news
+                else [],
                 has_history=True,
             )
         return histories, bundles

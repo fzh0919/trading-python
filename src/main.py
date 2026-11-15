@@ -78,6 +78,9 @@ async def run_app() -> None:
         ops_notifier=ops,
         fallback_model=cfg.models.fallback_model,
         fallback_thinking_level=cfg.models.fallback_thinking_level,
+        usage_summary_provider=db.get_usage_summary,
+        search_free_quota_monthly=cfg.models.google_search_free_quota_monthly,
+        search_warn_pct=cfg.models.google_search_warn_pct,
     )
     scheduler = TradingScheduler(cfg, t212, market_data, llm, db, tg, ops_notifier=ops)
     bot = AdvisorBot(

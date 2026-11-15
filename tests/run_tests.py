@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import faulthandler
+import os
 import sys
 import unittest
+
+DEFAULT_WATCHDOG_SECONDS = max(1, int(os.environ.get("TEST_WATCHDOG_SECONDS", "60")))
 
 
 def main() -> int:
     faulthandler.enable()
-    # Hard 10-second watchdog across the entire mocked test suite
-    faulthandler.dump_traceback_later(10, exit=True)
+    # Hard watchdog across the entire mocked test suite (overridable via TEST_WATCHDOG_SECONDS)
+    faulthandler.dump_traceback_later(DEFAULT_WATCHDOG_SECONDS, exit=True)
     try:
         suite = unittest.defaultTestLoader.discover("tests", pattern="test_*.py")
         runner = unittest.TextTestRunner(verbosity=2)

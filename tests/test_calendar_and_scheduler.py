@@ -74,14 +74,43 @@ class _MockT212(T212Client):
         )
 
 
-# TODO(IMP-08 / IMP-19): [接自 IMP-05 & IMP-06] screener.py 改用 get_histories() 时，
-# 须同步为 _MockMarketData 补齐 async def get_histories(...) 并包含完整 OHLCV 列。
 class _MockMarketData(MarketDataService):
-    async def get_bundles(self, symbols: list[str], include_news: bool = True, include_earnings: bool = True):
-        dates = pd.date_range("2025-10-01", periods=220, freq="B")
-        histories = {s: pd.DataFrame({"Close": [100.0 + i * 0.2 for i in range(220)]}, index=dates) for s in symbols}
+    @staticmethod
+    def _build_ohlcv(n: int = 220) -> pd.DataFrame:
+        dates = pd.date_range("2025-10-01", periods=n, freq="B")
+        closes = [100.0 + i * 0.2 for i in range(n)]
+        return pd.DataFrame(
+            {
+                "Open": [c * 0.995 for c in closes],
+                "High": [c * 1.01 for c in closes],
+                "Low": [c * 0.99 for c in closes],
+                "Close": closes,
+                "Volume": [1_000_000.0 for _ in closes],
+            },
+            index=dates,
+        )
+
+    async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+        return {s: self._build_ohlcv(220) for s in symbols if s and s.strip()}
+
+    async def get_bundles(
+        self,
+        symbols: list[str],
+        include_news: bool = True,
+        include_earnings: bool = True,
+        include_info: bool = True,
+        isin_map: dict[str, str] | None = None,
+    ):
+        histories = await self.get_histories(symbols, period="1y")
         bundles = {
-            s: TickerMarketBundle(symbol=s, quote_type="EQUITY", currency="USD", short_name=s, has_history=True)
+            s: TickerMarketBundle(
+                symbol=s,
+                quote_type="EQUITY",
+                currency="USD",
+                short_name=s,
+                isin=(isin_map or {}).get(s, ""),
+                has_history=True,
+            )
             for s in symbols
         }
         return histories, bundles

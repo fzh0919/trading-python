@@ -10,7 +10,7 @@ from pathlib import Path
 
 DEFAULT_HEARTBEAT_PATH = Path(os.environ.get("ADVISOR_HEARTBEAT_PATH", "/tmp/advisor.heartbeat"))
 DEFAULT_DB_PATH = Path(os.environ.get("ADVISOR_DB_PATH", "/app/data/advisor.db"))
-DEFAULT_MAX_STALE_SECONDS = 90.0
+DEFAULT_MAX_STALE_SECONDS = 180.0
 
 
 def write_heartbeat(path: str | Path = DEFAULT_HEARTBEAT_PATH, now_ts: float | None = None) -> Path:
