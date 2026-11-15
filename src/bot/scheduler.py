@@ -88,12 +88,21 @@ class TradingScheduler:
             err_detail = f"{type(exc).__name__}: {exc}"
             self.last_job_runs[job_name] = {"status": "CRASHED", "uk_time": uk_now_str, "detail": err_detail[:120]}
             if self.ops is not None:
-                await self.ops.notify(
-                    severity="CRITICAL",
-                    source=f"scheduler:{job_name}",
-                    alert_key=f"scheduler_crash:{job_name}",
-                    message=f"定时任务 {job_name} 发生未捕获崩溃：{err_detail}",
-                )
+                if job_name == "morning" and hasattr(self.ops, "notify_business_critical"):
+                    await self.ops.notify_business_critical(
+                        source=f"scheduler:{job_name}",
+                        alert_key=f"scheduler_crash:{job_name}",
+                        title="晨报定时任务异常崩溃",
+                        message=f"定时任务 {job_name} 发生未捕获崩溃：{err_detail}",
+                        bot_message="🚨 今日 /report 定时晨报生成异常中断，请发送 /report 重试或查看运维告警。",
+                    )
+                else:
+                    await self.ops.notify(
+                        severity="CRITICAL",
+                        source=f"scheduler:{job_name}",
+                        alert_key=f"scheduler_crash:{job_name}",
+                        message=f"定时任务 {job_name} 发生未捕获崩溃：{err_detail}",
+                    )
 
     async def check_and_run_due_jobs(self, now_utc: datetime | None = None) -> list[str]:
         """Evaluate whether morning report, premarket sentinel, or weekly radar is due right now."""

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from src.agents.llm_client import GeminiClient
 from src.agents.report_agent import generate_morning_report
@@ -20,7 +25,8 @@ from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig, EnvSettings
 from src.data_providers.market_data import MacroSnapshot, MarketDataService
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData, T212Client
-from src.ops_notifier import OpsNotifier
+from src.healthcheck import check_health, write_heartbeat
+from src.ops_notifier import OpsNotifier, send_ops_notify_sync
 from src.storage.db import AdvisorDatabase, get_trading_cycle_id
 from src.version import APP_VERSION
 
@@ -377,6 +383,207 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
                 rep = await generate_morning_report(cfg, t212, md, _HolidayReportLLM(), db, ops_notifier=ops)
             self.assertLessEqual(len(rep), 1500)
             self.assertIn("英国 Bank Holiday（LSE 休市", rep)
+
+
+class TestHomelabOpsNotifyAndHealthcheck(unittest.IsolatedAsyncioTestCase):
+    async def test_ops_notify_dual_routing_contract_bearer_and_resilience(self) -> None:
+        env = EnvSettings(
+            _env_file=None,
+            ops_notify_url="http://ops-notify:8000/alert",
+            ops_notify_token="secret-bearer-123",
+        )
+        self.assertEqual(env.ops_notify_url, "http://ops-notify:8000/alert")
+        self.assertEqual(env.ops_notify_token, "secret-bearer-123")
+
+        captured: list[tuple[dict[str, str], dict]] = []
+        mode = {"status": 200, "raise_net": False}
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            if mode["raise_net"]:
+                raise httpx.ConnectError("ops-notify unreachable", request=request)
+            headers = {k.lower(): v for k, v in request.headers.items()}
+            body = json.loads(request.content.decode("utf-8"))
+            captured.append((headers, body))
+            if mode["status"] != 200:
+                return httpx.Response(mode["status"], text="gateway error")
+            return httpx.Response(200, json={"ok": True})
+
+        tg = _StubTelegram()
+        ops = OpsNotifier(
+            telegram=tg,
+            chat_id="999",
+            db=None,
+            warn_cooldown_seconds=1800,
+            critical_cooldown_seconds=120,
+            ops_notify_url=env.ops_notify_url,
+            ops_notify_token=env.ops_notify_token,
+            transport=httpx.MockTransport(_handler),
+        )
+        self.assertTrue(ops.ops_notify_enabled)
+
+        # 1) Technical WARN -> goes ONLY to ops-notify with exact contract & Bearer header, NOT trading bot
+        ok_tech = await ops.notify(
+            severity="WARN",
+            source="t212",
+            alert_key="t212_rate_limit",
+            title="T212 限流退避",
+            message="429 rate-limited, retrying",
+        )
+        self.assertTrue(ok_tech)
+        self.assertEqual(len(tg.sent), 0)
+        self.assertEqual(len(captured), 1)
+        hdrs, payload = captured[-1]
+        self.assertEqual(hdrs.get("authorization"), "Bearer secret-bearer-123")
+        self.assertEqual(payload["service"], "trading-python")
+        self.assertEqual(payload["severity"], "WARN")
+        self.assertEqual(payload["alert_key"], "t212_rate_limit")
+        self.assertEqual(payload["title"], "T212 限流退避")
+        self.assertEqual(payload["cooldown_sec"], 1800)
+        self.assertIn("429 rate-limited", payload["message"])
+
+        # 2) Strong business-blocking CRITICAL -> ops-notify CRITICAL + 1 concise trading bot alert
+        ok_biz = await ops.notify_business_critical(
+            source="t212",
+            alert_key="t212_auth_failed:ISA",
+            title="T212 ISA 鉴权失效",
+            message="HTTP 401 unauthorized",
+            bot_message="🚨 T212 ISA 鉴权失效，请更换只读 Key。",
+        )
+        self.assertTrue(ok_biz)
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[-1][1]["severity"], "CRITICAL")
+        self.assertEqual(captured[-1][1]["cooldown_sec"], 120)
+        self.assertEqual(len(tg.sent), 1)
+        self.assertEqual(tg.sent[-1][1], "🚨 T212 ISA 鉴权失效，请更换只读 Key。")
+
+        # 3) ops-notify network failure must NOT raise and buffers for flush_pending() recovery
+        mode["raise_net"] = True
+        ok_fail = await ops.notify(
+            severity="WARN",
+            source="market_data",
+            alert_key="finnhub_down",
+            message="connection refused",
+        )
+        self.assertFalse(ok_fail)
+        self.assertEqual(len(tg.sent), 1)
+
+        mode["raise_net"] = False
+        flushed = await ops.flush_pending()
+        self.assertTrue(flushed)
+        self.assertEqual(len(captured), 3)
+        self.assertEqual(captured[-1][1]["alert_key"], "finnhub_down")
+
+        # 4) Startup notice delivers both Telegram (with REMOVE_KEYBOARD_MARKUP) and ops-notify INFO
+        ok_start = await ops.send_startup_notice(
+            version=APP_VERSION,
+            summary_lines=["ok"],
+            reply_markup=REMOVE_KEYBOARD_MARKUP,
+        )
+        self.assertTrue(ok_start)
+        self.assertEqual(tg.sent[-1][2], REMOVE_KEYBOARD_MARKUP)
+        self.assertEqual(captured[-1][1]["severity"], "INFO")
+        self.assertEqual(captured[-1][1]["alert_key"], "startup")
+
+        await ops.close()
+
+    async def test_t212_401_and_scheduler_morning_crash_route_to_business_blocking(self) -> None:
+        captured: list[dict] = []
+
+        async def _ops_handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={"ok": True})
+
+        async def _t212_401(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": "bad token"})
+
+        tg = _StubTelegram()
+        ops = OpsNotifier(
+            telegram=tg,
+            chat_id="999",
+            db=None,
+            warn_cooldown_seconds=0,
+            critical_cooldown_seconds=0,
+            ops_notify_url="http://ops-notify:8000/alert",
+            transport=httpx.MockTransport(_ops_handler),
+        )
+
+        # T212 401 triggers business-blocking CRITICAL to ops-notify + bot tip
+        t212 = T212Client(
+            isa_key="isa",
+            isa_secret="sec",
+            transport=httpx.MockTransport(_t212_401),
+            ops_notifier=ops,
+            transient_backoff_s=0.0,
+        )
+        data = await t212.get_portfolio(use_cache=False)
+        self.assertFalse(data.isa.ok)
+        self.assertTrue(any(p["alert_key"] == "t212_auth_failed:ISA" and p["severity"] == "CRITICAL" for p in captured))
+        self.assertTrue(any("鉴权失效" in msg for _, msg, _ in tg.sent))
+        await t212.close()
+
+        # Scheduler morning crash sends CRITICAL to ops-notify + bot tip; non-morning crash stays ops-notify only
+        tg.sent.clear()
+        captured.clear()
+        cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999", gemini_api_key="test"))
+        sched = TradingScheduler(cfg, t212, _FakeMarketHealthy(), SimpleNamespace(), SimpleNamespace(), tg, ops_notifier=ops)
+
+        async def _crash():
+            raise RuntimeError("boom")
+
+        await sched._execute_job(job_name="premarket", chat_id="999", uk_now_str="2026-11-16 14:15", coro=_crash())
+        self.assertEqual(len(tg.sent), 0)
+        self.assertEqual(captured[-1]["alert_key"], "scheduler_crash:premarket")
+
+        await sched._execute_job(job_name="morning", chat_id="999", uk_now_str="2026-11-16 07:30", coro=_crash())
+        self.assertEqual(len(tg.sent), 1)
+        self.assertIn("/report", tg.sent[-1][1])
+        self.assertEqual(captured[-1]["alert_key"], "scheduler_crash:morning")
+
+        await ops.close()
+
+    async def test_healthcheck_heartbeat_freshness_and_readonly_db_and_sync_crash_notify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hb_path = root / "advisor.heartbeat"
+            db_path = root / "advisor.db"
+
+            # 1) Missing heartbeat -> unhealthy
+            ok, reason = check_health(hb_path, db_path)
+            self.assertFalse(ok)
+            self.assertIn("heartbeat missing", reason)
+
+            # 2) Heartbeat written but DB missing -> unhealthy
+            write_heartbeat(hb_path, now_ts=1000.0)
+            os.utime(hb_path, (1000.0, 1000.0))
+            ok, reason = check_health(hb_path, db_path, max_stale_seconds=90.0, now_ts=1010.0)
+            self.assertFalse(ok)
+            self.assertIn("database missing", reason)
+
+            # 3) Valid initialized WAL DB + fresh heartbeat -> healthy
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("CREATE TABLE IF NOT EXISTS ops_events (id INTEGER PRIMARY KEY)")
+                conn.commit()
+            finally:
+                conn.close()
+            ok, reason = check_health(hb_path, db_path, max_stale_seconds=90.0, now_ts=1010.0)
+            self.assertTrue(ok, msg=reason)
+            self.assertEqual(reason, "ok")
+
+            # 4) Stale heartbeat -> unhealthy
+            ok, reason = check_health(hb_path, db_path, max_stale_seconds=90.0, now_ts=1200.0)
+            self.assertFalse(ok)
+            self.assertIn("heartbeat stale", reason)
+
+        # 5) Sync fatal crash helper never raises even when unreachable
+        with patch("src.ops_notifier.httpx.post", side_effect=httpx.ConnectError("down")) as mocked_post:
+            self.assertFalse(send_ops_notify_sync("http://ops-notify:8000/alert", message="fatal", token="tok"))
+            mocked_post.assert_called_once()
+            call_kwargs = mocked_post.call_args.kwargs
+            self.assertEqual(call_kwargs["headers"]["Authorization"], "Bearer tok")
+            self.assertEqual(call_kwargs["json"]["severity"], "CRITICAL")
+            self.assertEqual(call_kwargs["json"]["service"], "trading-python")
 
 
 if __name__ == "__main__":

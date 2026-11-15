@@ -10,7 +10,7 @@
    - `/report` 是全系统唯一的全景事实底座与风控总纲，是同交易周期（每日 `07:30 UK` 切换）内 `/pick`、`/us` 与自由聊天框的**绝对参照物（Single Source of Truth）**。
    - **任何优化严禁降低 `/report` 的规模、上下文完整性、模型档位（`Argon HIGH` + `Hydrogen HIGH`）、工具调用轮次（`6` 轮）或全市场分域联网检索深度**。
 2. **N95 本地重算换 Token 策略（定时任务不怕慢，日常交互极速轻量）**：
-   - **硬件算力充沛**：系统从 GCP `e2-medium` 迁移至英国本地常驻主机 **Intel N95 + 16GB RAM + 512GB SSD**，本地 CPU 与内存算力完全充裕。
+   - **硬件算力与运行定位**：开发期不考虑云端部署约束（GCP 暂保留旧版运行，待全部 `IMP` 完成后统一切割至英国本地常驻主机 **Intel N95 + 16GB RAM + 512GB SSD** 的 Docker Compose 容器），本地 CPU 与内存算力完全充裕。
    - **核心原则**：`/report`、`/pick`、`/us` 为后台定时任务，本地 Python 多算 10~30 秒完全无感。因此必须将**筹码分布（CYQ）、周线共振、K 线突破形态、公司身份与财报/除息日历锚定、本地多空证据冲突表（Disagreement）、T+5/T+10 历史建议 Alpha 结算**全部放在本地 Python 0-Token 算完，组装成高密度 `AnalysisContextPack` 喂给大模型，从而减少大模型盲目调工具的轮数；而**日常自由聊天与平淡交易日的 `/us` 则复用今日快照并默认采用轻量模型（`Hydrogen LOW`）**。
 3. **算力配额与月度预算边界（Gemini Paid Tier）**：
    - 运行在 Google AI Pro 订阅下的 **Gemini API Paid Tier**（含每月 \$10 USD Credit + Prepaid 余额，享每月 5,000 次免费 Google Search Grounding）。
@@ -31,6 +31,7 @@
 ```text
 trading-python/                     # [当前主项目]
 ├── docs/
+│   ├── PROJECT_MIGRATION_RULES.md  # [强制规范] N95 Homelab 容器化、SQLite 备份与 ops-notify 统一告警规范 (v1.1)
 │   ├── T212_API_manual.json        # [官方规范] Trading 212 Public API v0 OpenAPI 3.0 手册（含 Position.createdAt 与限流配额）
 │   └── finnhub_API_manual.json     # [官方规范] Finnhub API OpenAPI 规范手册（免费 60次/分；/quote、/calendar/earnings、/company-news、/stock/profile2、/stock/recommendation 等参考）
 ├── _ref/                           # [本地只读参考区，已被 .gitignore 与 .dockerignore 排除]
@@ -41,15 +42,16 @@ trading-python/                     # [当前主项目]
 │   │                               #           agents/context.py (确定性标的身份锚定防幻觉)
 │   └── REF_daily_stock_analysis-main/ # [参考库 3] 重点借鉴：analysis_context_pack (当日预计算快照复用)、agent/disagreement.py (0-Token多空分歧表)、
 │                                      #           agent/risk_override.py (后置风控护栏)、chat_object_decision.py (单聊标的提取)、provider_cache.py (缓存前缀对齐)
-├── .env.example / config.yaml      # 密钥模板 / 模型路由、日程、风控阈值与候选股票池
-├── deploy/                         # trading-advisor.service (systemd) & upgrade.sh (一键热升级)
+├── Dockerfile / docker-compose.yml # N95 容器化编排（锁定 python:3.12.13-slim-bookworm、mem_limit: 2g、healthcheck、homelab-net）
+├── .env.example / config.yaml      # 密钥模板（含 OPS_NOTIFY_*）/ 模型路由、日程、风控阈值与候选股票池
 ├── DEVELOPER_GUIDE.md              # 本文档：架构契约 + IMP 拓扑顺序追踪表 + 复盘台账 + Changelog
-    ├── README.md                   # 项目背景与部署使用说明
+    ├── README.md                   # 项目背景与 N95 Git + Docker Compose 部署说明
     ├── src/
-    │   ├── main.py                 # 入口：初始化 SQLite/OpsNotifier/各Client，启动调度器与长轮询
+    │   ├── main.py                 # 入口：初始化 SQLite/OpsNotifier/各Client，维护 /tmp 心跳、致命崩溃兜底与长轮询
+    │   ├── healthcheck.py          # 纯 Python 容器探活：校验 /tmp/advisor.heartbeat 新鲜度与只读 SQLite 状态
     │   ├── version.py              # 版本号单一真源 (APP_VERSION)
     │   ├── config.py               # Pydantic 配置加载 (.env + config.yaml)
-    │   ├── ops_notifier.py         # 统一 Telegram 运维告警（WARN 30m 冷却、CRITICAL 防抖、离线队列恢复）
+    │   ├── ops_notifier.py         # 统一运维告警（ops-notify 双态分流、WARN 冷却、CRITICAL 防抖与离线缓冲）
     │   ├── data_providers/
     │   │   ├── t212_client.py      # T212 API v0 只读客户端（summary/orders 1req/5s, positions 1req/1s, history 20req/1m）
     │   │   ├── market_data.py      # Yahoo Finance + Finnhub + FRED 并发抓取、身份日历锚定与 TTL 缓存
@@ -106,10 +108,17 @@ trading-python/                     # [当前主项目]
 
 > 💡 下游窗口直接按本字典接线，**不必通读千行上游源码**；后续新增公共函数/字段后，须在对应小节同步补齐 1~2 行契约。
 
-- **`src/config.py`（`IMP-01`）**：
+- **`src/config.py`（`IMP-01` & N95 迁移前置）**：
+  - `EnvSettings` 新增：`ops_notify_url: str = ""`（`OPS_NOTIFY_URL`）、`ops_notify_token: str = ""`（`OPS_NOTIFY_TOKEN`）
   - `ModelsSection` 新增：`chat_deep_model`, `chat_deep_thinking_level`, `google_search_free_quota_monthly` (`5000`), `google_search_warn_pct` (`85.0`)
   - `StrategySection` 新增：`us_anomaly_move_pct` (`1.8`), `us_anomaly_vix_change_pct` (`4.0`), `settlement_holding_days` (`5`)
   - `AppConfig.reload_pools_if_changed() -> bool`（按 `mtime_ns` 原地热重载 `watchlist` 与 `universe`，YAML 损坏时保留旧配置）
+- **`src/ops_notifier.py` & `src/healthcheck.py`（N95 迁移前置合规）**：
+  - `OpsNotifier(..., ops_notify_url="", ops_notify_token="", service_name="trading-python", transport=None)`；`ops_notify_enabled: bool`；`await ops.close()`
+  - `await ops.notify(..., title="", business_blocking=False, bot_message="") -> bool`（`ops_notify_url` 为空时降级走 `TelegramClient`；已配置时技术类仅 POST `ops-notify`）
+  - `await ops.notify_business_critical(*, source, alert_key, message, title="", bot_message="") -> bool`（强业务阻塞双发：`ops-notify CRITICAL` + 交易 Bot 极简提示）
+  - `send_ops_notify_sync(url, ..., service="trading-python", severity="CRITICAL", alert_key="process_fatal_crash", title=..., message, cooldown_sec=0, token="", timeout_s=5.0) -> bool`（`main()` 致命崩溃兜底上报）
+  - `src/healthcheck.py`：`write_heartbeat(path=DEFAULT_HEARTBEAT_PATH, now_ts=None) -> Path`；`check_health(heartbeat_path=DEFAULT_HEARTBEAT_PATH, db_path=DEFAULT_DB_PATH, *, max_stale_seconds=90.0, now_ts=None) -> tuple[bool, str]`（只读 SQLite URI `mode=ro` 校验）
 - **`src/engine/calendar_utils.py`（`IMP-02`）**：
   - `infer_market_from_symbol(symbol) -> str`（返回 `US | UK | XETRA | EURONEXT`）
   - `is_trading_day(day, market="US") -> bool` | `next_trading_day(start_date, market="US", inclusive=False) -> date`
@@ -156,7 +165,7 @@ trading-python/                     # [当前主项目]
 | `t212_client.py` | `test_t212_client.py` | `httpx.MockTransport` |
 | `market_data.py` | `test_market_data.py` | `_DummyOps`, Fake `httpx`/yfinance |
 | `analytics.py`, `portfolio_rules.py`, `screener.py` | `test_analytics_and_rules.py` | 纯离线 `pd.DataFrame` 构造器（须含 `Open/High/Low/Close/Volume`） |
-| `ops_notifier.py`, `tools.py`, `handlers.py(/health)` | `test_v504_ops_and_grounding.py` | `_StubTelegram`, `_FakeT212Healthy`, `_FakeMarketHealthy` |
+| `ops_notifier.py`, `healthcheck.py`, `main.py`, `tools.py`, `handlers.py(/health)` | `test_v504_ops_and_grounding.py` | `_StubTelegram`, `_FakeT212Healthy`, `_FakeMarketHealthy` |
 | 全链路端到端 (`/pos`/`report`/`pick`/`us`/`stats`) | `test_db_and_end_to_end.py` | `_FakeT212`, `_FakeMarketData`, `_RecordingLLM`, `_RecordingTg` |
 
 > ⚡ 单文件秒测：`python -m unittest tests.<模块名>`；改完收口必跑全量 `python -m tests.run_tests tests`。
@@ -184,7 +193,7 @@ trading-python/                     # [当前主项目]
   2. **降级数据不回写**：`portfolio.is_fallback` 或 `macro.is_stale` 为 `True` 时严禁调用 `db.save_snapshot()` 或覆盖有效缓存。
   3. **双币种严格隔离**：账户现金/净值/盈亏固定为 `GBP`，标的现价/均价/止损用本地货币；英股须防 `GBp` 便士与 `GBP` 英镑 100 倍量级错位。
   4. **空行情防毒化 + 完整 K 线桩**：空 DataFrame 或全挂宏观响应不得写入缓存；所有行情测试桩必须返回包含 `Open/High/Low/Close/Volume` 的 DataFrame。
-  5. **数据库延续 & 跨端打包边界**：线上 `data/advisor.db` 只做幂等迁移（`CREATE TABLE IF NOT EXISTS` / `_ensure_columns`），严禁删库；`patchX.Y.Z.zip` 内部路径强制正斜杠 `/`，并排除 `.env`、`data/`、`__pycache__/`、`.venv/`，同步更新 `src/version.py` 与 `pyproject.toml`。
+  5. **数据库延续 & 容器同步边界**：线上 `data/advisor.db` 只做幂等迁移（`CREATE TABLE IF NOT EXISTS` / `_ensure_columns`），严禁删库；宿主机备份或迁移库文件必须通过 `sqlite3 <db> ".backup <clean.db>"` 生成一致快照；代码通过 Git 同步至 `/opt/homelab/stacks/trading-python/` 并由 Docker Compose 重建（`.gitignore` 与 `.dockerignore` 均严格排除 `.env`、`data/`、`_ref/`、`logs/`、`__pycache__/`、`.venv/`），版本发布同步更新 `src/version.py` 与 `pyproject.toml`。
 
 ---
 
@@ -227,11 +236,11 @@ trading-python/                     # [当前主项目]
 | **IMP-12**<br>Step #12 (P0) | - [ ] 待开始 | **Phase 5: AI 业务编排**<br>`src/agents/report_agent.py` | **`/report` 核心基石与 `/us` 门控哨兵**<br>现状：**8.2 / 10**<br>*(集成全维 ContextPack、多空冲突表与 `/us` 异动门控)* | - [ ] **组装并持久化 `AnalysisContextPack`（参考 `REF_daily_stock_analysis`）**：在 `build_portfolio_fact_sheet` 中整合 `bundle.identity_summary`、CYQ 筹码、周线共振、除息/财报锚点、`IMP-07` 本地多空冲突表（Disagreement）及 `IMP-03` 历史反思教训（`TechnicalSnapshot` 可直接 `model_dump()`），并在 `/report` 生成后通过 `db.save_morning_report(..., context_pack=...)` 存入 `context_pack_json`<br>- [ ] **强化 `/report` 多空交锋与后置护栏（严禁缩减 `/report` 规模）**：在 Step 3 PM 拍板 Prompt 中显式注入 Bull/Bear 分歧点与本地 Disagreement 矩阵；PM 输出后调用 `IMP-07` 的 `apply_risk_override_guardrail` 做安全兜底；修正 4h 净值快照回退时的时间跨度标注<br>- [ ] **`/us` 盘中哨兵引入本地异动门控（Anomaly Gate，省 Token 核心）**：开盘前/盘中先用本地 Python 检查美股持仓涨跌幅、挂单距离与 VIX 变动；若无任何持仓异动（均小于 `cfg.strategy.us_anomaly_move_pct` 与 `us_anomaly_vix_change_pct`）且宏观平稳，免除重复强搜并走 `Hydrogen LOW` 输出极简平安报；一旦检测到异动标或宏观急变，自动针对异动股开启强搜 + 深度归因<br>- [ ] **[接自 IMP-02 & IMP-04 & IMP-05 & IMP-06 & IMP-07] 必须接线清单**：① 调用 `compute_technical_snapshot` 时传 `position_created_at=pos.created_at`（兼容 `None`）与 `bundle=bundles.get(sym)`，调 `get_bundles` 传入 `isin_map`；② **当 `portfolio.is_fallback` 为 `True` 时跳过 `await db.save_snapshot(portfolio)`，防降级缓存污染快照表**；③ 在 `_compute_portfolio_diff_text()` 与早报 Prompt 消费 `recent_transactions` / `recent_dividends` / `cash_flow_summary_text` 区分外部出入金/派息与交易盈亏；④ 复用 `get_market_calendar_alerts()`（`IMP-02`）提示欧股休市与英美半日市；⑤ 调 `evaluate_portfolio(..., histories=histories)`、`build_disagreement_matrix()` 与 `apply_risk_override_guardrail()`（取 `res.decision` 渲染） | *（待执行窗口完成后回填）* |
 | **IMP-13**<br>Step #13 (P1) | - [ ] 待开始 | **Phase 5: AI 业务编排**<br>`src/agents/pick_agent.py` | **`/pick` 与周五选股雷达编排器**<br>现状：**8.1 / 10**<br>*(复用持仓历史 + 注入复盘记忆 + Post-Screen 强校验)* | - [ ] **消除持仓行情并发重复拉取**：先获取或复用 `held_histories` / 当日 `AnalysisContextPack`，直接作为 `existing_histories` 传给 `IMP-08` 的 `run_quant_screener`<br>- [ ] **注入历史选股 T+5 复盘反思（参考 `REF_TradingAgents`）**：从 `db.py` 的 `get_recent_lessons()` / `get_symbol_lessons()` 读取近期选股结算的经验教训注入 Researcher 与 Risk Critic，防止对近期连续失效的板块/形态重复推荐（推荐落库配合 `cfg.strategy.settlement_holding_days`）<br>- [ ] **增加 Post-Screen 确定性代码强校验**：在 Risk Critic 输出 `PickDecision` 后，用真实本地货币 `bundle.current_price` 自动回填缺失的 `entry_price`，并调用 `IMP-07` 风控护栏硬性拦截超相关性阈值或违反当日 `daily_vetoes` 的推荐<br>- [ ] **[接自 IMP-02 & IMP-04 & IMP-05 & IMP-06 & IMP-07] 传递新建仓/ISIN 上下文与节假日提示**：`get_bundles` 传持仓 `isin_map`，`compute_technical_snapshot` 传 `position_created_at=pos.created_at` 与 `bundle=held_bundles.get(sym)`，注入 `bundle.identity_summary` / `ex_dividend_date`，复用 `get_market_calendar_alerts()`，并向 `evaluate_portfolio(..., histories=held_histories)` 与 `apply_risk_override_guardrail(..., high_correlation_symbols=..., daily_vetoes=...)` 接线 | *（待执行窗口完成后回填）* |
 | **IMP-14**<br>Step #14 (P1) | - [ ] 待开始 | **Phase 5: AI 业务编排**<br>`src/agents/chat_agent.py` | **瞬时查仓（`/pos`）与轻量智能单聊**<br>现状：**8.4 / 10**<br>*(参考 `REF_daily_stock_analysis/chat_object_decision.py`)* | - [ ] **0-Token 本地提问标的提取与快照局部切片**：解析 `user_query` 中提及的股票代码/名称，直接从 `db.py` 的 `get_context_pack()` 当日快照中提取对应标的的筹码/技术/风控详情注入 Prompt，无需每次调工具即可秒级精准回答<br>- [ ] **对齐 Gemini Implicit Cache 静态前缀顺序**：将日内不变的 `/report` 原文、风控红线置前，动态持仓与当前问题置后，最大化多轮对话缓存命中率（享 75% 输入折扣）<br>- [ ] **支持 `/deep` 按需升级重模型 & 跨周期记忆平滑**：日常对话默认走 `Hydrogen LOW`（极速省钱）；当用户消息以 `/deep` 开头时自动切换 `cfg.models.chat_deep_model` / `chat_deep_thinking_level` 深挖；跨 `07:30 UK` 周期时通过 `db.get_previous_cycle_chat_history()` 保留上一周期最近 2 条核心对话摘要防断层<br>- [ ] **[接自 IMP-02] 休市/半日市与节假日提示**：复用 `calendar_utils.get_market_calendar_alerts()`（`IMP-02`）替下当前手写的局部银行假日拼接 | *（待执行窗口完成后回填）* |
-| **IMP-15**<br>Step #15 (P1) | - [ ] 待开始 | **Phase 6: 交互与调度**<br>`src/bot/handlers.py` | **指令路由、互斥锁与看板中枢**<br>现状：**8.5 / 10**<br>*(防重入互斥锁 + `/usage` Token/Search 看板 + `/stats` 胜率看板)* | - [ ] **手动指令与定时任务共享互斥锁**：防止定时任务正在跑 `/report` 时用户手动点 `/report` 造成双倍并发消耗<br>- [ ] **`/usage` 强化纯 Token 与 Search 免费额度进度展示**：按用户要求不展示程序估算 USD 费用（账单以 AI Studio 为准），进一步增强 `cached_tokens` 命中率、Thinking Token 占比，并将 Search 免费额度统计统一切换为 `db.get_usage_summary()["this_month"]`（英国自然月 1 号起算，与 `IMP-03` / `IMP-09` 对齐）<br>- [ ] **`/stats` 升级为真实后验胜率与 Alpha 看板**：结合 `IMP-03` 的 `get_recommendation_stats()` / `get_recent_lessons()` 与当前本地货币现价，展示历史推荐胜率、平均超额 Alpha、近期经验教训及最近 10 条推荐表现<br>- [ ] **[接自 IMP-03 & IMP-04 & IMP-05] `/health` 补全降级与静默告警体检**：识别 `portfolio.is_fallback`/`acc.is_fallback`（禁止降级缓存显示纯绿灯）、`macro.is_stale`，并利用 `db.get_unnotified_ops_events()` 在体检中汇报尚未推送或曾被静默抑制的运维事件 | *（待执行窗口完成后回填）* |
+| **IMP-15**<br>Step #15 (P1) | - [ ] 待开始 | **Phase 6: 交互与调度**<br>`src/bot/handlers.py` | **指令路由、互斥锁与看板中枢**<br>现状：**8.5 / 10**<br>*(防重入互斥锁 + `/usage` Token/Search 看板 + `/stats` 胜率看板)* | - [ ] **手动指令与定时任务共享互斥锁**：防止定时任务正在跑 `/report` 时用户手动点 `/report` 造成双倍并发消耗<br>- [ ] **`/usage` 强化纯 Token 与 Search 免费额度进度展示**：按用户要求不展示程序估算 USD 费用（账单以 AI Studio 为准），进一步增强 `cached_tokens` 命中率、Thinking Token 占比，并将 Search 免费额度统计统一切换为 `db.get_usage_summary()["this_month"]`（英国自然月 1 号起算，与 `IMP-03` / `IMP-09` 对齐）<br>- [ ] **`/stats` 升级为真实后验胜率与 Alpha 看板**：结合 `IMP-03` 的 `get_recommendation_stats()` / `get_recent_lessons()` 与当前本地货币现价，展示历史推荐胜率、平均超额 Alpha、近期经验教训及最近 10 条推荐表现<br>- [ ] **[接自 IMP-03 & IMP-04 & IMP-05 & 迁移规范] `/health` 补全降级、静默告警与运维网关状态体检**：识别 `portfolio.is_fallback`/`acc.is_fallback`（禁止降级缓存显示纯绿灯）、`macro.is_stale`，利用 `db.get_unnotified_ops_events()` 在体检中汇报尚未推送或曾被静默抑制的运维事件，并可选展示 `ops-notify` 网关启用状态 | *（待执行窗口完成后回填）* |
 | **IMP-16**<br>Step #16 (P1) | - [ ] 待开始 | **Phase 6: 交互与调度**<br>`src/bot/scheduler.py` | **时区感知调度与盘后自动复盘结算**<br>现状：**8.5 / 10**<br>*(N95 断网补发 + 挂载 `REF_TradingAgents` 盘后结算)* | - [ ] **新增早报断网/重启补发（Catch-up）与失败重试**：适配本地 N95 家庭宽带重拨场景，若 `07:30~07:35 UK` 因断网错过或返回 `⚠️` 失败，在 `09:30 UK` 前恢复时自动补跑成功后再锁定 `scheduler_runs`<br>- [ ] **挂载每日盘后推荐自动结算与微反思任务（`run_daily_settlement`，参考 `REF_TradingAgents/memory/settlement.py` & `reflection.py`） & 90 天清理**：每日定时调用 `db.get_pending_settlements()`，联合 `IMP-02` 的 `infer_market_from_symbol` + `add_trading_days` + `has_market_closed_on_date` 确认已满 `cfg.strategy.settlement_holding_days`（5 个完整交易日）且当日已正式收盘，用本地行情算出真实收益率与相对基准（`SPY`/`ISF.L`）的 Alpha，调用一次 `Hydrogen LOW` 生成 2~4 句话（`<80 tokens`）复盘教训并经 `db.settle_recommendation()` 幂等写回；定期调用 `db.prune_old_records(retention_days=90)` 瘦身<br>- [ ] **[接自 IMP-02] 尊重半日市动态收盘时间**：`weekly_radar` 已通过 `us_sched.minutes_to_close` 动态切至半日市（如感恩节次日 `18:30 UK`），切勿回退写死 `21:30 UK` | *（待执行窗口完成后回填）* |
-| **IMP-17**<br>Step #17 (P2) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`src/ops_notifier.py` | **统一运维告警中心**<br>现状：**8.9 / 10**<br>*(断电重启后未达告警持久化补推)* | - [ ] **[接自 IMP-03] 断电重启后从 DB 捞取未送达告警**：`flush_pending()` 支持在本地 N95 主机断电/重启后，调用 `db.get_unnotified_ops_events()` 捞取最近 24 小时 `notified=0` 的关键告警合并补推，并通过 `db.mark_ops_events_notified()` 标记已送达（注意区分冷却抑制写入的 `notified=0, suppressed_count>0` 事件，避免冷却降噪记录刷屏） | *（待执行窗口完成后回填）* |
-| **IMP-18**<br>Step #18 (P2) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`src/main.py` &<br>`src/bot/telegram_client.py` | **入口生命周期与 Telegram 通信层**<br>现状：**9.0 / 10**<br>*(家庭宽带瞬断退避 + 停机连接池释放)* | - [ ] `TelegramClient._post` 遇到 Telegram `429`（读取 `retry_after`）或家庭宽带瞬断时增加轻量指数退避重试<br>- [ ] **[接自 IMP-03 & IMP-04 & IMP-05] 注入 DB 冷启动快照兜底并全链路释放连接池**：在 `main.py` 创建 `T212Client` 时注入 `snapshot_loader=db.get_latest_snapshot`；停机 `finally` 中统一调用 `await t212.close()`、`await market_data.close()`、`await telegram.close()`（及 `await db.close()`）优雅释放所有连接资源 | *（待执行窗口完成后回填）* |
-| **IMP-19**<br>Step #19 (P3) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`deploy/upgrade.sh` &<br>`tests/` | **热升级回滚与跨端打包脚本**<br>现状：**9.1 / 10**<br>*(单测失败自动回滚 + Windows 一键打包)* | - [ ] **`deploy/upgrade.sh` 增加单测失败自动回滚（Auto-Rollback）**：当第 5 步单测失败时，自动从备份还原旧代码与数据库并重启旧版服务，确保线上零中断<br>- [ ] **新增 Windows 端一键补丁打包脚本 `deploy/pack_patch.ps1`**：供英国本地台式机（同网段 LAN）或出差 Windows 笔记本一键校验并生成内部路径强制为 `/` 的 `patchX.Y.Z.zip`<br>- [ ] **[接自 IMP-05 & IMP-06] 集成测试与测试桩总复核**：确认 `tests/test_db_and_end_to_end.py`（`_FakeMarketData`）与 `tests/test_calendar_and_scheduler.py`（`_MockMarketData`）已完整实现 `get_histories` 与含 `Open/High/Low/Close/Volume` 的测试 K 线，补齐全链路端到端覆盖并通过最终编译与全量单测 | *（待执行窗口完成后回填）* |
+| **IMP-17**<br>Step #17 (P2) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`src/ops_notifier.py` | **统一运维告警中心**<br>现状：**9.2 / 10**<br>*(已完成 `ops-notify` 双态分流；待补 DB 断电重启捞取)* | - [x] *(已完成于 N95 迁移前置合规)* 接入 `OPS_NOTIFY_URL`/`OPS_NOTIFY_TOKEN` POST JSON 契约、双态路由（未配置降级 Telegram / 已配置按技术单发与强业务阻塞双发分流）、异常不阻塞主流程及 `close()`<br>- [ ] **[接自 IMP-03] 断电重启后从 DB 捞取未送达告警**：`flush_pending()` 须进一步调用 `db.get_unnotified_ops_events()` 捞取最近 24 小时 `notified=0` 的关键告警合并补推，并通过 `db.mark_ops_events_notified()` 标记已送达（区分冷却抑制写入的 `notified=0, suppressed_count>0` 避免刷屏，且补推时遵守 `ops_notify_url` 双态分流） | *（待执行窗口完成后回填）* |
+| **IMP-18**<br>Step #18 (P2) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`src/main.py` &<br>`src/bot/telegram_client.py` | **入口生命周期与 Telegram 通信层**<br>现状：**9.2 / 10**<br>*(已完成心跳探活、致命崩溃兜底与 `ops.close()`；待补网络退避与全连接池释放)* | - [x] *(已完成于 N95 迁移前置合规)* 新增 `/tmp/advisor.heartbeat` 定期刷新、`finally` 释放 `ops.close()` 及顶层 `main()` 致命崩溃同步上报 `ops-notify`<br>- [ ] `TelegramClient._post` 遇到 Telegram `429`（读取 `retry_after`）或家庭宽带瞬断时增加轻量指数退避重试<br>- [ ] **[接自 IMP-03 & IMP-04 & IMP-05] 注入 DB 冷启动快照兜底并全链路释放连接池**：在 `main.py` 创建 `T212Client` 时注入 `snapshot_loader=db.get_latest_snapshot`；停机 `finally` 中补全 `await t212.close()`、`await market_data.close()` 及 `await db.close()` 优雅释放所有资源 | *（待执行窗口完成后回填）* |
+| **IMP-19**<br>Step #19 (P3) | - [ ] 待开始 | **Phase 6: 运维与收口**<br>`docker-compose.yml` &<br>`tests/` | **Git + Docker Compose 迁移/备份演练与全链路验收**<br>现状：**9.2 / 10**<br>*(已淘汰旧宿主机 `deploy/` 脚本，转为标准容器栈验收)* | - [ ] **N95 迁移与热备演练验收**：按 `docs/PROJECT_MIGRATION_RULES.md` 第五节 SOP 完成停旧端、`sqlite3 .backup` 迁移至 `./data/advisor.db`、`docker compose up -d --build` 启动与 `healthcheck` (`healthy`) 校验<br>- [ ] **备份与 `ops-notify` 端到端实测**：在 N95 执行一次宿主机 `backup_daily.sh` 验证 `./data/` 与 `.env` 加密归档；验证一条测试告警经 `homelab-net` 送达 `ops-notify` 运维 Bot<br>- [ ] **[接自 IMP-05 & IMP-06] 集成测试与测试桩总复核**：确认 `tests/test_db_and_end_to_end.py`（`_FakeMarketData`）与 `tests/test_calendar_and_scheduler.py`（`_MockMarketData`）已完整实现 `get_histories` 与含 `Open/High/Low/Close/Volume` 的测试 K 线，补齐全链路端到端覆盖并通过最终编译与全量单测 | *（待执行窗口完成后回填）* |
 
 ---
 
@@ -246,7 +255,8 @@ trading-python/                     # [当前主项目]
 - **`[2026-11-14] IMP-05 (多源行情与身份/日历聚合)`**：修改 `src/data_providers/market_data.py`, `tests/test_market_data.py` | 实现 0-info `get_histories`、Singleflight/LRU 防毒、股息率校准、身份/除息日与深度情报 | `43 tests OK`
 - **`[2026-11-14] IMP-06 (本地零 Token 量化与筹码引擎)`**：修改 `src/data_providers/analytics.py`, `tests/test_analytics_and_rules.py` | 完成 `CYQMetrics`、拆股/坏点自愈、多周期指标、开仓后回撤、分市场去 Beta 与除息守卫 | `47 tests OK`
 - **`[2026-11-14] IMP-07 (持仓规则、多空冲突表与风控护栏)`**：修改 `src/engine/portfolio_rules.py`, `tests/test_analytics_and_rules.py`（下游加 `# TODO` 标注 `schemas.py`/`report_agent.py`/`pick_agent.py`） | 接入开仓后回撤、ATR 止损、除息豁免、挂单/汇率/现金门槛与 `build_disagreement_matrix`/`apply_risk_override_guardrail` | `50 tests OK`
-- *（当前进度：`7 / 19` 已完成，下一步待从 `IMP-08` 开始执行）*
+- **`[2026-11-15] N95 迁移合规前置改造（不占用 IMP 序列）`**：修改 `docker-compose.yml`, `Dockerfile`, `.gitignore`, `.env.example`, `src/config.py`, `src/ops_notifier.py`, `src/main.py`, `src/bot/scheduler.py`, `src/data_providers/t212_client.py`, `README.md`, `DEVELOPER_GUIDE.md`, `tests/test_v504_ops_and_grounding.py`；新增 `src/healthcheck.py`；删除 `deploy/` | 完成 N95 6 项 Compose 强制配置与 `homelab-net` 接入、纯 Python 心跳/只读 DB 探活、`ops-notify` 双态分流与强业务阻塞双发、致命崩溃兜底及文档同步 | `53 tests OK`
+- *（当前进度：`7 / 19` 已完成，下一步仍按拓扑序从 `IMP-08` 开始执行）*
 
 ---
 

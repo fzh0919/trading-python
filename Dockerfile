@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -12,6 +12,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY config.yaml .
 COPY src ./src
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /tmp
 
 CMD ["python", "-m", "src.main"]

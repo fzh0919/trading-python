@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import sys
 import time
 from contextlib import suppress
 
@@ -14,10 +15,11 @@ from src.agents.llm_client import GeminiClient
 from src.bot.handlers import BOT_COMMANDS, REMOVE_KEYBOARD_MARKUP, AdvisorBot
 from src.bot.scheduler import TradingScheduler
 from src.bot.telegram_client import TelegramClient
-from src.config import load_config
+from src.config import EnvSettings, load_config
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import T212Client
-from src.ops_notifier import OpsNotifier
+from src.healthcheck import write_heartbeat
+from src.ops_notifier import OpsNotifier, send_ops_notify_sync
 from src.storage.db import AdvisorDatabase
 from src.version import APP_VERSION
 
@@ -47,6 +49,8 @@ async def run_app() -> None:
         chat_id=cfg.env.telegram_chat_id,
         db=db,
         warn_cooldown_seconds=cfg.app.ops_warn_cooldown_seconds,
+        ops_notify_url=cfg.env.ops_notify_url,
+        ops_notify_token=cfg.env.ops_notify_token,
     )
 
     # TODO(IMP-18): [接自 IMP-04] 创建 T212Client 时注入 snapshot_loader=db.get_latest_snapshot 实现冷启动 5xx 读库降级兜底。
@@ -117,11 +121,18 @@ async def run_app() -> None:
             with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop_event.set)
 
+    def _touch_heartbeat() -> None:
+        try:
+            write_heartbeat()
+        except Exception as hb_exc:
+            logger.debug("Heartbeat update failed: %s", hb_exc)
+
     async def _poll_loop() -> None:
         offset: int | None = None
         consecutive_poll_errors = 0
         outage_recorded = False
         while not stop_event.is_set():
+            _touch_heartbeat()
             if not cfg.env.telegram_bot_token:
                 await asyncio.sleep(5.0)
                 continue
@@ -162,15 +173,25 @@ async def run_app() -> None:
     sched_task = asyncio.create_task(scheduler.run_forever())
     poll_task = asyncio.create_task(_poll_loop())
 
+    async def _heartbeat_loop() -> None:
+        while not stop_event.is_set():
+            if not sched_task.done() and not poll_task.done():
+                _touch_heartbeat()
+            await asyncio.sleep(15.0)
+
+    _touch_heartbeat()
+    hb_task = asyncio.create_task(_heartbeat_loop())
+
     logger.info("Trading 212 x Gemini AI Advisor v%s running...", APP_VERSION)
     try:
         await stop_event.wait()
     finally:
-        for task in (sched_task, poll_task):
+        for task in (hb_task, sched_task, poll_task):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
         # TODO(IMP-18): [接自 IMP-03 & IMP-04 & IMP-05] 停机清理一并释放 await t212.close()、await market_data.close()（及 await db.close()）。
+        await ops.close()
         await tg.close()
         logger.info("Shutdown complete.")
 
@@ -180,6 +201,23 @@ def main() -> None:
         asyncio.run(run_app())
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        logging.getLogger("trading-advisor").exception("Fatal unhandled exception in trading-python")
+        try:
+            env = EnvSettings()
+            if env.ops_notify_url.strip():
+                send_ops_notify_sync(
+                    env.ops_notify_url,
+                    severity="CRITICAL",
+                    alert_key="process_fatal_crash",
+                    title="trading-python 主进程致命崩溃",
+                    message=f"未捕获致命异常导致进程退出：{type(exc).__name__}: {exc}",
+                    cooldown_sec=0,
+                    token=env.ops_notify_token,
+                )
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":

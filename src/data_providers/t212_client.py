@@ -347,9 +347,28 @@ class T212Client:
     def set_snapshot_loader(self, snapshot_loader: Callable[[], Awaitable[PortfolioData | None]] | None) -> None:
         self._snapshot_loader = snapshot_loader
 
-    async def _notify_ops(self, severity: str, alert_key: str, message: str) -> None:
-        if self._ops is not None:
-            await self._ops.notify(severity=severity, source="t212", alert_key=alert_key, message=message)
+    async def _notify_ops(
+        self,
+        severity: str,
+        alert_key: str,
+        message: str,
+        *,
+        title: str = "",
+        business_blocking: bool = False,
+        bot_message: str = "",
+    ) -> None:
+        if self._ops is None:
+            return
+        if business_blocking and hasattr(self._ops, "notify_business_critical"):
+            await self._ops.notify_business_critical(
+                source="t212",
+                alert_key=alert_key,
+                message=message,
+                title=title,
+                bot_message=bot_message,
+            )
+            return
+        await self._ops.notify(severity=severity, source="t212", alert_key=alert_key, message=message)
 
     @staticmethod
     def _auth_headers(api_key: str, api_secret: str) -> dict[str, str]:
@@ -889,6 +908,7 @@ class T212Client:
         summary_realized: float | None = None
         summary_total_val: float | None = None
         summary_transient_err: str | None = None
+        auth_alert_sent = False
 
         try:
             # 1. Account summary
@@ -922,6 +942,16 @@ class T212Client:
                         summary_total_val = float(summary["totalValue"])
                 else:
                     cash_note = f"(Account summary HTTP {summary_res.status_code})"
+                    if summary_res.status_code in (401, 403):
+                        auth_alert_sent = True
+                        await self._notify_ops(
+                            "CRITICAL",
+                            f"t212_auth_failed:{account_label}",
+                            f"Trading 212 [{account_label}] /equity/account/summary 返回 HTTP {summary_res.status_code}，API Key 鉴权失效。",
+                            title=f"T212 {account_label} 鉴权失效",
+                            business_blocking=True,
+                            bot_message=f"🚨 Trading 212 [{account_label}] API Key 鉴权失效（HTTP {summary_res.status_code}），请及时更新只读密钥。",
+                        )
                     if _is_transient_http_status(summary_res.status_code):
                         summary_transient_err = f"HTTP {summary_res.status_code}"
             except httpx.HTTPError as exc:
@@ -937,6 +967,15 @@ class T212Client:
                 rate_bucket=account_label,
             )
             if pos_res.status_code != 200:
+                if pos_res.status_code in (401, 403) and not auth_alert_sent:
+                    await self._notify_ops(
+                        "CRITICAL",
+                        f"t212_auth_failed:{account_label}",
+                        f"Trading 212 [{account_label}] /equity/positions 返回 HTTP {pos_res.status_code}，API Key 鉴权失效。",
+                        title=f"T212 {account_label} 鉴权失效",
+                        business_blocking=True,
+                        bot_message=f"🚨 Trading 212 [{account_label}] API Key 鉴权失效（HTTP {pos_res.status_code}），今日风控与持仓同步已受阻。",
+                    )
                 return (
                     AccountSnapshot(
                         ok=False,
@@ -1276,6 +1315,9 @@ class T212Client:
                     "CRITICAL",
                     "t212_all_accounts_failed",
                     f"Trading 212 双账户全部读取失败！ISA: {isa_snap.error} | Invest: {invest_snap.error}",
+                    title="T212 双账户全部读取失败",
+                    business_blocking=True,
+                    bot_message="🚨 Trading 212 双账户全部读取失败，今日持仓与风控不可用，请检查 API 密钥或查看运维告警。",
                 )
             return data
 

@@ -1,6 +1,6 @@
 # Trading 212 × Gemini AI 私人量化投顾 (v5.0.5)
 
-面向英国个人投资者（Trading 212 **Stocks ISA** 免税长线账户 + **Invest** 应税短线账户，每账户约 10 只持仓，双账户均**仅保留 `GBP` 英镑现金**、不使用 Pie、不开启分红自动再投资）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling 常驻、零公网端口暴露）。
+面向英国个人投资者（Trading 212 **Stocks ISA** 免税长线账户 + **Invest** 应税短线账户，每账户约 10 只持仓，双账户均**仅保留 `GBP` 英镑现金**、不使用 Pie、不开启分红自动再投资）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling 常驻、零公网端口暴露、Docker 容器化部署）。
 
 ---
 
@@ -13,71 +13,65 @@
 
 ### 算力与硬件部署环境
 - **大模型与预算定位**：基于 Google AI Pro 订阅的 **Gemini API Paid Tier**（享有高并发配额、每月 5,000 次免费 Google Search Grounding 及 API 数据不用于模型训练的隐私保护）。理想月度消耗控制在 **\$10 USD 赠金以内（完美状态）**，月度上限 **\$20 USD**——在**绝对不缩减 `/report` 规模与深度**的前提下，通过优化日常单聊与消除重复工具调用控制成本。
-- **服务端硬件演进**：当前运行于 **Google Cloud `e2-medium`** 云主机；后续迁移至英国本地常驻迷你主机（**Intel N95 + 16GB RAM + 512GB SSD**）。
+- **服务端硬件与容器架构**：运行于英国本地常驻迷你主机 **Intel N95 + 16GB RAM + 512GB SSD**（`/opt/homelab/stacks/trading-python/`），采用 Docker Compose（`mem_limit: 2g`、`TZ=Europe/London`、纯 Python `healthcheck`），通过外部共享内网 `homelab-net` 接入 `ops-notify` 统一告警网关，**零公网端口暴露**。
 - **居家与跨国出差双场景维护**：
   - **交互层**：采用 Telegram Long Polling 架构，无论在英国本地家中还是出国出差（任意时区/酒店网络），手机与笔记本均可零端口映射实时交互；系统内部时钟与日程严格锁死 `Europe/London (UK)` 与交易所本地时间（`ET`）。
-  - **开发运维层**：日常在英国本地 Windows 台式机（与 N95 主机同网段局域网直连）或出差随身 Windows 笔记本（通过 SSH / Tailscale 虚拟局域网）编写代码、运行离线单测并一键推送补丁热升级。
+  - **开发运维层**：日常在英国本地 Windows 台式机或出差随身 Windows 笔记本（通过 SSH / Tailscale 虚拟局域网）编写代码并运行离线单测，通过私有 Git 仓库同步至 N95 主机并执行 `docker compose up -d --build` 滚动重建。
 
 ### 演进脉络与工作区目录说明
+- **`docs/PROJECT_MIGRATION_RULES.md`**：N95 Homelab 项目迁移与容器化强制规范（v1.1）。
 - **`docs/T212_API_manual.json`**：Trading 212 Public API v0 官方 OpenAPI 3.0 规范文档（含所有接口 Schema 与限流规则）。
-- **`_ref/OLD_trading-gs/`（前身，已停用，不进 Git）**：早期部署在 Google Apps Script 的 `v4.2~v4.4` 脚本，因 6 分钟超时限制与缺少本地量化矩阵/SQLite 持久化而退役。
-- **`trading-python/`（当前主项目）**：重构为独立 Python 异步服务，融合了 `_ref/` 下三个参考开源项目的核心理念（本地隔离，不随 Git/Docker 上传）：
-  - `_ref/REF_TradingAgents-main/`：多角色制衡（机会分析师 Bull vs 风控审计官 Bear → 组合经理 PM 结构化拍板）与历史决策记忆（Memory Log）。
-  - `_ref/REF_daily_stock_analysis-main/`：盘前/盘中/休市阶段感知、确定性上下文打包（FactSheet）与倒金字塔精炼推送。
-  - `_ref/REF_stock-master/`：本地确定性技术指标计算与零 Token 量化初筛。
+- **`_ref/`（本地隔离参考区，不进 Git / Docker）**：早期 GAS 脚本与三大参考开源项目（`REF_TradingAgents-main`、`REF_daily_stock_analysis-main`、`REF_stock-master`）。
 
 > **开发者与 AI 交接手册**：模块拆解、数据库/模型契约、待改进追踪表（`IMP-01 ~ IMP-19`）与版本日志见 [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)。
 
 ---
 
-## 2. 环境配置与快速启动
+## 2. 环境配置与 N95 容器化部署（Git + Docker Compose）
 
-**前置条件**：Python `>= 3.11`（推荐 `3.12`）。
+**前置条件**：
+- 本地开发与离线单测：Python `>= 3.12`（容器基础镜像已锁定 `python:3.12.13-slim-bookworm`）。
+- N95 宿主机环境：Docker + Docker Compose v2，且已创建外部共享网络 `homelab-net`（若首次初始化：`docker network create homelab-net`）。
 
-**API 密钥准备（`.env`）**：
+**API 密钥与环境变量准备（`.env`，严禁提交至 Git）**：
 - **Trading 212 API Key**（只读）：在 T212 生成 Key 时勾选 `Account Data`、`Portfolio`、`Orders - Read`、`History - Orders`（**勿勾选**下单执行权限与 Pie 权限）。
 - **Google Gemini API Key**：Paid Tier Key，用于多智能体推理与 Google Search Grounding 联网检索。
-- **Telegram Bot Token & Chat ID**：单用户 `chat_id` 白名单鉴权。
+- **Telegram Bot Token & Chat ID**：独立 Bot Token + 单用户 `chat_id` 白名单鉴权。
 - **Finnhub / FRED API Key**（免费可选）：增强美股财报日历与美债/利率/失业率官方宏观序列。
+- **Ops-Notify 运维网关（N95 必配）**：
+  - `OPS_NOTIFY_URL=http://ops-notify:8000/alert`（通过 `homelab-net` 内网推送运维告警，不刷屏交易交互 Bot；未配置时自动降级为直接走 Telegram）。
+  - `OPS_NOTIFY_TOKEN=`（若 `ops-notify` 开启鉴权则填写 Bearer Token，否则留空）。
 
-### 方式 A：Python `venv` + `systemd`（推荐，零 `sudo` 常驻）
+### 本地开发与离线验证（Windows 开发端）
 
 ```bash
-cd ~/trading-python
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-
-cp .env.example .env
-nano .env   # 填入密钥
-
-# 编译与离线单测验证
 python -m compileall -q src tests
 python -m tests.run_tests tests
-
-# 配置用户级 systemd 常驻
-mkdir -p ~/.config/systemd/user
-cp deploy/trading-advisor.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now trading-advisor.service
-journalctl --user -u trading-advisor.service -f
+git add -A && git commit -m "<msg>" && git push
 ```
-*(退出 SSH 后保持常驻：`loginctl enable-linger $USER`)*
 
-### 方式 B：Docker Compose 启动（GCP 云主机 / 本地 Intel N95 主机通用）
+### N95 首次部署与日常更新（Git 同步 + Docker Compose）
+
+> [!CAUTION]
+> 严禁在旧云主机与 N95 上同时运行同一 `TELEGRAM_BOT_TOKEN` 的 Long Polling 进程，否则会触发 `409 Conflict` 与定时任务重复推送。迁移前务必先彻底停服旧端，并用 `sqlite3 advisor.db ".backup clean.db"` 生成热备库后再拷入 `./data/advisor.db`。
 
 ```bash
-cp .env.example .env && nano .env
+# 1. 拉取最新代码至 N95 标准栈目录
+cd /opt/homelab/stacks/trading-python
+git pull --ff-only
+
+# 2. 首次部署配置密钥与持久化目录（日常更新跳过此步）
+mkdir -p data
+cp -n .env.example .env && nano .env
+chmod 600 .env
+
+# 3. 确认共享内网存在后构建并启动容器（自动挂载 ./data:/app/data 与 ./config.yaml:ro）
+docker network inspect homelab-net >/dev/null 2>&1 || docker network create homelab-net
 docker compose up -d --build
-docker compose logs -f
-```
-*(从 GCP `e2-medium` 迁移至本地 Intel N95 主机时，只需拷贝 `.env` 与 `data/advisor.db` 即可无缝延续所有历史记录)*
 
-### 一键热升级（兼容 `nohup` 与 `systemd`）
-
-```bash
-bash ~/trading-python/deploy/upgrade.sh ~/patch5.0.5.zip
+# 4. 巡检容器状态（确认 health 为 healthy 且无报错）
+docker compose ps
+docker compose logs -f --tail=100
 ```
 
 ---

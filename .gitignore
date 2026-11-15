@@ -6,9 +6,7 @@ __pycache__/
 *$py.class
 .venv/
 venv/
-data/*.db
-data/*.db-wal
-data/*.db-shm
+data/
 logs/
 *.log
 .pytest_cache/

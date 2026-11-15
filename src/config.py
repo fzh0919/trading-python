@@ -45,6 +45,8 @@ class EnvSettings(BaseSettings):
     finnhub_api_key: str = ""
     fred_api_key: str = ""
     t212_base_url: str = "https://live.trading212.com/api/v0"
+    ops_notify_url: str = ""
+    ops_notify_token: str = ""
 
 
 class AppSection(BaseModel):
