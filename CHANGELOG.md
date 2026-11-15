@@ -1,6 +1,6 @@
 # Trading 212 × Gemini AI Advisor — 历史变更与模块执行归档日志 (CHANGELOG)
 
-> 说明：本文件归档历史版本修改日志（`v5.0.1` ~ `v5.1.0`）及已完成 `IMP-xx` 模块的完整实现细节，以保持主开发手册 [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) 精简紧凑、节省 AI 助手上下文 Token。
+> 说明：本文件归档历史版本修改日志（`v5.0.1` ~ `v5.1.1`）及已完成 `IMP-xx` 模块的完整实现细节，以保持主开发手册 [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) 精简紧凑、节省 AI 助手上下文 Token。
 
 ---
 
@@ -33,7 +33,18 @@
 
 ---
 
-## 二、版本修改日志（Changelog `v5.0.1` ~ `v5.1.0`）
+## 二、版本修改日志（Changelog `v5.0.1` ~ `v5.1.1`）
+
+### `v5.1.1`（2026-11-15）
+修复 `/pick` 量化初筛阶段跨源/跨时区 K 线合并报错（`TypeError: Cannot join tz-naive with tz-aware DatetimeIndex`，全套 `86 tests OK`）：
+
+1. **统一历史 K 线索引去时区日历化（`src/data_providers/market_data.py`）**：
+   - 新增共享辅助函数 `normalize_history_index(index)`，将 `DatetimeIndex` 或日期类索引统一剥离时区并归整到交易所当地零点日历日期（`tz_localize(None).normalize()`，兼容跨夏令时混合偏移量对象索引，同时跳过数值索引），并保留夏令时 `00:00+01:00` 正确日期不发生 UTC 回退错位。
+   - 在 `_sanitize_history_df()` 源头接入 `normalize_history_index` 并过滤无效日期与重复索引，彻底消除 `yf.Ticker().history()`（带交易所时区）与 `yf.download()`（无时区）混存缓存引发的数据源格式分歧。
+2. **`/pick` 量化消费端防御兜底（`src/engine/screener.py`）**：
+   - 在 `_extract_ohlcv_series()` 中复用 `normalize_history_index` 做日历日期归一化、去重与排序，一并修复 `compute_portfolio_risk_metrics()`（持仓拼表与持仓+候选拼接）及 `compute_relative_strength()`（个股与区域基准拼接）中的 `tz-naive`/`tz-aware` 混用崩溃，以及跨市场全带时区时按 UTC 时刻拆行导致的 `.ffill(limit=1)` / `.shift(3)` 静默错位。
+3. **版本同步与离线回归测试（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `tests/`）**：
+   - 版本号升级至 `5.1.1`；在 `tests/test_analytics_and_rules.py` 新增 `test_screener_mixed_tz_aware_and_naive_indices`（覆盖 `America/New_York`、`Europe/London` 跨夏令时、`Europe/Berlin` 与无时区混排）、在 `tests/test_market_data.py` 新增 `test_sanitize_history_df_normalizes_mixed_timezones`。
 
 ### `v5.1.0`（2026-11-15）
 完成 `IMP-01 ~ IMP-19` 六阶段全链路重构与 N95 本地容器化迁移收口（全套 `84 tests OK`）：

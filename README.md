@@ -1,4 +1,4 @@
-# Trading 212 × Gemini AI 私人量化投顾 (v5.1.0)
+# Trading 212 × Gemini AI 私人量化投顾 (v5.1.1)
 
 面向英国个人投资者（Trading 212 **Stocks ISA** 免税长线账户 + **Invest** 应税短线账户，每账户约 10 只持仓，双账户均**仅保留 `GBP` 英镑现金**、不使用 Pie、不开启分红自动再投资）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling 常驻、零公网端口暴露、Docker 容器化部署）。
 

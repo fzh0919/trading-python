@@ -143,8 +143,25 @@ def _resolve_dividend_yield_pct(
     return round(div_y, 4)
 
 
+def normalize_history_index(index: pd.Index) -> pd.DatetimeIndex | None:
+    """Convert date-like index to tz-naive midnight timestamps, preserving local exchange dates."""
+    if isinstance(index, pd.DatetimeIndex):
+        return index.tz_localize(None).normalize()
+    if pd.api.types.is_numeric_dtype(index):
+        return None
+    try:
+        dt_idx = pd.to_datetime(index, errors="raise")
+        return pd.DatetimeIndex(dt_idx).tz_localize(None).normalize()
+    except Exception:
+        try:
+            # Handle object indices containing mixed UTC offsets across DST transitions
+            return pd.DatetimeIndex([pd.Timestamp(x).tz_localize(None).normalize() for x in index])
+        except Exception:
+            return None
+
+
 def _sanitize_history_df(df: pd.DataFrame | None) -> pd.DataFrame:
-    """Normalize OHLCV DataFrame: coerce numeric columns, drop invalid Close rows, sort index."""
+    """Normalize OHLCV DataFrame: coerce numeric columns, drop invalid Close rows, normalize & sort index."""
     if df is None or df.empty or "Close" not in df.columns:
         return pd.DataFrame()
     clean = df.copy()
@@ -155,6 +172,12 @@ def _sanitize_history_df(df: pd.DataFrame | None) -> pd.DataFrame:
     clean = clean[clean["Close"] > 0]
     if clean.empty:
         return pd.DataFrame()
+    norm_idx = normalize_history_index(clean.index)
+    if norm_idx is not None:
+        clean.index = norm_idx
+        clean = clean[clean.index.notna()]
+        if clean.empty:
+            return pd.DataFrame()
     clean = clean[~clean.index.duplicated(keep="last")].sort_index()
     return clean
 

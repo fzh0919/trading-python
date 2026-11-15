@@ -50,7 +50,7 @@ trading-python/                     # [当前主项目]
     ├── src/
     │   ├── main.py                 # 入口：初始化 SQLite/OpsNotifier/各Client，维护 /tmp 心跳、致命崩溃兜底与长轮询
     │   ├── healthcheck.py          # 纯 Python 容器探活：校验 /tmp/advisor.heartbeat 新鲜度与只读 SQLite 状态
-    │   ├── version.py              # 版本号单一真源 (APP_VERSION = "5.1.0")
+    │   ├── version.py              # 版本号单一真源 (APP_VERSION = "5.1.1")
     │   ├── config.py               # Pydantic 配置加载 (.env + config.yaml)
     │   ├── ops_notifier.py         # 统一运维告警（ops-notify 双态分流、WARN 冷却、CRITICAL 防抖与离线缓冲）
     │   ├── data_providers/
@@ -139,6 +139,7 @@ trading-python/                     # [当前主项目]
   - `PortfolioData` 新增：`is_fallback: bool`, `fallback_source: str`, `fallback_note: str`
   - `build_trade_context(...)` 返回字典键：`pending_orders_text`, `recent_trades_text`, `trade_summary_30d_text`, `cash_flow_summary_text`, `traded_tickers`
 - **`src/data_providers/market_data.py`（`IMP-05`）**：
+  - `normalize_history_index(index) -> pd.DatetimeIndex | None`（剥离时区并归整至当地交易日历零点；由 `_sanitize_history_df` 与 `screener._extract_ohlcv_series` 共用）
   - `await market_data.get_histories(symbols: list[str], period="1y") -> dict[str, pd.DataFrame]`（0 次 `.info`，含 Singleflight 与 LRU）
   - `await market_data.get_bundles(symbols, include_news=True, include_earnings=True, include_info=True, isin_map: dict[str, str] | None = None) -> tuple[dict[str, pd.DataFrame], dict[str, TickerMarketBundle]]`
   - `await market_data.get_us_realtime_quote(symbol)`；`await market_data.get_us_deep_intel(symbol) -> dict`（6h 缓存，含 `recommendations`, `earnings_surprises`, `insider_sentiment`）；`await market_data.close()`
@@ -298,10 +299,11 @@ trading-python/                     # [当前主项目]
 - **`[2026-11-15] IMP-17 (统一运维告警中心)`**：修改 `src/ops_notifier.py`, `tests/test_v504_ops_and_grounding.py`（`src/main.py` 增 `# TODO(IMP-18)` 标注） | `flush_pending()` 接入近 24h DB 未送达告警恢复与已送达标记，过滤冷却抑制并遵循 `ops-notify` 双态分流与内存去重 | `81 tests OK`
 - **`[2026-11-15] IMP-18 (入口生命周期与 Telegram 通信层)`**：修改 `src/bot/telegram_client.py`, `src/main.py`, `tests/test_v504_ops_and_grounding.py` | 实现 Telegram `429`/瞬断指数退避、`T212` 冷启动读库兜底、启动 `ops.flush_pending()` 与全连接池/DB 容错关闭 | `83 tests OK`
 - **`[2026-11-15] IMP-19 (迁移/备份演练与全链路总验收)`**：修改 `src/healthcheck.py`, `tests/test_calendar_and_scheduler.py`, `tests/test_db_and_end_to_end.py`, `README.md`, `DEVELOPER_GUIDE.md`, `CHANGELOG.md` | 补齐 `healthcheck` 相对路径回退与行情测试桩、清零全仓 `TODO`、通过容器合规+WAL `.backup` 迁移+`ops-notify`+全链路闭环验收 | `84 tests OK`
-- *（当前进度：`19 / 19` 已全部完成并定版 `v5.1.0`，全量离线单测 `84 tests OK`，已具备 N95 容器化切割上线条件）*
+- **`[2026-11-15] v5.1.1 (修复 /pick 混合时区 K 线拼接报错)`**：修改 `src/data_providers/market_data.py`, `src/engine/screener.py`, `src/version.py`, `pyproject.toml`, `tests/test_market_data.py`, `tests/test_analytics_and_rules.py`, `README.md`, `DEVELOPER_GUIDE.md`, `CHANGELOG.md` | 新增 `normalize_history_index` 在源头 `_sanitize_history_df` 与消费端 `_extract_ohlcv_series` 统一归整当地交易日历日期，修复 `tz-naive`/`tz-aware` 混用崩溃与跨时区行错位 | `86 tests OK`
+- *（当前进度：`19 / 19` 已全部完成，当前版本 `v5.1.1`，全量离线单测 `86 tests OK`，已具备 N95 容器化切割上线条件）*
 
 ---
 
 ## 六、历史修改日志（已冷热分离）
 
-完整版本变更记录（`v5.0.1` ~ `v5.1.0`）及已完成 `IMP-xx` 模块的详细技术实现流水，统一归档于 [`CHANGELOG.md`](./CHANGELOG.md)，新窗口默认无需通读历史归档。
+完整版本变更记录（`v5.0.1` ~ `v5.1.1`）及已完成 `IMP-xx` 模块的详细技术实现流水，统一归档于 [`CHANGELOG.md`](./CHANGELOG.md)，新窗口默认无需通读历史归档。

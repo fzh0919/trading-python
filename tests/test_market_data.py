@@ -497,6 +497,23 @@ class TestMarketDataService(unittest.IsolatedAsyncioTestCase):
         finally:
             await svc.close()
 
+    def test_sanitize_history_df_normalizes_mixed_timezones(self) -> None:
+        from src.data_providers.market_data import _sanitize_history_df
+
+        # UK BST timestamp 2026-10-20 00:00+01:00 must keep local date 2026-10-20 (not shift to Oct 19 UTC)
+        uk_idx = pd.date_range("2026-10-20", periods=5, freq="B", tz="Europe/London")
+        us_idx = pd.date_range("2026-10-20", periods=5, freq="B", tz="America/New_York")
+        df_uk = _sanitize_history_df(
+            pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1000.0}, index=uk_idx)
+        )
+        df_us = _sanitize_history_df(
+            pd.DataFrame({"Open": 200.0, "High": 202.0, "Low": 198.0, "Close": 201.0, "Volume": 2000.0}, index=us_idx)
+        )
+        self.assertIsNone(df_uk.index.tz)
+        self.assertIsNone(df_us.index.tz)
+        self.assertEqual(df_uk.index[0], pd.Timestamp("2026-10-20"))
+        self.assertEqual(list(df_uk.index), list(df_us.index))
+
 
 if __name__ == "__main__":
     unittest.main()

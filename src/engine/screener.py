@@ -19,7 +19,11 @@ from src.data_providers.analytics import (
     max_correlation_against_portfolio,
     resolve_market_benchmark,
 )
-from src.data_providers.market_data import MarketDataService, TickerMarketBundle
+from src.data_providers.market_data import (
+    MarketDataService,
+    TickerMarketBundle,
+    normalize_history_index,
+)
 from src.data_providers.t212_client import PortfolioData
 
 
@@ -87,6 +91,13 @@ def _extract_ohlcv_series(
     df = df[df["close"] > 0]
     if df.empty:
         return None
+    norm_idx = normalize_history_index(df.index)
+    if norm_idx is not None:
+        df.index = norm_idx
+        df = df[df.index.notna()]
+        if df.empty:
+            return None
+    df = df[~df.index.duplicated(keep="last")].sort_index()
     return (
         df["open"].fillna(df["close"]).astype(float),
         df["high"].fillna(df["close"]).astype(float),

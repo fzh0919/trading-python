@@ -1851,6 +1851,114 @@ class TestAnalyticsAndRules(unittest.TestCase):
         )
         self.assertIn("SAFEETF.L", d_md.stage2_syms)
 
+    def test_screener_mixed_tz_aware_and_naive_indices(self) -> None:
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        # Span UK BST -> GMT transition (Oct -> Nov) to verify local exchange date preservation
+        dates_naive = pd.date_range("2026-07-01", periods=100, freq="B")
+        dates_us = dates_naive.tz_localize("America/New_York")
+        dates_uk = dates_naive.tz_localize("Europe/London")
+        dates_eu = dates_naive.tz_localize("Europe/Berlin")
+
+        rng = np.random.default_rng(19)
+        base_rets = rng.normal(0.001, 0.015, 100)
+        p_us = 100.0 * np.cumprod(1.0 + base_rets)
+        p_uk = 200.0 * np.cumprod(1.0 + base_rets * 0.8 + rng.normal(0.0, 0.004, 100))
+        p_vwrl = 90.0 * np.cumprod(1.0 + base_rets * 0.7 + rng.normal(0.0, 0.004, 100))
+        p_msft = 300.0 * np.cumprod(1.0 + base_rets * 0.9 + rng.normal(0.0, 0.003, 100))
+        p_sap = 180.0 * np.cumprod(1.0 + base_rets * 0.6 + rng.normal(0.0, 0.005, 100))
+
+        def _ohlcv(arr: np.ndarray, idx: pd.DatetimeIndex) -> pd.DataFrame:
+            return pd.DataFrame(
+                {"Open": arr, "High": arr * 1.01, "Low": arr * 0.99, "Close": arr, "Volume": np.full(len(arr), 1e6)},
+                index=idx,
+            )
+
+        histories = {
+            "NVDA": _ohlcv(p_us, dates_us),
+            "AZN.L": _ohlcv(p_uk, dates_uk),
+            "VWRL.L": _ohlcv(p_vwrl, dates_naive),
+            "MSFT": _ohlcv(p_msft, dates_naive),
+            "SAP.DE": _ohlcv(p_sap, dates_eu),
+            "SPY": _ohlcv(p_vwrl, dates_naive),
+        }
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 21:00",
+            fetched_at_ms=1794776400000,
+            isa=AccountSnapshot(
+                ok=True,
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        inst_currency="USD",
+                        quantity=10,
+                        avg_price=100,
+                        cur_price=110,
+                        current_value=3000.0,
+                        total_cost=2700.0,
+                        pnl=300.0,
+                        fx_impact=0.0,
+                        return_pct=11.1,
+                        weight_pct=50.0,
+                    ),
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="AZN_EQ",
+                        ticker="AZN",
+                        yahoo_symbol="AZN.L",
+                        name="AstraZeneca",
+                        inst_currency="GBp",
+                        quantity=20,
+                        avg_price=10000,
+                        cur_price=10500,
+                        current_value=2000.0,
+                        total_cost=1900.0,
+                        pnl=100.0,
+                        fx_impact=0.0,
+                        return_pct=5.2,
+                        weight_pct=33.3,
+                    ),
+                ],
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                positions=[
+                    PositionItem(
+                        account="INVEST",
+                        raw_ticker="VWRL_EQ",
+                        ticker="VWRL",
+                        yahoo_symbol="VWRL.L",
+                        name="Vanguard FTSE All-World",
+                        inst_currency="GBP",
+                        quantity=10,
+                        avg_price=90,
+                        cur_price=95,
+                        current_value=1000.0,
+                        total_cost=950.0,
+                        pnl=50.0,
+                        fx_impact=0.0,
+                        return_pct=5.2,
+                        weight_pct=100.0,
+                    ),
+                ],
+            ),
+        )
+
+        risk = compute_portfolio_risk_metrics(histories, portfolio, ["MSFT", "SAP.DE"], lookback_days=60)
+        self.assertIn("MSFT", risk)
+        self.assertIn("SAP.DE", risk)
+        self.assertIsNotNone(risk["MSFT"]["weighted_corr"])
+        self.assertGreater(risk["MSFT"]["weighted_corr"], 0.7)
+        self.assertIsNotNone(risk["SAP.DE"]["marginal_vol_delta_pct"])
+
+        rs = compute_relative_strength(histories["NVDA"], histories["SPY"])
+        self.assertIsNotNone(rs["rs_20d_pct"])
+        self.assertIsNotNone(rs["rs_slope_20d"])
+
 
 if __name__ == "__main__":
     unittest.main()
