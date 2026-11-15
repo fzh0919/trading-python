@@ -8,10 +8,11 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -22,7 +23,7 @@ from src.agents.tools import MarketToolkit, clear_grounding_cache, run_forced_ma
 from src.bot.handlers import BOT_COMMANDS, REMOVE_KEYBOARD_MARKUP, AdvisorBot
 from src.bot.scheduler import TradingScheduler
 from src.bot.telegram_client import TelegramClient
-from src.config import AppConfig, EnvSettings
+from src.config import AppConfig, AppSection, EnvSettings
 from src.data_providers.market_data import MacroSnapshot, MarketDataService
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData, T212Client
 from src.healthcheck import check_health, write_heartbeat
@@ -356,7 +357,7 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
                 health_msg = tg.sent[-1][1]
                 self.assertIn(f"v{APP_VERSION}", health_msg)
                 self.assertIn("T212 ISA", health_msg)
-                self.assertIn("Google Search 30日用量", health_msg)
+                self.assertIn("Google Search 本月用量", health_msg)
                 self.assertIn("最近 5 条运维事件", health_msg)
                 self.assertNotIn("**", health_msg)
                 self.assertNotIn("#", health_msg)
@@ -841,6 +842,525 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["candidate"], "NVDA")
         self.assertEqual(res["most_correlated_holding"], "AZN.L")
         self.assertIsNotNone(res["max_correlation_60d"])
+
+
+class TestImp15HealthDiagnostics(unittest.IsolatedAsyncioTestCase):
+    async def test_imp15_health_reports_fallback_stale_unnotified_ops_gateway_and_monthly_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp15_health.db")
+            await db.init()
+
+            # Insert one usage row in current UK month and one in previous month (within 30d window)
+            await db.log_llm_usage(
+                {
+                    "call_label": "report_pm",
+                    "model": "gemini-4-argon",
+                    "prompt_tokens": 1000,
+                    "output_tokens": 200,
+                    "search_queries": 17,
+                }
+            )
+            await db.log_llm_usage(
+                {
+                    "call_label": "prev_month_search",
+                    "model": "gemini-4-argon",
+                    "prompt_tokens": 1000,
+                    "output_tokens": 200,
+                    "search_queries": 100,
+                }
+            )
+            month_start_uk = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/London")).replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
+            prev_month_ms = int((month_start_uk - timedelta(days=2)).timestamp() * 1000)
+            async with db._connect(write=True) as conn:
+                await conn.execute(
+                    "UPDATE llm_usage_logs SET created_at_ms = ? WHERE call_label = 'prev_month_search'",
+                    (prev_month_ms,),
+                )
+                await conn.commit()
+
+            # Log an unnotified suppressed ops event
+            await db.log_ops_event(
+                severity="WARN",
+                source="t212:rate_limit",
+                alert_key="t212_429",
+                message="T212 触发 429 限流退避",
+                notified=False,
+                suppressed_count=4,
+            )
+
+            class _FallbackT212(T212Client):
+                async def get_portfolio(self, use_cache: bool = True) -> PortfolioData:
+                    return PortfolioData(
+                        fetched_at_uk="2026-11-15 08:00",
+                        fetched_at_ms=1794729600000,
+                        is_fallback=True,
+                        fallback_source="db_snapshot",
+                        fallback_note="T212 HTTP 503，已使用冷启动快照兜底",
+                        isa=AccountSnapshot(
+                            ok=True,
+                            account_label="ISA",
+                            total_account_value=8000.0,
+                            is_fallback=True,
+                            fallback_source="db_snapshot",
+                            fallback_reason="HTTP 503",
+                            snapshot_fetched_at_uk="2026-11-14 18:00",
+                        ),
+                        invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=4000.0),
+                    )
+
+            class _StaleMarket(MarketDataService):
+                async def get_macro_snapshot(self) -> MacroSnapshot:
+                    return MacroSnapshot(
+                        fetched_at_utc="2026-11-15 08:00 UTC",
+                        gbp_usd=1.27,
+                        vix=19.5,
+                        spy_5d_pct=0.4,
+                        is_stale=True,
+                    )
+
+            cfg = AppConfig(
+                env=EnvSettings(
+                    _env_file=None,
+                    telegram_chat_id="999",
+                    gemini_api_key="test-key",
+                    ops_notify_url="http://ops-notify:8000/alert",
+                )
+            )
+            tg = _StubTelegram()
+            ops = OpsNotifier(
+                telegram=tg,
+                chat_id="999",
+                db=db,
+                ops_notify_url="http://ops-notify:8000/alert",
+            )
+            bot = AdvisorBot(cfg, _FallbackT212(), _StaleMarket(), object(), db, tg, ops_notifier=ops)
+            try:
+                msg = await bot._run_health_check()
+                self.assertIn("⚠️ T212 ISA [降级缓存]", msg)
+                self.assertNotIn("✅ T212 ISA", msg)
+                self.assertIn("T212 组合降级告警", msg)
+                self.assertIn("Yahoo 行情/宏观: ⚠️ 降级/陈旧缓存 (is_stale)", msg)
+                self.assertNotIn("Yahoo 行情/宏观: ✅ 正常", msg)
+                self.assertIn("近 24h 未送达/静默抑制告警 (1 条)", msg)
+                self.assertIn("抑制合并4次", msg)
+                self.assertIn("已启用 ops-notify", msg)
+                self.assertIn("Google Search 本月用量: 17 / 5,000", msg)
+                self.assertNotIn("117 / 5,000", msg)
+                self.assertNotIn("**", msg)
+                self.assertNotIn("#", msg)
+            finally:
+                await ops.close()
+
+
+class TestImp17OpsRecovery(unittest.IsolatedAsyncioTestCase):
+    async def test_imp17_flush_pending_recovers_db_events_via_ops_notify_and_skips_suppressed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp17_ops.db")
+            await db.init()
+
+            # Pre-restart persisted ops events: INFO, cooldown-suppressed WARN, and 2 real unnotified alerts
+            await db.log_ops_event(
+                severity="INFO",
+                source="lifecycle",
+                alert_key="startup",
+                message="old startup",
+                notified=False,
+                suppressed_count=0,
+            )
+            await db.log_ops_event(
+                severity="WARN",
+                source="t212",
+                alert_key="t212_rate_limit",
+                message="suppressed 429 repeat",
+                notified=False,
+                suppressed_count=3,
+            )
+            await db.log_ops_event(
+                severity="WARN",
+                source="market_data",
+                alert_key="finnhub_down",
+                message="finnhub timeout before power loss",
+                notified=False,
+                suppressed_count=0,
+            )
+            await db.log_ops_event(
+                severity="CRITICAL",
+                source="t212",
+                alert_key="t212_auth_failed:ISA",
+                message="ISA HTTP 401 before reboot",
+                notified=False,
+                suppressed_count=0,
+            )
+
+            captured: list[dict] = []
+            mode = {"raise_net": True}
+
+            async def _handler(request: httpx.Request) -> httpx.Response:
+                if mode["raise_net"]:
+                    raise httpx.ConnectError("ops-notify still starting", request=request)
+                captured.append(json.loads(request.content.decode("utf-8")))
+                return httpx.Response(200, json={"ok": True})
+
+            tg = _StubTelegram()
+            # Fresh OpsNotifier instance simulating process restart (empty in-memory buffers)
+            ops = OpsNotifier(
+                telegram=tg,
+                chat_id="999",
+                db=db,
+                ops_notify_url="http://ops-notify:8000/alert",
+                ops_notify_token="tok-17",
+                transport=httpx.MockTransport(_handler),
+            )
+            try:
+                # Failure keeps DB unnotified rows intact for retry
+                self.assertFalse(await ops.flush_pending())
+                self.assertEqual(len(captured), 0)
+                self.assertEqual(len(await db.get_unnotified_ops_events(hours=24)), 3)
+
+                # Recovery pushes merged ops-notify alert ONLY (no trading Bot spam) and marks delivered rows
+                mode["raise_net"] = False
+                self.assertTrue(await ops.flush_pending())
+                self.assertEqual(len(tg.sent), 0)
+                self.assertEqual(len(captured), 1)
+                payload = captured[0]
+                self.assertEqual(payload["severity"], "CRITICAL")
+                self.assertEqual(payload["alert_key"], "ops_recovery_flush")
+                self.assertEqual(payload["cooldown_sec"], 0)
+                self.assertIn("finnhub timeout before power loss", payload["message"])
+                self.assertIn("ISA HTTP 401 before reboot", payload["message"])
+                self.assertNotIn("suppressed 429 repeat", payload["message"])
+                self.assertNotIn("old startup", payload["message"])
+
+                remaining = await db.get_unnotified_ops_events(hours=24)
+                self.assertEqual(len(remaining), 1)
+                self.assertEqual(remaining[0]["alert_key"], "t212_rate_limit")
+                self.assertEqual(remaining[0]["suppressed_count"], 3)
+
+                # Idempotent second flush sends nothing further
+                self.assertTrue(await ops.flush_pending())
+                self.assertEqual(len(captured), 1)
+            finally:
+                await ops.close()
+
+    async def test_imp17_flush_pending_telegram_fallback_dedupes_in_memory_and_recovers_db(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp17_tg.db")
+            await db.init()
+
+            await db.log_ops_event(
+                severity="WARN",
+                source="market_data",
+                alert_key="fred_down",
+                message="FRED unreachable pre-restart",
+                notified=False,
+                suppressed_count=0,
+            )
+            await db.log_ops_event(
+                severity="WARN",
+                source="t212",
+                alert_key="t212_rate_limit",
+                message="suppressed warn should not spam",
+                notified=False,
+                suppressed_count=2,
+            )
+
+            tg = _StubTelegram(fail_delivery=True)
+            ops = OpsNotifier(
+                telegram=tg,
+                chat_id="999",
+                db=db,
+                ops_notify_url="",
+            )
+            # In-process failure queues into _pending_buffer AND persists notified=0 in DB
+            self.assertFalse(
+                await ops.notify(
+                    severity="CRITICAL",
+                    source="scheduler",
+                    alert_key="morning_crash",
+                    message="morning report failed in process",
+                )
+            )
+            tg.fail_delivery = False
+
+            self.assertTrue(await ops.flush_pending())
+            # 1 message from in-memory buffer + 1 message from pre-restart DB recovery (no duplicate for morning_crash!)
+            self.assertEqual(len(tg.sent), 2)
+            self.assertIn("morning report failed in process", tg.sent[0][1])
+            self.assertIn("FRED unreachable pre-restart", tg.sent[1][1])
+            self.assertNotIn("morning report failed in process", tg.sent[1][1])
+            self.assertNotIn("suppressed warn should not spam", tg.sent[1][1])
+
+            # Only the cooldown-suppressed row remains unnotified in DB
+            remaining = await db.get_unnotified_ops_events(hours=24)
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["alert_key"], "t212_rate_limit")
+
+            # Subsequent flush is a no-op
+            self.assertTrue(await ops.flush_pending())
+            self.assertEqual(len(tg.sent), 2)
+
+
+class TestImp18MainAndTelegramClient(unittest.IsolatedAsyncioTestCase):
+    async def test_imp18_telegram_client_429_retry_after_and_transient_backoff(self) -> None:
+        attempts: list[str] = []
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(request.url.path.rsplit("/", 1)[-1])
+            idx = len(attempts)
+            if idx == 1:
+                return httpx.Response(
+                    429,
+                    json={
+                        "ok": False,
+                        "error_code": 429,
+                        "description": "Too Many Requests: retry after 2",
+                        "parameters": {"retry_after": 0.02},
+                    },
+                )
+            if idx == 2:
+                raise httpx.ConnectError("broadband transient drop", request=request)
+            if idx == 3:
+                return httpx.Response(502, text="<html>Bad Gateway</html>")
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 101}})
+
+        sleep_calls: list[float] = []
+        orig_sleep = asyncio.sleep
+
+        async def _spy_sleep(delay: float) -> None:
+            sleep_calls.append(delay)
+            await orig_sleep(0)
+
+        tg = TelegramClient(
+            "secret-token-18",
+            transport=httpx.MockTransport(_handler),
+            max_retries=3,
+            base_backoff_s=0.01,
+            max_retry_wait_s=1.0,
+        )
+        try:
+            with patch("src.bot.telegram_client.asyncio.sleep", side_effect=_spy_sleep):
+                ok = await tg.send_message("999", "hello imp-18")
+            self.assertTrue(ok)
+            self.assertEqual(len(attempts), 4)
+            self.assertEqual(sleep_calls, [0.02, 0.02, 0.04])
+        finally:
+            await tg.close()
+
+        # Non-retryable 400 fails in 1 shot without backoff
+        bad_attempts = 0
+
+        async def _bad_req(request: httpx.Request) -> httpx.Response:
+            nonlocal bad_attempts
+            bad_attempts += 1
+            return httpx.Response(400, json={"ok": False, "error_code": 400, "description": "Bad Request"})
+
+        tg_bad = TelegramClient(
+            "secret-token-18",
+            transport=httpx.MockTransport(_bad_req),
+            max_retries=2,
+            base_backoff_s=0.01,
+        )
+        try:
+            self.assertFalse(await tg_bad.send_message("999", "bad"))
+            self.assertEqual(bad_attempts, 1)
+        finally:
+            await tg_bad.close()
+
+        # Persistent network outage exhausts retries and still raises httpx.HTTPError for _poll_loop tracking
+        timeout_attempts = 0
+
+        async def _always_timeout(request: httpx.Request) -> httpx.Response:
+            nonlocal timeout_attempts
+            timeout_attempts += 1
+            raise httpx.ReadTimeout("timed out", request=request)
+
+        tg_outage = TelegramClient(
+            "secret-token-18",
+            transport=httpx.MockTransport(_always_timeout),
+            max_retries=1,
+            base_backoff_s=0.0,
+        )
+        try:
+            with self.assertRaises(httpx.ReadTimeout):
+                await tg_outage.get_updates(offset=1, timeout_s=5)
+            self.assertEqual(timeout_attempts, 2)
+        finally:
+            await tg_outage.close()
+
+        # Exhausting 429 returns structured error payload and respects Retry-After header cap
+        rl_attempts = 0
+        rl_sleeps: list[float] = []
+
+        async def _always_429(request: httpx.Request) -> httpx.Response:
+            nonlocal rl_attempts
+            rl_attempts += 1
+            return httpx.Response(429, headers={"Retry-After": "999"}, text="rate limited")
+
+        async def _spy_rl_sleep(delay: float) -> None:
+            rl_sleeps.append(delay)
+            await orig_sleep(0)
+
+        tg_429 = TelegramClient(
+            "secret-token-18",
+            transport=httpx.MockTransport(_always_429),
+            max_retries=1,
+            base_backoff_s=0.01,
+            max_retry_wait_s=0.25,
+        )
+        try:
+            with patch("src.bot.telegram_client.asyncio.sleep", side_effect=_spy_rl_sleep):
+                res = await tg_429._post("sendMessage", {"chat_id": "999", "text": "hi"})
+            self.assertFalse(res.get("ok"))
+            self.assertEqual(res.get("error_code"), 429)
+            self.assertEqual(rl_attempts, 2)
+            self.assertEqual(rl_sleeps, [0.25])
+        finally:
+            await tg_429.close()
+
+    async def test_imp18_run_app_injects_snapshot_loader_flushes_ops_and_closes_all(self) -> None:
+        import src.main as main_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "imp18_main.db"
+            hb_path = Path(tmpdir) / "advisor.heartbeat"
+
+            pre_db = AdvisorDatabase(db_path)
+            await pre_db.init()
+            saved_snap = PortfolioData(
+                fetched_at_uk="2026-11-15 08:00",
+                fetched_at_ms=1794729600000,
+                isa=AccountSnapshot(
+                    ok=True,
+                    account_label="ISA",
+                    currency="GBP",
+                    total_account_value=5000.0,
+                    total_cash=5000.0,
+                ),
+                invest=AccountSnapshot(
+                    ok=True,
+                    account_label="Invest",
+                    currency="GBP",
+                    total_account_value=3000.0,
+                    total_cash=3000.0,
+                ),
+                total_combined_value=8000.0,
+                total_combined_cash=8000.0,
+            )
+            await pre_db.save_snapshot(saved_snap)
+            await pre_db.log_ops_event(
+                severity="CRITICAL",
+                source="t212",
+                alert_key="pre_crash_alert",
+                message="power loss before notify",
+                notified=False,
+                suppressed_count=0,
+            )
+
+            cfg = AppConfig(
+                env=EnvSettings(
+                    _env_file=None,
+                    telegram_bot_token="fake-tg-token",
+                    telegram_chat_id="999",
+                    gemini_api_key="fake-gemini",
+                    ops_notify_url="http://ops-notify:8000/alert",
+                    ops_notify_token="tok-18",
+                ),
+                app=AppSection(db_path=str(db_path), log_level="WARNING"),
+            )
+
+            tg_requests: list[str] = []
+            ops_payloads: list[dict] = []
+            closed_resources: list[str] = []
+            captured: dict[str, object] = {}
+
+            async def _tg_handler(request: httpx.Request) -> httpx.Response:
+                method = request.url.path.rsplit("/", 1)[-1]
+                tg_requests.append(method)
+                if method == "getUpdates":
+                    return httpx.Response(200, json={"ok": True, "result": []})
+                return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+            async def _ops_handler(request: httpx.Request) -> httpx.Response:
+                ops_payloads.append(json.loads(request.content.decode("utf-8")))
+                return httpx.Response(200, json={"ok": True})
+
+            class _TrackedDB(AdvisorDatabase):
+                async def close(self) -> None:
+                    closed_resources.append("db")
+                    await super().close()
+
+            class _TrackedTG(TelegramClient):
+                def __init__(self, bot_token: str, **kwargs) -> None:
+                    super().__init__(
+                        bot_token,
+                        transport=httpx.MockTransport(_tg_handler),
+                        base_backoff_s=0.0,
+                    )
+
+                async def close(self) -> None:
+                    closed_resources.append("tg")
+                    await super().close()
+
+            class _TrackedOps(OpsNotifier):
+                def __init__(self, **kwargs) -> None:
+                    kwargs["transport"] = httpx.MockTransport(_ops_handler)
+                    super().__init__(**kwargs)
+
+                async def close(self) -> None:
+                    closed_resources.append("ops")
+                    await super().close()
+
+            class _TrackedT212(T212Client):
+                def __init__(self, **kwargs) -> None:
+                    super().__init__(**kwargs)
+                    captured["t212"] = self
+
+                async def close(self) -> None:
+                    closed_resources.append("t212")
+                    await super().close()
+                    raise RuntimeError("simulated t212 close hiccup")
+
+            class _TrackedMarketData(MarketDataService):
+                async def close(self) -> None:
+                    closed_resources.append("market_data")
+                    await super().close()
+
+            class _FastScheduler(TradingScheduler):
+                async def run_forever(self) -> None:
+                    stop_event.set()
+                    await asyncio.sleep(0)
+
+            stop_event = asyncio.Event()
+
+            with (
+                patch.object(main_mod, "load_config", return_value=cfg),
+                patch.object(main_mod, "AdvisorDatabase", _TrackedDB),
+                patch.object(main_mod, "TelegramClient", _TrackedTG),
+                patch.object(main_mod, "OpsNotifier", _TrackedOps),
+                patch.object(main_mod, "T212Client", _TrackedT212),
+                patch.object(main_mod, "MarketDataService", _TrackedMarketData),
+                patch.object(main_mod, "TradingScheduler", _FastScheduler),
+                patch.object(main_mod, "write_heartbeat", lambda: write_heartbeat(hb_path)),
+            ):
+                await main_mod.run_app(stop_event=stop_event)
+
+            # Verify snapshot_loader injection works end-to-end against real DB
+            t212_inst = captured["t212"]
+            self.assertIsNotNone(t212_inst._snapshot_loader)
+            loaded = await t212_inst._snapshot_loader()
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.total_combined_value, 8000.0)
+
+            # Verify startup flush_pending pushed the pre-restart CRITICAL event via ops-notify
+            recovery_msgs = [p for p in ops_payloads if p.get("alert_key") == "ops_recovery_flush"]
+            self.assertEqual(len(recovery_msgs), 1)
+            self.assertIn("power loss before notify", recovery_msgs[0]["message"])
+            self.assertEqual(await pre_db.get_unnotified_ops_events(hours=24), [])
+
+            # Verify all resources closed even when t212.close() raised
+            self.assertEqual(closed_resources, ["t212", "market_data", "ops", "tg", "db"])
 
 
 if __name__ == "__main__":

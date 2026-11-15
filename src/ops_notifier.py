@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -90,6 +90,8 @@ class OpsNotifier:
         self._suppressed_counts: dict[tuple[str, str], int] = defaultdict(int)
         self._pending_buffer: list[str] = []
         self._pending_ops_buffer: list[dict[str, Any]] = []
+        self._pending_tg_keys: list[tuple[str, str, str] | None] = []
+        self._pending_ops_keys: list[tuple[str, str, str] | None] = []
 
     @property
     def ops_notify_enabled(self) -> bool:
@@ -200,15 +202,29 @@ class OpsNotifier:
             )
             return False
 
-    def _queue_offline(self, line: str) -> None:
+    @staticmethod
+    def _event_key(source: str, alert_key: str, message: str) -> tuple[str, str, str]:
+        return (str(source), str(alert_key), str(message)[:1000])
+
+    def _queue_offline(self, line: str, event_key: tuple[str, str, str] | None = None) -> None:
         if len(self._pending_buffer) >= 20:
             self._pending_buffer.pop(0)
+            if self._pending_tg_keys:
+                self._pending_tg_keys.pop(0)
         self._pending_buffer.append(line)
+        self._pending_tg_keys.append(event_key)
 
-    def _queue_ops_offline(self, payload: dict[str, Any]) -> None:
+    def _queue_ops_offline(
+        self,
+        payload: dict[str, Any],
+        event_key: tuple[str, str, str] | None = None,
+    ) -> None:
         if len(self._pending_ops_buffer) >= 20:
             self._pending_ops_buffer.pop(0)
+            if self._pending_ops_keys:
+                self._pending_ops_keys.pop(0)
         self._pending_ops_buffer.append(payload)
+        self._pending_ops_keys.append(event_key)
 
     async def notify(
         self,
@@ -251,6 +267,7 @@ class OpsNotifier:
 
         now_uk = self._now_uk()
         sup_note = f"\n（距上次告警期间已合并同类提示 {prior_suppressed} 次）" if prior_suppressed > 0 else ""
+        ev_key = self._event_key(source, alert_key, message)
 
         if self.ops_notify_enabled:
             ops_sev = "CRITICAL" if business_blocking else sev
@@ -264,7 +281,7 @@ class OpsNotifier:
             )
             ops_sent = await self._deliver_ops_notify(payload)
             if not ops_sent:
-                self._queue_ops_offline(payload)
+                self._queue_ops_offline(payload, ev_key)
 
             bot_sent = False
             if business_blocking:
@@ -274,7 +291,7 @@ class OpsNotifier:
                 )
                 bot_sent = await self._deliver_text(tip)
                 if not bot_sent:
-                    self._queue_offline(f"• [{now_uk}] [CRITICAL] {source}: {tip[:180]}")
+                    self._queue_offline(f"• [{now_uk}] [CRITICAL] {source}: {tip[:180]}", ev_key)
 
             sent = ops_sent or bot_sent
         else:
@@ -282,7 +299,7 @@ class OpsNotifier:
             formatted = f"{icon} [运维告警 | {sev}] {source}\n时间: {now_uk} UK\n详情: {message}{sup_note}"
             sent = await self._deliver_text(formatted)
             if not sent:
-                self._queue_offline(f"• [{now_uk}] [{sev}] {source}: {message[:180]}")
+                self._queue_offline(f"• [{now_uk}] [{sev}] {source}: {message[:180]}", ev_key)
 
         await self._persist(
             severity="CRITICAL" if business_blocking else sev,
@@ -317,6 +334,7 @@ class OpsNotifier:
     async def record_offline_incident(self, *, source: str, alert_key: str, message: str) -> None:
         """Record a transport outage locally without attempting Telegram HTTP calls."""
         now_uk = self._now_uk()
+        ev_key = self._event_key(source, alert_key, message)
         if self.ops_notify_enabled:
             payload = self._build_ops_payload(
                 severity="WARN",
@@ -328,7 +346,7 @@ class OpsNotifier:
             )
             ops_sent = await self._deliver_ops_notify(payload)
             if not ops_sent:
-                self._queue_ops_offline(payload)
+                self._queue_ops_offline(payload, ev_key)
             await self._persist(
                 severity="WARN",
                 source=source,
@@ -339,7 +357,7 @@ class OpsNotifier:
             )
             return
 
-        self._queue_offline(f"• [{now_uk}] [WARN] {source}: {message[:180]}")
+        self._queue_offline(f"• [{now_uk}] [WARN] {source}: {message[:180]}", ev_key)
         await self._persist(
             severity="WARN",
             source=source,
@@ -349,29 +367,174 @@ class OpsNotifier:
             suppressed_count=0,
         )
 
-    # TODO(IMP-17): [接自 IMP-03] flush_pending() 须调用 db.get_unnotified_ops_events() 与 db.mark_ops_events_notified()
-    # 捞取最近 24h 未送达的关键告警；注意区分冷却抑制写入的 (notified=0, suppressed_count>0) 记录避免重复刷屏，
-    # 且补推时遵循 ops_notify_url 双态分流（技术类仅推 ops-notify，避免刷屏交易 Bot）。
-    async def flush_pending(self) -> bool:
-        """Flush buffered alerts after connectivity recovers."""
+    @staticmethod
+    def _format_recovered_event_line(ev: dict[str, Any]) -> str:
+        msg = str(ev.get("message") or "").replace("\n", " ").strip()
+        return f"• [{ev['created_at_uk']}] [{ev['severity']}] {ev['source']} ({ev['alert_key']}): {msg[:180]}"
+
+    @classmethod
+    def _chunk_recovered_events(
+        cls,
+        events: list[dict[str, Any]],
+        *,
+        max_chars: int = 3400,
+    ) -> list[tuple[list[int], list[str]]]:
+        """Group recovered DB events into message-sized chunks preserving chronological order."""
+        chunks: list[tuple[list[int], list[str]]] = []
+        cur_ids: list[int] = []
+        cur_lines: list[str] = []
+        cur_len = 0
+        for ev in events:
+            line = cls._format_recovered_event_line(ev)
+            added_len = len(line) + (1 if cur_lines else 0)
+            if cur_lines and cur_len + added_len > max_chars:
+                chunks.append((cur_ids, cur_lines))
+                cur_ids = []
+                cur_lines = []
+                cur_len = 0
+            cur_ids.append(int(ev["id"]))
+            cur_lines.append(line)
+            cur_len += len(line) + (1 if len(cur_lines) > 1 else 0)
+        if cur_ids:
+            chunks.append((cur_ids, cur_lines))
+        return chunks
+
+    async def _recover_unnotified_db_events(
+        self,
+        *,
+        flushed_keys: Counter[tuple[str, str, str]],
+        in_flight_keys: set[tuple[str, str, str]],
+        can_deliver: bool,
+    ) -> bool:
+        """Recover recent unnotified CRITICAL/WARN DB events after restart without re-sending cooldown-suppressed rows."""
+        if self.db is None:
+            return True
+        try:
+            events = await self.db.get_unnotified_ops_events(
+                hours=24,
+                severities=("CRITICAL", "WARN"),
+                limit=200,
+            )
+        except Exception as exc:
+            logger.warning("OpsNotifier failed loading unnotified ops events (%s: %s)", type(exc).__name__, exc)
+            return False
+
+        if not events:
+            return True
+
+        # Match just-flushed in-memory alerts newest-first so older pre-restart identical events still recover.
+        already_delivered_ids: list[int] = []
+        matched_ids: set[int] = set()
+        remaining_flushed = Counter(flushed_keys)
+        for ev in reversed(events):
+            key = self._event_key(str(ev["source"]), str(ev["alert_key"]), str(ev["message"]))
+            if remaining_flushed[key] > 0:
+                remaining_flushed[key] -= 1
+                eid = int(ev["id"])
+                matched_ids.add(eid)
+                already_delivered_ids.append(eid)
+
+        if already_delivered_ids:
+            try:
+                await self.db.mark_ops_events_notified(already_delivered_ids)
+            except Exception as exc:
+                logger.warning("OpsNotifier failed marking flushed ops events (%s: %s)", type(exc).__name__, exc)
+
+        # Filter out cooldown-suppressed records (suppressed_count > 0) and items still in memory buffers.
+        db_only_events: list[dict[str, Any]] = []
+        for ev in events:
+            eid = int(ev["id"])
+            if eid in matched_ids:
+                continue
+            if int(ev.get("suppressed_count") or 0) > 0:
+                continue
+            key = self._event_key(str(ev["source"]), str(ev["alert_key"]), str(ev["message"]))
+            if key in in_flight_keys:
+                continue
+            db_only_events.append(ev)
+
+        if not db_only_events:
+            return True
+        if not can_deliver:
+            return False
+
         all_ok = True
+        events_by_id = {int(ev["id"]): ev for ev in db_only_events}
+        for chunk_ids, chunk_lines in self._chunk_recovered_events(db_only_events):
+            body = "\n".join(chunk_lines)
+            if self.ops_notify_enabled:
+                has_crit = any(str(events_by_id[eid].get("severity", "")).upper() == "CRITICAL" for eid in chunk_ids)
+                payload = self._build_ops_payload(
+                    severity="CRITICAL" if has_crit else "WARN",
+                    source="ops_recovery",
+                    alert_key="ops_recovery_flush",
+                    title=f"重启/断连恢复：补推 {len(chunk_ids)} 条未送达告警",
+                    message=body,
+                    cooldown_sec=0,
+                )
+                delivered = await self._deliver_ops_notify(payload)
+            else:
+                summary = "🔄 [系统恢复] 补推近 24h 未送达关键告警：\n" + body
+                delivered = await self._deliver_text(summary)
+
+            if not delivered:
+                all_ok = False
+                break
+            try:
+                await self.db.mark_ops_events_notified(chunk_ids)
+            except Exception as exc:
+                logger.warning("OpsNotifier failed marking recovered ops events (%s: %s)", type(exc).__name__, exc)
+                all_ok = False
+        return all_ok
+
+    async def flush_pending(self) -> bool:
+        """Flush buffered in-memory alerts and recover recent unnotified DB events after connectivity/restart."""
+        all_ok = True
+        ops_flush_ok = True
+        tg_flush_ok = True
+        flushed_keys: Counter[tuple[str, str, str]] = Counter()
+        in_flight_keys: set[tuple[str, str, str]] = set()
+
         if self.ops_notify_enabled and self._pending_ops_buffer:
             remaining_ops: list[dict[str, Any]] = []
+            remaining_ops_keys: list[tuple[str, str, str] | None] = []
             for idx, payload in enumerate(self._pending_ops_buffer):
+                key = self._pending_ops_keys[idx] if idx < len(self._pending_ops_keys) else None
                 if await self._deliver_ops_notify(payload):
+                    if key is not None:
+                        flushed_keys[key] += 1
                     continue
                 remaining_ops.extend(self._pending_ops_buffer[idx:])
+                if idx < len(self._pending_ops_keys):
+                    remaining_ops_keys.extend(self._pending_ops_keys[idx:])
+                ops_flush_ok = False
                 all_ok = False
                 break
             self._pending_ops_buffer = remaining_ops
+            self._pending_ops_keys = remaining_ops_keys
+            in_flight_keys.update(k for k in remaining_ops_keys if k is not None)
 
         if self._pending_buffer:
             summary = "🔄 [系统恢复] Telegram 通道已恢复，以下为断连期间离线汇总：\n" + "\n".join(self._pending_buffer)
             sent = await self._deliver_text(summary)
             if sent:
+                for key in self._pending_tg_keys:
+                    if key is not None:
+                        flushed_keys[key] += 1
                 self._pending_buffer.clear()
+                self._pending_tg_keys.clear()
             else:
+                tg_flush_ok = False
                 all_ok = False
+                in_flight_keys.update(k for k in self._pending_tg_keys if k is not None)
+
+        can_deliver_db = ops_flush_ok if self.ops_notify_enabled else tg_flush_ok
+        if not await self._recover_unnotified_db_events(
+            flushed_keys=flushed_keys,
+            in_flight_keys=in_flight_keys,
+            can_deliver=can_deliver_db,
+        ):
+            all_ok = False
         return all_ok
 
     async def send_startup_notice(

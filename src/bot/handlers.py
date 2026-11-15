@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -72,6 +74,7 @@ class AdvisorBot:
         ops_notifier: OpsNotifier | None = None,
         scheduler: TradingScheduler | None = None,
         started_monotonic: float | None = None,
+        execution_lock: asyncio.Lock | None = None,
     ) -> None:
         self.cfg = cfg
         self.t212 = t212
@@ -81,6 +84,11 @@ class AdvisorBot:
         self.tg = telegram
         self.ops = ops_notifier
         self.scheduler = scheduler
+        self.execution_lock: asyncio.Lock = (
+            execution_lock
+            if execution_lock is not None
+            else (getattr(scheduler, "execution_lock", None) or asyncio.Lock())
+        )
         self._started_monotonic = started_monotonic if started_monotonic is not None else time.monotonic()
         self._started_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
         self._active_task: asyncio.Task[None] | None = None
@@ -157,17 +165,7 @@ class AdvisorBot:
             return
 
         if lower.startswith("/stats"):
-            rows = await self.db.get_recent_recommendations(limit=10)
-            if not rows:
-                await self._send_reply(chat_id, "📭 暂无历史选股或调仓记录（运行一次 /pick 后会自动建档）。")
-                return
-            lines = ["📒 最近 10 条 /pick 与加减仓存档："]
-            for r in rows:
-                price_s = f" @ {r['entry_price']}" if r["entry_price"] is not None else ""
-                lines.append(
-                    f"• [{r['created_at_uk']}] [{r['account']}] {r['action']} {r['symbol']}{price_s}：{r['thesis']}"
-                )
-            await self._send_reply(chat_id, "\n".join(lines))
+            await self._send_reply(chat_id, await self._build_stats_message())
             return
 
         if lower.startswith("/usage"):
@@ -183,11 +181,123 @@ class AdvisorBot:
         if wait:
             await self._active_task
 
+    @staticmethod
+    def _is_heavy_ai_command(lower: str) -> bool:
+        return not (
+            lower.startswith("/pos")
+            or lower.startswith("/health")
+            or lower.startswith("/heath")
+        )
+
+    @staticmethod
+    def _compute_live_move_pct(symbol: str, entry_price: float, cur_price: float) -> tuple[float | None, bool]:
+        """Compute native-currency return % with a 100x GBp/GBP unit mismatch guard for .L tickers."""
+        if entry_price <= 0 or cur_price <= 0:
+            return None, False
+        ratio = cur_price / entry_price
+        if symbol.strip().upper().endswith(".L") and (0.005 <= ratio <= 0.05 or 20.0 <= ratio <= 200.0):
+            return None, True
+        return (ratio - 1.0) * 100.0, False
+
+    async def _build_stats_message(self) -> str:
+        stats, lessons, rows = await asyncio.gather(
+            self.db.get_recommendation_stats(),
+            self.db.get_recent_lessons(limit=3),
+            self.db.get_recent_recommendations(limit=10),
+        )
+        if not rows and stats.get("total_count", 0) == 0:
+            return "📭 暂无历史选股或调仓记录（运行一次 /pick 后会自动建档）。"
+
+        symbols = list(
+            dict.fromkeys(
+                str(r["symbol"]).strip()
+                for r in rows
+                if r.get("symbol") and str(r["symbol"]).strip().upper() != "CASH"
+            )
+        )
+        live_prices: dict[str, float] = {}
+        if symbols:
+            try:
+                histories = await self.market_data.get_histories(symbols, period="1y")
+            except Exception as exc:
+                logger.warning("Failed fetching live prices for /stats: %s", exc)
+                histories = {}
+            for sym, df in histories.items():
+                if df is not None and not df.empty and "Close" in df.columns:
+                    raw_close = float(df["Close"].iloc[-1])
+                    if math.isfinite(raw_close) and raw_close > 0:
+                        live_prices[sym] = raw_close
+
+        lines = [
+            "📊 历史选股后验胜率与 Alpha 看板",
+            (
+                f"• 样本总览: 共 {stats['total_count']} 条 "
+                f"(已结算 {stats['settled_count']} | 待结算 {stats['pending_count']} | 跳过 {stats['skipped_count']})"
+            ),
+        ]
+        if stats["settled_count"] > 0:
+            avg_raw = f"{stats['avg_raw_return_pct']:+.2f}%" if stats["avg_raw_return_pct"] is not None else "N/A"
+            avg_alpha = f"{stats['avg_alpha_pct']:+.2f}%" if stats["avg_alpha_pct"] is not None else "N/A"
+            lines.append(
+                f"• 原始胜率: {stats['win_rate_pct']:.1f}% ({stats['win_count']}/{stats['settled_count']}) | 平均收益: {avg_raw}"
+            )
+            lines.append(
+                f"• 超额 Alpha 胜率: {stats['alpha_win_rate_pct']:.1f}% ({stats['alpha_win_count']}/{stats['settled_count']}) | 平均 Alpha: {avg_alpha}"
+            )
+        else:
+            lines.append("• 胜率与 Alpha: 暂无已结算 (T+N) 样本，待盘后结算后自动生成。")
+
+        if lessons:
+            lines.append("\n【近期复盘教训】")
+            for ls in lessons:
+                raw_s = f"{ls['raw_return_pct']:+.1f}%" if ls.get("raw_return_pct") is not None else "N/A"
+                alpha_s = f"{ls['alpha_pct']:+.1f}%" if ls.get("alpha_pct") is not None else "N/A"
+                bench_s = ls.get("benchmark_symbol") or "基准"
+                ts_s = ls.get("settled_at_uk") or ls.get("created_at_uk")
+                lines.append(
+                    f"• [{ts_s}] {ls['symbol']} ({ls['action']}, 收益 {raw_s} vs {bench_s} Alpha {alpha_s}): "
+                    f"{str(ls['reflection_lesson'])[:120]}"
+                )
+
+        if rows:
+            lines.append("\n【最近 10 条 /pick 与加减仓表现】")
+            for r in rows:
+                sym = str(r["symbol"])
+                entry = r.get("entry_price")
+                price_s = f" @ {entry}" if entry is not None else ""
+                status = str(r.get("outcome_status") or "PENDING").upper()
+                cur_p = live_prices.get(sym)
+                if status == "SETTLED":
+                    raw_s = f"{r['raw_return_pct']:+.1f}%" if r.get("raw_return_pct") is not None else "N/A"
+                    alpha_s = f"{r['alpha_pct']:+.1f}%" if r.get("alpha_pct") is not None else "N/A"
+                    cur_s = f" | 现价 {cur_p:.2f}" if cur_p is not None else ""
+                    perf_s = f" [已结算: 收益 {raw_s}, Alpha {alpha_s}{cur_s}]"
+                elif status == "SKIPPED":
+                    perf_s = " [已跳过结算]"
+                elif cur_p is not None and entry is not None and float(entry) > 0:
+                    move_pct, unit_mismatch = self._compute_live_move_pct(sym, float(entry), cur_p)
+                    if unit_mismatch:
+                        perf_s = f" [待结算 | 现价 {cur_p:.2f} (GBp/GBP量级差异)]"
+                    elif move_pct is not None:
+                        perf_s = f" [待结算 | 现价 {cur_p:.2f} ({move_pct:+.1f}%)]"
+                    else:
+                        perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
+                elif cur_p is not None:
+                    perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
+                else:
+                    perf_s = " [待结算]"
+                lines.append(
+                    f"• [{r['created_at_uk']}] [{r['account']}] {r['action']} {sym}{price_s}{perf_s}：{r['thesis']}"
+                )
+
+        return "\n".join(lines)
+
     async def _run_health_check(self) -> str:
-        portfolio, macro, ops_events, usage_30d = await asyncio.gather(
+        portfolio, macro, ops_events, unnotified_events, usage_30d = await asyncio.gather(
             self.t212.get_portfolio(use_cache=True),
             self.market_data.get_macro_snapshot(),
             self.db.get_recent_ops_events(limit=5),
+            self.db.get_unnotified_ops_events(hours=24, limit=10),
             self.db.get_usage_summary(days=30),
         )
         uptime_s = _format_uptime(time.monotonic() - self._started_monotonic)
@@ -197,9 +307,30 @@ class AdvisorBot:
                 return f"⚠️ {label}: 失败 ({str(acc.error)[:80]})"
             ord_s = "挂单✓" if acc.pending_orders_supported else "挂单403/关"
             hist_s = "历史✓" if acc.order_history_supported else "历史403/关"
+            if getattr(acc, "is_fallback", False):
+                fb_src = getattr(acc, "fallback_source", "") or "cache"
+                fb_at = getattr(acc, "snapshot_fetched_at_uk", "")
+                fb_reason = getattr(acc, "fallback_reason", "")
+                meta_parts = [f"来源:{fb_src}"]
+                if fb_at:
+                    meta_parts.append(f"快照:{fb_at}")
+                if fb_reason:
+                    meta_parts.append(f"原因:{str(fb_reason)[:40]}")
+                return (
+                    f"⚠️ {label} [降级缓存]: 净值 {acc.account_currency} {acc.total_account_value:,.2f} "
+                    f"({ord_s}, {hist_s}; {', '.join(meta_parts)})"
+                )
             return f"✅ {label}: 净值 {acc.account_currency} {acc.total_account_value:,.2f} ({ord_s}, {hist_s})"
 
         yf_ok = macro.gbp_usd is not None and macro.spy_5d_pct is not None
+        macro_stale = bool(getattr(macro, "is_stale", False))
+        if macro_stale:
+            yf_status = "⚠️ 降级/陈旧缓存 (is_stale)"
+        elif not yf_ok:
+            yf_status = "⚠️ 数据残缺"
+        else:
+            yf_status = "✅ 正常"
+
         finnhub_status = (
             f"⚠️ 异常 ({self.market_data.finnhub.last_error})"
             if self.market_data.finnhub.last_error
@@ -216,30 +347,54 @@ class AdvisorBot:
             if self.cfg.env.gemini_api_key.strip()
             else "🚨 GEMINI_API_KEY 缺失"
         )
-        # TODO(IMP-15): [接自 IMP-03 & IMP-04 & IMP-05] /health 须检查 portfolio.is_fallback/acc.is_fallback、macro.is_stale
-        # 及 db.get_unnotified_ops_events() 未送达/抑制告警；Search 统计建议统一切换为 usage_30d["this_month"]。
-        search_q_30d = usage_30d["last_nd"].get("search_queries", 0)
+        ops_enabled = bool(self.ops is not None and getattr(self.ops, "ops_notify_enabled", False))
+        ops_gateway_status = "✅ 已启用 ops-notify（双态分流）" if ops_enabled else "➖ 未配置（降级走本 Bot）"
+        unnotified_cnt = len(unnotified_events)
+        suppressed_total = sum(int(ev.get("suppressed_count") or 0) for ev in unnotified_events)
+        if unnotified_cnt > 0:
+            alert_health = f"⚠️ {unnotified_cnt} 条未送达/静默抑制(合并{suppressed_total}次)"
+        else:
+            alert_health = "✅ 正常"
+
+        month_bucket = usage_30d.get("this_month") or usage_30d["last_nd"]
+        search_q_month = month_bucket.get("search_queries", 0)
 
         lines = [
             f"🩺 系统全链路运维体检（v{APP_VERSION}）",
             f"• 启动时间: {self._started_uk} UK | 连续运行: {uptime_s}",
-            f"• SQLite & 告警: ✅ 正常 | 强制联网扫描: {'开启' if self.cfg.models.enable_forced_search_grounding else '关闭'}",
+            f"• SQLite & 告警: {alert_health} | 运维网关: {ops_gateway_status}",
+            f"• 强制联网扫描: {'开启' if self.cfg.models.enable_forced_search_grounding else '关闭'}",
             f"• Gemini: {gemini_status}",
-            f"• Google Search 30日用量: {search_q_30d:,} / {self.cfg.models.google_search_free_quota_monthly:,} 免费额度",
+            f"• Google Search 本月用量: {search_q_month:,} / {self.cfg.models.google_search_free_quota_monthly:,} 免费额度",
             "",
             "【外部接口连通性】",
             f"• {_acc_line('T212 ISA', portfolio.isa)}",
             f"• {_acc_line('T212 Invest', portfolio.invest)}",
-            f"• Yahoo 行情/宏观: {'✅ 正常' if yf_ok else '⚠️ 数据残缺'} (GBP/USD={macro.gbp_usd or 'N/A'}, VIX={macro.vix or 'N/A'})",
-            f"• Finnhub 美股新闻/财历: {finnhub_status}",
-            f"• FRED 利率/失业率: {fred_status}",
         ]
+        if getattr(portfolio, "is_fallback", False):
+            fb_note = getattr(portfolio, "fallback_note", "") or getattr(portfolio, "fallback_source", "") or "已启用兜底快照"
+            lines.append(f"• ⚠️ T212 组合降级告警: 当前非实时实盘数据（{str(fb_note)[:80]}）")
+        lines.extend(
+            [
+                f"• Yahoo 行情/宏观: {yf_status} (GBP/USD={macro.gbp_usd or 'N/A'}, VIX={macro.vix or 'N/A'})",
+                f"• Finnhub 美股新闻/财历: {finnhub_status}",
+                f"• FRED 利率/失业率: {fred_status}",
+            ]
+        )
 
         if self.scheduler is not None and self.scheduler.last_job_runs:
             lines.append("\n【最近定时任务记录】")
             for job_name, info in self.scheduler.last_job_runs.items():
                 detail = f" ({info['detail']})" if info.get("detail") else ""
                 lines.append(f"• {job_name}: {info['status']} @ {info['uk_time']} UK{detail}")
+
+        if unnotified_events:
+            lines.append(f"\n【近 24h 未送达/静默抑制告警 ({unnotified_cnt} 条)】")
+            for ev in unnotified_events[:5]:
+                sup = f", 抑制合并{ev['suppressed_count']}次" if ev["suppressed_count"] > 0 else ""
+                lines.append(
+                    f"• [{ev['created_at_uk']}] [{ev['severity']}] {ev['source']}: {ev['message'][:80]} (待补推{sup})"
+                )
 
         lines.append("\n【最近 5 条运维事件】")
         if not ops_events:
@@ -257,88 +412,102 @@ class AdvisorBot:
     async def _run_query_task(self, chat_id: str, text: str) -> None:
         status_msg_id: int | None = None
         try:
-            await self.tg.send_typing(chat_id)
             lower = text.lower()
+            is_heavy = self._is_heavy_ai_command(lower)
+            async with AsyncExitStack() as stack:
+                if is_heavy:
+                    if self.execution_lock.locked():
+                        active_job = getattr(self.scheduler, "current_job_name", None)
+                        job_hint = f"（{active_job}）" if active_job else ""
+                        await self.tg.send_message(
+                            chat_id,
+                            f"⏳ 后台定时任务{job_hint}或另一项 AI 分析正在执行中，为避免重复消耗额度与并发冲突，请稍候完成后再试。",
+                        )
+                        return
+                    await stack.enter_async_context(self.execution_lock)
 
-            if lower.startswith("/pos"):
-                status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在拉取 T212 双账户实时仓位与挂单...")
+                await self.tg.send_typing(chat_id)
+
+                if lower.startswith("/pos"):
+                    status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在拉取 T212 双账户实时仓位与挂单...")
+                    self._active_status_msg_id = status_msg_id
+                    reply = await format_positions_instant(self.cfg, self.t212)
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 持仓快照已就绪：")
+                    await self.tg.send_message(chat_id, reply)
+                    return
+
+                if lower.startswith("/health") or lower.startswith("/heath"):
+                    status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在巡检 T212 / 行情 / Gemini / DB 全链路状态...")
+                    self._active_status_msg_id = status_msg_id
+                    reply = await self._run_health_check()
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 运维自检报告已生成：")
+                    await self.tg.send_message(chat_id, reply)
+                    return
+
+                if lower.startswith("/report"):
+                    status_msg_id = await self.tg.send_status(
+                        chat_id, "⏳ 正在并发拉取 T212、行情与英/欧/美全市场 Google 深度检索并生成晨报..."
+                    )
+                    self._active_status_msg_id = status_msg_id
+                    reply = await generate_morning_report(
+                        self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
+                    )
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 全景晨报分析完成：")
+                    await self.tg.send_message(chat_id, reply)
+                    return
+
+                if lower.startswith("/us"):
+                    status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在扫描美股实时阶段与持仓异动...")
+                    self._active_status_msg_id = status_msg_id
+                    reply = await generate_us_sentinel(
+                        self.cfg,
+                        self.t212,
+                        self.market_data,
+                        self.llm,
+                        self.db,
+                        is_scheduled_premarket=False,
+                        ops_notifier=self.ops,
+                    )
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 美股盯盘简报完成：")
+                    await self.tg.send_message(chat_id, reply)
+                    return
+
+                if lower.startswith("/pick"):
+                    focus_query = text[5:].strip()
+                    label = f"「{focus_query}」" if focus_query else "全市场（美/英/欧股 + LSE ETF + 持仓加减）"
+                    status_msg_id = await self.tg.send_status(
+                        chat_id, f"⏳ 第 1/2 步：量化初筛 + 全市场联网催化扫描中（方向：{label}）..."
+                    )
+                    self._active_status_msg_id = status_msg_id
+                    reply = await generate_pick_radar(
+                        self.cfg,
+                        self.t212,
+                        self.market_data,
+                        self.llm,
+                        self.db,
+                        focus_query=focus_query,
+                        is_weekly_auto=False,
+                        ops_notifier=self.ops,
+                    )
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 投研选股 + 风控官双审完成：")
+                    await self.tg.send_message(chat_id, reply)
+                    return
+
+                # Free-form chat
+                status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在核对实盘数据并思考回复...")
                 self._active_status_msg_id = status_msg_id
-                reply = await format_positions_instant(self.cfg, self.t212)
-                await self.tg.edit_status(chat_id, status_msg_id, "✅ 持仓快照已就绪：")
-                await self.tg.send_message(chat_id, reply)
-                return
-
-            if lower.startswith("/health") or lower.startswith("/heath"):
-                status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在巡检 T212 / 行情 / Gemini / DB 全链路状态...")
-                self._active_status_msg_id = status_msg_id
-                reply = await self._run_health_check()
-                await self.tg.edit_status(chat_id, status_msg_id, "✅ 运维自检报告已生成：")
-                await self.tg.send_message(chat_id, reply)
-                return
-
-            if lower.startswith("/report"):
-                status_msg_id = await self.tg.send_status(
-                    chat_id, "⏳ 正在并发拉取 T212、行情与英/欧/美全市场 Google 深度检索并生成晨报..."
+                reply = await answer_user_chat(
+                    text, self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
                 )
-                self._active_status_msg_id = status_msg_id
-                reply = await generate_morning_report(
-                    self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
-                )
-                await self.tg.edit_status(chat_id, status_msg_id, "✅ 全景晨报分析完成：")
+                await self.tg.edit_status(chat_id, status_msg_id, "✅ 回复如下：")
                 await self.tg.send_message(chat_id, reply)
-                return
-
-            if lower.startswith("/us"):
-                status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在扫描美股实时阶段与持仓异动...")
-                self._active_status_msg_id = status_msg_id
-                reply = await generate_us_sentinel(
-                    self.cfg,
-                    self.t212,
-                    self.market_data,
-                    self.llm,
-                    self.db,
-                    is_scheduled_premarket=False,
-                    ops_notifier=self.ops,
-                )
-                await self.tg.edit_status(chat_id, status_msg_id, "✅ 美股盯盘简报完成：")
-                await self.tg.send_message(chat_id, reply)
-                return
-
-            if lower.startswith("/pick"):
-                focus_query = text[5:].strip()
-                label = f"「{focus_query}」" if focus_query else "全市场（美/英/欧股 + LSE ETF + 持仓加减）"
-                status_msg_id = await self.tg.send_status(
-                    chat_id, f"⏳ 第 1/2 步：量化初筛 + 全市场联网催化扫描中（方向：{label}）..."
-                )
-                self._active_status_msg_id = status_msg_id
-                reply = await generate_pick_radar(
-                    self.cfg,
-                    self.t212,
-                    self.market_data,
-                    self.llm,
-                    self.db,
-                    focus_query=focus_query,
-                    is_weekly_auto=False,
-                    ops_notifier=self.ops,
-                )
-                await self.tg.edit_status(chat_id, status_msg_id, "✅ 投研选股 + 风控官双审完成：")
-                await self.tg.send_message(chat_id, reply)
-                return
-
-            # Free-form chat
-            status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在核对实盘数据并思考回复...")
-            self._active_status_msg_id = status_msg_id
-            reply = await answer_user_chat(
-                text, self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
-            )
-            await self.tg.edit_status(chat_id, status_msg_id, "✅ 回复如下：")
-            await self.tg.send_message(chat_id, reply)
         except asyncio.CancelledError:
             logger.info("Task cancelled for query: %s", text[:40])
             raise
         except Exception as exc:
             logger.exception("Error processing message %s", text[:40])
-            await self.tg.edit_status(chat_id, status_msg_id, "❌ 处理失败")
+            if status_msg_id is not None:
+                await self.tg.edit_status(chat_id, status_msg_id, "❌ 处理失败")
             if self.ops is not None:
                 await self.ops.notify(
                     severity="CRITICAL",
@@ -358,45 +527,68 @@ class AdvisorBot:
             thought_tok = b["thought_tokens"]
             search_q = b.get("search_queries", 0)
             cache_pct = (cached_tok / in_tok * 100.0) if in_tok > 0 else 0.0
+            gen_tok = out_tok + thought_tok
+            think_pct = (thought_tok / gen_tok * 100.0) if gen_tok > 0 else 0.0
             search_str = f" | 搜索 {search_q}次" if search_q else ""
             return (
                 f"• {title}：{b['calls']}次 ({b['rounds']}轮){search_str}\n"
-                f"  输入 {in_tok:,} (缓存 {cached_tok:,}, {cache_pct:.0f}%) | "
-                f"输出 {out_tok:,} + 思考 {thought_tok:,}"
+                f"  输入 {in_tok:,} (缓存 {cached_tok:,}, 命中 {cache_pct:.0f}%) | "
+                f"输出 {out_tok:,} + 思考 {thought_tok:,} (思考占生成 {think_pct:.0f}%)"
             )
 
         m = self.cfg.models
-        # TODO(IMP-15): [接自 IMP-03] 与 IMP-09 对齐，按自然月 free quota 改用 summary["this_month"].get("search_queries", 0)。
-        search_30d = summary["last_nd"].get("search_queries", 0)
+        month_bucket = summary.get("this_month") or summary["last_nd"]
+        search_month = month_bucket.get("search_queries", 0)
         free_quota = m.google_search_free_quota_monthly
         warn_at = int(free_quota * m.google_search_warn_pct / 100.0) if free_quota > 0 else 0
+        quota_pct = (search_month / free_quota * 100.0) if free_quota > 0 else 0.0
+        remaining_quota = max(free_quota - search_month, 0) if free_quota > 0 else 0
         search_badge = ""
-        if free_quota > 0 and search_30d >= free_quota:
+        if free_quota > 0 and search_month >= free_quota:
             search_badge = " 🚨 已超免费额度（超额按量计费）"
-        elif free_quota > 0 and search_30d >= warn_at:
+        elif free_quota > 0 and search_month >= warn_at:
             search_badge = f" ⚠️ 接近 {m.google_search_warn_pct:.0f}% 预警线"
 
         lines = [
             f"📊 Gemini API Token 与搜索用量看板（周期 {summary['cycle_date']}）",
             _fmt_bucket("今日周期", summary["today"]),
             _fmt_bucket("近 7 天", summary["last_7d"]),
+            _fmt_bucket("本月 (UK自然月)", month_bucket),
             _fmt_bucket(f"近 {summary['days']} 天", summary["last_nd"]),
-            f"🔍 近 {summary['days']} 天 Google Search 查询: {search_30d:,} / {free_quota:,} 月免费额度{search_badge}",
+            (
+                f"🔍 本月 Google Search 查询: {search_month:,} / {free_quota:,} "
+                f"({quota_pct:.1f}%, 剩余 {remaining_quota:,}){search_badge}"
+            ),
+            "ℹ️ 费用以 Google AI Studio 官方账单为准，本看板仅统计纯 Token 与搜索配额。",
         ]
         if summary["by_label_7d"]:
             lines.append("\n【近 7 天分节点消耗】")
             for item in summary["by_label_7d"]:
+                in_t = item["prompt_tokens"]
+                cached_t = item["cached_tokens"]
+                out_t = item["output_tokens"]
+                thought_t = item["thought_tokens"]
+                c_pct = (cached_t / in_t * 100.0) if in_t > 0 else 0.0
+                gen_t = out_t + thought_t
+                th_pct = (thought_t / gen_t * 100.0) if gen_t > 0 else 0.0
                 lines.append(
-                    f"• {item['label']}: {item['calls']}次 | "
-                    f"In {item['prompt_tokens']:,} (缓存 {item['cached_tokens']:,}) / "
-                    f"Out+Think {item['output_tokens'] + item['thought_tokens']:,}"
+                    f"• {item['label']}: {item['calls']}次 | 缓存命中 {c_pct:.0f}% | 思考占生成 {th_pct:.0f}% | "
+                    f"In {in_t:,} (缓存 {cached_t:,}) / Out+Think {gen_t:,}"
                 )
         if summary["by_model_nd"]:
             lines.append(f"\n【近 {summary['days']} 天分模型统计】")
             for item in summary["by_model_nd"]:
-                tot_tok = item["prompt_tokens"] + item["output_tokens"] + item["thought_tokens"]
+                in_t = item["prompt_tokens"]
+                cached_t = item["cached_tokens"]
+                out_t = item["output_tokens"]
+                thought_t = item["thought_tokens"]
+                tot_tok = in_t + out_t + thought_t
+                c_pct = (cached_t / in_t * 100.0) if in_t > 0 else 0.0
+                gen_t = out_t + thought_t
+                th_pct = (thought_t / gen_t * 100.0) if gen_t > 0 else 0.0
                 lines.append(
-                    f"• {item['model']}: {item['calls']}次 ({item['rounds']}轮) | 总Token {tot_tok:,}"
+                    f"• {item['model']}: {item['calls']}次 ({item['rounds']}轮) | "
+                    f"总Token {tot_tok:,} | 缓存命中 {c_pct:.0f}% | 思考占生成 {th_pct:.0f}%"
                 )
         if summary["last_nd"]["calls"] == 0:
             lines.append("\nℹ️ 暂无调用记录（运行 /report、/us、/pick 或单聊后会自动累计）。")

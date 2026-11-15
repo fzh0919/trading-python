@@ -102,18 +102,29 @@ class _MockMarketData(MarketDataService):
         isin_map: dict[str, str] | None = None,
     ):
         histories = await self.get_histories(symbols, period="1y")
-        bundles = {
-            s: TickerMarketBundle(
+        bundles: dict[str, TickerMarketBundle] = {}
+        for s in symbols:
+            currency = "GBP" if s.endswith(".L") else ("EUR" if s.endswith((".DE", ".AS", ".PA")) else "USD")
+            hist = histories.get(s)
+            curr_price = round(float(hist["Close"].iloc[-1]), 2) if hist is not None and not hist.empty else None
+            b = TickerMarketBundle(
                 symbol=s,
                 quote_type="EQUITY",
-                currency="USD",
+                currency=currency,
                 short_name=s,
+                current_price=curr_price,
                 isin=(isin_map or {}).get(s, ""),
                 has_history=True,
             )
-            for s in symbols
-        }
+            b.identity_summary = b.build_identity_anchor(isin_override=(isin_map or {}).get(s))
+            bundles[s] = b
         return histories, bundles
+
+    async def get_us_deep_intel(self, symbol: str) -> dict:
+        return {}
+
+    async def get_us_realtime_quote(self, symbol: str) -> dict | None:
+        return None
 
     async def get_macro_snapshot(self) -> MacroSnapshot:
         return MacroSnapshot(fetched_at_utc="2026-11-13 09:00 UTC", gbp_usd=1.27, vix=15.0)
@@ -293,6 +304,324 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
         # 5. Alerts summary smoke check
         alerts = get_market_calendar_alerts(bf_open)
         self.assertTrue(any("美股半日市" in a for a in alerts))
+
+    async def test_imp16_morning_catchup_retry_and_lock_on_success_only(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "test.db")
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
+                universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["NVDA"]),
+            )
+            tg = _StubTg()
+            sched = TradingScheduler(
+                cfg,
+                _MockT212(),
+                _MockMarketData(),
+                _StubLLM(),
+                db,
+                tg,
+                morning_retry_cooldown_s=300.0,
+            )
+
+            call_outcomes = [
+                "⚠️ 家庭宽带重拨导致 T212 超时",
+                "早报恢复补发成功正文",
+            ]
+
+            async def _fake_morning(*args, **kwargs) -> str:
+                return call_outcomes.pop(0)
+
+            with patch("src.bot.scheduler.generate_morning_report", side_effect=_fake_morning):
+                # 07:31 UK fails -> NOT locked in scheduler_runs, no Telegram spam
+                t1 = datetime(2026, 11, 13, 7, 31, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(t1), ["morning"])
+                self.assertEqual(sched.last_job_runs["morning"]["status"], "FAILED")
+                self.assertFalse(await db.has_scheduler_job_fired("morning", "2026-11-13"))
+                self.assertEqual(len(tg.sent), 0)
+
+                # 07:33 UK inside 300s cooldown -> skipped
+                t2 = datetime(2026, 11, 13, 7, 33, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(t2), [])
+                self.assertEqual(len(call_outcomes), 1)
+
+                # 08:15 UK after cooldown & inside 09:30 catch-up window -> succeeds & locks DB
+                t3 = datetime(2026, 11, 13, 8, 15, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(t3), ["morning"])
+                self.assertEqual(sched.last_job_runs["morning"]["status"], "OK")
+                self.assertTrue(await db.has_scheduler_job_fired("morning", "2026-11-13"))
+                self.assertEqual(len(tg.sent), 1)
+                self.assertEqual(tg.sent[0][1], "早报恢复补发成功正文")
+
+                # Restarted scheduler at 08:45 UK must NOT double-fire
+                sched2 = TradingScheduler(cfg, _MockT212(), _MockMarketData(), _StubLLM(), db, tg)
+                self.assertEqual(
+                    await sched2.check_and_run_due_jobs(datetime(2026, 11, 13, 8, 45, tzinfo=timezone.utc)),
+                    [],
+                )
+
+            # Separate day: missed 07:30-07:35 due to downtime, boots at 08:50 UK -> catches up directly
+            async def _fake_morning_ok(*args, **kwargs) -> str:
+                return "重启后补发早报"
+
+            with patch("src.bot.scheduler.generate_morning_report", side_effect=_fake_morning_ok):
+                mon_late = datetime(2026, 11, 16, 8, 50, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(mon_late), ["morning"])
+                self.assertTrue(await db.has_scheduler_job_fired("morning", "2026-11-16"))
+                self.assertEqual(tg.sent[-1][1], "重启后补发早报")
+
+            # Exhausted catch-up window after 09:30 UK emits one missed notice if failures happened earlier
+            async def _fake_morning_fail(*args, **kwargs) -> str:
+                return "⚠️ 持续断网"
+
+            with patch("src.bot.scheduler.generate_morning_report", side_effect=_fake_morning_fail):
+                tue_fail = datetime(2026, 11, 17, 7, 31, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(tue_fail), ["morning"])
+                self.assertFalse(await db.has_scheduler_job_fired("morning", "2026-11-17"))
+                tue_after = datetime(2026, 11, 17, 9, 35, tzinfo=timezone.utc)
+                self.assertEqual(await sched.check_and_run_due_jobs(tue_after), [])
+                self.assertIn("补发窗口", tg.sent[-1][1])
+                prev_cnt = len(tg.sent)
+                # Calling again at 10:00 UK does not duplicate the missed notice
+                self.assertEqual(
+                    await sched.check_and_run_due_jobs(datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)),
+                    [],
+                )
+                self.assertEqual(len(tg.sent), prev_cnt)
+
+    async def test_imp16_daily_settlement_t5_calendars_alpha_reflection_and_prune(self) -> None:
+        class _SettlementMarketData(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[list[str]] = []
+
+            @staticmethod
+            def _series_df(dates_str: list[str], closes: list[float]) -> pd.DataFrame:
+                idx = pd.to_datetime(dates_str)
+                return pd.DataFrame(
+                    {
+                        "Open": [c * 0.995 for c in closes],
+                        "High": [c * 1.01 for c in closes],
+                        "Low": [c * 0.99 for c in closes],
+                        "Close": closes,
+                        "Volume": [1_000_000.0 for _ in closes],
+                    },
+                    index=idx,
+                )
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                self.calls.append(list(symbols))
+                dates = [
+                    "2026-11-05",
+                    "2026-11-06",
+                    "2026-11-09",
+                    "2026-11-10",
+                    "2026-11-11",
+                    "2026-11-12",
+                    "2026-11-13",
+                ]
+                out: dict[str, pd.DataFrame] = {}
+                for sym in symbols:
+                    if sym == "NVDA":
+                        out[sym] = self._series_df(dates, [98.0, 100.0, 102.0, 104.0, 106.0, 108.0, 110.0])
+                    elif sym == "SPY":
+                        out[sym] = self._series_df(dates, [495.0, 500.0, 501.0, 503.0, 505.0, 508.0, 510.0])
+                    elif sym == "AZN.L":
+                        # Stock stored in GBp (10000 -> 10600, +6.0%), while rec entry_price was 100.0 GBP
+                        out[sym] = self._series_df(dates, [9900.0, 10000.0, 10100.0, 10200.0, 10300.0, 10400.0, 10600.0])
+                    elif sym == "ISF.L":
+                        out[sym] = self._series_df(dates, [795.0, 800.0, 802.0, 804.0, 805.0, 806.0, 808.0])
+                    elif sym == "AMD":
+                        out[sym] = self._series_df(dates, [148.0, 150.0, 149.0, 147.0, 146.0, 145.0, 144.0])
+                return out
+
+        class _ReflectionLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+                self.fail_symbols: set[str] = set()
+
+            async def generate(self, **kwargs) -> str:
+                self.calls.append(dict(kwargs))
+                prompt = kwargs.get("prompt", "")
+                for sym in self.fail_symbols:
+                    if f"标的: {sym} " in prompt:
+                        return "⚠️ Gemini 瞬时不可用"
+                return "## **T+5复盘**：顺势突破录得正超额Alpha，短期逻辑获验证；下次继续控制仓位与止损。"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "test.db")
+            await db.init()
+
+            # Insert old records (>90 days before 2026-11-13) to test pruning while keeping latest snapshot
+            old_ms = int(datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+            recent_ms = int(datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+            async with db._connect(write=True) as conn:
+                await conn.execute(
+                    "INSERT INTO portfolio_snapshots (cycle_date, fetched_at_uk, fetched_at_ms, total_combined_value, payload_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("2026-07-01", "2026-07-01 12:00", old_ms, 5000.0, "{}"),
+                )
+                await conn.execute(
+                    "INSERT INTO portfolio_snapshots (cycle_date, fetched_at_uk, fetched_at_ms, total_combined_value, payload_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("2026-11-10", "2026-11-10 12:00", recent_ms, 10000.0, "{}"),
+                )
+                await conn.execute(
+                    "INSERT INTO ops_events (created_at_uk, created_at_ms, severity, source, alert_key, message, notified, suppressed_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, 0)",
+                    ("2026-07-01 12:00", old_ms, "WARN", "test", "old_k", "old msg"),
+                )
+                await conn.commit()
+
+            base_ms = int(datetime(2026, 11, 6, 21, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-06 21:30",
+                        "created_at_ms": base_ms,
+                        "account": "Invest",
+                        "symbol": "NVDA",
+                        "action": "BUY",
+                        "entry_price": 100.0,
+                        "thesis": "AI算力需求景气",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "SPY",
+                    },
+                    {
+                        "created_at_uk": "2026-11-06 16:40",
+                        "created_at_ms": base_ms + 1000,
+                        "account": "ISA",
+                        "symbol": "AZN.L",
+                        "action": "ADD",
+                        "entry_price": 100.0,  # GBP vs GBp 10000 in history -> auto-aligned
+                        "thesis": "医药防御低吸",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "ISF.L",
+                    },
+                    {
+                        "created_at_uk": "2026-11-06 21:30",
+                        "created_at_ms": base_ms + 2000,
+                        "account": "Invest",
+                        "symbol": "AMD",
+                        "action": "BUY",
+                        "entry_price": 150.0,
+                        "thesis": "芯片补涨",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "SPY",
+                    },
+                    {
+                        "created_at_uk": "2026-11-06 21:30",
+                        "created_at_ms": base_ms + 3000,
+                        "account": "ISA",
+                        "symbol": "VWRP.L",
+                        "action": "WATCH",
+                        "entry_price": None,
+                        "thesis": "无价格观察",
+                    },
+                    {
+                        "created_at_uk": "2026-11-12 21:30",
+                        "created_at_ms": recent_ms + 5000,
+                        "account": "Invest",
+                        "symbol": "NVDA",
+                        "action": "ADD",
+                        "entry_price": 108.0,
+                        "thesis": "未满5个交易日",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "SPY",
+                    },
+                ]
+            )
+
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="12345"))
+            md = _SettlementMarketData()
+            llm = _ReflectionLLM()
+            llm.fail_symbols.add("AMD")  # transient failure for AMD should keep it PENDING
+            tg = _StubTg()
+            sched = TradingScheduler(cfg, _MockT212(), md, llm, db, tg)
+
+            # At 18:00 UTC on 2026-11-13: LSE closed (16:30 UK), US still OPEN (21:00 UTC)!
+            # Only AZN.L (UK) settles + VWRP.L (no price) skips; NVDA/AMD (US) remain PENDING!
+            res_lse_close = await sched.run_daily_settlement(
+                now_utc=datetime(2026, 11, 13, 18, 0, tzinfo=timezone.utc)
+            )
+            self.assertEqual(res_lse_close["settled"], 1)
+            self.assertEqual(res_lse_close["skipped"], 1)
+            self.assertEqual(res_lse_close["pruned"]["portfolio_snapshots"], 1)
+            self.assertEqual(res_lse_close["pruned"]["ops_events"], 1)
+
+            # Verify AZN.L settled accurately (+6.0% vs ISF.L +1.0% -> Alpha +5.0%) despite GBP vs GBp entry
+            azn_lessons = await db.get_symbol_lessons("AZN.L", limit=1)
+            self.assertEqual(len(azn_lessons), 1)
+            self.assertAlmostEqual(azn_lessons[0]["raw_return_pct"], 6.0, places=2)
+            self.assertAlmostEqual(azn_lessons[0]["alpha_pct"], 5.0, places=2)
+            self.assertNotIn("#", azn_lessons[0]["reflection_lesson"])
+            self.assertNotIn("**", azn_lessons[0]["reflection_lesson"])
+
+            # At 22:00 UTC on 2026-11-13 via check_and_run_due_jobs -> daily_settlement runs
+            fired = await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 22, 0, tzinfo=timezone.utc))
+            self.assertEqual(fired, ["daily_settlement"])
+            self.assertTrue(await db.has_scheduler_job_fired("daily_settlement", "2026-11-13"))
+            self.assertEqual(len(tg.sent), 0)  # background settlement must not spam Telegram chat
+
+            # NVDA settled (+10.0% vs SPY +2.0% -> Alpha +8.0%), AMD failed reflection so stayed PENDING, newer NVDA not due
+            nvda_lessons = await db.get_symbol_lessons("NVDA", limit=1)
+            self.assertEqual(len(nvda_lessons), 1)
+            self.assertAlmostEqual(nvda_lessons[0]["raw_return_pct"], 10.0, places=2)
+            self.assertAlmostEqual(nvda_lessons[0]["alpha_pct"], 8.0, places=2)
+            self.assertEqual(llm.calls[-1]["model"], cfg.models.chat_model)
+            self.assertEqual(llm.calls[-1]["thinking_level"], "LOW")
+            self.assertEqual(llm.calls[-1]["usage_label"], "settlement_reflection")
+
+            still_pending = await db.get_pending_settlements()
+            self.assertEqual([r["symbol"] for r in still_pending], ["AMD", "NVDA"])
+
+            # Re-running check_and_run_due_jobs at 22:15 UTC does not re-fire
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 22, 15, tzinfo=timezone.utc)),
+                [],
+            )
+
+    async def test_imp16_shared_execution_lock_mutex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "test.db")
+            await db.init()
+            shared_lock = asyncio.Lock()
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="12345"))
+            sched = TradingScheduler(
+                cfg,
+                _MockT212(),
+                _MockMarketData(),
+                _StubLLM(),
+                db,
+                _StubTg(),
+                execution_lock=shared_lock,
+            )
+
+            observed_job_inside = None
+            orig_impl = sched._run_daily_settlement_impl
+
+            async def _spy_impl(now_utc=None):
+                nonlocal observed_job_inside
+                observed_job_inside = sched.current_job_name
+                return await orig_impl(now_utc=now_utc)
+
+            sched._run_daily_settlement_impl = _spy_impl  # type: ignore[method-assign]
+
+            async with shared_lock:
+                task = asyncio.create_task(
+                    sched.run_daily_settlement(now_utc=datetime(2026, 11, 13, 22, 0, tzinfo=timezone.utc))
+                )
+                await asyncio.sleep(0.02)
+                self.assertFalse(task.done())
+                self.assertIsNone(sched.current_job_name)
+
+            res = await asyncio.wait_for(task, timeout=5.0)
+            self.assertEqual(res["checked"], 0)
+            self.assertEqual(observed_job_inside, "daily_settlement")
+            self.assertIsNone(sched.current_job_name)
+            self.assertFalse(shared_lock.locked())
 
 
 if __name__ == "__main__":

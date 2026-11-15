@@ -6,7 +6,9 @@ import asyncio
 import tempfile
 import unittest
 import zlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -26,6 +28,7 @@ from src.agents.schemas import (
 )
 from src.agents.tools import clear_grounding_cache
 from src.bot.handlers import AdvisorBot
+from src.bot.scheduler import TradingScheduler
 from src.bot.telegram_client import TelegramClient, split_message_into_chunks
 from src.config import AppConfig, EnvSettings, UniverseSection
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
@@ -48,7 +51,6 @@ class _FakeT212(T212Client):
         return self._data
 
 
-# TODO(IMP-11 / IMP-19): [接自 IMP-05 & IMP-06] tools.py 改用 get_histories() 与最终集成验收时复核 _FakeMarketData。
 class _FakeMarketData(MarketDataService):
     async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
         dates = pd.date_range("2025-10-01", periods=230, freq="B")
@@ -81,11 +83,15 @@ class _FakeMarketData(MarketDataService):
         histories = await self.get_histories(symbols, period="1y")
         bundles = {}
         for sym in symbols:
-            bundles[sym] = TickerMarketBundle(
+            currency = "GBP" if sym.endswith(".L") else ("EUR" if sym.endswith((".DE", ".AS", ".PA")) else "USD")
+            hist = histories.get(sym)
+            curr_price = round(float(hist["Close"].iloc[-1]), 2) if hist is not None and not hist.empty else None
+            b = TickerMarketBundle(
                 symbol=sym,
                 quote_type="ETF" if sym.endswith(".L") and sym in {"VWRP.L", "VUAG.L"} else "EQUITY",
-                currency="GBP" if sym.endswith(".L") else "USD",
+                currency=currency,
                 short_name=sym,
+                current_price=curr_price,
                 isin=(isin_map or {}).get(sym, ""),
                 forward_pe=20.0 if not sym.endswith(".L") else None,
                 news=[{"date": "2026-11-13", "source": "Reuters", "title": f"{sym} steady momentum"}]
@@ -93,7 +99,15 @@ class _FakeMarketData(MarketDataService):
                 else [],
                 has_history=True,
             )
+            b.identity_summary = b.build_identity_anchor(isin_override=(isin_map or {}).get(sym))
+            bundles[sym] = b
         return histories, bundles
+
+    async def get_us_deep_intel(self, symbol: str) -> dict:
+        return {}
+
+    async def get_us_realtime_quote(self, symbol: str) -> dict | None:
+        return None
 
     async def get_macro_snapshot(self) -> MacroSnapshot:
         return MacroSnapshot(
@@ -163,6 +177,8 @@ class _RecordingLLM:
         prompt = kwargs.get("prompt", "")
         if kwargs.get("use_google_search"):
             return f"联网新闻摘要：{prompt[:60]}"
+        if kwargs.get("usage_label") == "settlement_reflection":
+            return "T+5复盘：顺势动量验证正超额Alpha，短期逻辑获验证；继续严守止损与分散纪律。"
         if "增量选股投研员" in prompt:
             return "初选提案：建议 ISA 考察 VWRP.L 补齐非美敞口。"
         if "独立风控与挂单审计官" in prompt:
@@ -1243,6 +1259,765 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(vwrp_recs[0]["entry_price"], 118.25, places=2)
             self.assertEqual(vwrp_recs[0]["horizon_days"], 7)
             self.assertEqual(vwrp_recs[0]["benchmark_symbol"], "SPY")
+
+    async def test_imp14_chat_object_slicing_implicit_cache_deep_and_cross_cycle(self) -> None:
+        from unittest.mock import patch
+        from src.agents.chat_agent import answer_user_chat, decide_chat_objects
+        from src.config import ModelsSection
+
+        portfolio = _sample_portfolio()
+        # Add Unilever short name / base ticker scenario & short 1-char ticker safety check
+        portfolio.isa.positions.append(
+            PositionItem(
+                account="ISA",
+                raw_ticker="ULVRl_EQ",
+                ticker="ULVR",
+                yahoo_symbol="ULVR.L",
+                name="Unilever PLC",
+                inst_currency="GBX",
+                quantity=50,
+                avg_price=4500.0,
+                cur_price=4600.0,
+                current_value=2300.0,
+                total_cost=2250.0,
+                pnl=50.0,
+                fx_impact=0.0,
+                return_pct=2.22,
+                weight_pct=15.0,
+            )
+        )
+        portfolio.invest.positions.append(
+            PositionItem(
+                account="Invest",
+                raw_ticker="V_US_EQ",
+                ticker="V",
+                yahoo_symbol="V",
+                name="Visa Inc.",
+                inst_currency="USD",
+                quantity=5,
+                avg_price=280.0,
+                cur_price=300.0,
+                current_value=1180.0,
+                total_cost=1100.0,
+                pnl=80.0,
+                fx_impact=0.0,
+                return_pct=7.27,
+                weight_pct=15.0,
+            )
+        )
+
+        context_pack = {
+            "pack_version": 1,
+            "cycle_date": "2026-11-15",
+            "exposure_summary": "半导体敞口偏高，英股消费品分散",
+            "disagreement_text": "• NVDA: 多空分歧(趋势vs估值) | 逢回调看支撑",
+            "recent_lessons": [
+                {
+                    "symbol": "AMD",
+                    "action": "BUY",
+                    "alpha_pct": -3.4,
+                    "reflection_lesson": "高PE芯片追涨容易被震出",
+                }
+            ],
+            "symbols": {
+                "NVDA": {
+                    "symbol": "NVDA",
+                    "identity_summary": "NVDA | NVIDIA Corp | NASDAQ | Technology/Semiconductors | ISIN:US67066G1040",
+                    "technical_line": "• NVDA [BULL] 现价 140.00 USD | 筹码[单峰] 获利78%/均成本128.50",
+                    "technical": {"cyq_cost_90_low": 115.0, "cyq_cost_90_high": 145.0},
+                    "bundle_summary": {
+                        "short_name": "NVIDIA",
+                        "long_name": "NVIDIA Corporation",
+                        "currency": "USD",
+                        "current_price": 140.0,
+                        "roe_pct": 92.5,
+                        "profit_margin_pct": 55.2,
+                        "revenue_growth_pct": 78.0,
+                        "recommendation_key": "strong_buy",
+                        "news": [{"date": "2026-11-14", "title": "NVDA Blackwell demand strong"}],
+                    },
+                    "evaluations": [
+                        {
+                            "account": "ISA",
+                            "action_bias": "HOLD",
+                            "weight_pct": 40.0,
+                            "native_return_pct": 16.67,
+                            "effective_stop_pct": -12.5,
+                            "reasons": ["趋势多头但单一仓位较重"],
+                        }
+                    ],
+                    "disagreements": [
+                        {
+                            "account": "ISA",
+                            "conflict_type": "趋势vs估值",
+                            "bull_points": ["周线多头且ROE强劲"],
+                            "bear_points": ["获利盘偏高注意兑现"],
+                            "decision_hint": "持有观察勿追高",
+                        }
+                    ],
+                    "lessons": [
+                        {
+                            "created_at_uk": "2026-11-01",
+                            "action": "BUY",
+                            "alpha_pct": 4.2,
+                            "reflection_lesson": "财报后回踩MA20介入胜率高",
+                        }
+                    ],
+                },
+                "ULVR.L": {
+                    "symbol": "ULVR.L",
+                    "identity_summary": "ULVR.L | Unilever PLC | LSE | Consumer Defensive",
+                    "technical_line": "• ULVR.L [RANGE] 现价 4600.00 GBp | 除息 2026-11-21(6天后)",
+                    "bundle_summary": {"short_name": "Unilever", "currency": "GBp", "current_price": 4600.0},
+                    "evaluations": [{"account": "ISA", "action_bias": "HOLD", "weight_pct": 15.0}],
+                    "disagreements": [],
+                    "lessons": [{"created_at_uk": "2026-10-20", "action": "BUY", "alpha_pct": 1.1, "reflection_lesson": "ULVR专属教训标记"}],
+                },
+                "V": {
+                    "symbol": "V",
+                    "identity_summary": "V | Visa Inc. | NYSE | Financial Services",
+                    "technical_line": "• V [BULL] 现价 300.00 USD",
+                    "bundle_summary": {"short_name": "Visa", "currency": "USD", "current_price": 300.0},
+                },
+            },
+        }
+
+        # 1) Pure 0-token symbol resolution: CJK adjacency, name alias, negation, short-code case sensitivity, follow-up
+        res_nvda = decide_chat_objects("现在能加仓NVDA吗", portfolio, context_pack)
+        self.assertEqual(res_nvda.decision_kind, "confirm")
+        self.assertEqual(res_nvda.target_symbols, ("NVDA",))
+
+        res_name_neg = decide_chat_objects("不要看NVDA，对比一下Unilever和V", portfolio, context_pack)
+        self.assertEqual(res_name_neg.decision_kind, "compare")
+        self.assertEqual(res_name_neg.target_symbols, ("ULVR.L", "V"))
+        self.assertEqual(res_name_neg.denied_symbols, ("NVDA",))
+
+        res_short_lower = decide_chat_objects("value style vs growth", portfolio, context_pack)
+        self.assertEqual(res_short_lower.target_symbols, ())
+        res_short_upper = decide_chat_objects("看看V现在能买吗", portfolio, context_pack)
+        self.assertEqual(res_short_upper.target_symbols, ("V",))
+
+        res_followup = decide_chat_objects(
+            "它的止损设多少合适？",
+            portfolio,
+            context_pack,
+            prev_cycle_turns=[("NVDA筹码怎么样？", "目前单峰获利78%")],
+        )
+        self.assertEqual(res_followup.decision_kind, "maintain")
+        self.assertEqual(res_followup.target_symbols, ("NVDA",))
+
+        # 2) Full answer_user_chat wiring: ContextPack slice, Implicit Cache prefix stability, /deep routing, prev cycle, calendar, db=db
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp14_chat.db")
+            await db.init()
+
+            await db.save_morning_report(
+                "【今日核心行动与挂单裁决】\n• 保持4%现金缓冲",
+                "晨报总结：严控芯片权重",
+                ["冻结芯片追高"],
+                context_pack=context_pack,
+            )
+            await db.save_pick_radar("英国ETF", "research", "PICK_RADAR_BODY_" + ("X" * 400) + "_END_PICK", "2026-11-15 17:00")
+            # Seed a previous cycle chat turn before current 2026-11-15 cycle
+            await db.append_chat_turn(
+                user_query="上一周期问ULVR",
+                bot_reply="上一周期建议等除息后再定",
+                cycle_date="2020-01-01",
+            )
+
+            class _ChatSpyLLM:
+                def __init__(self) -> None:
+                    self.calls: list[dict] = []
+
+                async def generate(self, **kwargs) -> str:
+                    self.calls.append(kwargs)
+                    return "先说结论：NVDA 继续持有观察，不追高。"
+
+            llm = _ChatSpyLLM()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+                models=ModelsSection(
+                    chat_model="gemini-4-hydrogen",
+                    chat_thinking_level="LOW",
+                    chat_deep_model="gemini-4-argon",
+                    chat_deep_thinking_level="HIGH",
+                ),
+            )
+            t212 = _FakeT212(portfolio)
+            md = _FakeMarketData()
+
+            captured_toolkit_dbs: list[object] = []
+            from src.agents import chat_agent as _chat_mod
+            orig_toolkit = _chat_mod.MarketToolkit
+
+            def _spy_toolkit(*args, **kwargs):
+                captured_toolkit_dbs.append(kwargs.get("db"))
+                return orig_toolkit(*args, **kwargs)
+
+            with (
+                patch("src.agents.chat_agent.get_market_calendar_alerts", return_value=["🇺🇸 今日美股半日市（13:00 ET / 18:00 UK 提前收盘）"]),
+                patch("src.agents.chat_agent.MarketToolkit", side_effect=_spy_toolkit),
+            ):
+                # Turn 1: Normal query mentioning NVDA
+                await answer_user_chat("NVDA现在筹码和分歧怎么样？", cfg, t212, md, llm, db)
+                c1 = llm.calls[-1]
+                p1 = c1["prompt"]
+
+                self.assertEqual(c1["model"], "gemini-4-hydrogen")
+                self.assertEqual(c1["thinking_level"], "LOW")
+                self.assertEqual(c1["max_tool_rounds"], 3)
+                self.assertIn("500 字以内", c1["system_instruction"])
+                self.assertEqual(captured_toolkit_dbs[-1], db)
+
+                # Static prefix order: morning report & guardrails & pick & baseline BEFORE live time / ISA / current query
+                idx_report = p1.index("【今日早报及美股哨兵纪要】")
+                idx_veto = p1.index("【今日风控红线】")
+                idx_pick = p1.index("【最近一次选股雷达")
+                idx_base = p1.index("【本周期组合基线与跨周期摘要】")
+                idx_time = p1.index("当前英国时间 ")
+                idx_isa = p1.index("【ISA 账户】")
+                idx_slice = p1.index("【提问标的本地快照切片")
+                idx_hist = p1.index("【今日对话记录")
+                idx_query = p1.index("【用户当前问题】")
+                self.assertTrue(idx_report < idx_veto < idx_pick < idx_base < idx_time < idx_isa < idx_slice < idx_hist < idx_query)
+
+                # Local ContextPack slice injected ONLY for NVDA (not ULVR.L slice)
+                self.assertIn("NVDA | NVIDIA Corp | NASDAQ", p1)
+                self.assertIn("90%筹码带 115.00-145.00", p1)
+                self.assertIn("ROE 92.5%", p1)
+                self.assertIn("趋势多头但单一仓位较重", p1)
+                self.assertIn("趋势vs估值", p1)
+                self.assertIn("财报后回踩MA20介入胜率高", p1)
+                self.assertNotIn("ULVR专属教训标记", p1)
+
+                # Cross-cycle memory & calendar alert & /pick[:1050] preserved
+                self.assertIn("上一周期问ULVR", p1)
+                self.assertIn("🇺🇸 今日美股半日市", p1)
+                self.assertIn("_END_PICK", p1)
+
+                # Turn 2: Mutate live portfolio price & use /deep follow-up -> static prefix byte-identical!
+                portfolio.isa.positions[0].cur_price = 148.5
+                await answer_user_chat("/deep 它止损设多少合适？", cfg, t212, md, llm, db)
+                c2 = llm.calls[-1]
+                p2 = c2["prompt"]
+
+                self.assertEqual(c2["model"], "gemini-4-argon")
+                self.assertEqual(c2["thinking_level"], "HIGH")
+                self.assertEqual(c2["max_tool_rounds"], 4)
+                self.assertIn("1000~1200 字以内", c2["system_instruction"])
+                self.assertEqual(p1[: p1.index("当前英国时间 ")], p2[: p2.index("当前英国时间 ")])
+                # Follow-up recovered NVDA slice from Turn 1
+                self.assertIn("上下文沿用", p2)
+                self.assertIn("90%筹码带 115.00-145.00", p2)
+
+    async def test_imp15_mutex_lock_usage_and_stats_dashboard(self) -> None:
+        async def _run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = AdvisorDatabase(Path(tmpdir) / "imp15_e2e.db")
+                await db.init()
+
+                cfg = AppConfig(
+                    env=EnvSettings(_env_file=None, telegram_chat_id="999", gemini_api_key="test-key"),
+                    universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["NVDA"]),
+                )
+                t212 = _FakeT212(_sample_portfolio())
+                md = _FakeMarketData()
+                llm = _RecordingLLM()
+                tg = _RecordingTg()
+                sched = TradingScheduler(cfg, t212, md, llm, db, tg)
+                bot = AdvisorBot(cfg, t212, md, llm, db, tg, scheduler=sched)
+                self.assertIs(bot.execution_lock, sched.execution_lock)
+
+                # 1. Shared mutex: while scheduler holds lock running morning report, manual /report is rejected
+                #    while lightweight /pos continues immediately without blocking.
+                started_evt = asyncio.Event()
+                release_evt = asyncio.Event()
+
+                async def _blocking_morning() -> str:
+                    started_evt.set()
+                    await release_evt.wait()
+                    return "定时晨报已完成"
+
+                sched_task = asyncio.create_task(
+                    sched._execute_job(
+                        job_name="morning",
+                        chat_id="999",
+                        uk_now_str="2026-11-15 07:30",
+                        coro=_blocking_morning(),
+                    )
+                )
+                await started_evt.wait()
+                self.assertTrue(bot.execution_lock.locked())
+
+                calls_before = len(llm.calls)
+                await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/report"}}, wait=True)
+                self.assertEqual(len(llm.calls), calls_before)
+                self.assertIn("后台定时任务（morning）", tg.messages[-1])
+
+                # Lightweight /pos still works while heavy lock is held
+                await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pos"}}, wait=True)
+                self.assertIn("ISA", tg.messages[-1])
+
+                release_evt.set()
+                await sched_task
+                self.assertFalse(bot.execution_lock.locked())
+
+                # 2. /usage displays natural-month Search quota, cache hit rate, thinking share, and zero $
+                await db.log_llm_usage(
+                    {
+                        "call_label": "report_pm",
+                        "model": "gemini-4-argon",
+                        "thinking_level": "HIGH",
+                        "api_rounds": 2,
+                        "prompt_tokens": 10000,
+                        "cached_tokens": 6000,
+                        "output_tokens": 500,
+                        "thought_tokens": 1500,
+                        "total_tokens": 12000,
+                        "search_queries": 42,
+                        "success": True,
+                    }
+                )
+                await db.log_llm_usage(
+                    {
+                        "call_label": "prev_month_search",
+                        "model": "gemini-4-hydrogen",
+                        "prompt_tokens": 2000,
+                        "cached_tokens": 0,
+                        "output_tokens": 100,
+                        "thought_tokens": 100,
+                        "total_tokens": 2200,
+                        "search_queries": 100,
+                        "success": True,
+                    }
+                )
+                month_start_uk = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/London")).replace(
+                    day=1, hour=0, minute=0, second=0, microsecond=0
+                )
+                prev_month_ms = int((month_start_uk - timedelta(days=2)).timestamp() * 1000)
+                async with db._connect(write=True) as conn:
+                    await conn.execute(
+                        "UPDATE llm_usage_logs SET created_at_ms = ? WHERE call_label = 'prev_month_search'",
+                        (prev_month_ms,),
+                    )
+                    await conn.commit()
+
+                await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/usage"}}, wait=True)
+                usage_msg = tg.messages[-1]
+                self.assertIn("本月 (UK自然月)", usage_msg)
+                self.assertIn("42 / 5,000", usage_msg)
+                self.assertNotIn("142 / 5,000", usage_msg)
+                self.assertIn("命中 60%", usage_msg)
+                self.assertIn("思考占生成 75%", usage_msg)
+                self.assertNotIn("$", usage_msg)
+                self.assertNotIn("**", usage_msg)
+                self.assertNotIn("#", usage_msg)
+
+                # 3. /stats displays win rates, average alpha, lessons, live prices, and GBp/GBP 100x guard
+                await db.log_recommendations(
+                    [
+                        {
+                            "account": "Invest",
+                            "symbol": "NVDA",
+                            "action": "BUY",
+                            "entry_price": 100.0,
+                            "thesis": "AI需求强劲",
+                        },
+                        {
+                            "account": "Invest",
+                            "symbol": "AAPL",
+                            "action": "BUY",
+                            "entry_price": 200.0,
+                            "thesis": "估值扩张",
+                        },
+                        {
+                            "account": "Invest",
+                            "symbol": "MSFT",
+                            "action": "BUY",
+                            "entry_price": 100.0,
+                            "thesis": "云业务稳健",
+                        },
+                        {
+                            "account": "ISA",
+                            "symbol": "AZN.L",
+                            "action": "BUY",
+                            "entry_price": 12000.0,
+                            "thesis": "英股医药龙头",
+                        },
+                    ]
+                )
+                pending = await db.get_pending_settlements(limit=10)
+                nvda_rec = next(r for r in pending if r["symbol"] == "NVDA")
+                aapl_rec = next(r for r in pending if r["symbol"] == "AAPL")
+                await db.settle_recommendation(
+                    nvda_rec["id"],
+                    benchmark_symbol="SPY",
+                    settled_at_uk="2026-11-12 21:00",
+                    raw_return_pct=12.5,
+                    alpha_pct=8.0,
+                    reflection_lesson="放量突破均线后胜率高",
+                )
+                await db.settle_recommendation(
+                    aapl_rec["id"],
+                    benchmark_symbol="SPY",
+                    settled_at_uk="2026-11-13 21:00",
+                    raw_return_pct=-4.0,
+                    alpha_pct=-6.0,
+                    reflection_lesson="财报前追高易回撤",
+                )
+
+                await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/stats"}}, wait=True)
+                stats_msg = tg.messages[-1]
+                self.assertIn("原始胜率: 50.0% (1/2)", stats_msg)
+                self.assertIn("平均收益: +4.25%", stats_msg)
+                self.assertIn("超额 Alpha 胜率: 50.0% (1/2)", stats_msg)
+                self.assertIn("平均 Alpha: +1.00%", stats_msg)
+                self.assertIn("近期复盘教训", stats_msg)
+                self.assertIn("放量突破均线后胜率高", stats_msg)
+                self.assertIn("BUY MSFT @ 100.0 [待结算 | 现价", stats_msg)
+                self.assertIn("BUY AZN.L @ 12000.0 [待结算 | 现价", stats_msg)
+                self.assertIn("GBp/GBP量级差异", stats_msg)
+                self.assertNotIn("$", stats_msg)
+                self.assertNotIn("**", stats_msg)
+                self.assertNotIn("#", stats_msg)
+
+        await asyncio.wait_for(_run(), timeout=15.0)
+
+    async def test_imp19_migration_backup_compliance_and_full_lifecycle_e2e(self) -> None:
+        import json
+        import os
+        import sqlite3
+        import tomllib
+        from unittest.mock import patch
+
+        import httpx
+        import yaml
+
+        import src.healthcheck as hc
+        from src.config import AppSection
+        from src.healthcheck import check_health, write_heartbeat
+        from src.ops_notifier import OpsNotifier
+        from src.version import APP_VERSION
+
+        # 1) Static container, runtime, ignore rules, and version consistency audit (PROJECT_MIGRATION_RULES v1.2)
+        repo_root = Path(__file__).resolve().parents[1]
+        dockerfile_lines = [
+            ln.strip()
+            for ln in (repo_root / "Dockerfile").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        self.assertEqual(dockerfile_lines[0], "FROM python:3.12.13-slim-bookworm")
+        self.assertEqual((repo_root / ".python-version").read_text(encoding="utf-8").strip(), "3.12.13")
+
+        compose = yaml.safe_load((repo_root / "docker-compose.yml").read_text(encoding="utf-8"))
+        advisor = compose["services"]["advisor"]
+        self.assertEqual(advisor["restart"], "unless-stopped")
+        self.assertIn("TZ=Europe/London", advisor["environment"])
+        self.assertEqual(advisor["mem_limit"], "2g")
+        self.assertEqual(advisor["stop_grace_period"], "30s")
+        self.assertEqual(advisor["logging"]["driver"], "json-file")
+        self.assertEqual(advisor["logging"]["options"]["max-size"], "10m")
+        self.assertEqual(advisor["logging"]["options"]["max-file"], "3")
+        self.assertIn("src.healthcheck", " ".join(str(x) for x in advisor["healthcheck"]["test"]))
+        self.assertIn("./config.yaml:/app/config.yaml:ro", advisor["volumes"])
+        self.assertIn("./data:/app/data", advisor["volumes"])
+        self.assertIn("homelab-net", advisor["networks"])
+        self.assertTrue(compose["networks"]["homelab-net"]["external"])
+        self.assertNotIn("ports", advisor)
+
+        gitignore_text = (repo_root / ".gitignore").read_text(encoding="utf-8")
+        dockerignore_text = (repo_root / ".dockerignore").read_text(encoding="utf-8")
+        for required_excl in (".env", "data/", "_ref/", "logs/", "__pycache__/", ".venv/"):
+            self.assertIn(required_excl, gitignore_text)
+            self.assertIn(required_excl, dockerignore_text)
+
+        pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(pyproject["project"]["version"], APP_VERSION)
+
+        class _Imp19MarketData(_FakeMarketData):
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                dates = pd.date_range(end="2026-11-13", periods=230, freq="B")
+                histories: dict[str, pd.DataFrame] = {}
+                for sym in symbols:
+                    seed = zlib.crc32(sym.encode("utf-8"))
+                    freq_div = 3.5 + (seed % 9) * 0.7
+                    phase = ((seed >> 4) % 23) * 0.35
+                    base = 100.0 + np.linspace(0, 25, 230) + np.sin(np.arange(230) / freq_div + phase) * 2.0
+                    histories[sym] = pd.DataFrame(
+                        {
+                            "Open": base * 0.996,
+                            "High": base * 1.012,
+                            "Low": base * 0.988,
+                            "Close": base,
+                            "Volume": np.full(230, 1_500_000.0),
+                        },
+                        index=dates,
+                    )
+                return histories
+
+        async def _run() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                legacy_db_path = root / "legacy_gcp.db"
+                n95_stack_dir = root / "n95_stack"
+                n95_db_path = n95_stack_dir / "data" / "advisor.db"
+                n95_db_path.parent.mkdir(parents=True, exist_ok=True)
+                hb_path = root / "advisor.heartbeat"
+                backup_db_path = root / "daily_backup" / "advisor.db"
+                backup_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # 2) Legacy v5.0.5 DB creation (missing IMP-03 migrated columns) + online WAL .backup migration
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                rec_ms = int(datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc).timestamp() * 1000)
+                legacy_snap = _sample_portfolio().model_copy(
+                    update={"total_combined_value": 14500.0, "fetched_at_ms": now_ms - 3_600_000}
+                )
+                src_conn = sqlite3.connect(legacy_db_path)
+                try:
+                    src_conn.executescript(
+                        """
+                        PRAGMA journal_mode=WAL;
+                        CREATE TABLE portfolio_snapshots (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            cycle_date TEXT NOT NULL,
+                            fetched_at_uk TEXT NOT NULL,
+                            fetched_at_ms INTEGER NOT NULL,
+                            total_combined_value REAL NOT NULL,
+                            payload_json TEXT NOT NULL
+                        );
+                        CREATE TABLE morning_reports (
+                            cycle_date TEXT PRIMARY KEY,
+                            report_text TEXT NOT NULL,
+                            conclusion_text TEXT NOT NULL,
+                            premarket_note TEXT DEFAULT '',
+                            updated_at_ms INTEGER NOT NULL
+                        );
+                        CREATE TABLE pick_radars (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            created_at_uk TEXT NOT NULL,
+                            created_at_ms INTEGER NOT NULL,
+                            focus_query TEXT DEFAULT '',
+                            research_text TEXT DEFAULT '',
+                            final_text TEXT NOT NULL
+                        );
+                        CREATE TABLE pick_recommendations (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            created_at_uk TEXT NOT NULL,
+                            created_at_ms INTEGER NOT NULL,
+                            account TEXT NOT NULL,
+                            symbol TEXT NOT NULL,
+                            action TEXT NOT NULL,
+                            entry_price REAL,
+                            thesis TEXT DEFAULT ''
+                        );
+                        CREATE TABLE chat_history (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            cycle_date TEXT NOT NULL,
+                            user_query TEXT NOT NULL,
+                            bot_reply TEXT NOT NULL,
+                            created_at_ms INTEGER NOT NULL
+                        );
+                        CREATE TABLE llm_usage_logs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            created_at_uk TEXT NOT NULL,
+                            created_at_ms INTEGER NOT NULL,
+                            cycle_date TEXT NOT NULL,
+                            call_label TEXT NOT NULL,
+                            model TEXT NOT NULL,
+                            thinking_level TEXT NOT NULL,
+                            api_rounds INTEGER NOT NULL DEFAULT 1,
+                            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                            cached_tokens INTEGER NOT NULL DEFAULT 0,
+                            output_tokens INTEGER NOT NULL DEFAULT 0,
+                            thought_tokens INTEGER NOT NULL DEFAULT 0,
+                            total_tokens INTEGER NOT NULL DEFAULT 0,
+                            estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
+                            latency_ms INTEGER NOT NULL DEFAULT 0,
+                            success INTEGER NOT NULL DEFAULT 1
+                        );
+                        CREATE TABLE ops_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            created_at_uk TEXT NOT NULL,
+                            created_at_ms INTEGER NOT NULL,
+                            severity TEXT NOT NULL,
+                            source TEXT NOT NULL,
+                            alert_key TEXT NOT NULL,
+                            message TEXT NOT NULL,
+                            notified INTEGER NOT NULL DEFAULT 0,
+                            suppressed_count INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE scheduler_runs (
+                            job_name TEXT NOT NULL,
+                            uk_date TEXT NOT NULL,
+                            fired_at_uk TEXT NOT NULL,
+                            PRIMARY KEY (job_name, uk_date)
+                        );
+                        """
+                    )
+                    src_conn.execute(
+                        "INSERT INTO portfolio_snapshots (cycle_date, fetched_at_uk, fetched_at_ms, total_combined_value, payload_json) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        ("2026-11-15", "2026-11-15 08:00", now_ms - 3_600_000, 14500.0, legacy_snap.model_dump_json()),
+                    )
+                    src_conn.execute(
+                        "INSERT INTO pick_recommendations (created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("2026-10-28 15:00", rec_ms, "Invest", "NVDA", "BUY", 100.0, "AI算力需求延续"),
+                    )
+                    src_conn.execute(
+                        "INSERT INTO ops_events (created_at_uk, created_at_ms, severity, source, alert_key, message, notified, suppressed_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                        ("2026-11-15 08:30", now_ms - 60_000, "CRITICAL", "t212", "legacy_unnotified", "legacy outage before migration"),
+                    )
+                    src_conn.commit()
+
+                    # Perform online hot-backup while source WAL connection remains open
+                    dst_conn = sqlite3.connect(n95_db_path)
+                    try:
+                        src_conn.backup(dst_conn)
+                    finally:
+                        dst_conn.close()
+                finally:
+                    src_conn.close()
+
+                db = AdvisorDatabase(n95_db_path)
+                await db.init()
+
+                latest_snap = await db.get_latest_snapshot()
+                self.assertIsNotNone(latest_snap)
+                self.assertEqual(latest_snap.total_combined_value, 14500.0)
+                pending_legacy = await db.get_pending_settlements()
+                self.assertEqual(len(pending_legacy), 1)
+                self.assertEqual(pending_legacy[0]["symbol"], "NVDA")
+
+                write_heartbeat(hb_path)
+                ok, reason = check_health(hb_path, n95_db_path)
+                self.assertTrue(ok, msg=reason)
+
+                # Verify relative data/advisor.db fallback when running check_health on host/local stack dir
+                if not hc.DEFAULT_DB_PATH.exists():
+                    orig_cwd = os.getcwd()
+                    try:
+                        os.chdir(n95_stack_dir)
+                        clean_env = {k: v for k, v in os.environ.items() if k != "ADVISOR_DB_PATH"}
+                        with patch.dict(os.environ, clean_env, clear=True):
+                            ok_rel, reason_rel = check_health(hb_path)
+                            self.assertTrue(ok_rel, msg=reason_rel)
+                    finally:
+                        os.chdir(orig_cwd)
+
+                # 3) ops-notify end-to-end delivery + full business closed loop on migrated DB
+                ops_requests: list[tuple[str, dict]] = []
+
+                async def _ops_handler(request: httpx.Request) -> httpx.Response:
+                    ops_requests.append(
+                        (
+                            request.headers.get("Authorization", ""),
+                            json.loads(request.content.decode("utf-8")),
+                        )
+                    )
+                    return httpx.Response(200, json={"ok": True})
+
+                cfg = AppConfig(
+                    env=EnvSettings(
+                        _env_file=None,
+                        telegram_chat_id="999",
+                        gemini_api_key="test-key",
+                        ops_notify_url="http://ops-notify:8000/alert",
+                        ops_notify_token="n95-secret",
+                    ),
+                    app=AppSection(db_path=str(n95_db_path)),
+                    universe=UniverseSection(isa_long_term=["VWRP.L", "AZN.L"], invest_tactical=["AMD"]),
+                )
+                tg = _RecordingTg()
+                ops = OpsNotifier(
+                    telegram=tg,
+                    chat_id="999",
+                    db=db,
+                    ops_notify_url=cfg.env.ops_notify_url,
+                    ops_notify_token=cfg.env.ops_notify_token,
+                    transport=httpx.MockTransport(_ops_handler),
+                )
+                t212 = _FakeT212(_sample_portfolio())
+                md = _Imp19MarketData()
+                llm = _RecordingLLM()
+                sched = TradingScheduler(cfg, t212, md, llm, db, tg, ops_notifier=ops)
+                bot = AdvisorBot(cfg, t212, md, llm, db, tg, ops_notifier=ops, scheduler=sched)
+
+                try:
+                    self.assertTrue(await ops.flush_pending())
+                    self.assertTrue(
+                        await ops.notify(
+                            severity="WARN",
+                            source="imp19_rehearsal",
+                            alert_key="imp19_test_alert",
+                            title="N95 迁移演练测试",
+                            message="验证 homelab-net ops-notify 连通",
+                        )
+                    )
+                    self.assertEqual(len(ops_requests), 2)
+                    self.assertTrue(all(auth == "Bearer n95-secret" for auth, _ in ops_requests))
+                    self.assertTrue(all(p["service"] == "trading-python" for _, p in ops_requests))
+                    self.assertEqual(ops_requests[0][1]["alert_key"], "ops_recovery_flush")
+                    self.assertIn("legacy outage before migration", ops_requests[0][1]["message"])
+                    self.assertEqual(ops_requests[1][1]["alert_key"], "imp19_test_alert")
+                    self.assertEqual(tg.messages, [])
+
+                    clear_grounding_cache()
+                    await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/report"}}, wait=True)
+                    report_msg = tg.messages[-1]
+                    self.assertLessEqual(len(report_msg), 1800)
+                    self.assertIsNotNone(await db.get_context_pack(allow_fallback=False))
+
+                    await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/us"}}, wait=True)
+                    self.assertIn("美股或个股简报", tg.messages[-1])
+
+                    await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pick 英国ETF"}}, wait=True)
+                    self.assertIn("VWRP.L", tg.messages[-1])
+
+                    settle_res = await sched.run_daily_settlement(
+                        now_utc=datetime(2026, 11, 13, 22, 10, tzinfo=timezone.utc)
+                    )
+                    self.assertEqual(settle_res["settled"], 1)
+                    self.assertEqual(settle_res["not_due"], 1)
+                    nvda_lessons = await db.get_symbol_lessons("NVDA", limit=1)
+                    self.assertEqual(len(nvda_lessons), 1)
+                    self.assertEqual(nvda_lessons[0]["outcome_status"], "SETTLED")
+                    self.assertIsNotNone(nvda_lessons[0]["alpha_pct"])
+                    self.assertTrue(nvda_lessons[0]["reflection_lesson"])
+
+                    await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/stats"}}, wait=True)
+                    stats_msg = tg.messages[-1]
+                    self.assertIn("已结算", stats_msg)
+                    self.assertIn("近期复盘教训", stats_msg)
+                    self.assertIn("BUY VWRP.L", stats_msg)
+
+                    await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/health"}}, wait=True)
+                    health_msg = tg.messages[-1]
+                    self.assertIn(f"v{APP_VERSION}", health_msg)
+                    self.assertIn("已启用 ops-notify", health_msg)
+                    self.assertIn("SQLite & 告警: ✅ 正常", health_msg)
+
+                    # Post-cycle online SQLite .backup simulation (N95 backup_daily.sh readiness)
+                    live_conn = sqlite3.connect(n95_db_path)
+                    try:
+                        bkp_conn = sqlite3.connect(backup_db_path)
+                        try:
+                            live_conn.backup(bkp_conn)
+                        finally:
+                            bkp_conn.close()
+                    finally:
+                        live_conn.close()
+
+                    ok_bkp, reason_bkp = check_health(hb_path, backup_db_path)
+                    self.assertTrue(ok_bkp, msg=reason_bkp)
+                finally:
+                    await ops.close()
+                    await t212.close()
+                    await md.close()
+                    await db.close()
+
+        await asyncio.wait_for(_run(), timeout=20.0)
 
 
 if __name__ == "__main__":

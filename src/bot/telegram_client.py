@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_dict(res: httpx.Response) -> dict[str, Any] | None:
+    try:
+        parsed = res.json()
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def split_message_into_chunks(text: str, max_length: int = 3800) -> list[str]:
@@ -35,11 +44,18 @@ class TelegramClient:
         self,
         bot_token: str,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        max_retries: int = 2,
+        base_backoff_s: float = 0.5,
+        max_retry_wait_s: float = 30.0,
     ) -> None:
         self.bot_token = bot_token.strip()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        self._max_retries = max(0, int(max_retries))
+        self._base_backoff_s = max(0.0, float(base_backoff_s))
+        self._max_retry_wait_s = max(0.0, float(max_retry_wait_s))
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -51,12 +67,91 @@ class TelegramClient:
             await self._client.aclose()
             self._client = None
 
+    def _compute_backoff_s(self, attempt: int) -> float:
+        return min(self._base_backoff_s * (2**attempt), self._max_retry_wait_s)
+
+    def _extract_retry_after_s(
+        self,
+        res: httpx.Response,
+        data: dict[str, Any] | None,
+        attempt: int,
+    ) -> float:
+        raw_retry_after: Any = None
+        if isinstance(data, dict):
+            params = data.get("parameters")
+            if isinstance(params, dict):
+                raw_retry_after = params.get("retry_after")
+        if raw_retry_after is None:
+            raw_retry_after = res.headers.get("Retry-After")
+        if raw_retry_after is not None:
+            try:
+                parsed = float(str(raw_retry_after).strip())
+                if parsed >= 0:
+                    return min(parsed, self._max_retry_wait_s)
+            except (TypeError, ValueError):
+                pass
+        return self._compute_backoff_s(attempt)
+
     async def _post(self, method: str, payload: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
         if not self.bot_token:
             return {"ok": False, "description": "TELEGRAM_BOT_TOKEN missing"}
         client = self._get_client()
-        res = await client.post(f"{self.base_url}/{method}", json=payload, timeout=timeout)
-        return res.json()
+        url = f"{self.base_url}/{method}"
+
+        for attempt in range(self._max_retries + 1):
+            try:
+                res = await client.post(url, json=payload, timeout=timeout)
+                data = _parse_json_dict(res)
+
+                is_rate_limited = res.status_code == 429 or (
+                    isinstance(data, dict) and data.get("error_code") == 429
+                )
+                if is_rate_limited:
+                    if attempt >= self._max_retries:
+                        return data or {
+                            "ok": False,
+                            "error_code": 429,
+                            "description": (res.text or "Too Many Requests")[:200],
+                        }
+                    wait_s = self._extract_retry_after_s(res, data, attempt)
+                    logger.warning("Telegram 429 rate-limited on %s, retrying in %.2fs", method, wait_s)
+                    await asyncio.sleep(wait_s)
+                    continue
+
+                if 500 <= res.status_code < 600:
+                    if attempt >= self._max_retries:
+                        return data or {
+                            "ok": False,
+                            "error_code": res.status_code,
+                            "description": (res.text or f"HTTP {res.status_code}")[:200],
+                        }
+                    wait_s = self._compute_backoff_s(attempt)
+                    logger.warning("Telegram HTTP %d on %s, retrying in %.2fs", res.status_code, method, wait_s)
+                    await asyncio.sleep(wait_s)
+                    continue
+
+                if data is not None:
+                    return data
+                return {
+                    "ok": False,
+                    "error_code": res.status_code,
+                    "description": (res.text or f"Invalid JSON response (HTTP {res.status_code})")[:200],
+                }
+            except httpx.HTTPError as exc:
+                if attempt >= self._max_retries:
+                    raise
+                wait_s = self._compute_backoff_s(attempt)
+                safe_msg = str(exc).replace(self.bot_token, "***") if self.bot_token else str(exc)
+                logger.warning(
+                    "Telegram %s transient error (%s: %s), retrying in %.2fs",
+                    method,
+                    type(exc).__name__,
+                    safe_msg,
+                    wait_s,
+                )
+                await asyncio.sleep(wait_s)
+
+        return {"ok": False, "description": "Telegram request exhausted retries"}
 
     async def delete_webhook(self, drop_pending_updates: bool = False) -> dict[str, Any]:
         return await self._post("deleteWebhook", {"drop_pending_updates": drop_pending_updates})

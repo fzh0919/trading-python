@@ -24,7 +24,7 @@ from src.storage.db import AdvisorDatabase
 from src.version import APP_VERSION
 
 
-async def run_app() -> None:
+async def run_app(stop_event: asyncio.Event | None = None) -> None:
     started_mono = time.monotonic()
     cfg = load_config()
     logging.basicConfig(
@@ -53,7 +53,6 @@ async def run_app() -> None:
         ops_notify_token=cfg.env.ops_notify_token,
     )
 
-    # TODO(IMP-18): [接自 IMP-04] 创建 T212Client 时注入 snapshot_loader=db.get_latest_snapshot 实现冷启动 5xx 读库降级兜底。
     t212 = T212Client(
         base_url=cfg.env.t212_base_url,
         isa_key=cfg.env.t212_isa_key,
@@ -65,6 +64,7 @@ async def run_app() -> None:
         cash_interest_rate_pct=cfg.strategy.cash_interest_rate_pct,
         cache_ttl_seconds=cfg.app.cache_ttl_seconds,
         ops_notifier=ops,
+        snapshot_loader=db.get_latest_snapshot,
     )
     market_data = MarketDataService(
         finnhub_key=cfg.env.finnhub_api_key,
@@ -95,107 +95,115 @@ async def run_app() -> None:
         started_monotonic=started_mono,
     )
 
-    if cfg.env.telegram_bot_token:
-        wh_res = await tg.delete_webhook(drop_pending_updates=False)
-        logger.info("Telegram deleteWebhook -> Long Polling switch: %s", wh_res.get("ok"))
-        try:
-            cmd_res = await tg.set_my_commands(BOT_COMMANDS)
-            logger.info("Telegram setMyCommands synced: %s", cmd_res.get("ok"))
-        except Exception as exc:
-            logger.warning("Telegram setMyCommands failed: %s", exc)
-        await ops.send_startup_notice(
-            version=APP_VERSION,
-            summary_lines=[
-                f"核心路由: {cfg.models.report_model} ({cfg.models.report_thinking_level}) | 备援: {cfg.models.fallback_model}",
-                f"全市场强制联网搜索: {'开启' if cfg.models.enable_forced_search_grounding else '关闭'} "
-                f"(早报 {cfg.models.report_search_model} | 日常 {cfg.models.search_model})",
-                f"晨报日程: 工作日 {cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK",
-            ],
-            reply_markup=REMOVE_KEYBOARD_MARKUP,
-        )
-    else:
-        logger.warning("TELEGRAM_BOT_TOKEN is empty; Telegram polling will idle until configured.")
-
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig_name in ("SIGINT", "SIGTERM"):
-        sig = getattr(signal, sig_name, None)
-        if sig is not None:
-            with suppress(NotImplementedError):
-                loop.add_signal_handler(sig, stop_event.set)
-
-    def _touch_heartbeat() -> None:
-        try:
-            write_heartbeat()
-        except Exception as hb_exc:
-            logger.debug("Heartbeat update failed: %s", hb_exc)
-
-    async def _poll_loop() -> None:
-        offset: int | None = None
-        consecutive_poll_errors = 0
-        outage_recorded = False
-        while not stop_event.is_set():
-            _touch_heartbeat()
-            if not cfg.env.telegram_bot_token:
-                await asyncio.sleep(5.0)
-                continue
-            try:
-                updates = await tg.get_updates(offset=offset, timeout_s=25)
-                if consecutive_poll_errors >= 2:
-                    await ops.flush_pending()
-                consecutive_poll_errors = 0
-                outage_recorded = False
-                for upd in updates:
-                    offset = max(offset or 0, int(upd["update_id"]) + 1)
-                    await bot.handle_update(upd)
-            except asyncio.CancelledError:
-                raise
-            except httpx.HTTPError as exc:
-                consecutive_poll_errors += 1
-                logger.warning("Telegram polling transient error (%s: %s); retrying in 5s", type(exc).__name__, exc)
-                if consecutive_poll_errors >= 2 and not outage_recorded:
-                    outage_recorded = True
-                    await ops.record_offline_incident(
-                        source="telegram:polling",
-                        alert_key="telegram_polling_outage",
-                        message=f"Telegram 轮询连续断连 ({type(exc).__name__}: {exc})",
-                    )
-                await asyncio.sleep(5.0)
-            except Exception as exc:
-                consecutive_poll_errors += 1
-                logger.exception("Telegram polling error; retrying in 5s")
-                if not outage_recorded:
-                    outage_recorded = True
-                    await ops.record_offline_incident(
-                        source="telegram:polling",
-                        alert_key="telegram_polling_exception",
-                        message=f"Telegram 轮询异常 ({type(exc).__name__}: {exc})",
-                    )
-                await asyncio.sleep(5.0)
-
-    sched_task = asyncio.create_task(scheduler.run_forever())
-    poll_task = asyncio.create_task(_poll_loop())
-
-    async def _heartbeat_loop() -> None:
-        while not stop_event.is_set():
-            if not sched_task.done() and not poll_task.done():
-                _touch_heartbeat()
-            await asyncio.sleep(15.0)
-
-    _touch_heartbeat()
-    hb_task = asyncio.create_task(_heartbeat_loop())
-
-    logger.info("Trading 212 x Gemini AI Advisor v%s running...", APP_VERSION)
+    hb_task: asyncio.Task[None] | None = None
+    sched_task: asyncio.Task[None] | None = None
+    poll_task: asyncio.Task[None] | None = None
     try:
+        if cfg.env.telegram_bot_token:
+            wh_res = await tg.delete_webhook(drop_pending_updates=False)
+            logger.info("Telegram deleteWebhook -> Long Polling switch: %s", wh_res.get("ok"))
+            try:
+                cmd_res = await tg.set_my_commands(BOT_COMMANDS)
+                logger.info("Telegram setMyCommands synced: %s", cmd_res.get("ok"))
+            except Exception as exc:
+                logger.warning("Telegram setMyCommands failed: %s", exc)
+            await ops.send_startup_notice(
+                version=APP_VERSION,
+                summary_lines=[
+                    f"核心路由: {cfg.models.report_model} ({cfg.models.report_thinking_level}) | 备援: {cfg.models.fallback_model}",
+                    f"全市场强制联网搜索: {'开启' if cfg.models.enable_forced_search_grounding else '关闭'} "
+                    f"(早报 {cfg.models.report_search_model} | 日常 {cfg.models.search_model})",
+                    f"晨报日程: 工作日 {cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK",
+                ],
+                reply_markup=REMOVE_KEYBOARD_MARKUP,
+            )
+        else:
+            logger.warning("TELEGRAM_BOT_TOKEN is empty; Telegram polling will idle until configured.")
+
+        await ops.flush_pending()
+
+        stop_event = stop_event or asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig_name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, sig_name, None)
+            if sig is not None:
+                with suppress(NotImplementedError):
+                    loop.add_signal_handler(sig, stop_event.set)
+
+        def _touch_heartbeat() -> None:
+            try:
+                write_heartbeat()
+            except Exception as hb_exc:
+                logger.debug("Heartbeat update failed: %s", hb_exc)
+
+        async def _poll_loop() -> None:
+            offset: int | None = None
+            consecutive_poll_errors = 0
+            outage_recorded = False
+            while not stop_event.is_set():
+                _touch_heartbeat()
+                if not cfg.env.telegram_bot_token:
+                    await asyncio.sleep(5.0)
+                    continue
+                try:
+                    updates = await tg.get_updates(offset=offset, timeout_s=25)
+                    if consecutive_poll_errors >= 2:
+                        await ops.flush_pending()
+                    consecutive_poll_errors = 0
+                    outage_recorded = False
+                    for upd in updates:
+                        offset = max(offset or 0, int(upd["update_id"]) + 1)
+                        await bot.handle_update(upd)
+                except asyncio.CancelledError:
+                    raise
+                except httpx.HTTPError as exc:
+                    consecutive_poll_errors += 1
+                    logger.warning("Telegram polling transient error (%s: %s); retrying in 5s", type(exc).__name__, exc)
+                    if consecutive_poll_errors >= 2 and not outage_recorded:
+                        outage_recorded = True
+                        await ops.record_offline_incident(
+                            source="telegram:polling",
+                            alert_key="telegram_polling_outage",
+                            message=f"Telegram 轮询连续断连 ({type(exc).__name__}: {exc})",
+                        )
+                    await asyncio.sleep(5.0)
+                except Exception as exc:
+                    consecutive_poll_errors += 1
+                    logger.exception("Telegram polling error; retrying in 5s")
+                    if not outage_recorded:
+                        outage_recorded = True
+                        await ops.record_offline_incident(
+                            source="telegram:polling",
+                            alert_key="telegram_polling_exception",
+                            message=f"Telegram 轮询异常 ({type(exc).__name__}: {exc})",
+                        )
+                    await asyncio.sleep(5.0)
+
+        sched_task = asyncio.create_task(scheduler.run_forever())
+        poll_task = asyncio.create_task(_poll_loop())
+
+        async def _heartbeat_loop() -> None:
+            while not stop_event.is_set():
+                if not sched_task.done() and not poll_task.done():
+                    _touch_heartbeat()
+                await asyncio.sleep(15.0)
+
+        _touch_heartbeat()
+        hb_task = asyncio.create_task(_heartbeat_loop())
+
+        logger.info("Trading 212 x Gemini AI Advisor v%s running...", APP_VERSION)
         await stop_event.wait()
     finally:
         for task in (hb_task, sched_task, poll_task):
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        # TODO(IMP-18): [接自 IMP-03 & IMP-04 & IMP-05] 停机清理一并释放 await t212.close()、await market_data.close()（及 await db.close()）。
-        await ops.close()
-        await tg.close()
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        for resource in (t212, market_data, ops, tg, db):
+            try:
+                await resource.close()
+            except Exception as close_exc:
+                logger.warning("Error closing %s: %s", type(resource).__name__, close_exc)
         logger.info("Shutdown complete.")
 
 

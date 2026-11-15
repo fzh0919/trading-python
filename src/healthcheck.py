@@ -47,6 +47,10 @@ def check_health(
         return False, f"heartbeat stale: age={age:.1f}s > {max_stale_seconds:.1f}s"
 
     db = Path(db_path)
+    if "ADVISOR_DB_PATH" not in os.environ and db == DEFAULT_DB_PATH and not db.exists():
+        local_db = Path("data/advisor.db")
+        if local_db.exists():
+            db = local_db
     if not db.exists():
         return False, f"database missing: {db}"
 
