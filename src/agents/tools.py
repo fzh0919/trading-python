@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
@@ -14,6 +15,7 @@ from src.data_providers.analytics import (
     compute_technical_snapshot,
     format_technical_line,
     max_correlation_against_portfolio,
+    resolve_market_benchmark,
 )
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import PortfolioData
@@ -21,11 +23,30 @@ from src.data_providers.t212_client import PortfolioData
 if TYPE_CHECKING:
     from src.agents.llm_client import LLMBackend
     from src.ops_notifier import OpsNotifier
+    from src.storage.db import AdvisorDatabase
 
 logger = logging.getLogger(__name__)
 
 _EU_SUFFIXES = (".DE", ".AS", ".PA", ".SW", ".MI", ".MC", ".BR", ".VI", ".ST", ".CO", ".HE", ".OL")
-_GROUNDING_CACHE: dict[str, tuple[float, str]] = {}
+# cache_key -> (stored_at_monotonic, expires_at_monotonic, output)
+_GROUNDING_CACHE: dict[str, tuple[float, float, str]] = {}
+_GROUNDING_CACHE_MAX_ENTRIES = 64
+_DEFAULT_GROUNDING_CONCURRENCY = 3
+_INSPECT_TOOL_MAX_CHARS = 3800
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def _prune_grounding_cache(now: float) -> None:
+    """Evict expired entries (and oldest if over capacity) to prevent memory growth."""
+    expired = [k for k, (_, expires_at, _) in _GROUNDING_CACHE.items() if now >= expires_at]
+    for k in expired:
+        _GROUNDING_CACHE.pop(k, None)
+    while len(_GROUNDING_CACHE) > _GROUNDING_CACHE_MAX_ENTRIES:
+        oldest_key = min(_GROUNDING_CACHE, key=lambda k: _GROUNDING_CACHE[k][0])
+        _GROUNDING_CACHE.pop(oldest_key, None)
 
 
 def clear_grounding_cache() -> None:
@@ -81,6 +102,7 @@ async def run_forced_market_grounding(
     focus_query: str = "",
     ttl_seconds: int = 900,
     ops_notifier: OpsNotifier | None = None,
+    max_concurrent_searches: int = _DEFAULT_GROUNDING_CONCURRENCY,
 ) -> str:
     """Run grouped concurrent Google Search Grounding across UK/EU/US equities, ETFs, and macro news."""
     if llm is None:
@@ -88,10 +110,11 @@ async def run_forced_market_grounding(
 
     clean_syms = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
     cache_key = f"{scope}:{','.join(sorted(clean_syms))}:{focus_query.strip().lower()}"
-    now = time.monotonic()
+    now = _monotonic()
+    _prune_grounding_cache(now)
     cached = _GROUNDING_CACHE.get(cache_key)
-    if cached and ttl_seconds > 0 and (now - cached[0]) < ttl_seconds:
-        return cached[1]
+    if cached and ttl_seconds > 0 and (now - cached[0]) < ttl_seconds and now < cached[1]:
+        return cached[2]
 
     qtypes = quote_types or {}
     uk_syms: list[str] = []
@@ -150,11 +173,19 @@ async def run_forced_market_grounding(
     if not tasks_meta:
         return ""
 
+    sem = asyncio.Semaphore(max(1, max_concurrent_searches))
+
+    async def _bounded_search(prompt: str) -> str:
+        async with sem:
+            return await _single_search_query(
+                llm=llm,
+                model=search_model,
+                prompt=prompt,
+                usage_label=usage_label,
+            )
+
     raw_results = await asyncio.gather(
-        *(
-            _single_search_query(llm=llm, model=search_model, prompt=p, usage_label=usage_label)
-            for _, p in tasks_meta
-        ),
+        *(_bounded_search(p) for _, p in tasks_meta),
         return_exceptions=True,
     )
 
@@ -181,8 +212,84 @@ async def run_forced_market_grounding(
 
     output = "\n\n".join(sections)
     if output and ttl_seconds > 0:
-        _GROUNDING_CACHE[cache_key] = (now, output)
+        write_now = _monotonic()
+        _GROUNDING_CACHE[cache_key] = (write_now, write_now + ttl_seconds, output)
+        _prune_grounding_cache(write_now)
     return output
+
+
+def _format_us_deep_intel(intel: dict[str, Any]) -> str:
+    """Format Finnhub US deep intel (recommendations, EPS surprises, insider MSPR) into a compact string."""
+    if not intel:
+        return ""
+    parts: list[str] = []
+    recs = intel.get("recommendations") or []
+    if recs:
+        r = recs[0]
+        parts.append(
+            f"机构评级({r.get('period', '')}): 强买{r.get('strong_buy', 0)}/买{r.get('buy', 0)}/"
+            f"持{r.get('hold', 0)}/卖{r.get('sell', 0)}/强卖{r.get('strong_sell', 0)}"
+        )
+    surprises = intel.get("earnings_surprises") or []
+    if surprises:
+        s_items = []
+        for s in surprises[:2]:
+            sp = s.get("surprise_pct")
+            sp_str = f"{sp:+.1f}%" if isinstance(sp, (int, float)) else "N/A"
+            s_items.append(f"{s.get('period', '')}({sp_str})")
+        parts.append("EPS惊喜: " + ", ".join(s_items))
+    insider = intel.get("insider_sentiment")
+    if isinstance(insider, dict) and insider.get("mspr") is not None:
+        parts.append(f"内部人90d MSPR={insider['mspr']:.2f}(净变动{insider.get('change', 0)})")
+    return " | ".join(parts)
+
+
+def _format_past_lessons(rows: list[dict[str, Any]]) -> list[str]:
+    """Format settled T+5 reflection lessons compactly for inspect_ticker."""
+    lessons: list[str] = []
+    for row in rows[:2]:
+        date_s = str(row.get("created_at_uk") or row.get("settled_at_uk") or "").strip()[:10]
+        action = str(row.get("action") or "").strip()
+        alpha = row.get("alpha_pct")
+        alpha_str = f" Alpha={alpha:+.1f}%" if isinstance(alpha, (int, float)) else ""
+        text = str(row.get("reflection_lesson") or "").strip()[:120]
+        if text:
+            prefix = f"[{date_s} {action}{alpha_str}]".strip()
+            lessons.append(f"{prefix} {text}".strip())
+    return lessons
+
+
+def _compact_inspect_payload(payload: dict[str, Any], max_chars: int = _INSPECT_TOOL_MAX_CHARS) -> dict[str, Any]:
+    """Ensure inspect_ticker JSON payload stays strictly under max_tool_result_chars=4000."""
+    serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(serialized) <= max_chars:
+        return payload
+
+    # Step 1: Trim news item titles/summaries if news is bulky
+    news = payload.get("news")
+    if isinstance(news, list) and news:
+        compact_news = []
+        for item in news[:3]:
+            if isinstance(item, dict):
+                compact_news.append({k: (str(v)[:100] if isinstance(v, str) else v) for k, v in item.items()})
+            else:
+                compact_news.append(str(item)[:100])
+        payload["news"] = compact_news
+        if len(json.dumps(payload, ensure_ascii=False, default=str)) <= max_chars:
+            return payload
+
+    # Step 2: Trim optional prose fields progressively
+    for key, limit in (("us_deep_intel", 160), ("identity_summary", 160), ("summary", 900)):
+        val = payload.get(key)
+        if isinstance(val, str) and len(val) > limit:
+            payload[key] = val[: limit - 1] + "…"
+    if len(json.dumps(payload, ensure_ascii=False, default=str)) <= max_chars:
+        return payload
+
+    # Step 3: Drop news down to 1 item if still over budget
+    if isinstance(payload.get("news"), list) and len(payload["news"]) > 1:
+        payload["news"] = payload["news"][:1]
+    return payload
 
 
 class MarketToolkit:
@@ -196,19 +303,30 @@ class MarketToolkit:
         llm: LLMBackend | None = None,
         search_model: str = "gemini-4-hydrogen",
         ops_notifier: OpsNotifier | None = None,
+        db: AdvisorDatabase | None = None,
     ) -> None:
         self.market_data = market_data
         self.portfolio = portfolio
         self.llm = llm
         self.search_model = search_model
         self.ops_notifier = ops_notifier
+        self.db = db
+
+    def _find_holding_context(self, sym: str) -> tuple[str | None, str | None]:
+        """Return (isin, created_at) from current portfolio positions for a Yahoo symbol."""
+        for pos in self.portfolio.all_positions():
+            if pos.yahoo_symbol.strip().upper() == sym:
+                isin = pos.isin.strip() if pos.isin and pos.isin.strip() else None
+                created_at = pos.created_at.strip() if pos.created_at and pos.created_at.strip() else None
+                return isin, created_at
+        return None, None
 
     def declarations(self) -> list[types.FunctionDeclaration]:
         decls = [
             types.FunctionDeclaration(
                 name="inspect_ticker",
                 description=(
-                    "获取任意股票或ETF的实时确定性行情、MA20/50/200、RSI14、52周回撤、PE估值、财报日期及最近新闻。"
+                    "获取任意股票或ETF的实时确定性行情、CYQ筹码获利盘/集中度、周线趋势、MA20/50/200、RSI14、52周回撤、PE估值、财报/除息日、历史复盘教训及最近新闻。"
                     "美股直接传代码如 'NVDA'；英股/LSE ETF 加 '.L' 如 'AZN.L'、'VWRP.L'；欧股加 '.DE'/'.AS'/'.PA'。"
                 ),
                 parameters={
@@ -269,23 +387,74 @@ class MarketToolkit:
             sym = str(args.get("symbol") or "").strip().upper()
             if not sym:
                 return {"error": "symbol is required"}
-            # TODO(IMP-11): [接自 IMP-04 & IMP-05 & IMP-06] inspect_ticker 传入持仓 isin (兼容 None) 与 bundle=bundle，
-            # 并按需接入 self.market_data.get_us_deep_intel(sym)、bundle.identity_summary/ex_dividend_date 与 DB 历史反思教训。
-            histories, bundles = await self.market_data.get_bundles([sym], include_news=True, include_earnings=True)
+            pos_isin, pos_created_at = self._find_holding_context(sym)
+            isin_map = {sym: pos_isin} if pos_isin else None
+            histories, bundles = await self.market_data.get_bundles(
+                [sym],
+                include_news=True,
+                include_earnings=True,
+                isin_map=isin_map,
+            )
             hist = histories.get(sym)
             bundle = bundles.get(sym)
-            tech = compute_technical_snapshot(sym, hist)
-            return {
+            tech = compute_technical_snapshot(
+                sym,
+                hist,
+                position_created_at=pos_created_at,
+                bundle=bundle,
+            )
+
+            us_deep_intel_str = ""
+            quote_type = bundle.quote_type if bundle else ""
+            if _classify_symbol_region(sym, quote_type) == "US" and hasattr(self.market_data, "get_us_deep_intel"):
+                try:
+                    raw_intel = await self.market_data.get_us_deep_intel(sym)
+                    us_deep_intel_str = _format_us_deep_intel(raw_intel or {})
+                except Exception as exc:
+                    logger.debug("inspect_ticker get_us_deep_intel(%s) failed: %s", sym, exc)
+
+            past_lessons: list[str] = []
+            if self.db is not None:
+                try:
+                    lesson_rows = await self.db.get_symbol_lessons(sym, limit=2)
+                    past_lessons = _format_past_lessons(lesson_rows)
+                except Exception as exc:
+                    logger.debug("inspect_ticker get_symbol_lessons(%s) failed: %s", sym, exc)
+
+            cyq_summary: dict[str, Any] | None = None
+            if tech is not None and tech.cyq_benefit_part_pct is not None:
+                cyq_summary = {
+                    "benefit_part_pct": tech.cyq_benefit_part_pct,
+                    "avg_cost": tech.cyq_avg_cost,
+                    "concentration_90_pct": tech.cyq_concentration_90_pct,
+                    "regime": tech.cyq_regime,
+                }
+
+            payload: dict[str, Any] = {
                 "symbol": sym,
                 "summary": format_technical_line(sym, tech, bundle),
                 "name": bundle.short_name if bundle else sym,
+                "identity_summary": bundle.identity_summary if bundle else "",
                 "currency": bundle.currency if bundle else "",
-                "quote_type": bundle.quote_type if bundle else "",
+                "quote_type": quote_type,
                 "sector": bundle.sector if bundle else "",
                 "dividend_yield_pct": bundle.dividend_yield_pct if bundle else None,
                 "target_mean_price": bundle.target_mean_price if bundle else None,
-                "news": bundle.news if bundle else [],
+                "ex_dividend_date": bundle.ex_dividend_date if bundle else None,
+                "days_to_ex_dividend": (
+                    tech.days_to_ex_dividend
+                    if tech is not None and tech.days_to_ex_dividend is not None
+                    else (bundle.days_to_ex_dividend if bundle else None)
+                ),
+                "weekly_bullish": tech.weekly_bullish if tech else None,
+                "weekly_rsi14": tech.weekly_rsi14 if tech else None,
+                "cyq": cyq_summary,
+                "us_deep_intel": us_deep_intel_str,
+                "past_lessons": past_lessons,
+                # [用户授权调整] 保持 inspect_ticker 返回紧凑（新闻截前 3 条）；控制整包 < 4000 字符以免触发裁剪。
+                "news": (bundle.news[:3] if bundle else []),
             }
+            return _compact_inspect_payload(payload)
 
         if name == "check_portfolio_correlation":
             sym = str(args.get("symbol") or "").strip().upper()
@@ -294,11 +463,22 @@ class MarketToolkit:
                 return {"error": "symbol is required"}
             if not held_syms:
                 return {"symbol": sym, "note": "当前无持仓可比对"}
-            # TODO(IMP-11): [接自 IMP-05 & IMP-06] 改调 market_data.get_histories() 并补入 "ISF.L" 激活分市场去 Beta 相关性。
             all_syms = list(dict.fromkeys([*held_syms, sym]))
-            fetch_syms = list(dict.fromkeys([*all_syms, "SPY"]))
-            histories, _ = await self.market_data.get_bundles(fetch_syms, include_news=False, include_earnings=False)
-            corr = compute_correlation_matrix(histories, all_syms, lookback_days=60, benchmark_symbol="SPY")
+            bench_syms: list[str] = ["SPY", "ISF.L"]
+            for s in all_syms:
+                for b in resolve_market_benchmark(s):
+                    if b not in bench_syms:
+                        bench_syms.append(b)
+            fetch_syms = list(dict.fromkeys([*all_syms, *bench_syms]))
+            histories = await self.market_data.get_histories(fetch_syms, period="1y")
+            corr = compute_correlation_matrix(
+                histories,
+                all_syms,
+                lookback_days=60,
+                benchmark_symbol="SPY",
+                uk_benchmark_symbol="ISF.L",
+                eu_benchmark_symbol="EXS1.DE",
+            )
             most_sym, corr_val = max_correlation_against_portfolio(corr, sym, held_syms)
             return {
                 "candidate": sym,

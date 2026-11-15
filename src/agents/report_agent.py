@@ -6,8 +6,10 @@ import asyncio
 import logging
 import re
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction
@@ -15,6 +17,7 @@ from src.agents.schemas import (
     MorningReportDecision,
     parse_or_repair_structured_json,
     render_morning_report,
+    trim_text_at_line_boundary,
 )
 from src.agents.tools import MarketToolkit, run_forced_market_grounding
 from src.config import AppConfig
@@ -35,20 +38,76 @@ from src.data_providers.t212_client import (
     format_account_overview,
     format_positions_text,
 )
-from src.engine.calendar_utils import get_uk_weekday_label, get_us_market_schedule_uk, is_uk_bank_holiday
-from src.engine.portfolio_rules import evaluate_portfolio, format_evaluations_text
-from src.storage.db import AdvisorDatabase
+from src.engine.calendar_utils import (
+    get_market_calendar_alerts,
+    get_uk_weekday_label,
+    get_us_market_schedule_uk,
+    is_uk_bank_holiday,
+)
+from src.engine.portfolio_rules import (
+    DisagreementItem,
+    HoldingEvaluation,
+    apply_risk_override_guardrail,
+    build_disagreement_matrix,
+    evaluate_portfolio,
+    format_disagreement_matrix_text,
+    format_evaluations_text,
+)
+from src.storage.db import AdvisorDatabase, get_trading_cycle_id
 
 logger = logging.getLogger(__name__)
 LONDON_TZ = ZoneInfo("Europe/London")
+CONTEXT_PACK_VERSION = "1.0"
+_PENDING_PROXIMITY_PCT = 1.5
+_VIX_DANGER_LEVEL = 28.0
 
 
-def _compute_portfolio_diff_text(current: PortfolioData, previous: PortfolioData | None) -> str:
+def _is_us_symbol(symbol: str) -> bool:
+    return "." not in symbol and "=" not in symbol and "^" not in symbol
+
+
+def _extract_holding_context(portfolio: PortfolioData) -> tuple[dict[str, str], dict[str, str]]:
+    """Extract per-symbol ISIN and earliest open timestamp from live portfolio positions."""
+    isin_map: dict[str, str] = {}
+    created_at_map: dict[str, str] = {}
+    for pos in portfolio.all_positions():
+        sym = pos.yahoo_symbol
+        if pos.isin and pos.isin.strip():
+            isin_map.setdefault(sym, pos.isin.strip().upper())
+        if pos.created_at and pos.created_at.strip():
+            ts = pos.created_at.strip()
+            existing = created_at_map.get(sym)
+            if existing is None or ts < existing:
+                created_at_map[sym] = ts
+    return isin_map, created_at_map
+
+
+def _format_snapshot_age(elapsed_hours: float) -> str:
+    if elapsed_hours >= 24.0:
+        return f"约{elapsed_hours / 24.0:.1f}天前"
+    if elapsed_hours >= 1.0:
+        return f"约{elapsed_hours:.1f}小时前"
+    return f"约{max(1, int(round(elapsed_hours * 60)))}分钟前"
+
+
+def _compute_portfolio_diff_text(
+    current: PortfolioData,
+    previous: PortfolioData | None,
+    *,
+    cash_flow_summary_text: str = "",
+) -> str:
+    """Summarize portfolio value/position changes with snapshot age & cash-flow attribution."""
     if previous is None:
-        return "（首次建档，暂无前一日净值基准；以 30 日实盘成交作依据）"
+        base = "（首次建档，暂无前一日净值基准；以 30 日实盘成交作依据）"
+        return f"{base} | {cash_flow_summary_text.splitlines()[0]}" if cash_flow_summary_text else base
 
-    def _map_pos(data: PortfolioData) -> dict[str, dict]:
-        out = {}
+    elapsed_hours = max(0.0, (current.fetched_at_ms - previous.fetched_at_ms) / 3_600_000.0)
+    span_str = _format_snapshot_age(elapsed_hours)
+    fallback_tag = "，不足4h基准已回退最近快照" if elapsed_hours < 3.99 else ""
+    anchor_note = f"对比 {previous.fetched_at_uk} UK（{span_str}{fallback_tag}）"
+
+    def _map_pos(data: PortfolioData) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
         for acc in (data.isa, data.invest):
             if not acc.ok:
                 continue
@@ -69,6 +128,35 @@ def _compute_portfolio_diff_text(current: PortfolioData, previous: PortfolioData
         changes.append(
             f"总净值: {previous.total_combined_value:,.2f} → {current.total_combined_value:,.2f} GBP ({val_diff:+,.2f})"
         )
+
+    ext_in_out = 0.0
+    int_sum = 0.0
+    fee_sum = 0.0
+    div_sum = 0.0
+    for acc in (current.isa, current.invest):
+        for tx in acc.recent_transactions:
+            if tx.date_time_ms >= previous.fetched_at_ms:
+                if tx.tx_type in {"DEPOSIT", "WITHDRAW"}:
+                    ext_in_out += tx.amount
+                elif tx.tx_type in {"INTEREST_ON_FREE_CASH", "LENDING_INTEREST"}:
+                    int_sum += tx.amount
+                elif tx.tx_type == "FEE":
+                    fee_sum += tx.amount
+        for dv in acc.recent_dividends:
+            if dv.paid_on_ms >= previous.fetched_at_ms:
+                div_sum += dv.amount
+
+    if abs(ext_in_out) >= 0.01:
+        changes.append(
+            f"区间外部出入金 {ext_in_out:+,.2f} GBP（剔除出入金后净值变动约 {val_diff - ext_in_out:+,.2f} GBP）"
+        )
+    if abs(div_sum) >= 0.01:
+        changes.append(f"区间派息入账 +{div_sum:,.2f} GBP")
+    if abs(int_sum) >= 0.01:
+        changes.append(f"区间现金利息 +{int_sum:,.2f} GBP")
+    if abs(fee_sum) >= 0.01:
+        changes.append(f"区间平台扣费 {fee_sum:+,.2f} GBP")
+
     for k, cur in cur_map.items():
         if k not in prev_map:
             changes.append(f"新增 [{cur['account']}] {cur['ticker']} ({cur['qty']:.4f}股)")
@@ -79,7 +167,10 @@ def _compute_portfolio_diff_text(current: PortfolioData, previous: PortfolioData
     for k, prev in prev_map.items():
         if k not in cur_map:
             changes.append(f"清仓 [{prev['account']}] {prev['ticker']}")
-    return "; ".join(changes) if changes else f"对比 {previous.fetched_at_uk} 无仓位数量变动"
+
+    if not changes:
+        return f"{anchor_note} 无净值或仓位数量变动"
+    return f"{anchor_note} | " + "; ".join(changes)
 
 
 def _extract_conclusion_fallback(report_text: str) -> str:
@@ -89,44 +180,267 @@ def _extract_conclusion_fallback(report_text: str) -> str:
     return report_text[:500].strip()
 
 
-async def build_portfolio_fact_sheet(
+def _compact_lesson_record(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "created_at_uk": str(row.get("created_at_uk") or ""),
+        "account": str(row.get("account") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "action": str(row.get("action") or ""),
+        "raw_return_pct": row.get("raw_return_pct"),
+        "alpha_pct": row.get("alpha_pct"),
+        "reflection_lesson": str(row.get("reflection_lesson") or "").strip()[:240],
+    }
+
+
+async def _fetch_symbol_lessons(
+    db: AdvisorDatabase | None,
+    symbols: list[str],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    if db is None:
+        return {}, []
+
+    async def _load_recent() -> list[dict[str, Any]]:
+        try:
+            rows = await db.get_recent_lessons(limit=5)
+            return [_compact_lesson_record(r) for r in rows]
+        except Exception as exc:
+            logger.debug("Failed to load recent lessons: %s", exc)
+            return []
+
+    async def _load_sym(sym: str) -> tuple[str, list[dict[str, Any]]]:
+        try:
+            rows = await db.get_symbol_lessons(sym, limit=2)
+            return sym, [_compact_lesson_record(r) for r in rows]
+        except Exception as exc:
+            logger.debug("Failed to load lessons for %s: %s", sym, exc)
+            return sym, []
+
+    recent_task = _load_recent()
+    sym_tasks = [_load_sym(sym) for sym in symbols]
+    results = await asyncio.gather(recent_task, *sym_tasks)
+    recent_lessons = results[0]
+    by_symbol = {sym: items for sym, items in results[1:] if items}
+    return by_symbol, recent_lessons
+
+
+def build_analysis_context_pack(
+    *,
+    portfolio: PortfolioData,
+    tracked_syms: list[str],
+    tech_map: dict[str, TechnicalSnapshot],
+    bundles: dict[str, TickerMarketBundle],
+    macro: MacroSnapshot,
+    evals: list[HoldingEvaluation],
+    disagreements: list[DisagreementItem],
+    disagreement_text: str,
+    exposure_text: str,
+    calendar_alerts: list[str],
+    isin_map: dict[str, str] | None = None,
+    lessons_by_sym: dict[str, list[dict[str, Any]]] | None = None,
+    recent_lessons: list[dict[str, Any]] | None = None,
+    cash_flow_summary: str = "",
+    portfolio_diff: str = "",
+    cycle_date: str | None = None,
+) -> dict[str, Any]:
+    """Assemble compact JSON-serializable AnalysisContextPack for SQLite persistence & cross-command reuse."""
+    now_utc = datetime.now(timezone.utc)
+    resolved_cycle = cycle_date or get_trading_cycle_id(now_utc)
+    isin_lookup = isin_map or {}
+    lessons_lookup = lessons_by_sym or {}
+
+    pos_by_sym: dict[str, list[dict[str, Any]]] = {}
+    for pos in portfolio.all_positions():
+        native_ret = (
+            round(((pos.cur_price / pos.avg_price) - 1.0) * 100.0, 2)
+            if pos.avg_price > 0 and pos.cur_price > 0
+            else None
+        )
+        pos_by_sym.setdefault(pos.yahoo_symbol, []).append(
+            {
+                "account": pos.account,
+                "ticker": pos.ticker,
+                "inst_currency": pos.inst_currency,
+                "weight_pct": round(pos.weight_pct, 2),
+                "return_pct": round(pos.return_pct, 2),
+                "native_return_pct": native_ret,
+                "cur_price": pos.cur_price,
+                "avg_price": pos.avg_price,
+                "created_at": pos.created_at,
+            }
+        )
+
+    eval_by_sym: dict[str, list[dict[str, Any]]] = {}
+    for ev in evals:
+        eval_by_sym.setdefault(ev.yahoo_symbol, []).append(ev.model_dump())
+
+    dis_by_sym: dict[str, list[dict[str, Any]]] = {}
+    for dis in disagreements:
+        dis_by_sym.setdefault(dis.yahoo_symbol, []).append(dis.model_dump())
+
+    symbols_pack: dict[str, dict[str, Any]] = {}
+    missing_tech: list[str] = []
+    for sym in tracked_syms:
+        b = bundles.get(sym)
+        t = tech_map.get(sym)
+        if t is None:
+            missing_tech.append(sym)
+        identity = ""
+        if b is not None:
+            identity = b.identity_summary or b.build_identity_anchor(isin_override=isin_lookup.get(sym))
+        held_list = pos_by_sym.get(sym, [])
+        fallback_curr = held_list[0]["inst_currency"] if held_list else ""
+        bundle_summary = (
+            {
+                "short_name": b.short_name,
+                "long_name": b.long_name,
+                "quote_type": b.quote_type,
+                "exchange": b.exchange,
+                "currency": b.currency or fallback_curr,
+                "sector": b.sector,
+                "industry": b.industry,
+                "current_price": b.current_price,
+                "target_mean_price": b.target_mean_price,
+                "forward_pe": b.forward_pe,
+                "trailing_pe": b.trailing_pe,
+                "dividend_yield_pct": b.dividend_yield_pct,
+                "beta": b.beta,
+                "roe_pct": b.roe_pct,
+                "profit_margin_pct": b.profit_margin_pct,
+                "revenue_growth_pct": b.revenue_growth_pct,
+                "debt_to_equity": b.debt_to_equity,
+                "recommendation_key": b.recommendation_key,
+                "earnings_date": b.earnings_date,
+                "days_to_earnings": b.days_to_earnings,
+                "ex_dividend_date": b.ex_dividend_date,
+                "days_to_ex_dividend": b.days_to_ex_dividend,
+                "news": list(b.news[:3]),
+            }
+            if b is not None
+            else {}
+        )
+        symbols_pack[sym] = {
+            "symbol": sym,
+            "identity_summary": identity or sym,
+            "isin": isin_lookup.get(sym) or (b.isin if b else ""),
+            "held_accounts": held_list,
+            "technical": t.model_dump() if t is not None else None,
+            "technical_line": format_technical_line(sym, t, b),
+            "bundle_summary": bundle_summary,
+            "evaluations": eval_by_sym.get(sym, []),
+            "disagreements": dis_by_sym.get(sym, []),
+            "lessons": lessons_lookup.get(sym, []),
+        }
+
+    return {
+        "pack_version": CONTEXT_PACK_VERSION,
+        "cycle_date": resolved_cycle,
+        "generated_at_uk": now_utc.astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M"),
+        "is_fallback": bool(portfolio.is_fallback),
+        "calendar_alerts": list(calendar_alerts),
+        "macro": macro.model_dump() | {"summary": macro.to_text()},
+        "exposure_summary": exposure_text,
+        "cash_flow_summary": cash_flow_summary,
+        "portfolio_diff": portfolio_diff,
+        "disagreements": [d.model_dump() for d in disagreements],
+        "disagreement_text": disagreement_text,
+        "recent_lessons": list(recent_lessons or []),
+        "symbols": symbols_pack,
+        "data_quality": {
+            "portfolio_is_fallback": bool(portfolio.is_fallback),
+            "macro_is_stale": bool(macro.is_stale),
+            "missing_tech_symbols": missing_tech,
+        },
+    }
+
+
+async def _assemble_fact_sheet_bundle(
     portfolio: PortfolioData,
     market_data: MarketDataService,
     cfg: AppConfig,
+    *,
     us_only: bool = False,
-) -> tuple[str, dict[str, TechnicalSnapshot], dict[str, TickerMarketBundle], MacroSnapshot]:
-    """Gather deterministic data for held positions AND pending orders + exposure breakdown."""
+    db: AdvisorDatabase | None = None,
+) -> tuple[
+    str,
+    dict[str, TechnicalSnapshot],
+    dict[str, TickerMarketBundle],
+    MacroSnapshot,
+    dict[str, pd.DataFrame],
+    list[HoldingEvaluation],
+    list[DisagreementItem],
+    str,
+    list[str],
+    dict[str, Any],
+]:
+    """Gather deterministic data, CYQ/weekly/ex-div technicals, disagreements, lessons & ContextPack."""
     all_tracked = portfolio.unique_yahoo_symbols(include_pending=True)
     held_all = portfolio.unique_yahoo_symbols(include_pending=False)
-    # For US sentinel mode, focus technicals/news strictly on US tickers while keeping macro & exposure context
-    tracked_syms = [s for s in all_tracked if "." not in s and "=" not in s and "^" not in s] if us_only else all_tracked
+    tracked_syms = [s for s in all_tracked if _is_us_symbol(s)] if us_only else all_tracked
     held_syms_set = set(held_all)
 
     fetch_syms = all_tracked if (us_only and len(all_tracked) > len(tracked_syms)) else tracked_syms
-    # TODO(IMP-12): [接自 IMP-04 & IMP-05 & IMP-06] get_bundles 传 isin_map，compute_technical_snapshot 传入 pos.created_at (兼容 None) 与 bundle；
-    # 整合 bundle.identity_summary / CYQ / 周线 / 除息 / Disagreement 组装 AnalysisContextPack 并存入 save_morning_report(..., context_pack=...)；
-    # /us 哨兵接入 cfg.strategy.us_anomaly_move_pct / us_anomaly_vix_change_pct 门控及 get_market_calendar_alerts()。
-    (histories, bundles), macro = await asyncio.gather(
-        market_data.get_bundles(fetch_syms, include_news=True, include_earnings=True),
+    isin_map, created_at_map = _extract_holding_context(portfolio)
+    fetch_isin_map = {sym: isin_map[sym] for sym in fetch_syms if sym in isin_map} or None
+
+    (histories, bundles), macro, (lessons_by_sym, recent_lessons) = await asyncio.gather(
+        market_data.get_bundles(
+            fetch_syms,
+            include_news=True,
+            include_earnings=True,
+            isin_map=fetch_isin_map,
+        ),
         market_data.get_macro_snapshot(),
+        _fetch_symbol_lessons(db, tracked_syms),
     )
+
     tech_map: dict[str, TechnicalSnapshot] = {}
     for sym in tracked_syms:
-        snap = compute_technical_snapshot(sym, histories.get(sym))
+        snap = compute_technical_snapshot(
+            sym,
+            histories.get(sym),
+            position_created_at=created_at_map.get(sym),
+            bundle=bundles.get(sym),
+        )
         if snap is not None:
             tech_map[sym] = snap
 
-    # TODO(IMP-12): [接自 IMP-07] 传入 histories=histories 到 evaluate_portfolio(..., histories=histories)，
-    # 并调用 build_disagreement_matrix() / format_disagreement_matrix_text() 写入 fact_sheet 与 Step 3 PM / ContextPack。
-    evals = evaluate_portfolio(portfolio, tech_map, bundles, cfg.strategy)
+    evals = evaluate_portfolio(portfolio, tech_map, bundles, cfg.strategy, histories=histories)
     if us_only:
-        evals = [e for e in evals if "." not in e.yahoo_symbol]
+        evals = [e for e in evals if _is_us_symbol(e.yahoo_symbol)]
     eval_text = format_evaluations_text(evals)
     exposure_text = compute_exposure_summary(portfolio, bundles)
 
-    held_lines = [format_technical_line(sym, tech_map.get(sym), bundles.get(sym)) for sym in tracked_syms if sym in held_syms_set]
+    disagreements = build_disagreement_matrix(portfolio, tech_map, bundles, cfg.strategy, evals=evals)
+    if us_only:
+        disagreements = [d for d in disagreements if _is_us_symbol(d.yahoo_symbol)]
+    disagreement_text = format_disagreement_matrix_text(disagreements)
+
+    calendar_alerts = get_market_calendar_alerts()
+
+    identity_lines: list[str] = []
+    for sym in tracked_syms:
+        b = bundles.get(sym)
+        if b is None:
+            continue
+        anchor = b.identity_summary or b.build_identity_anchor(isin_override=isin_map.get(sym))
+        if anchor:
+            identity_lines.append(f"• {anchor}")
+
+    held_lines = [
+        format_technical_line(sym, tech_map.get(sym), bundles.get(sym))
+        for sym in tracked_syms
+        if sym in held_syms_set
+    ]
     pending_only_syms = [sym for sym in tracked_syms if sym not in held_syms_set]
     pending_tech_lines = [format_technical_line(sym, tech_map.get(sym), bundles.get(sym)) for sym in pending_only_syms]
+
+    lesson_lines: list[str] = []
+    for sym in tracked_syms:
+        for item in lessons_by_sym.get(sym, []):
+            alpha_str = f"Alpha {item['alpha_pct']:+.1f}%" if item.get("alpha_pct") is not None else "已结算"
+            lesson_lines.append(
+                f"• {sym} [{item['created_at_uk']} {item['action']} | {alpha_str}]: {item['reflection_lesson']}"
+            )
 
     news_lines = []
     for sym in tracked_syms:
@@ -135,10 +449,28 @@ async def build_portfolio_fact_sheet(
             titles = " / ".join(f"[{n['date']}] {n['title']}" for n in b.news[:2])
             news_lines.append(f"• {sym}: {titles}")
 
+    calendar_section = (
+        "\n\n【英美欧市场日历提醒】\n" + "\n".join(f"• {a}" for a in calendar_alerts)
+        if calendar_alerts
+        else ""
+    )
+    identity_section = (
+        "\n\n【标的身份锚定（ISIN / 交易所 / 板块）】\n" + "\n".join(identity_lines)
+        if identity_lines
+        else ""
+    )
+    lesson_section = (
+        "\n\n【标的 T+5 历史复盘教训（SQLite 记忆）】\n" + "\n".join(lesson_lines)
+        if lesson_lines
+        else ""
+    )
+
     fact_sheet = (
-        f"【实时宏观与汇率（确定性数据源）】\n{macro.to_text()}\n\n"
-        f"【跨账户重叠与行业集中度（Python 实算）】\n{exposure_text}\n\n"
-        f"【持仓量化技术面、目标价与财报雷达】\n"
+        f"【实时宏观与汇率（确定性数据源）】\n{macro.to_text()}"
+        + calendar_section
+        + f"\n\n【跨账户重叠与行业集中度（Python 实算）】\n{exposure_text}"
+        + identity_section
+        + f"\n\n【持仓量化技术面、目标价与财报雷达】\n"
         + ("\n".join(held_lines) if held_lines else "（无持仓技术数据）")
         + (
             "\n\n【未成交活动挂单标的实时技术面与估值（供审计挂单）】\n" + "\n".join(pending_tech_lines)
@@ -147,9 +479,81 @@ async def build_portfolio_fact_sheet(
         )
         + "\n\n【Python 规则引擎：加仓 / 减仓 / 止损复核信号】\n"
         + eval_text
+        + "\n\n【本地多空证据冲突表（Disagreement Matrix）】\n"
+        + disagreement_text
+        + lesson_section
         + "\n\n【近期公司新闻摘要】\n"
         + ("\n".join(news_lines) if news_lines else "（近7天无重要突发新闻或暂无抓取）")
     )
+
+    cycle_id = (
+        db._cycle_id()
+        if db is not None
+        else get_trading_cycle_id(
+            reset_hour=cfg.schedule.morning_report_hour,
+            reset_minute=cfg.schedule.morning_report_minute,
+        )
+    )
+    context_pack = build_analysis_context_pack(
+        portfolio=portfolio,
+        tracked_syms=tracked_syms,
+        tech_map=tech_map,
+        bundles=bundles,
+        macro=macro,
+        evals=evals,
+        disagreements=disagreements,
+        disagreement_text=disagreement_text,
+        exposure_text=exposure_text,
+        calendar_alerts=calendar_alerts,
+        isin_map=isin_map,
+        lessons_by_sym=lessons_by_sym,
+        recent_lessons=recent_lessons,
+        cycle_date=cycle_id,
+    )
+    return (
+        fact_sheet,
+        tech_map,
+        bundles,
+        macro,
+        histories,
+        evals,
+        disagreements,
+        disagreement_text,
+        calendar_alerts,
+        context_pack,
+    )
+
+
+async def build_portfolio_fact_sheet(
+    portfolio: PortfolioData,
+    market_data: MarketDataService,
+    cfg: AppConfig,
+    us_only: bool = False,
+    *,
+    db: AdvisorDatabase | None = None,
+    context_pack_out: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, TechnicalSnapshot], dict[str, TickerMarketBundle], MacroSnapshot]:
+    """Gather deterministic data for held positions AND pending orders + exposure breakdown."""
+    (
+        fact_sheet,
+        tech_map,
+        bundles,
+        macro,
+        _histories,
+        _evals,
+        _disagreements,
+        _disagreement_text,
+        _calendar_alerts,
+        context_pack,
+    ) = await _assemble_fact_sheet_bundle(
+        portfolio,
+        market_data,
+        cfg,
+        us_only=us_only,
+        db=db,
+    )
+    if context_pack_out is not None:
+        context_pack_out.update(context_pack)
     return fact_sheet, tech_map, bundles, macro
 
 
@@ -162,9 +566,9 @@ async def generate_morning_report(
     ops_notifier: OpsNotifier | None = None,
 ) -> str:
     """TradingAgents-Lite 3-step pipeline:
-    1) Deterministic FactSheet + Concurrent Multi-Region Google Search Grounding
+    1) Deterministic FactSheet + ContextPack + Concurrent Multi-Region Google Search Grounding
     2) Concurrent Analyst (Bull/Opportunity, HIGH, <=6 tool rounds) & Risk Auditor (Bear, Argon HIGH, <=6 tool rounds)
-    3) Portfolio Manager Pydantic Structured Synthesis (with auto-repair) -> <= 1500 chars
+    3) Portfolio Manager Pydantic Structured Synthesis + RiskOverride Guardrail -> <= 1800 chars
     """
     portfolio = await t212.get_portfolio(use_cache=False)
     if not portfolio.isa.ok and not portfolio.invest.ok:
@@ -184,12 +588,24 @@ async def generate_morning_report(
         else asyncio.sleep(0, result="")
     )
 
-    prev_snap, past_lessons, (fact_sheet, _, bundles, _), grounding_brief = await asyncio.gather(
+    prev_snap, past_lessons, fact_bundle, grounding_brief = await asyncio.gather(
         db.get_previous_snapshot(min_age_hours=4.0),
         db.get_past_decision_context(limit=5),
-        build_portfolio_fact_sheet(portfolio, market_data, cfg),
+        _assemble_fact_sheet_bundle(portfolio, market_data, cfg, us_only=False, db=db),
         grounding_coro,
     )
+    (
+        fact_sheet,
+        _tech_map,
+        bundles,
+        macro,
+        _histories,
+        evals,
+        _disagreements,
+        disagreement_text,
+        calendar_alerts,
+        context_pack,
+    ) = fact_bundle
 
     trade_ctx = build_trade_context(
         portfolio,
@@ -198,7 +614,15 @@ async def generate_morning_report(
         max_summary_lines=10,
         bundles=bundles,
     )
-    diff_text = _compute_portfolio_diff_text(portfolio, prev_snap)
+    cash_flow_text = trade_ctx.get("cash_flow_summary_text") or "（近30天无外部出入金或派息流水）"
+    diff_text = _compute_portfolio_diff_text(
+        portfolio,
+        prev_snap,
+        cash_flow_summary_text=trade_ctx.get("cash_flow_summary_text", ""),
+    )
+    context_pack["cash_flow_summary"] = cash_flow_text
+    context_pack["portfolio_diff"] = diff_text
+
     us_sched = get_us_market_schedule_uk()
     uk_bank_holiday = is_uk_bank_holiday()
     now_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
@@ -211,13 +635,17 @@ async def generate_morning_report(
         dst_note = "今日美股休市"
     if uk_bank_holiday:
         dst_note += " | 🇬🇧 今日英国 Bank Holiday（LSE 休市，英股/LSE ETF 暂不成交，按下一开盘日预案）"
+    extra_alerts = [a for a in calendar_alerts if "英国 Bank Holiday" not in a]
+    if extra_alerts:
+        dst_note += " | " + "；".join(extra_alerts)
 
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
         f"=== 一、双账户状态 ===\n"
         f"【Stocks ISA】\n{format_account_overview(portfolio.isa)}\n持仓：\n{format_positions_text(portfolio.isa)}\n\n"
         f"【Invest】\n{format_account_overview(portfolio.invest)}\n持仓：\n{format_positions_text(portfolio.invest)}\n\n"
-        f"【净值变动】{diff_text}\n\n"
+        f"【净值变动与出入金归因】{diff_text}\n"
+        f"【近{cfg.strategy.order_history_days}天出入金与派息流水（区分外部资金与交易盈亏）】\n{cash_flow_text}\n\n"
         f"【当前活动挂单（含市场现价/目标价）】\n{trade_ctx['pending_orders_text']}\n\n"
         f"【近7天实盘成交】\n{trade_ctx['recent_trades_text']}\n\n"
         f"【近{cfg.strategy.order_history_days}天行为统计】\n{trade_ctx['trade_summary_30d_text']}\n\n"
@@ -231,13 +659,14 @@ async def generate_morning_report(
         llm=llm,
         search_model=cfg.models.report_search_model,
         ops_notifier=ops_notifier,
+        db=db,
     )
 
     # ---------- Step 2A: Opportunity & Portfolio Analyst ----------
     analyst_sys = build_agent_system_instruction(
         "你是组合机会分析师（Bull/Opportunity 视角）。请基于用户提供的唯一真实事实数据，用干货要点输出完整内部研报草稿供 PM 拍板（1200 字内）：\n"
         "1. 宏观利率/汇率主线与今日整体交易气候；\n"
-        "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点；\n"
+        "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
         "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
         "4. 近 7 日财报事件应对预案。\n"
         "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与实时 Google Search 摘要已涵盖持仓及挂单的量价、目标价、财报日与最新新闻，"
@@ -255,7 +684,9 @@ async def generate_morning_report(
         "3. 【活动挂单零情面独立审计】：逐一核查【当前活动挂单】！"
         "无论挂单是用户手动下单还是前序 AI 建议，结合当前现价、均线位置、分析师目标价、"
         f"{cfg.strategy.uk_stamp_duty_pct:.1f}% 印花税/{cfg.strategy.fx_fee_pct * 2:.2f}% 往返换汇费以及 {cfg.strategy.cash_interest_rate_pct:.1f}% 现金利息门槛——"
-        "只要限价过高、向上空间不足或逆势风险大，必须敢于直白裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！",
+        "只要限价过高、向上空间不足或逆势风险大，必须敢于直白裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！\n"
+        # [用户授权调整] 1200 字草稿集中用于异动/分歧/挂单；IMP-12 请保留。
+        "4. 篇幅聚焦：常规无异常 HOLD 持仓合并略过，把 1200 字集中分配给异动标的、分歧标的与活动挂单。",
         cfg.strategy,
     )
     auditor_prompt = f"【任务：独立风控与挂单审计官（Bear 视角，深度审计并保留完整依据，1200 字内）】\n{shared_context}"
@@ -288,22 +719,34 @@ async def generate_morning_report(
 
     # ---------- Step 3: Portfolio Manager Structured Synthesis ----------
     pm_sys = build_agent_system_instruction(
-        "你是最终投资组合经理（Portfolio Manager），负责拍板权衡「机会分析师」与「独立风控审计官」的冲突并输出结构化今日总纲（严格遵守 JSON Schema）。\n"
+        "你是最终投资组合经理（Portfolio Manager），负责拍板权衡「机会分析师（Bull）」与「独立风控审计官（Bear）」的冲突并输出结构化今日总纲（严格遵守 JSON Schema）。\n"
         "严格去重与排版准则（违反将导致重要信息被截断）：\n"
+        "• 对【本地多空证据冲突对照】中列出的标的，必须正面裁决采纳 Bull 还是 Bear 依据，严禁和稀泥。\n"
         "• `top_actions`【只放现有持仓的 ADD/TRIM/STOP/HOLD】（1~3条）；所有活动挂单的撤改留在 `pending_order_audits`，严禁把 CANCEL_ORDER/MODIFY_ORDER 重复写进 `top_actions`！\n"
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
         "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=35字）。\n"
-        "• 全文必须精炼直白，控制在 1250 字左右（绝不可超 1500 字），确保财报预警与操作复盘完整展示。",
+        # [用户授权调整] /report 目标篇幅调至 1500~1650 字、安全天花板 1800 字；IMP-12 请保留。
+        "• 全文必须精炼直白，控制在 1500~1650 字左右（绝不可超 1800 字），确保财报预警与操作复盘完整展示。",
         cfg.strategy,
+    )
+    calendar_block = (
+        "=== 市场日历与休市/半日市提醒 ===\n" + "\n".join(f"• {a}" for a in calendar_alerts) + "\n\n"
+        if calendar_alerts
+        else ""
     )
     pm_prompt = (
         f"=== 历史决策回顾 (Memory Log) ===\n{past_lessons}\n\n"
-        f"=== 账户速览 ===\nISA 现金 {portfolio.isa.account_currency} {portfolio.isa.total_cash:,.2f} ({portfolio.isa.cash_ratio_pct:.1f}% | 可用 {portfolio.isa.available_to_trade:,.2f}) | "
+        + calendar_block
+        + f"=== 账户速览与净值变动 ===\n"
+        f"ISA 现金 {portfolio.isa.account_currency} {portfolio.isa.total_cash:,.2f} ({portfolio.isa.cash_ratio_pct:.1f}% | 可用 {portfolio.isa.available_to_trade:,.2f}) | "
         f"Invest 现金 {portfolio.invest.account_currency} {portfolio.invest.total_cash:,.2f} ({portfolio.invest.cash_ratio_pct:.1f}%)\n"
+        f"净值变动：{diff_text}\n"
+        f"资金流水：{cash_flow_text}\n"
         f"活动挂单：\n{trade_ctx['pending_orders_text']}\n\n"
-        f"=== 机会分析师报告 ===\n{analyst_notes}\n\n"
-        f"=== 独立风控审计官挑刺与挂单审计 ===\n{auditor_notes}"
+        f"=== 本地多空证据冲突对照 (Bull vs Bear Disagreement Matrix) ===\n{disagreement_text}\n\n"
+        f"=== 机会分析师报告 (Bull) ===\n{analyst_notes}\n\n"
+        f"=== 独立风控审计官挑刺与挂单审计 (Bear) ===\n{auditor_notes}"
     )
 
     raw_pm = await llm.generate(
@@ -327,27 +770,145 @@ async def generate_morning_report(
         alert_source="report_pm",
     )
     holiday_banner = "🇬🇧 今日英国 Bank Holiday（LSE 休市，英股/LSE ETF 暂不交易）\n\n" if uk_bank_holiday else ""
-    max_body_chars = 1500 - len(holiday_banner)
-    # TODO(IMP-12): [接自 IMP-07] decision 非空时先调用 apply_risk_override_guardrail(decision, portfolio=portfolio, macro=macro, strategy=cfg.strategy, bundle_map=bundles, evals=evals) 取修正后 decision 再渲染。
+    # [用户授权调整] /report 安全天花板由 1500 放宽至 1800（Prompt 控制 1500~1650 字）；IMP-12 接线时请保留 1800 上限。
+    max_body_chars = 1800 - len(holiday_banner)
     if decision is not None:
-        final_report = holiday_banner + render_morning_report(decision, max_chars=max_body_chars)
-        guardrails = list(decision.daily_vetoes)
-        actions_summary = "; ".join(
-            f"[{a.account}] {a.action} {a.symbol}({a.price_zone})" for a in decision.top_actions[:4]
+        override_res = apply_risk_override_guardrail(
+            decision,
+            portfolio=portfolio,
+            macro=macro,
+            strategy=cfg.strategy,
+            bundle_map=bundles,
+            evals=evals,
         )
-        short_conclusion = f"{decision.headline} | 重点动作: {actions_summary}"
+        resolved_decision = override_res.decision if isinstance(override_res.decision, MorningReportDecision) else decision
+        final_report = holiday_banner + render_morning_report(
+            resolved_decision,
+            max_chars=max_body_chars,
+            risk_override=override_res,
+        )
+        guardrails = list(resolved_decision.daily_vetoes)
+        actions_summary = "; ".join(
+            f"[{a.account}] {a.action} {a.symbol}({a.price_zone})" for a in resolved_decision.top_actions[:4]
+        )
+        short_conclusion = f"{resolved_decision.headline} | 重点动作: {actions_summary}"
     else:
         logger.warning("Morning PM structured parse fell back to plain text.")
         final_report = holiday_banner + resolved_pm_raw[:max_body_chars]
         guardrails = []
         short_conclusion = _extract_conclusion_fallback(final_report)
 
-    # TODO(IMP-12): [接自 IMP-04] 当 portfolio.is_fallback 为 True 时必须跳过 db.save_snapshot(portfolio)，防降级缓存污染最新快照；
-    # 同时在 _compute_portfolio_diff_text() 与早报中消费 recent_transactions / recent_dividends / cash_flow_summary_text。
-    await db.save_snapshot(portfolio)
+    if not portfolio.is_fallback:
+        await db.save_snapshot(portfolio)
+    else:
+        logger.warning("Skipping save_snapshot because portfolio is fallback data (%s)", portfolio.fallback_note)
+
     if not final_report.startswith("⚠️"):
-        await db.save_morning_report(final_report, short_conclusion, guardrails=guardrails)
+        await db.save_morning_report(
+            final_report,
+            short_conclusion,
+            guardrails=guardrails,
+            context_pack=context_pack,
+        )
     return final_report
+
+
+def _daily_move_pct_from_hist(hist: pd.DataFrame | None) -> float | None:
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return None
+    closes = pd.to_numeric(hist["Close"], errors="coerce").dropna().astype(float)
+    closes = closes[closes > 0]
+    if len(closes) < 2:
+        return None
+    prev = float(closes.iloc[-2])
+    last = float(closes.iloc[-1])
+    if prev <= 0:
+        return None
+    return ((last / prev) - 1.0) * 100.0
+
+
+def _evaluate_us_anomaly_gate(
+    *,
+    portfolio: PortfolioData,
+    cfg: AppConfig,
+    histories: dict[str, pd.DataFrame],
+    bundles: dict[str, TickerMarketBundle],
+    macro: MacroSnapshot,
+    vix_hist: pd.DataFrame | None,
+    morning_context_pack: dict[str, Any] | None,
+    realtime_quotes: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bool, list[str], list[str]]:
+    """Evaluate local 0-LLM Anomaly Gate for /us sentinel (moves, order proximity, VIX delta)."""
+    move_threshold = float(cfg.strategy.us_anomaly_move_pct)
+    vix_chg_threshold = float(cfg.strategy.us_anomaly_vix_change_pct)
+    quotes = realtime_quotes or {}
+
+    anomaly_syms: list[str] = []
+    reasons: list[str] = []
+
+    us_held_syms = [s for s in portfolio.unique_yahoo_symbols(include_pending=False) if _is_us_symbol(s)]
+    for sym in us_held_syms:
+        move_pct: float | None = None
+        quote = quotes.get(sym)
+        if quote:
+            q_pct = quote.get("change_pct")
+            if q_pct is not None:
+                move_pct = float(q_pct)
+            else:
+                q_cur = quote.get("current_price")
+                q_prev = quote.get("prev_close")
+                if q_cur and q_prev and float(q_prev) > 0:
+                    move_pct = ((float(q_cur) / float(q_prev)) - 1.0) * 100.0
+        if move_pct is None:
+            move_pct = _daily_move_pct_from_hist(histories.get(sym))
+
+        if move_pct is not None and abs(move_pct) >= move_threshold:
+            anomaly_syms.append(sym)
+            reasons.append(f"{sym} 日内/最新日线涨跌 {move_pct:+.2f}%（达异动阈值 ±{move_threshold:.1f}%）")
+
+    for order in portfolio.all_pending_orders():
+        sym = order.yahoo_symbol
+        if not sym or not _is_us_symbol(sym):
+            continue
+        quote = quotes.get(sym) or {}
+        b = bundles.get(sym)
+        hist_sym = histories.get(sym)
+        hist_last = None
+        if hist_sym is not None and not hist_sym.empty and "Close" in hist_sym.columns:
+            c_ser = pd.to_numeric(hist_sym["Close"], errors="coerce").dropna()
+            if not c_ser.empty:
+                hist_last = float(c_ser.iloc[-1])
+        cur_price = quote.get("current_price") or (b.current_price if b else None) or hist_last
+        if cur_price is None or cur_price <= 0:
+            continue
+        for label, trig in (("限价", order.limit_price), ("止损", order.stop_price)):
+            if trig is None or trig <= 0:
+                continue
+            dist_pct = ((cur_price - trig) / trig) * 100.0
+            crossed = (
+                (order.side == "BUY" and cur_price <= trig)
+                or (order.side == "SELL" and label == "止损" and cur_price <= trig)
+                or (order.side == "SELL" and label == "限价" and cur_price >= trig)
+            )
+            if crossed or abs(dist_pct) <= _PENDING_PROXIMITY_PCT:
+                if sym not in anomaly_syms:
+                    anomaly_syms.append(sym)
+                reasons.append(
+                    f"[{order.account}] {sym} {order.side} 挂单{label} {trig:.2f} 临近/触及现价 {cur_price:.2f}（距 {dist_pct:+.2f}%）"
+                )
+
+    vix_chg_pct = _daily_move_pct_from_hist(vix_hist)
+    if vix_chg_pct is None and macro.vix is not None and morning_context_pack:
+        base_vix = (morning_context_pack.get("macro") or {}).get("vix")
+        if base_vix is not None and float(base_vix) > 0:
+            vix_chg_pct = ((macro.vix / float(base_vix)) - 1.0) * 100.0
+
+    if vix_chg_pct is not None and abs(vix_chg_pct) >= vix_chg_threshold:
+        reasons.append(f"VIX 日变动 {vix_chg_pct:+.2f}%（达阈值 ±{vix_chg_threshold:.1f}%）")
+    if macro.vix is not None and macro.vix >= _VIX_DANGER_LEVEL:
+        reasons.append(f"VIX 处于高危水平 {macro.vix:.2f}（>= {_VIX_DANGER_LEVEL:.0f}）")
+
+    return bool(reasons), anomaly_syms, reasons
 
 
 async def generate_us_sentinel(
@@ -359,14 +920,86 @@ async def generate_us_sentinel(
     is_scheduled_premarket: bool = False,
     ops_notifier: OpsNotifier | None = None,
 ) -> str:
-    """Delta US Sentinel (/us & premarket): checks latest US data against FULL /report + vetoes, <= 450 chars."""
+    """Delta US Sentinel (/us & premarket): local Anomaly Gate -> calm LOW <=450 / anomaly search+MEDIUM <=600."""
     sched = get_us_market_schedule_uk()
     portfolio = await t212.get_portfolio(use_cache=not is_scheduled_premarket)
-    fact_sheet, _, bundles, _ = await build_portfolio_fact_sheet(portfolio, market_data, cfg, us_only=True)
-    (morning_report_full, morning_conclusion), guardrails = await asyncio.gather(
+    if not portfolio.isa.ok and not portfolio.invest.ok:
+        return f"⚠️ Trading 212 数据获取失败，无法执行美股哨兵：\nISA: {portfolio.isa.error}\nInvest: {portfolio.invest.error}"
+
+    us_held_syms = [s for s in portfolio.unique_yahoo_symbols(include_pending=False) if _is_us_symbol(s)]
+    us_tracked_syms = [s for s in portfolio.unique_yahoo_symbols(include_pending=True) if _is_us_symbol(s)]
+
+    async def _fetch_vix_hist() -> dict[str, pd.DataFrame]:
+        try:
+            return await market_data.get_histories(["^VIX"], period="1mo")
+        except Exception as exc:
+            logger.debug("VIX history fetch failed in /us gate: %s", exc)
+            return {}
+
+    async def _fetch_us_quotes() -> dict[str, dict[str, Any]]:
+        if not getattr(getattr(market_data, "finnhub", None), "enabled", False) or not us_tracked_syms:
+            return {}
+        pairs = await asyncio.gather(
+            *(market_data.get_us_realtime_quote(sym) for sym in us_tracked_syms),
+            return_exceptions=True,
+        )
+        out: dict[str, dict[str, Any]] = {}
+        for sym, res in zip(us_tracked_syms, pairs):
+            if isinstance(res, dict) and res:
+                out[sym] = res
+        return out
+
+    (
+        fact_bundle,
+        (morning_report_full, morning_conclusion),
+        guardrails,
+        morning_pack,
+        vix_hist_map,
+        realtime_quotes,
+    ) = await asyncio.gather(
+        _assemble_fact_sheet_bundle(portfolio, market_data, cfg, us_only=True, db=db),
         db.get_morning_context(include_premarket=False),
         db.get_daily_guardrails(),
+        db.get_context_pack(allow_fallback=False),
+        _fetch_vix_hist(),
+        _fetch_us_quotes(),
     )
+    (
+        fact_sheet,
+        _tech_map,
+        bundles,
+        macro,
+        histories,
+        _evals,
+        _disagreements,
+        _disagreement_text,
+        calendar_alerts,
+        _context_pack,
+    ) = fact_bundle
+
+    has_anomaly, anomaly_syms, anomaly_reasons = _evaluate_us_anomaly_gate(
+        portfolio=portfolio,
+        cfg=cfg,
+        histories=histories,
+        bundles=bundles,
+        macro=macro,
+        vix_hist=vix_hist_map.get("^VIX"),
+        morning_context_pack=morning_pack,
+        realtime_quotes=realtime_quotes,
+    )
+
+    us_grounding = ""
+    if has_anomaly and cfg.models.enable_forced_search_grounding:
+        search_targets = anomaly_syms or us_held_syms or us_tracked_syms
+        if search_targets:
+            us_grounding = await run_forced_market_grounding(
+                llm=llm,
+                search_model=cfg.models.search_model,
+                scope="us",
+                symbols=search_targets,
+                ttl_seconds=cfg.app.market_data_ttl_seconds,
+                ops_notifier=ops_notifier,
+            )
 
     trade_ctx = build_trade_context(
         portfolio,
@@ -384,46 +1017,71 @@ async def generate_us_sentinel(
     }.get(sched.phase, sched.phase)
 
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未生成 /report 红线）"
-    morning_baseline = morning_report_full[:1500] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
+    # [用户授权调整] 随 /report 放宽至 1800 同步放宽基线切片；IMP-12 请保留。
+    morning_baseline = morning_report_full[:1800] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
+    gate_block = (
+        "【本地异动门控：已触发深度复核】\n" + "\n".join(f"• {r}" for r in anomaly_reasons)
+        if has_anomaly
+        else (
+            f"【本地异动门控：市场与美股持仓均平稳】"
+            f"（持仓波动均 < ±{cfg.strategy.us_anomaly_move_pct:.1f}%，VIX 变动 < ±{cfg.strategy.us_anomaly_vix_change_pct:.1f}%，无挂单逼近触发）"
+        )
+    )
+    cal_block = "\n" + " | ".join(calendar_alerts) if calendar_alerts else ""
+
     us_sys = build_agent_system_instruction(
         "你是【美股增量哨兵（Delta Sentinel）】。\n"
         "你的唯一职责：以今日晨报 `/report` 全文为绝对基线，结合最新美股行情/新闻/宏观，做一次开盘前二次核验！\n"
         "禁止对早报已决定的英股或正常无异动美股另起炉灶。\n"
-        "严格二选一开头并限制在 380 字以内（绝对不超 450 字，禁用 Markdown # 和 **）：\n"
-        "• 若今日早报之后无颠覆性美股新变量（或休市无新行情）：第一行直接写「✅ 维持早报计划」，"
-        "随后仅用 2~3 条简写：美股开盘执行动作确认、止损核对与财报静默期提醒。\n"
-        "• 若盘前突发新新闻/跳空/宏观剧震真正改变赔率：第一行写「🚨 盘前增量修正」，"
-        "直指要修正 /report 哪一条建议 + 最新数据依据 + 调整后指令。",
+        "严格二选一开头（禁用 Markdown # 和 **）：\n"
+        "• 若今日早报之后无颠覆性美股新变量（或休市无新行情 / 本地异动门控平稳）：第一行直接写「✅ 维持早报计划」，"
+        "随后仅用 2~3 条简写：美股开盘执行动作确认、止损核对与财报静默期提醒（控制在 380 字以内，绝不超 450 字）。\n"
+        "• 若本地异动门控触发且突发新新闻、大幅跳空或宏观剧震真正改变赔率：第一行写「🚨 盘前增量修正」，"
+        "直指要修正 /report 哪一条建议 + 最新数据依据 + 调整后指令（控制在 550 字以内，绝不超 600 字）。",
         cfg.strategy,
     )
     prompt = (
-        f"【任务：美股增量哨兵】当前时段：{phase_desc}（UK {sched.uk_date} {sched.uk_weekday_label}）。\n\n"
+        f"【任务：美股增量哨兵】当前时段：{phase_desc}（UK {sched.uk_date} {sched.uk_weekday_label}{cal_block}）。\n"
+        f"{gate_block}\n\n"
         f"=== 今日 /report 全文（必须对照逐条核验）===\n{morning_baseline}\n\n"
         f"=== 今日风控红线 ===\n{veto_block}\n\n"
         f"=== 最新美股事实与可用现金（ISA {portfolio.isa.available_to_trade:,.2f} GBP | Invest {portfolio.invest.available_to_trade:,.2f} GBP）===\n"
         f"【美股活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"{fact_sheet}"
+        + (f"\n\n=== 异动标的实时 Google Search 归因 ===\n{us_grounding}" if us_grounding else "")
     )
 
-    toolkit = MarketToolkit(
-        market_data,
-        portfolio,
-        llm=llm,
-        search_model=cfg.models.search_model,
-        ops_notifier=ops_notifier,
-    )
+    if has_anomaly:
+        toolkit = MarketToolkit(
+            market_data,
+            portfolio,
+            llm=llm,
+            search_model=cfg.models.search_model,
+            ops_notifier=ops_notifier,
+            db=db,
+        )
+        tools = toolkit.declarations()
+        tool_executor = toolkit.as_executor()
+        us_thinking = cfg.models.us_thinking_level
+    else:
+        tools = None
+        tool_executor = None
+        us_thinking = "LOW"
+
     memo = await llm.generate(
         model=cfg.models.us_sentinel_model,
         prompt=prompt,
         system_instruction=us_sys,
-        thinking_level=cfg.models.us_thinking_level,
-        tools=toolkit.declarations(),
-        tool_executor=toolkit.as_executor(),
+        thinking_level=us_thinking,
+        tools=tools,
+        tool_executor=tool_executor,
         temperature=0.15,
         usage_label="us_sentinel",
     )
     if not memo.startswith("⚠️"):
-        if len(memo) > 450:
-            memo = memo[:449].rstrip() + "…"
+        # [用户授权调整] /us 触发异常修正（「🚨」）放宽至 600 字安全天花板、平稳日保持 450 字，并改按换行边界优雅裁剪。
+        us_max_chars = 600 if (has_anomaly or memo.lstrip().startswith("🚨")) else 450
+        if len(memo) > us_max_chars:
+            memo = trim_text_at_line_boundary(memo, us_max_chars)
         await db.append_premarket_note(memo)
     return memo

@@ -361,7 +361,7 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
                 self.assertNotIn("**", health_msg)
                 self.assertNotIn("#", health_msg)
 
-            # UK Bank Holiday annotation in morning report stays <= 1500 chars
+            # UK Bank Holiday annotation in morning report stays <= 1800 chars
             class _HolidayReportLLM:
                 async def generate(self, **kwargs) -> str:
                     if kwargs.get("response_schema") is MorningReportDecision:
@@ -381,7 +381,7 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
 
             with patch("src.agents.report_agent.is_uk_bank_holiday", return_value=True):
                 rep = await generate_morning_report(cfg, t212, md, _HolidayReportLLM(), db, ops_notifier=ops)
-            self.assertLessEqual(len(rep), 1500)
+            self.assertLessEqual(len(rep), 1800)
             self.assertIn("英国 Bank Holiday（LSE 休市", rep)
 
 
@@ -584,6 +584,263 @@ class TestHomelabOpsNotifyAndHealthcheck(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call_kwargs["headers"]["Authorization"], "Bearer tok")
             self.assertEqual(call_kwargs["json"]["severity"], "CRITICAL")
             self.assertEqual(call_kwargs["json"]["service"], "trading-python")
+
+
+class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
+    async def test_imp11_grounding_semaphore_and_expired_cache_cleanup(self) -> None:
+        from src.agents import tools as tools_mod
+
+        clear_grounding_cache()
+        active = 0
+        max_active = 0
+
+        class _ConcurrencyLLM:
+            async def generate(self, **kwargs) -> str:
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                await asyncio.sleep(0.02)
+                active -= 1
+                return "ok"
+
+        # 21 US symbols -> 7 batches + 1 macro batch = 8 search calls, capped at Semaphore(3)
+        syms = [f"SYM{i}" for i in range(21)]
+        with patch("src.agents.tools._monotonic", return_value=1000.0):
+            out1 = await run_forced_market_grounding(
+                llm=_ConcurrencyLLM(),
+                search_model="gemini-4-hydrogen",
+                scope="report",
+                symbols=syms,
+                ttl_seconds=60,
+            )
+        self.assertIn("ok", out1)
+        self.assertEqual(max_active, 3)
+        self.assertEqual(len(tools_mod._GROUNDING_CACHE), 1)
+
+        # Advance local monotonic clock past TTL=60s; new call should prune expired entry
+        with patch("src.agents.tools._monotonic", return_value=1100.0):
+            await run_forced_market_grounding(
+                llm=_ConcurrencyLLM(),
+                search_model="gemini-4-hydrogen",
+                scope="pick",
+                symbols=["NVDA"],
+                ttl_seconds=60,
+            )
+        self.assertEqual(len(tools_mod._GROUNDING_CACHE), 1)
+        self.assertTrue(any(k.startswith("pick:") for k in tools_mod._GROUNDING_CACHE))
+        clear_grounding_cache()
+
+    async def test_imp11_inspect_ticker_cyq_weekly_exdiv_intel_lessons_and_budget(self) -> None:
+        import json
+        import numpy as np
+        import pandas as pd
+        from src.data_providers.market_data import TickerMarketBundle
+        from src.data_providers.t212_client import PositionItem
+
+        dates = pd.bdate_range("2025-10-01", periods=220)
+        closes = np.linspace(100.0, 145.0, len(dates)) + np.sin(np.arange(len(dates)) / 4.0) * 2.0
+        hist_df = pd.DataFrame(
+            {
+                "Open": closes * 0.995,
+                "High": closes * 1.01,
+                "Low": closes * 0.99,
+                "Close": closes,
+                "Volume": np.full(len(dates), 2_000_000.0),
+            },
+            index=dates,
+        )
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 08:00",
+            fetched_at_ms=1_700_000_000_000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA Corporation",
+                        inst_currency="USD",
+                        isin="US67066G1040",
+                        created_at="2026-09-01T10:00:00Z",
+                        quantity=10.0,
+                        avg_price=120.0,
+                        cur_price=145.0,
+                        current_value=1150.0,
+                        total_cost=950.0,
+                        pnl=200.0,
+                        fx_impact=0.0,
+                        return_pct=21.0,
+                    )
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+
+        class _RichMarketData(MarketDataService):
+            def __init__(self) -> None:
+                self.seen_isin_maps: list[dict[str, str] | None] = []
+                self.deep_intel_calls: list[str] = []
+
+            async def get_bundles(self, symbols, include_news=True, include_earnings=True, isin_map=None, **_kwargs):
+                self.seen_isin_maps.append(isin_map)
+                sym = symbols[0]
+                bundle = TickerMarketBundle(
+                    symbol=sym,
+                    short_name="NVIDIA Corp",
+                    long_name="NVIDIA Corporation",
+                    currency="USD",
+                    quote_type="EQUITY",
+                    sector="Technology",
+                    isin=(isin_map or {}).get(sym) or "",
+                    identity_summary=f"NVIDIA Corporation (NVDA | US67066G1040 | Technology) " + ("X" * 80),
+                    current_price=145.0,
+                    ex_dividend_date="2026-11-18",
+                    days_to_ex_dividend=3,
+                    news=[
+                        {"date": f"2026-11-1{i}", "title": f"Headline {i} " + ("Y" * 180), "publisher": "Wire"}
+                        for i in range(1, 7)
+                    ],
+                )
+                return {sym: hist_df}, {sym: bundle}
+
+            async def get_us_deep_intel(self, symbol: str):
+                self.deep_intel_calls.append(symbol)
+                return {
+                    "symbol": symbol,
+                    "recommendations": [{"period": "2026-11-01", "strong_buy": 20, "buy": 15, "hold": 3, "sell": 0, "strong_sell": 0}],
+                    "earnings_surprises": [{"period": "2026-09-30", "surprise_pct": 8.4}],
+                    "insider_sentiment": {"mspr": 12.5, "change": 4500},
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp11.db")
+            await db.init()
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-01 09:00",
+                        "symbol": "NVDA",
+                        "account": "ISA",
+                        "action": "BUY",
+                        "entry_price": 130.0,
+                        "benchmark_symbol": "SPY",
+                    }
+                ]
+            )
+            recent_recs = await db.get_recent_recommendations(limit=1)
+            rec_id = recent_recs[0]["id"]
+            await db.settle_recommendation(
+                rec_id,
+                benchmark_symbol="SPY",
+                settled_at_uk="2026-11-08 21:10",
+                raw_return_pct=5.2,
+                alpha_pct=2.8,
+                reflection_lesson="回踩MA20缩量企稳后买点胜率高。",
+            )
+
+            md = _RichMarketData()
+            toolkit = MarketToolkit(md, portfolio, db=db)
+
+            # 1) Held symbol passes ISIN, gets CYQ/weekly/ex_div/deep_intel/past_lessons & stays < 4000 chars
+            res = await toolkit.execute("inspect_ticker", {"symbol": "NVDA"})
+            self.assertEqual(md.seen_isin_maps[0], {"NVDA": "US67066G1040"})
+            self.assertEqual(md.deep_intel_calls, ["NVDA"])
+            self.assertIsNotNone(res["cyq"])
+            self.assertIsNotNone(res["weekly_bullish"])
+            self.assertEqual(res["ex_dividend_date"], "2026-11-18")
+            self.assertEqual(res["days_to_ex_dividend"], 3)
+            self.assertIn("筹码", res["summary"])
+            self.assertIn("周多头", res["summary"])
+            self.assertIn("机构评级", res["us_deep_intel"])
+            self.assertEqual(len(res["past_lessons"]), 1)
+            self.assertIn("回踩MA20", res["past_lessons"][0])
+            self.assertEqual(len(res["news"]), 3)
+            self.assertLess(len(json.dumps(res, ensure_ascii=False, default=str)), 4000)
+
+            # 2) Unheld symbol passes isin_map=None gracefully
+            res_unheld = await toolkit.execute("inspect_ticker", {"symbol": "MSFT"})
+            self.assertIsNone(md.seen_isin_maps[1])
+            self.assertEqual(res_unheld["past_lessons"], [])
+
+            await db.close()
+
+    async def test_imp11_check_portfolio_correlation_uses_get_histories_and_isf_l(self) -> None:
+        import numpy as np
+        import pandas as pd
+        from src.data_providers.t212_client import PositionItem
+
+        dates = pd.bdate_range("2026-06-01", periods=90)
+        rng = np.random.default_rng(7)
+        spy_c = 500.0 * np.cumprod(1.0 + rng.normal(0.0005, 0.01, len(dates)))
+        isf_c = 800.0 * np.cumprod(1.0 + rng.normal(0.0003, 0.009, len(dates)))
+        azn_c = 12000.0 * np.cumprod(1.0 + rng.normal(0.0004, 0.012, len(dates)))
+        nvda_c = 130.0 * np.cumprod(1.0 + rng.normal(0.0008, 0.018, len(dates)))
+
+        def _df(c: np.ndarray) -> pd.DataFrame:
+            return pd.DataFrame(
+                {"Open": c * 0.995, "High": c * 1.01, "Low": c * 0.99, "Close": c, "Volume": np.full(len(c), 1_000_000.0)},
+                index=dates,
+            )
+
+        hist_map = {"SPY": _df(spy_c), "ISF.L": _df(isf_c), "AZN.L": _df(azn_c), "NVDA": _df(nvda_c)}
+
+        class _HistOnlyMarketData(MarketDataService):
+            def __init__(self) -> None:
+                self.called_histories: list[tuple[list[str], str]] = []
+                self.called_bundles = False
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                self.called_histories.append((list(symbols), period))
+                return {s: hist_map[s] for s in symbols if s in hist_map}
+
+            async def get_bundles(self, *args, **kwargs):
+                self.called_bundles = True
+                raise AssertionError("check_portfolio_correlation must not call get_bundles")
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-15 08:00",
+            fetched_at_ms=1_700_000_000_000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="AZNl_EQ",
+                        ticker="AZN",
+                        yahoo_symbol="AZN.L",
+                        name="AstraZeneca",
+                        inst_currency="GBp",
+                        quantity=10.0,
+                        avg_price=11500.0,
+                        cur_price=12000.0,
+                        current_value=1200.0,
+                        total_cost=1150.0,
+                        pnl=50.0,
+                        fx_impact=0.0,
+                        return_pct=4.3,
+                    )
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        md = _HistOnlyMarketData()
+        toolkit = MarketToolkit(md, portfolio)
+        res = await toolkit.execute("check_portfolio_correlation", {"symbol": "NVDA"})
+
+        self.assertFalse(md.called_bundles)
+        self.assertEqual(len(md.called_histories), 1)
+        fetched_syms, period = md.called_histories[0]
+        self.assertEqual(period, "1y")
+        self.assertIn("SPY", fetched_syms)
+        self.assertIn("ISF.L", fetched_syms)
+        self.assertEqual(res["candidate"], "NVDA")
+        self.assertEqual(res["most_correlated_holding"], "AZN.L")
+        self.assertIsNotNone(res["max_correlation_60d"])
 
 
 if __name__ == "__main__":

@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+if TYPE_CHECKING:
+    from src.engine.portfolio_rules import RiskOverrideResult
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
+_GUARDRAIL_TAG = "[🛡️风控护栏修正]"
 
 
 class ReportActionItem(BaseModel):
@@ -29,6 +33,40 @@ class PendingOrderAuditItem(BaseModel):
     reason: str = Field(description="结合现价、均线、目标价及印花税/换汇成本给出的一句话审计结论（不超过38字）")
 
 
+class FlaggedPositionItem(BaseModel):
+    symbol: str = Field(description="标的代码，如 NVDA、ULVR.L")
+    summary: str = Field(description="一句话异动/观察摘要（不超过40字）")
+
+
+def _coerce_flagged_position_str(raw: str) -> FlaggedPositionItem | None:
+    text = raw.strip().lstrip("•-* ").strip()
+    if not text:
+        return None
+    m = re.match(
+        r"^([A-Za-z0-9]{1,12}(?:\.[A-Za-z]{1,4})?)(?:\s*[\[\(][^\]\)]*[\]\)])?\s*(?:[:：—\-]\s*|\s+|$)(.*)$",
+        text,
+    )
+    if m:
+        cand_sym = m.group(1).strip().upper()
+        rest = m.group(2).strip()
+        if any(c.isalpha() for c in cand_sym) and not rest.startswith("/"):
+            return FlaggedPositionItem(symbol=cand_sym, summary=rest)
+    return FlaggedPositionItem(symbol="", summary=text)
+
+
+def _as_flagged_position_item(item: Any) -> FlaggedPositionItem | None:
+    if isinstance(item, FlaggedPositionItem):
+        return FlaggedPositionItem(symbol=item.symbol.strip(), summary=item.summary.strip())
+    if isinstance(item, dict):
+        return FlaggedPositionItem(
+            symbol=str(item.get("symbol") or "").strip(),
+            summary=str(item.get("summary") or "").strip(),
+        )
+    if isinstance(item, str):
+        return _coerce_flagged_position_str(item)
+    return _coerce_flagged_position_str(str(item))
+
+
 class MorningReportDecision(BaseModel):
     headline: str = Field(description="一句话定调今日核心策略与现金态度（不超过45字）")
     top_actions: list[ReportActionItem] = Field(
@@ -45,7 +83,7 @@ class MorningReportDecision(BaseModel):
     )
     macro_and_cash: str = Field(description="宏观利率/VIX/汇率与4%现金安全垫精炼要点（不超过90字）")
     account_diagnosis: str = Field(description="ISA与Invest净值、FX影响、行业/跨账户集中度痛点（不超过130字）")
-    flagged_positions: list[str] = Field(
+    flagged_positions: list[FlaggedPositionItem] = Field(
         default_factory=list,
         description="仅列出【未在 top_actions 与 pending_order_audits 中出现过】的其他异动/破位/观察持仓，每条<=40字（最多4条，严禁与上方重复）",
     )
@@ -55,6 +93,20 @@ class MorningReportDecision(BaseModel):
         default_factory=list,
         description="近7日财报预警与应对预案（每条<=30字，无则为空数组）",
     )
+
+    @field_validator("flagged_positions", mode="before")
+    @classmethod
+    def _normalize_flagged_positions(cls, value: Any) -> list[FlaggedPositionItem]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        normalized: list[FlaggedPositionItem] = []
+        for item in value:
+            coerced = _as_flagged_position_item(item)
+            if coerced is not None:
+                normalized.append(coerced)
+        return normalized
 
 
 class PickActionItem(BaseModel):
@@ -160,32 +212,139 @@ async def parse_or_repair_structured_json(
     return None, raw_text
 
 
+def _is_orphan_header_line(line: str, *, allow_unclosed: bool = False) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("【"):
+        return False
+    if stripped.endswith("】") and len(stripped) >= 3:
+        return True
+    return allow_unclosed and "】" not in stripped
+
+
+def _strip_trailing_orphan_headers(section: str, *, allow_unclosed: bool = False) -> str:
+    lines = section.splitlines()
+    while lines and (
+        not lines[-1].strip()
+        or _is_orphan_header_line(lines[-1], allow_unclosed=allow_unclosed)
+    ):
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _fit_max_chars(sections: list[str], max_chars: int) -> str:
-    """Keep top priority sections intact and gracefully trim tail sections if over max_chars."""
-    text = "\n\n".join(s for s in sections if s.strip())
+    """Keep top priority sections intact and gracefully trim tail sections without leaving orphan headers."""
+    if max_chars <= 0:
+        return ""
+    kept = [
+        cleaned
+        for s in sections
+        if s and (cleaned := _strip_trailing_orphan_headers(s))
+    ]
+    if not kept:
+        return ""
+    text = "\n\n".join(kept)
     if len(text) <= max_chars:
         return text
 
     # Drop optional/lower sections progressively from the end while keeping sections[0] (top actions)
-    kept = [s for s in sections if s.strip()]
     while len(kept) > 1 and len("\n\n".join(kept)) > max_chars:
         last = kept[-1]
         lines = last.splitlines()
         if len(lines) > 2:
-            kept[-1] = "\n".join(lines[:-1])
+            trimmed = _strip_trailing_orphan_headers("\n".join(lines[:-1]))
+            if trimmed:
+                kept[-1] = trimmed
+            else:
+                kept.pop()
         else:
             kept.pop()
 
     joined = "\n\n".join(kept)
-    if len(joined) > max_chars:
-        return joined[: max_chars - 1].rstrip() + "…"
-    return joined
+    if len(joined) <= max_chars:
+        return joined
+    if max_chars == 1:
+        return joined[:1]
+
+    sliced = joined[: max_chars - 1].rstrip()
+    sliced_lines = sliced.splitlines()
+    while len(sliced_lines) > 1 and (
+        not sliced_lines[-1].strip()
+        or _is_orphan_header_line(sliced_lines[-1], allow_unclosed=True)
+    ):
+        sliced_lines.pop()
+    result = "\n".join(sliced_lines).rstrip() or sliced
+    return result + "…"
 
 
-# TODO(IMP-10): [接自 IMP-07] 配合 portfolio_rules.apply_risk_override_guardrail() 返回的 RiskOverrideResult.notes/overrides，
-# 在 render_morning_report / render_pick_report 中统一高亮展示 [🛡️风控护栏修正] 标记，并升级 flagged_positions 结构化去重。
-def render_morning_report(decision: MorningReportDecision, max_chars: int = 1500) -> str:
+def trim_text_at_line_boundary(text: str, max_chars: int) -> str:
+    """Trim multi-line text at newline boundaries before falling back to hard slicing."""
+    cleaned = text.strip()
+    if max_chars <= 0:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+    lines = cleaned.splitlines()
+    while len(lines) > 1 and len("\n".join(lines)) > max_chars:
+        lines.pop()
+        while lines and (not lines[-1].strip() or _is_orphan_header_line(lines[-1])):
+            lines.pop()
+    candidate = "\n".join(lines).rstrip()
+    if candidate and len(candidate) <= max_chars:
+        return candidate
+    if max_chars == 1:
+        return cleaned[:1]
+    return cleaned[: max_chars - 1].rstrip() + "…"
+
+
+def _format_guardrail_note(text: str) -> str:
+    cleaned = text.strip().lstrip("•-* ").strip()
+    if not cleaned:
+        return ""
+    if _GUARDRAIL_TAG in cleaned:
+        return cleaned
+    return f"{_GUARDRAIL_TAG} {cleaned}"
+
+
+def _extract_override_notes(risk_override: Any) -> list[str]:
+    if risk_override is None:
+        return []
+    notes = list(getattr(risk_override, "notes", None) or [])
+    formatted: list[str] = []
+    seen: set[str] = set()
+    for note in notes:
+        fn = _format_guardrail_note(str(note))
+        if fn and fn not in seen:
+            seen.add(fn)
+            formatted.append(fn)
+    if formatted:
+        return formatted
+    for ov in getattr(risk_override, "overrides", None) or []:
+        acct = str(getattr(ov, "account", "") or "").strip()
+        sym = str(getattr(ov, "symbol", "") or "").strip()
+        from_act = str(getattr(ov, "from_action", "") or "").strip()
+        to_act = str(getattr(ov, "to_action", "") or "").strip()
+        reason = str(getattr(ov, "reason", "") or "").strip()
+        prefix = f"[{acct}] {sym}" if acct else sym
+        raw = f"{prefix}: {from_act}→{to_act}（{reason}）" if reason else f"{prefix}: {from_act}→{to_act}"
+        fn = _format_guardrail_note(raw)
+        if fn and fn not in seen:
+            seen.add(fn)
+            formatted.append(fn)
+    return formatted
+
+
+# [用户授权调整] /report 渲染默认安全天花板由 1500 放宽至 1800（Prompt 软约束 1500~1650 字）。
+def render_morning_report(
+    decision: MorningReportDecision,
+    max_chars: int = 1800,
+    *,
+    risk_override: RiskOverrideResult | None = None,
+) -> str:
     """Render MorningReportDecision as inverted-pyramid Telegram report strictly <= max_chars with zero overlap."""
+    ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
+    if isinstance(ro_decision, MorningReportDecision):
+        decision = ro_decision
+
     audited_orders = {(a.account.strip().upper(), a.symbol.strip().upper()) for a in decision.pending_order_audits}
     filtered_actions = [
         act
@@ -200,6 +359,10 @@ def render_morning_report(decision: MorningReportDecision, max_chars: int = 1500
     for idx, act in enumerate(filtered_actions[:4], 1):
         pz = f" @ {act.price_zone}" if act.price_zone else ""
         action_lines.append(f"{idx}. [{act.account}] {act.action} {act.symbol}{pz} — {act.reason}")
+
+    override_notes = _extract_override_notes(risk_override)
+    for note in override_notes[:4]:
+        action_lines.append(f"• {note}")
 
     if decision.pending_order_audits:
         action_lines.append("【活动挂单裁决】")
@@ -217,42 +380,71 @@ def render_morning_report(decision: MorningReportDecision, max_chars: int = 1500
         f"• 今日风控红线：{veto_str}"
     )
 
-    covered_syms = {
-        act.symbol.strip().upper().split(".")[0] for act in filtered_actions
-    } | {
-        aud.symbol.strip().upper().split(".")[0] for aud in decision.pending_order_audits
-    }
+    covered_syms: set[str] = set()
+    for act in filtered_actions:
+        sym_up = act.symbol.strip().upper()
+        if sym_up and sym_up != "CASH":
+            covered_syms.add(sym_up)
+            covered_syms.add(sym_up.split(".")[0])
+    for aud in decision.pending_order_audits:
+        sym_up = aud.symbol.strip().upper()
+        if sym_up and sym_up != "CASH":
+            covered_syms.add(sym_up)
+            covered_syms.add(sym_up.split(".")[0])
+
     pos_lines: list[str] = []
     if decision.earnings_watch:
         pos_lines.append("• 近7日财报预警：" + " | ".join(decision.earnings_watch[:4]))
     if decision.trade_review:
         pos_lines.append(f"• 操作复盘：{decision.trade_review}")
-    for line in decision.flagged_positions[:5]:
-        # Skip position blurbs that merely repeat symbols already given explicit actions/audits above
-        prefix = (
-            line.strip()
-            .lstrip("•-* ")
-            .split(":")[0]
-            .split("：")[0]
-            .split("[")[0]
-            .split("(")[0]
-            .split("—")[0]
-            .strip()
-            .upper()
-        )
-        head_token = prefix.split()[0].split(".")[0] if prefix else ""
-        if head_token and head_token in covered_syms and "/" not in head_token:
+    for raw_item in decision.flagged_positions[:5]:
+        item = _as_flagged_position_item(raw_item)
+        if item is None:
             continue
-        pos_lines.append(f"• {line}")
+        sym = item.symbol.strip()
+        summary = item.summary.strip()
+        if not sym and not summary:
+            continue
+        if sym:
+            sym_up = sym.upper()
+            sym_base = sym_up.split(".")[0]
+            if "/" not in sym_up and (sym_up in covered_syms or sym_base in covered_syms):
+                continue
+            if not summary:
+                pos_lines.append(f"• {sym}")
+            elif re.match(rf"^{re.escape(sym)}\s*[:：]", summary, flags=re.IGNORECASE):
+                pos_lines.append(f"• {summary}")
+            else:
+                pos_lines.append(f"• {sym}: {summary}")
+        else:
+            pos_lines.append(f"• {summary}")
     if decision.hold_summary:
         pos_lines.append(f"• 常规持有：{decision.hold_summary}")
 
-    sec3 = "【财报预警、复盘与重点异动】\n" + "\n".join(pos_lines)
+    sec3 = "【财报预警、复盘与重点异动】\n" + "\n".join(pos_lines) if pos_lines else ""
     return _fit_max_chars([sec1, sec2, sec3], max_chars=max_chars)
 
 
-def render_pick_report(decision: PickDecision, max_chars: int = 1000) -> str:
+def render_pick_report(
+    decision: PickDecision,
+    max_chars: int = 1000,
+    *,
+    risk_override: RiskOverrideResult | None = None,
+) -> str:
     """Render PickDecision as inverted-pyramid Telegram pick brief strictly <= max_chars."""
+    ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
+    if isinstance(ro_decision, PickDecision):
+        decision = ro_decision
+
+    guardrail_notes = _extract_override_notes(risk_override)
+    seen_guardrails = set(guardrail_notes)
+    for rej in decision.rejected_or_frozen:
+        if _GUARDRAIL_TAG in rej:
+            fn = _format_guardrail_note(rej)
+            if fn and fn not in seen_guardrails:
+                seen_guardrails.add(fn)
+                guardrail_notes.append(fn)
+
     sec1_lines = [f"📌 本轮结论：{decision.headline}"]
     if not decision.selected_actions:
         sec1_lines.append("• ⚪ 今日无高赔率新机会通过风控审核，建议保留现金继续享 4.0% 年化利息。")
@@ -263,12 +455,18 @@ def render_pick_report(decision: PickDecision, max_chars: int = 1000) -> str:
                 f"   逻辑：{item.thesis}\n"
                 f"   区间：{item.entry_zone} | 止损：{item.stop_condition} | 目标：{item.target_window}"
             )
+    for gnote in guardrail_notes[:4]:
+        sec1_lines.append(f"• {gnote}")
     sec1 = "【本轮精选行动（四要素直给）】\n" + "\n".join(sec1_lines)
 
     sec2_lines = []
     if decision.consistency_and_cash_note:
         sec2_lines.append(f"• 基线与现金：{decision.consistency_and_cash_note}")
-    for rej in decision.rejected_or_frozen[:4]:
+    remaining_rejections = [
+        rej for rej in decision.rejected_or_frozen
+        if _format_guardrail_note(rej) not in seen_guardrails
+    ]
+    for rej in remaining_rejections[:4]:
         sec2_lines.append(f"• 驳回/冻结：{rej}")
     sec2 = "【风控审查与现金约束】\n" + "\n".join(sec2_lines) if sec2_lines else ""
 

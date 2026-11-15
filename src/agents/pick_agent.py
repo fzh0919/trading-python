@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction
@@ -16,21 +18,333 @@ from src.config import AppConfig
 
 if TYPE_CHECKING:
     from src.ops_notifier import OpsNotifier
-from src.data_providers.analytics import compute_exposure_summary, compute_technical_snapshot
-from src.data_providers.market_data import MarketDataService
+from src.data_providers.analytics import (
+    compute_correlation_matrix,
+    compute_exposure_summary,
+    compute_technical_snapshot,
+    max_correlation_against_portfolio,
+    resolve_market_benchmark,
+)
+from src.data_providers.market_data import MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import (
+    PortfolioData,
     T212Client,
     build_trade_context,
     format_account_overview,
-    format_positions_text,
 )
-from src.engine.calendar_utils import get_us_market_schedule_uk, is_uk_bank_holiday
-from src.engine.portfolio_rules import evaluate_portfolio, format_evaluations_text
-from src.engine.screener import run_quant_screener
+from src.engine.calendar_utils import get_market_calendar_alerts, get_us_market_schedule_uk
+from src.engine.portfolio_rules import (
+    HoldingEvaluation,
+    apply_risk_override_guardrail,
+    evaluate_portfolio,
+    format_evaluations_text,
+)
+from src.engine.screener import ScreenerCandidate, run_quant_screener
 from src.storage.db import AdvisorDatabase
 
 logger = logging.getLogger(__name__)
 LONDON_TZ = ZoneInfo("Europe/London")
+
+
+def _extract_holding_context(portfolio: PortfolioData) -> tuple[dict[str, str], dict[str, str]]:
+    """Extract per-symbol ISIN and earliest open timestamp from live portfolio positions."""
+    isin_map: dict[str, str] = {}
+    created_at_map: dict[str, str] = {}
+    for pos in portfolio.all_positions():
+        sym = pos.yahoo_symbol
+        if pos.isin and pos.isin.strip():
+            isin_map.setdefault(sym, pos.isin.strip().upper())
+        if pos.created_at and pos.created_at.strip():
+            ts = pos.created_at.strip()
+            existing = created_at_map.get(sym)
+            if existing is None or ts < existing:
+                created_at_map[sym] = ts
+    return isin_map, created_at_map
+
+
+def _lookup_ci(mapping: dict[str, Any], symbol: str) -> Any:
+    """Case-insensitive lookup in a symbol-keyed dict."""
+    if symbol in mapping:
+        return mapping[symbol]
+    sym_up = symbol.strip().upper()
+    for k, v in mapping.items():
+        if k.strip().upper() == sym_up:
+            return v
+    return None
+
+
+def _format_lessons_section(
+    recent_lessons: list[dict[str, Any]],
+    symbol_lessons: dict[str, list[dict[str, Any]]],
+    horizon_days: int,
+) -> str:
+    """Format compact T+N reflection lessons for Researcher & Risk Critic prompts."""
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    lines: list[str] = []
+
+    def _append_row(row: dict[str, Any]) -> None:
+        lesson = str(row.get("reflection_lesson") or "").strip()
+        if not lesson:
+            return
+        sym = str(row.get("symbol") or "").strip().upper()
+        acct = str(row.get("account") or "").strip()
+        act = str(row.get("action") or "").strip().upper()
+        dt = str(row.get("created_at_uk") or "").strip()
+        key = (dt, acct, sym, act)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        alpha = row.get("alpha_pct")
+        raw_ret = row.get("raw_return_pct")
+        perf_parts: list[str] = []
+        if raw_ret is not None:
+            perf_parts.append(f"收益 {float(raw_ret):+.1f}%")
+        if alpha is not None:
+            perf_parts.append(f"Alpha {float(alpha):+.1f}%")
+        perf = " / ".join(perf_parts) or "已结算"
+        lines.append(f"• [{dt} {acct}] {act} {sym} ({perf}): {lesson[:180]}")
+
+    for row in recent_lessons:
+        _append_row(row)
+    for rows in symbol_lessons.values():
+        for row in rows:
+            _append_row(row)
+
+    if not lines:
+        return f"（暂无已结算的 T+{horizon_days} 选股复盘教训；请严格按四重护栏与交易摩擦门槛审核）"
+    return "\n".join(lines[:8])
+
+
+async def _fetch_candidate_symbol_lessons(
+    db: AdvisorDatabase,
+    symbols: list[str],
+    pack_symbols: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Load per-symbol lessons, reusing ContextPack slices when available."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    to_query: list[str] = []
+    for sym in symbols:
+        pack_entry = _lookup_ci(pack_symbols, sym) if pack_symbols else None
+        if isinstance(pack_entry, dict) and "lessons" in pack_entry:
+            lessons = pack_entry.get("lessons") or []
+            if lessons:
+                out[sym] = list(lessons)
+            continue
+        to_query.append(sym)
+
+    if not to_query:
+        return out
+
+    async def _load_one(sym: str) -> tuple[str, list[dict[str, Any]]]:
+        try:
+            return sym, await db.get_symbol_lessons(sym, limit=2)
+        except Exception as exc:
+            logger.debug("Failed to load symbol lessons for %s: %s", sym, exc)
+            return sym, []
+
+    results = await asyncio.gather(*(_load_one(sym) for sym in to_query))
+    for sym, rows in results:
+        if rows:
+            out[sym] = rows
+    return out
+
+
+def _build_holding_identity_section(
+    tracked_syms: list[str],
+    held_bundles: dict[str, TickerMarketBundle],
+    isin_map: dict[str, str],
+    pack_symbols: dict[str, Any],
+) -> str:
+    """Build compact identity & ex-dividend anchor lines for held/pending symbols."""
+    lines: list[str] = []
+    for sym in tracked_syms:
+        b = held_bundles.get(sym)
+        pack_entry = _lookup_ci(pack_symbols, sym) if pack_symbols else None
+        anchor = ""
+        ex_div_date = None
+        days_to_ex_div = None
+        if b is not None:
+            anchor = b.identity_summary or b.build_identity_anchor(isin_override=isin_map.get(sym))
+            ex_div_date = b.ex_dividend_date
+            days_to_ex_div = b.days_to_ex_dividend
+        if not anchor and isinstance(pack_entry, dict):
+            anchor = str(pack_entry.get("identity_summary") or "").strip()
+        if isinstance(pack_entry, dict) and ex_div_date is None:
+            bsum = pack_entry.get("bundle_summary") or {}
+            if isinstance(bsum, dict):
+                ex_div_date = bsum.get("ex_dividend_date")
+                days_to_ex_div = bsum.get("days_to_ex_dividend")
+        if not anchor and not ex_div_date:
+            continue
+        ex_note = ""
+        if ex_div_date:
+            days_str = f"({days_to_ex_div}天后)" if days_to_ex_div is not None else ""
+            ex_note = f" | 除息日 {ex_div_date}{days_str}"
+        lines.append(f"• {anchor or sym}{ex_note}")
+    return "\n".join(lines)
+
+
+def _collect_high_correlation_symbols(
+    isa_cands: list[ScreenerCandidate],
+    invest_cands: list[ScreenerCandidate],
+    selected_actions: list[Any],
+    held_syms: list[str],
+    all_histories: dict[str, pd.DataFrame],
+    cfg: AppConfig,
+) -> set[str]:
+    """Combine screener overlap warnings with deterministic check on ad-hoc LLM picks."""
+    threshold = cfg.strategy.overlap_correlation_threshold
+    screened_syms: set[str] = set()
+    high_corr: set[str] = set()
+    for c in (*isa_cands, *invest_cands):
+        sym_up = c.symbol.strip().upper()
+        screened_syms.add(sym_up)
+        if c.overlap_warning or (c.max_portfolio_corr is not None and c.max_portfolio_corr >= threshold):
+            high_corr.add(sym_up)
+
+    held_up = {s.strip().upper() for s in held_syms}
+    extra_check_syms: list[str] = []
+    for item in selected_actions:
+        sym = str(getattr(item, "symbol", "") or "").strip()
+        sym_up = sym.upper()
+        act_up = str(getattr(item, "action", "") or "").strip().upper()
+        if act_up not in {"BUY", "ADD"} or not sym_up or sym_up == "CASH":
+            continue
+        if sym_up in screened_syms or sym_up in held_up:
+            continue
+        if _lookup_ci(all_histories, sym) is not None:
+            extra_check_syms.append(sym)
+
+    if extra_check_syms and held_syms:
+        corr_input: dict[str, pd.DataFrame] = {}
+        for hs in held_syms:
+            df = _lookup_ci(all_histories, hs)
+            if df is not None and not df.empty:
+                corr_input[hs] = df
+        target_keys: list[str] = []
+        for sym in extra_check_syms:
+            df = _lookup_ci(all_histories, sym)
+            if df is not None and not df.empty:
+                corr_input[sym] = df
+                target_keys.append(sym)
+        if target_keys:
+            corr_matrix = compute_correlation_matrix(
+                corr_input,
+                [*held_syms, *target_keys],
+                lookback_days=cfg.strategy.correlation_window_days,
+                benchmark_symbol="SPY",
+                uk_benchmark_symbol="ISF.L",
+                eu_benchmark_symbol="EXS1.DE",
+            )
+            for sym in target_keys:
+                _, max_corr = max_correlation_against_portfolio(corr_matrix, sym, held_syms)
+                if max_corr is not None and max_corr >= threshold:
+                    high_corr.add(sym.strip().upper())
+
+    return high_corr
+
+
+async def _post_screen_validate_decision(
+    decision: PickDecision,
+    *,
+    portfolio: PortfolioData,
+    macro: Any,
+    cfg: AppConfig,
+    market_data: MarketDataService,
+    held_bundles: dict[str, TickerMarketBundle],
+    held_histories: dict[str, pd.DataFrame],
+    evals: list[HoldingEvaluation],
+    isa_cands: list[ScreenerCandidate],
+    invest_cands: list[ScreenerCandidate],
+    guardrails: list[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Backfill native entry_price, apply deterministic risk override guardrail, and render."""
+    all_bundles = dict(held_bundles)
+    all_histories = dict(held_histories)
+
+    missing_syms = [
+        item.symbol.strip()
+        for item in decision.selected_actions
+        if item.symbol.strip()
+        and item.symbol.strip().upper() != "CASH"
+        and _lookup_ci(all_bundles, item.symbol) is None
+    ]
+    if missing_syms:
+        unique_missing = list(dict.fromkeys(missing_syms))
+        try:
+            extra_hists, extra_bundles = await market_data.get_bundles(
+                unique_missing,
+                include_news=False,
+                include_earnings=True,
+                include_info=True,
+            )
+            all_histories.update(extra_hists)
+            all_bundles.update(extra_bundles)
+        except Exception as exc:
+            logger.warning("Post-screen bundle fetch failed for %s: %s", unique_missing, exc)
+
+    hydrated_actions = []
+    for item in decision.selected_actions:
+        if item.entry_price <= 0:
+            resolved_price: float | None = None
+            bundle = _lookup_ci(all_bundles, item.symbol)
+            if bundle is not None and bundle.current_price is not None and bundle.current_price > 0:
+                resolved_price = float(bundle.current_price)
+            else:
+                hist = _lookup_ci(all_histories, item.symbol)
+                if hist is not None and not hist.empty and "Close" in hist.columns:
+                    try:
+                        last_close = float(hist["Close"].dropna().iloc[-1])
+                        if last_close > 0:
+                            resolved_price = last_close
+                    except (IndexError, TypeError, ValueError):
+                        resolved_price = None
+            if resolved_price is not None and resolved_price > 0:
+                item = item.model_copy(update={"entry_price": round(resolved_price, 4)})
+        hydrated_actions.append(item)
+
+    hydrated_decision = decision.model_copy(update={"selected_actions": hydrated_actions})
+    high_corr_syms = _collect_high_correlation_symbols(
+        isa_cands,
+        invest_cands,
+        hydrated_decision.selected_actions,
+        portfolio.unique_yahoo_symbols(),
+        all_histories,
+        cfg,
+    )
+    override_res = apply_risk_override_guardrail(
+        hydrated_decision,
+        portfolio=portfolio,
+        macro=macro,
+        strategy=cfg.strategy,
+        bundle_map=all_bundles,
+        evals=evals,
+        high_correlation_symbols=high_corr_syms,
+        daily_vetoes=guardrails,
+    )
+    resolved_decision = (
+        override_res.decision
+        if isinstance(override_res.decision, PickDecision)
+        else hydrated_decision
+    )
+    final_text = render_pick_report(
+        resolved_decision,
+        max_chars=1000,
+        risk_override=override_res,
+    )
+    parsed_picks = [
+        {
+            "account": item.account,
+            "symbol": item.symbol,
+            "action": item.action,
+            "entry_price": item.entry_price if item.entry_price > 0 else None,
+            "thesis": item.thesis,
+            "horizon_days": cfg.strategy.settlement_holding_days,
+            "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
+        }
+        for item in resolved_decision.selected_actions
+    ]
+    return final_text, parsed_picks
 
 
 async def generate_pick_radar(
@@ -49,32 +363,64 @@ async def generate_pick_radar(
     if not portfolio.isa.ok and not portfolio.invest.ok:
         return f"⚠️ Trading 212 账户读取失败，无法生成选股雷达：\nISA: {portfolio.isa.error}\nInvest: {portfolio.invest.error}"
 
-    # TODO(IMP-13): [接自 IMP-02 & IMP-04 & IMP-05 & IMP-06] 传 isin_map、pos.created_at 与 bundle；复用 held_histories 传入 run_quant_screener(..., existing_histories=...)；
-    # 注入 db.get_recent_lessons()/get_symbol_lessons()、cfg.strategy.settlement_holding_days、bundle.identity_summary 与 get_market_calendar_alerts()。
     tracked_syms = portfolio.unique_yahoo_symbols(include_pending=True)
-    ((held_histories, held_bundles), macro, (isa_cands, invest_cands), (_, morning_conclusion), guardrails) = await asyncio.gather(
-        market_data.get_bundles(tracked_syms, include_news=True, include_earnings=True),
-        market_data.get_macro_snapshot(),
-        run_quant_screener(
-            portfolio=portfolio,
-            market_data=market_data,
-            universe=cfg.universe,
-            watchlist=cfg.watchlist,
-            strategy=cfg.strategy,
-            top_n_per_track=8,
+    isin_map, created_at_map = _extract_holding_context(portfolio)
+
+    # Step 1: Fetch held bundles/histories + macro + today's /report ContextPack & recent lessons first
+    (
+        (held_histories, held_bundles),
+        macro,
+        (_, morning_conclusion),
+        guardrails,
+        context_pack,
+        recent_lessons,
+    ) = await asyncio.gather(
+        market_data.get_bundles(
+            tracked_syms,
+            include_news=True,
+            include_earnings=True,
+            isin_map=isin_map or None,
         ),
+        market_data.get_macro_snapshot(),
         db.get_morning_context(),
         db.get_daily_guardrails(),
+        db.get_context_pack(allow_fallback=False),
+        db.get_recent_lessons(limit=5),
     )
+
+    # Step 2: Reuse held_histories in quant screener to eliminate duplicate OHLCV fetches
+    isa_cands, invest_cands = await run_quant_screener(
+        portfolio=portfolio,
+        market_data=market_data,
+        universe=cfg.universe,
+        watchlist=cfg.watchlist,
+        strategy=cfg.strategy,
+        existing_histories=held_histories,
+        top_n_per_track=8,
+    )
+
+    pack_symbols = (
+        context_pack.get("symbols", {})
+        if isinstance(context_pack, dict) and isinstance(context_pack.get("symbols"), dict)
+        else {}
+    )
+    if not recent_lessons and isinstance(context_pack, dict):
+        pack_recent = context_pack.get("recent_lessons")
+        if isinstance(pack_recent, list):
+            recent_lessons = pack_recent
 
     tech_map = {}
     for sym in tracked_syms:
-        snap = compute_technical_snapshot(sym, held_histories.get(sym))
+        snap = compute_technical_snapshot(
+            sym,
+            held_histories.get(sym),
+            position_created_at=created_at_map.get(sym),
+            bundle=held_bundles.get(sym),
+        )
         if snap is not None:
             tech_map[sym] = snap
 
-    # TODO(IMP-13): [接自 IMP-07] evaluate_portfolio 可选传入 histories=held_histories；
-    evals = evaluate_portfolio(portfolio, tech_map, held_bundles, cfg.strategy)
+    evals = evaluate_portfolio(portfolio, tech_map, held_bundles, cfg.strategy, histories=held_histories)
     evals_text = format_evaluations_text(evals)
     exposure_text = compute_exposure_summary(portfolio, held_bundles)
     trade_ctx = build_trade_context(portfolio, max_recent_lines=6, max_summary_lines=6, bundles=held_bundles)
@@ -92,11 +438,12 @@ async def generate_pick_radar(
     )
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未运行 /report，请独立执行全部风控红线检查）"
     us_sched = get_us_market_schedule_uk()
-    uk_hol_note = "｜🇬🇧 英国 Bank Holiday（LSE 休市，英股/ETF 参考下一开盘日）" if is_uk_bank_holiday() else ""
+    calendar_alerts = get_market_calendar_alerts()
+    calendar_note = f"｜{'；'.join(calendar_alerts)}" if calendar_alerts else ""
     market_phase_note = (
         f"当前英国时间 {us_sched.uk_date}（{us_sched.uk_weekday_label}），美股阶段：{us_sched.phase}"
         + ("（周末/休市：所有建议均为下个开盘日/限价挂单参考）" if us_sched.phase in {"WEEKEND", "HOLIDAY"} else "")
-        + uk_hol_note
+        + calendar_note
     )
     total_assets = max(portfolio.total_combined_value, 1.0)
     total_cash_pct = (portfolio.total_combined_cash / total_assets) * 100.0
@@ -111,8 +458,13 @@ async def generate_pick_radar(
     cand_syms = list(
         dict.fromkeys([*(c.symbol for c in isa_cands[:6]), *(c.symbol for c in invest_cands[:6])])
     )
-    grounding_brief = (
-        await run_forced_market_grounding(
+    lesson_syms = list(dict.fromkeys([*cand_syms, *tracked_syms]))
+
+    async def _empty_grounding() -> str:
+        return ""
+
+    grounding_coro = (
+        run_forced_market_grounding(
             llm=llm,
             search_model=cfg.models.search_model,
             scope="pick",
@@ -122,6 +474,22 @@ async def generate_pick_radar(
             ops_notifier=ops_notifier,
         )
         if cfg.models.enable_forced_search_grounding
+        else _empty_grounding()
+    )
+    grounding_brief, symbol_lessons = await asyncio.gather(
+        grounding_coro,
+        _fetch_candidate_symbol_lessons(db, lesson_syms, pack_symbols),
+    )
+
+    lessons_text = _format_lessons_section(
+        recent_lessons,
+        symbol_lessons,
+        cfg.strategy.settlement_holding_days,
+    )
+    identity_text = _build_holding_identity_section(tracked_syms, held_bundles, isin_map, pack_symbols)
+    pack_disagreement_text = (
+        str(context_pack.get("disagreement_text") or "").strip()
+        if isinstance(context_pack, dict)
         else ""
     )
 
@@ -131,12 +499,14 @@ async def generate_pick_radar(
         llm=llm,
         search_model=cfg.models.search_model,
         ops_notifier=ops_notifier,
+        db=db,
     )
 
     # ---------- Stage 1: Incremental Opportunity Researcher ----------
     researcher_sys = build_agent_system_instruction(
         "你是增量选股投研员（Researcher Agent）。存量持仓体检与老挂单审计已由 `/report` 完成，你专注于结合今日风控红线，"
         "从全市场（美/英/欧个股与 LSE 英镑 ETF）中挖掘最值得新买入的配置或高确定性卖弱换强机会。\n"
+        f"请参考历史 T+{cfg.strategy.settlement_holding_days} 交易日选股复盘教训，避免对近期连续失效的板块或追高形态重复推荐。\n"
         "请给出不超过 3 条核心提案（ISA 新股或 LSE ETF / Invest 短线催化 / 必要时的卖弱换强），"
         "每条写清逻辑、介入区间、止损、目标；若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
         cfg.strategy,
@@ -148,10 +518,13 @@ async def generate_pick_radar(
         f"=== 今日 /report 审计基线与风控红线（必须严格继承，除非有盘中新数据证明必须修正）===\n"
         f"早报基调：{morning_conclusion or '（暂无）'}\n"
         f"红线清单：\n{veto_block}\n\n"
+        f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训（禁止重蹈覆辙）】：\n{lessons_text}\n\n"
         f"【精确现金底座（禁止自行估算比例）】：{exact_cash_summary}\n"
         f"【宏观快照】：{macro.to_text()}\n"
         f"【行业与跨账户暴露】：\n{exposure_text}\n"
-        f"【ISA 账户概览】：{format_account_overview(portfolio.isa).splitlines()[0]}\n"
+        + (f"【存量标的身份与除息日历锚点】：\n{identity_text}\n" if identity_text else "")
+        + (f"【今日早报多空冲突摘要（ContextPack）】：\n{pack_disagreement_text}\n" if pack_disagreement_text else "")
+        + f"【ISA 账户概览】：{format_account_overview(portfolio.isa).splitlines()[0]}\n"
         f"【Invest 账户概览】：{format_account_overview(portfolio.invest).splitlines()[0]}\n"
         f"【活动挂单】：\n{trade_ctx['pending_orders_text']}\n"
         f"【现有持仓触发信号】：\n{evals_text}\n\n"
@@ -181,7 +554,7 @@ async def generate_pick_radar(
         "【四重一票否决硬护栏】：\n"
         f"1. 现金与 {cfg.strategy.cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税）：跑不赢现金利息的平庸机会直接枪毙。\n"
         f"2. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
-        "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级。\n"
+        "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
         "4. 一致性、精确现金与去重：严格继承 `/report` 红线（仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
         "若当前为周末/休市，请在 headline 标明“下周一开盘/限价挂单参考”；"
         "`rejected_or_frozen` 只列本轮选股新否决的候选股或方向，不要把早报已裁决的老挂单再复述一遍；"
@@ -192,6 +565,7 @@ async def generate_pick_radar(
         f"【时段状态】：{market_phase_note}\n"
         f"【今日 /report 基线】：{morning_conclusion or '（暂无）'}\n"
         f"【今日红线】：\n{veto_block}\n\n"
+        f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
         f"【行业暴露】：\n{exposure_text}\n\n"
         f"【投研员提案（待审）】：\n{research_output}"
@@ -219,19 +593,20 @@ async def generate_pick_radar(
     )
     now_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
 
-    # TODO(IMP-13): [接自 IMP-07] decision 非空时调用 apply_risk_override_guardrail(decision, portfolio=portfolio, macro=macro, strategy=cfg.strategy, bundle_map=held_bundles, high_correlation_symbols=..., daily_vetoes=morning_vetoes) 做后置强校验。
     if decision is not None:
-        final_text = render_pick_report(decision, max_chars=1000)
-        parsed_picks = [
-            {
-                "account": item.account,
-                "symbol": item.symbol,
-                "action": item.action,
-                "entry_price": item.entry_price if item.entry_price > 0 else None,
-                "thesis": item.thesis,
-            }
-            for item in decision.selected_actions
-        ]
+        final_text, parsed_picks = await _post_screen_validate_decision(
+            decision,
+            portfolio=portfolio,
+            macro=macro,
+            cfg=cfg,
+            market_data=market_data,
+            held_bundles=held_bundles,
+            held_histories=held_histories,
+            evals=evals,
+            isa_cands=isa_cands,
+            invest_cands=invest_cands,
+            guardrails=guardrails,
+        )
     else:
         logger.warning("Pick Critic structured parse fell back to plain text.")
         final_text = resolved_critic_raw.strip()[:1000]
@@ -240,6 +615,9 @@ async def generate_pick_radar(
     if not final_text.startswith("⚠️"):
         await db.save_pick_radar(focus_query, research_output, final_text, now_uk)
         if parsed_picks:
-            await db.log_recommendations(parsed_picks)
+            await db.log_recommendations(
+                parsed_picks,
+                default_horizon_days=cfg.strategy.settlement_holding_days,
+            )
 
     return final_text
