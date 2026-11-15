@@ -555,10 +555,11 @@ async def generate_pick_radar(
         f"1. 现金与 {cfg.strategy.cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税）：跑不赢现金利息的平庸机会直接枪毙。\n"
         f"2. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
         "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
-        "4. 一致性、精确现金与去重：严格继承 `/report` 红线（仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
-        "若当前为周末/休市，请在 headline 标明“下周一开盘/限价挂单参考”；"
-        "`rejected_or_frozen` 只列本轮选股新否决的候选股或方向，不要把早报已裁决的老挂单再复述一遍；"
-        "若无优质机会，直接让 `selected_actions` 为空数组拿 4% 利息。",
+        "4. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线（仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
+        "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
+        "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
+        "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
+        f"若无优质机会，直接让 `selected_actions` 为空数组 `[]`，并在 headline 直说“本轮无推荐，建议现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
         cfg.strategy,
     )
     critic_prompt = (

@@ -470,13 +470,28 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered_p.count("[🛡️风控护栏修正]"), 2)
         self.assertIn("TSM(BUY→拦截)", rendered_p)
         self.assertIn("META(ADD→拦截)", rendered_p)
-        self.assertIn("旧驳回1", rendered_p)
+        self.assertNotIn("旧驳回1", rendered_p)
+        self.assertNotIn("驳回/冻结", rendered_p)
         self.assertNotIn("**", rendered_p)
         self.assertNotIn("#", rendered_p)
 
         # Fallback: even if caller passes res_pick.decision without risk_override, guardrail tags are still surfaced
         rendered_p_no_ro = render_pick_report(res_pick.decision, max_chars=1000)
         self.assertEqual(rendered_p_no_ro.count("[🛡️风控护栏修正]"), 2)
+
+        # Empty recommendations: suppress internal candidate rejections & suggest holding cash for interest
+        empty_pick = PickDecision(
+            headline="本轮无推荐，建议现金拿住吃4.0%利息",
+            selected_actions=[],
+            rejected_or_frozen=["AZN.L：短线追高", "META：科技红线"],
+            consistency_and_cash_note="可用现金继续享 4.0% 年化利息。",
+        )
+        rendered_empty = render_pick_report(empty_pick, max_chars=1000)
+        self.assertIn("无推荐", rendered_empty)
+        self.assertIn("4.0%", rendered_empty)
+        self.assertNotIn("AZN.L", rendered_empty)
+        self.assertNotIn("META", rendered_empty)
+        self.assertNotIn("驳回/冻结", rendered_empty)
 
     def test_imp10_fit_max_chars_prevents_orphan_headers(self) -> None:
         # 1) Trimming lines inside tail section exposes a sub-header -> must be stripped
@@ -1249,6 +1264,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("VWRP.L", out)
             self.assertIn("AMD(BUY→拦截)", out)
             self.assertIn("META(BUY→拦截)", out)
+            self.assertNotIn("高估值软件股", out)
+            self.assertNotIn("驳回/冻结", out)
 
             # 4) Only surviving pick logged with native bundle.current_price (118.25), horizon_days=7, benchmark=SPY
             recs = await db.get_recent_recommendations(limit=10)

@@ -121,14 +121,16 @@ class PickActionItem(BaseModel):
 
 
 class PickDecision(BaseModel):
-    headline: str = Field(description="一句话定调本轮选股/换仓结论与现金安排（不超过55字）")
+    headline: str = Field(
+        description="一句话定调本轮最终选股结论与现金安排（不超过55字；严禁提及任何未入选、内部讨论或被否决的候选标的/方向；若无推荐，直接写“本轮无推荐标的，建议现金拿住吃4%利息”）"
+    )
     selected_actions: list[PickActionItem] = Field(
         default_factory=list,
         description="通过风控官四重护栏的最终推荐（0~3条）；若均未达标请返回空数组",
     )
     rejected_or_frozen: list[str] = Field(
         default_factory=list,
-        description="1~3条【本轮选股中新探测但被风控驳回】的标的或方向及原因（每条<=35字；勿重复早报已撤的老挂单）",
+        description="内部保留字段，模型输出时请一律返回空数组 []（严禁在最终回复中列举未入选候选股或内部审查过程）",
     )
     consistency_and_cash_note: str = Field(
         description="一句话说明执行建议后的双账户剩余现金与占总资产精确比例，及对早报红线的继承（不超过85字）"
@@ -447,7 +449,7 @@ def render_pick_report(
 
     sec1_lines = [f"📌 本轮结论：{decision.headline}"]
     if not decision.selected_actions:
-        sec1_lines.append("• ⚪ 今日无高赔率新机会通过风控审核，建议保留现金继续享 4.0% 年化利息。")
+        sec1_lines.append("• ⚪ 本轮无推荐标的，建议现金拿住继续吃 4.0% 年化利息。")
     else:
         for idx, item in enumerate(decision.selected_actions[:3], 1):
             sec1_lines.append(
@@ -462,12 +464,6 @@ def render_pick_report(
     sec2_lines = []
     if decision.consistency_and_cash_note:
         sec2_lines.append(f"• 基线与现金：{decision.consistency_and_cash_note}")
-    remaining_rejections = [
-        rej for rej in decision.rejected_or_frozen
-        if _format_guardrail_note(rej) not in seen_guardrails
-    ]
-    for rej in remaining_rejections[:4]:
-        sec2_lines.append(f"• 驳回/冻结：{rej}")
-    sec2 = "【风控审查与现金约束】\n" + "\n".join(sec2_lines) if sec2_lines else ""
+    sec2 = "【现金约束与风控基线】\n" + "\n".join(sec2_lines) if sec2_lines else ""
 
     return _fit_max_chars([sec1, sec2], max_chars=max_chars)
