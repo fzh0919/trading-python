@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+logs/
+*.log
+.pytest_cache/
+.ruff_cache/
+_ref/

@@ -1,0 +1,137 @@
+# Trading 212 x Gemini AI Advisor v5.0 Strategy & Runtime Config
+
+app:
+  timezone: "Europe/London"
+  db_path: "data/advisor.db"
+  log_level: "INFO"
+  cache_ttl_seconds: 120
+  market_data_ttl_seconds: 900
+  ops_warn_cooldown_seconds: 1800
+
+models:
+  # 关键风控与最终拍板统一使用 gemini-4-argon + HIGH；多轮工具/机会归纳/备援使用 gemini-4-hydrogen
+  report_analyst_model: "gemini-4-hydrogen"
+  report_model: "gemini-4-argon"          # /report Step 2B 风控审计官 + Step 3 PM 拍板
+  us_sentinel_model: "gemini-4-hydrogen"  # /us 与盘前增量哨兵
+  pick_researcher_model: "gemini-4-hydrogen"  # /pick Stage 1 多轮工具投研探测
+  pick_model: "gemini-4-argon"            # /pick Stage 2 风控官终审拍板
+  chat_model: "gemini-4-hydrogen"         # Telegram 日常单聊
+  chat_deep_model: "gemini-4-hydrogen"    # /deep 深度单聊升级模型
+  fallback_model: "gemini-4-hydrogen"     # 主模型失败时自动降级备援模型
+  report_search_model: "gemini-4-hydrogen" # /report 强制联网与深挖搜索模型（保精度）
+  search_model: "gemini-3.5-flash-lite"   # 单聊 / /pick / /us 联网搜索模型（高性价比）
+
+  report_analyst_thinking_level: "HIGH"     # 深度分析晨报（不追求速度）
+  report_thinking_level: "HIGH"             # LOW | MEDIUM | HIGH
+  us_thinking_level: "MEDIUM"               # LOW | MEDIUM | HIGH
+  pick_researcher_thinking_level: "HIGH"    # LOW | MEDIUM | HIGH | XHIGH
+  pick_thinking_level: "HIGH"               # LOW | MEDIUM | HIGH
+  chat_thinking_level: "LOW"                # LOW | MEDIUM | HIGH | XHIGH
+  chat_deep_thinking_level: "HIGH"          # /deep 单聊升级思考深度
+  fallback_thinking_level: "HIGH"
+
+  enable_forced_search_grounding: true
+  report_max_tool_rounds: 6
+  google_search_free_quota_monthly: 5000    # Google Search Grounding 月免费额度参考线
+  google_search_warn_pct: 85.0              # 达到月免费额度该百分比时预警提醒
+
+schedule:
+  morning_report_hour: 7
+  morning_report_minute: 30
+  premarket_lead_minutes: 15
+  enable_weekly_radar: true
+  weekly_radar_after_close_minutes: 30
+
+strategy:
+  cash_interest_rate_pct: 4.0       # T212 uninvested cash APY (%)
+  fx_fee_pct: 0.15                  # T212 FX fee per leg for non-GBP trades (%)
+  uk_stamp_duty_pct: 0.50           # UK Stamp Duty on UK-domiciled individual stocks (ETFs = 0%)
+  order_history_days: 30
+  order_history_max_pages: 3
+  max_daily_chat_turns: 12
+
+  # Deterministic Add/Trim/Stop/Correlation guardrails (portfolio_rules.py & screener.py)
+  max_isa_single_weight_pct: 30.0
+  max_invest_single_weight_pct: 25.0
+  max_total_portfolio_weight_pct: 22.0  # 跨 ISA+Invest 同发行人个股上限（宽基/行业 ETF 豁免）
+  invest_stop_loss_alert_pct: -12.0
+  invest_take_profit_review_pct: 25.0
+  trailing_profit_activation_pct: 20.0  # 浮盈 >=20% 后激活近60日波段高点移动止盈保护
+  trailing_drawdown_from_peak_pct: -12.0
+  isa_deep_drawdown_review_pct: -25.0   # ISA 长线仓深套基本面防死扛复核线
+  rsi_oversold_threshold: 38.0
+  rsi_overbought_threshold: 75.0
+  pullback_from_high_add_min_pct: -25.0
+  pullback_from_high_add_max_pct: -8.0
+  require_uptrend_for_add: true         # 须严格满足 Price > MA200 才触发加仓提示
+  overlap_correlation_threshold: 0.85
+  correlation_window_days: 60
+
+  # /us intraday anomaly gate & T+N settlement horizon (IMP-12 / IMP-16)
+  us_anomaly_move_pct: 1.8
+  us_anomaly_vix_change_pct: 4.0
+  settlement_holding_days: 5
+
+# Optional priority symbols (Yahoo Finance symbols, e.g. ["TSM", "AZN.L", "ASML.AS"])
+watchlist: []
+
+# Curated multi-market screener universe (no hardcoded user holdings required;
+# AI inspects live ISA/Invest holdings dynamically and filters overlap by correlation)
+universe:
+  isa_long_term:
+    # Broad & factor LSE GBP ETFs (0% FX fee, 0% UK stamp duty)
+    - "VWRP.L"
+    - "VUAG.L"
+    - "SWDA.L"
+    - "EQGB.L"
+    - "VERG.L"
+    - "VHYL.L"
+    - "IUKD.L"
+    - "CSP1.L"
+    - "CNX1.L"
+    - "IWQU.L"
+    - "IGLT.L"
+    # UK / EU / US high-moat compounders
+    - "AZN.L"
+    - "ULVR.L"
+    - "REL.L"
+    - "HSBA.L"
+    - "GSK.L"
+    - "ASML.AS"
+    - "NVO"
+    - "MC.PA"
+    - "SAP.DE"
+    - "MSFT"
+    - "AAPL"
+    - "GOOGL"
+    - "AMZN"
+    - "BRK-B"
+    - "V"
+    - "COST"
+    - "JNJ"
+    - "PG"
+    - "TSM"
+
+  invest_tactical:
+    # High-liquidity US / UK / EU catalyst & swing names
+    - "NVDA"
+    - "META"
+    - "TSLA"
+    - "AMD"
+    - "AVGO"
+    - "NFLX"
+    - "CRM"
+    - "UBER"
+    - "MU"
+    - "PANW"
+    - "PLTR"
+    - "LLY"
+    - "UNH"
+    - "JPM"
+    - "GS"
+    - "RR.L"
+    - "BA.L"
+    - "BARC.L"
+    - "SHEL.L"
+    - "RIO.L"
+    - "SIE.DE"

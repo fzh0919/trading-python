@@ -1,0 +1,15 @@
+services:
+  advisor:
+    build: .
+    container_name: t212-ai-advisor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

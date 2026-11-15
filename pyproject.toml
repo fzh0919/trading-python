@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-python"
+version = "5.0.5"
+description = "Trading 212 x Gemini AI Investment Advisor (Multi-Market ISA/Invest + Deterministic Quant Data + Agentic Pick & Risk Review)"
+requires-python = ">=3.11"
+dependencies = [
+  "google-genai>=1.60.0",
+  "yfinance>=0.2.54",
+  "pandas>=2.2.0",
+  "numpy>=1.26.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.7.0",
+  "pydantic-settings>=2.2.0",
+  "PyYAML>=6.0.1",
+  "python-dotenv>=1.0.1",
+  "aiosqlite>=0.20.0",
+  "tzdata>=2024.1",
+  "tenacity>=8.2.3",
+]

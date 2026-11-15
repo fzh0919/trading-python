@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading 212 x Gemini AI Investment Advisor (v5.0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading-python
+ExecStart=%h/trading-python/.venv/bin/python -m src.main
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

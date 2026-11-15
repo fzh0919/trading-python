@@ -1,0 +1,17 @@
+_ref/
+.git/
+.gitignore
+.venv/
+venv/
+data/
+logs/
+*.log
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+tests/
