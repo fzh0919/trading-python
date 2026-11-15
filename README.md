@@ -51,7 +51,7 @@ uv python install 3.12.13
 uv venv --python 3.12.13
 uv pip install -r requirements.txt
 
-# 日常编译、全套纯离线单测（84 tests）与 Git 同步
+# 日常编译、全套纯离线单测（86 tests）与 Git 同步
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m tests.run_tests tests
 git add -A && git commit -m "<msg>" && git push
