@@ -1,6 +1,6 @@
-# N95 Homelab 项目迁移与容器化引入规范（PROJECT_MIGRATION_RULES v1.1）
+# N95 Homelab 项目迁移与容器化引入规范（PROJECT_MIGRATION_RULES v1.2）
 
-> **使用方式**：每当需要将云上已有项目或新项目接入 N95 Homelab 时，必须向 AI 助手提供本规范文档。**任何违反以下强制条款的方案（如宿主机直接 `pip install`、裸跑脚本、开放公网端口、明文提交密钥、多项目共用 Long Polling Token）一律禁止执行。**
+> **使用方式**：每当需要将云上已有项目或新项目接入 N95 Homelab 时，必须向 AI 助手提供本规范文档。**任何违反以下强制条款的方案（如宿主机直接 `pip install`、裸跑脚本、开放公网端口、明文提交密钥、多项目共用 Long Polling Token、使用非指定 Python 版本）一律禁止执行。**
 
 ---
 
@@ -10,11 +10,21 @@
    - 代码开发与离线单测在 Windows 本地 `<HOMELAB_ROOT>\projects\<project_name>\`（台式机 `D:\HOMELAB\...` / 笔记本 `F:\HOMELAB\...`）完成，通过私有 Git 仓库同步，再由部署脚本让 N95 拉取代码并重建容器。
    - 严禁在 N95 宿主机直接跑 `pip install`、`npm install -g` 或宿主机 `systemd` 业务进程。
    - `projects\` 下必须保持**扁平一对一**结构；若项目本地开发需参考大型第三方源码，统一放入该项目内的 `_ref/`（先移除内部 `.git`），并在 `.gitignore` 与 `.dockerignore` 中**双重排除 `_ref/`**；小体积 API 手册放 `docs/` 随 Git 同步。
-2. **N95 标准部署路径**：所有项目必须部署在 `/opt/homelab/stacks/<project_name>/`：
+2. **Python 运行时强制统一规范（`3.12.13`）**：
+   - **容器层强制锁死**：所有 Python 项目的 `Dockerfile` 必须使用 **`FROM python:3.12.13-slim-bookworm`**（严禁使用 `:latest` 或未锁定补丁/发行版的标签如 `3.11-slim`、`3.12-slim`），确保所有服务在 N95 上共享同一基础镜像层与运行时行为。
+   - **本地开发强制隔离与同步**：严禁在系统全局 Python（如 `D:\Python` 或 `C:\Python314`）中直接运行项目或混装依赖。每个项目必须在自身根目录放置 `.python-version`（内容为 `3.12.13`，纳入 Git），并使用 `uv` 创建基于 `3.12.13` 的独立虚拟环境 `.venv/`（仅存本地，由 `.gitignore` 与 `.dockerignore` 双重排除）。
+   - **跨端初始化命令（台式机 / 笔记本通用）**：
+     ```powershell
+     uv python install 3.12.13
+     uv venv --python 3.12.13
+     uv pip install -r requirements.txt
+     ```
+3. **N95 标准部署路径**：所有项目必须部署在 `/opt/homelab/stacks/<project_name>/`：
    ```text
    /opt/homelab/stacks/<project_name>/
    ├── docker-compose.yml    # 必选：服务编排（须含下方 6 项强制配置）
-   ├── Dockerfile            # 必选：或明确锁定基础镜像版本（禁止无约束 :latest）
+   ├── Dockerfile            # 必选：Python 项目强制 FROM python:3.12.13-slim-bookworm
+   ├── .python-version       # 必选（Python 项目）：内容锁定 3.12.13，纳入 Git
    ├── .dockerignore         # 必选：排除 _ref/、.git/、.venv/、data/、.env*
    ├── .env                  # 必选（如有密钥）：仅存 N95 本地，权限 chmod 600，严禁进 Git
    ├── .env.example          # 必选：脱敏环境变量模板，纳入 Git
@@ -95,7 +105,8 @@
 AI 助手协助迁移具体项目时，必须严格按以下顺序执行，严禁跳过第 2 步直接双开：
 
 1. **本地适配改造（在 `<HOMELAB_ROOT>\projects\<name>`）**：
-   - 补齐 `Dockerfile`、`docker-compose.yml`、`.gitignore`、`.env.example`；若旧项目用 Telegram Webhook，先改为 Long Polling；接入 `ops-notify` 错误告警；跑通本地编译与离线单测，推至 GitHub 私有库。
+   - 补齐 `Dockerfile`（锁定 `python:3.12.13-slim-bookworm`）、`docker-compose.yml`、`.python-version`（`3.12.13`）、`.gitignore`、`.dockerignore`、`.env.example`；若旧项目用 Telegram Webhook，先改为 Long Polling；接入 `ops-notify` 错误告警。
+   - 在项目根目录用 `uv venv --python 3.12.13` 创建 `.venv` 并安装依赖，使用 `.venv` 跑通本地编译与离线单测，推至 GitHub 私有库。
 2. **旧云主机安全停服（防双开抢占）**：
    - 在旧云主机停止容器/进程并确认彻底退出（避免新旧两台同时对同一 Telegram Bot 做 Long Polling 或重复跑定时任务）。
 3. **数据与密钥迁移**：
