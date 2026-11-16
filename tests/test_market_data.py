@@ -799,6 +799,63 @@ class TestMarketDataService(unittest.IsolatedAsyncioTestCase):
         finally:
             await svc.close()
 
+    async def test_get_bundles_with_db_and_prepost_single_day_2y_cache_no_ambiguous_df(self) -> None:
+        """Regression: 2y cached DataFrame in get_bundles(db=...) and 15m single-day fallback must not raise DataFrame truthiness."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "advisor.db")
+            await db.init()
+            svc = MarketDataService(ttl_seconds=900, db=db)
+
+            hist_2y = _sample_ohlcv(260, 100.0)
+            history_calls = 0
+
+            class _TickerStub:
+                def __init__(self, sym: str) -> None:
+                    self.sym = sym
+                    self.info = {
+                        "shortName": f"{sym} Corp",
+                        "quoteType": "EQUITY",
+                        "currency": "USD",
+                        "sector": "Technology",
+                    }
+                    self.calendar = {}
+                    self.news = []
+
+                def history(self, **kwargs: Any) -> pd.DataFrame:
+                    nonlocal history_calls
+                    history_calls += 1
+                    return hist_2y
+
+            def _fake_download(**kwargs: Any) -> pd.DataFrame:
+                interval = kwargs.get("interval", "1d")
+                if interval == "15m":
+                    # Only 1 unique ET date -> triggers daily_df fallback in _extract_intraday_15m_quote
+                    idx = pd.DatetimeIndex(
+                        [pd.Timestamp("2026-11-16 09:00:00", tz="America/New_York")]
+                    )
+                    return pd.DataFrame({"Close": [float(hist_2y["Close"].iloc[-1]) * 1.03]}, index=idx)
+                return hist_2y
+
+            try:
+                with (
+                    patch("src.data_providers.market_data.yf.download", side_effect=_fake_download),
+                    patch("src.data_providers.market_data.yf.Ticker", side_effect=_TickerStub),
+                ):
+                    histories, bundles = await svc.get_bundles(
+                        ["AAPL"], include_news=False, include_earnings=False
+                    )
+                    self.assertFalse(histories["AAPL"].empty)
+                    self.assertEqual(bundles["AAPL"].short_name, "AAPL Corp")
+                    # Preloaded via db pre-step get_histories("2y"), so Ticker.history() must not be called
+                    self.assertEqual(history_calls, 0)
+
+                    prepost = await svc.get_us_prepost_quotes(["AAPL"])
+                    self.assertIn("AAPL", prepost)
+                    self.assertGreater(prepost["AAPL"]["change_pct"], 0.0)
+            finally:
+                await svc.close()
+                await db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

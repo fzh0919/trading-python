@@ -848,6 +848,21 @@ class MarketDataService:
                 return df
         return None
 
+    def _get_cached_hist_fallback(
+        self,
+        symbol: str,
+        now: float,
+        periods: tuple[str, ...] = ("2y", "1y"),
+        *,
+        allow_stale: bool = False,
+    ) -> pd.DataFrame | None:
+        """Return the first cached history DataFrame across periods without ambiguous DataFrame truthiness."""
+        for period in periods:
+            cached = self._get_cached_hist(symbol, period, now, allow_stale=allow_stale)
+            if cached is not None:
+                return cached
+        return None
+
     def _set_cached_hist(self, symbol: str, period: str, now: float, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             return
@@ -1301,7 +1316,7 @@ class MarketDataService:
             missing_h_syms = [
                 s
                 for s in unique_syms
-                if self._get_cached_hist(s, "2y", now) is None and self._get_cached_hist(s, "1y", now) is None
+                if self._get_cached_hist_fallback(s, now) is None
             ]
             if missing_h_syms:
                 await self.get_histories(missing_h_syms, period="2y")
@@ -1310,7 +1325,7 @@ class MarketDataService:
         loop = asyncio.get_running_loop()
 
         async def _load_one(sym: str) -> None:
-            h_cached = self._get_cached_hist(sym, "2y", now) or self._get_cached_hist(sym, "1y", now)
+            h_cached = self._get_cached_hist_fallback(sym, now)
             b_cached = self._get_cached_bundle(sym, now, require_info=include_info)
             if h_cached is not None and b_cached is not None:
                 histories[sym] = h_cached
@@ -1582,10 +1597,7 @@ class MarketDataService:
             elif not prev_bars.empty:
                 prev_close = float(prev_bars.iloc[-1])
         else:
-            daily_df = (
-                self._get_cached_hist(sym, "2y", time.monotonic(), allow_stale=True)
-                or self._get_cached_hist(sym, "1y", time.monotonic(), allow_stale=True)
-            )
+            daily_df = self._get_cached_hist_fallback(sym, time.monotonic(), allow_stale=True)
             if daily_df is not None and not daily_df.empty and "Close" in daily_df.columns:
                 d_closes = pd.to_numeric(daily_df["Close"], errors="coerce").dropna()
                 if not d_closes.empty:
