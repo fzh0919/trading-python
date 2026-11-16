@@ -78,6 +78,51 @@ watchlist: []
 # Curated multi-market screener universe (no hardcoded user holdings required;
 # AI inspects live ISA/Invest holdings dynamically and filters overlap by correlation)
 universe:
+  # Weekly / manual 0-token audition over FTSE100+FTSE250+SP500+NASDAQ100+EuroStoxx50 -> top 150 active equities
+  audition_enabled: true
+  audition_target_size: 150
+  audition_sector_cap: 28
+  audition_min_uk_eu_slots: 30
+  audition_min_avg_dollar_vol_usd: 5000000.0
+  audition_fundamentals_ttl_days: 21
+  audition_info_concurrency: 2
+  audition_info_delay_seconds: 0.45
+  audition_sync_online_indices: true
+  audition_indices:
+    - "SP500"
+    - "NASDAQ100"
+    - "FTSE100"
+    - "FTSE250"
+    - "EUROSTOXX50"
+
+  # Curated LSE GBP UCITS ETFs (0% FX fee, 0% UK stamp duty; kept separate from 150-stock equity audition)
+  etf_symbols:
+    - "VWRP.L"
+    - "VUAG.L"
+    - "SWDA.L"
+    - "EQGB.L"
+    - "VERG.L"
+    - "VHYL.L"
+    - "IUKD.L"
+    - "CSP1.L"
+    - "CNX1.L"
+    - "IWQU.L"
+    - "IGLT.L"
+    - "ISF.L"
+    - "EMIM.L"
+    - "WSML.L"
+    - "SGLN.L"
+    - "INRG.L"
+    - "SMGB.L"
+    - "HEAL.L"
+    - "IITU.L"
+    - "VJPN.L"
+    - "VFEM.L"
+    - "MIDD.L"
+    - "VGOV.L"
+    - "IWFQ.L"
+    - "IWMO.L"
+
   isa_long_term:
     # Broad & factor LSE GBP ETFs (0% FX fee, 0% UK stamp duty)
     - "VWRP.L"

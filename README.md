@@ -102,7 +102,7 @@ docker compose exec advisor python -c "from src.config import load_config; from 
 - **美股开盘前 15 分钟（常规 `14:15 UK` / 错位周 `13:15 UK`）**：自动推送 `/us` 盘前增量哨兵（美股法定休市日静音提醒；结合 `yfinance 15m prepost` 捕捉真实盘前跳空，平稳日仅发极简平安报）。
 - **周五美股收盘后 30 分钟（常规 `21:30 UK` / 美股半日市自动提前至 `18:30 UK`）**：自动推送 `/pick` 周末选股雷达。
 - **工作日 `22:00~23:30 UK`（盘后静默任务）**：自动执行 `T+5`（按英/欧/美各市场交易日历与收盘判定）历史推荐真实收益/Alpha 结算、微反思记忆写回、0-Token `T+10`/`T+20` 延伸 Alpha 与 `MFE/MAE` 极值追评，及 90 天旧库记录清理。
-- **周六 `10:00~22:00 UK`（周末静默体检，不发消息）**：自动执行 0-Token 离线候选池与阈值体检（120d 滚动高相关重叠、`>=60d` Phase 4 僵尸股及突破样本止盈止损回测），结果汇总进 `/stats` 看板。
+- **周六 `10:00~22:00 UK`（周末静默体检，不发消息）**：自动执行 0-Token 多市场底池海选（从 S&P 500 + NASDAQ 100 + FTSE 100/250 + Euro Stoxx 50 海选出 150 只精锐个股 + LSE ETF）与离线候选池/阈值体检（120d 滚动高相关重叠、`>=60d` Phase 4 僵尸股及突破样本止盈止损回测），结果汇总进 `/stats` 看板。
 
 **手动指令（左侧 `/` 菜单 + `/help`，自由单聊支持 `/deep` 开头升级深度推理）：**
 - `/pos` — 瞬时拉取双账户实时仓位、净值、挂单与近 7 天成交（0 Token 秒出）
@@ -110,6 +110,7 @@ docker compose exec advisor python -c "from src.config import load_config; from 
 - `/pick [方向]` — 四维量化初筛 + 联网催化扫描 + 投研员/风控官双审 + 后置硬拦截（`<=1000` 字）
 - `/us` — 美股盘前/盘中/收盘/休市自适应增量简报（平稳日 `<=450` 字 / 异动日 `<=600` 字）
 - `/stats` — 查看历史选股真实 `T+5`/`T+10`/`T+20` 胜率与超额 Alpha 轨迹、持仓期 `MFE`/`MAE` 极值分布、近期复盘教训、待结算浮盈与周末选股池离线体检
+- `/refresh_pool` — 手动触发多市场底池海选更新（`0-Token` 精选 150 只个股 + LSE ETF；也可在命令行执行 `python -m src.refresh_pool`）
 - `/health` — 全链路实时体检（T212 降级/行情/Finnhub/FRED/Gemini/DB/未送达告警与 `ops-notify` 网关状态）
 - `/usage` — 查看 Token 消耗、缓存命中率、思考占比与本月 Google Search 免费额度进度
 - `/clear` / `/cancel` — 清空今日单聊记忆 / 立即中止正在运行的耗时分析

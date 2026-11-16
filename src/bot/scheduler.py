@@ -27,7 +27,7 @@ from src.engine.calendar_utils import (
     infer_market_from_symbol,
     is_london_weekday,
 )
-from src.engine.screener import run_offline_universe_and_threshold_audit
+from src.engine.screener import run_offline_universe_and_threshold_audit, run_universe_audition
 from src.storage.db import AdvisorDatabase
 
 if TYPE_CHECKING:
@@ -376,13 +376,14 @@ class TradingScheduler:
 
     def _has_audit_universe(self) -> bool:
         return bool(
-            self.cfg.universe.isa_long_term
+            self.cfg.universe.audition_enabled
+            or self.cfg.universe.isa_long_term
             or self.cfg.universe.invest_tactical
             or self.cfg.universe.etf_symbols
         )
 
     async def _run_weekly_quant_audit_impl(self, now_utc: datetime | None = None) -> dict[str, Any]:
-        """Run 0-token offline universe & threshold audit and save silently to quant_health_audits."""
+        """Run 0-token offline universe audition + threshold audit and save silently to quant_health_audits."""
         base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
         dt_uk = base.astimezone(LONDON_TZ)
         uk_date = dt_uk.date().isoformat()
@@ -392,6 +393,20 @@ class TradingScheduler:
             self.cfg.reload_pools_if_changed()
         except Exception as exc:
             logger.debug("Weekly quant audit config hot-reload failed: %s", exc)
+
+        audition_res: dict[str, Any] | None = None
+        if self.cfg.universe.audition_enabled and hasattr(self.db, "replace_active_universe_pool"):
+            try:
+                audition_res = await run_universe_audition(
+                    self.cfg,
+                    self.t212,
+                    self.market_data,
+                    self.db,
+                    sync_online_indices=True,
+                    sync_t212_metadata=True,
+                )
+            except Exception as exc:
+                logger.warning("Weekly universe audition failed; falling back to existing pool: %s", exc)
 
         portfolio: PortfolioData | None = None
         try:
@@ -413,12 +428,22 @@ class TradingScheduler:
                 fallback_source="empty_fallback",
             )
 
+        active_pool_rows: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_active_universe_pool"):
+            try:
+                active_pool_rows = await self.db.get_active_universe_pool()
+            except Exception:
+                active_pool_rows = []
+
         held_syms = portfolio.unique_yahoo_symbols(include_pending=False)
-        pool_syms = (
-            list(self.cfg.universe.isa_long_term)
-            + list(self.cfg.universe.invest_tactical)
-            + list(self.cfg.universe.etf_symbols)
-        )
+        if active_pool_rows:
+            pool_syms = [str(r["symbol"]) for r in active_pool_rows] + list(self.cfg.universe.etf_symbols)
+        else:
+            pool_syms = (
+                list(self.cfg.universe.isa_long_term)
+                + list(self.cfg.universe.invest_tactical)
+                + list(self.cfg.universe.etf_symbols)
+            )
         all_syms = list(dict.fromkeys(s for s in (held_syms + pool_syms) if s))
 
         histories: dict[str, pd.DataFrame] = {}
@@ -428,12 +453,17 @@ class TradingScheduler:
             except Exception as exc:
                 logger.warning("Weekly quant audit histories fetch failed: %s", exc)
 
-        audit = run_offline_universe_and_threshold_audit(
-            histories=histories,
-            portfolio=portfolio,
-            universe=self.cfg.universe,
-            strategy=self.cfg.strategy,
-        )
+        audit_kwargs: dict[str, Any] = {
+            "histories": histories,
+            "portfolio": portfolio,
+            "universe": self.cfg.universe,
+            "strategy": self.cfg.strategy,
+        }
+        if active_pool_rows:
+            audit_kwargs["active_pool_rows"] = active_pool_rows
+        audit = run_offline_universe_and_threshold_audit(**audit_kwargs)
+        if audition_res:
+            audit["audition"] = audition_res
         await self.db.save_quant_audit(
             audit_date=uk_date,
             summary_text=audit["summary_text"],
@@ -441,6 +471,28 @@ class TradingScheduler:
             created_at_uk=uk_now_str,
         )
         return {**audit, "audit_date": uk_date}
+
+    async def run_pool_audition(
+        self,
+        *,
+        sync_online_indices: bool = True,
+        sync_t212_metadata: bool = True,
+    ) -> dict[str, Any]:
+        """Acquire execution_lock and refresh the curated 150-stock active universe pool."""
+        async with self.execution_lock:
+            self.current_job_name = "refresh_pool"
+            try:
+                return await run_universe_audition(
+                    self.cfg,
+                    self.t212,
+                    self.market_data,
+                    self.db,
+                    sync_online_indices=sync_online_indices,
+                    sync_t212_metadata=sync_t212_metadata,
+                )
+            finally:
+                if self.current_job_name == "refresh_pool":
+                    self.current_job_name = None
 
     async def run_weekly_quant_audit(self, now_utc: datetime | None = None) -> dict[str, Any]:
         """Acquire execution_lock and silently execute weekly offline universe & threshold audit."""
@@ -809,13 +861,27 @@ class TradingScheduler:
                     logger.warning("Prewarm dividend archive failed (%s): %s", scope, exc)
 
         held_syms = portfolio.unique_yahoo_symbols(include_pending=True) if portfolio is not None else []
-        pool_syms = (
-            list(self.cfg.watchlist)
-            + list(self.cfg.universe.isa_long_term)
-            + list(self.cfg.universe.invest_tactical)
-            + list(self.cfg.universe.etf_symbols)
-            + ["SPY", "QQQ", "ISF.L", "EXS1.DE"]
-        )
+        active_pool_rows: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_active_universe_pool"):
+            try:
+                active_pool_rows = await self.db.get_active_universe_pool()
+            except Exception:
+                active_pool_rows = []
+        if active_pool_rows:
+            pool_syms = (
+                list(self.cfg.watchlist)
+                + [str(r["symbol"]) for r in active_pool_rows]
+                + list(self.cfg.universe.etf_symbols)
+                + ["SPY", "QQQ", "ISF.L", "EXS1.DE"]
+            )
+        else:
+            pool_syms = (
+                list(self.cfg.watchlist)
+                + list(self.cfg.universe.isa_long_term)
+                + list(self.cfg.universe.invest_tactical)
+                + list(self.cfg.universe.etf_symbols)
+                + ["SPY", "QQQ", "ISF.L", "EXS1.DE"]
+            )
         all_syms = list(dict.fromkeys(s for s in (held_syms + pool_syms) if s))
 
         hist_map: dict[str, pd.DataFrame] = {}

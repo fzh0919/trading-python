@@ -106,9 +106,10 @@ trading-python/                     # [当前主项目]
 7. `ops_events(id, created_at_uk, created_at_ms, severity, source, alert_key, message, notified, suppressed_count)`：运维告警审计表。
 8. `scheduler_runs(job_name, uk_date, fired_at_uk, PK(job_name, uk_date))`：定时任务当日/当周触发幂等锁。
 9. `ohlcv_cache(symbol, period, last_bar_date, last_close, updated_at_ms, payload_json, PK(symbol, period))`：`2y` 日线持久化底座（支持 `1mo` 增量拼接与 `>0.5%` 拆股全量重拉，`prune_old_records` 清理超期行）。
-10. `t212_instruments_metadata(ticker PK, yahoo_symbol, isin, currency_code, short_name, inst_type, extended_hours, working_schedule_id, updated_at_ms)`：T212 标的元数据长期归档表（永久保留）。
+10. `t212_instruments_metadata(ticker PK, yahoo_symbol, isin, currency_code, short_name, inst_type, extended_hours, working_schedule_id, isa_eligible, invest_eligible, updated_at_ms)`：T212 标的元数据与分账户可买性长期归档表（永久保留）。
 11. `t212_dividend_archive(id PK, account, ticker, yahoo_symbol, amount_gbp, gross_per_share, paid_on, paid_on_ms)`：T212 历史实收英镑股息长期归档表（永久保留）。
 12. `quant_health_audits(audit_date PK, created_at_uk, summary_text, payload_json)`：周末离线候选池与止盈/止损阈值体检档案。
+13. `fundamentals_cache(symbol PK, ..., payload_json, updated_at_ms)` / `active_universe_pool(symbol PK, ..., quality_score, isa_eligible, invest_eligible, is_etf, updated_at_uk)` / `index_constituents_cache(index_name PK, symbols_json, updated_at_ms)`：多市场底池海选（S&P500+NASDAQ100+FTSE100+FTSE250+EuroStoxx50+LSE ETF -> 150 只精锐个股）持久化与基本面 21 天防限流缓存。
 
 ### 3.3 核心模块接口字典（精确签名与字段契约速查，随 `IMP` 滚动更新）
 

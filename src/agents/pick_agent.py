@@ -479,16 +479,28 @@ async def generate_pick_radar(
         db.get_recent_lessons(limit=5),
     )
 
-    # Step 2: Reuse held_histories in quant screener to eliminate duplicate OHLCV fetches
-    isa_cands, invest_cands = await run_quant_screener(
-        portfolio=portfolio,
-        market_data=market_data,
-        universe=cfg.universe,
-        watchlist=cfg.watchlist,
-        strategy=cfg.strategy,
-        existing_histories=held_histories,
-        top_n_per_track=8,
-    )
+    # Step 2: Load curated 150-stock active pool (if auditioned) & reuse held_histories in quant screener
+    active_pool_rows: list[dict[str, Any]] = []
+    if hasattr(db, "get_active_universe_pool"):
+        try:
+            active_pool_rows = await db.get_active_universe_pool()
+        except Exception as exc:
+            logger.debug("Failed loading active_universe_pool; falling back to config.yaml: %s", exc)
+            active_pool_rows = []
+
+    screener_kwargs: dict[str, Any] = {
+        "portfolio": portfolio,
+        "market_data": market_data,
+        "universe": cfg.universe,
+        "watchlist": cfg.watchlist,
+        "strategy": cfg.strategy,
+        "existing_histories": held_histories,
+        "top_n_per_track": 8,
+    }
+    if active_pool_rows:
+        screener_kwargs["active_pool_rows"] = active_pool_rows
+
+    isa_cands, invest_cands = await run_quant_screener(**screener_kwargs)
 
     pack_symbols = (
         context_pack.get("symbols", {})

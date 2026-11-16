@@ -817,6 +817,35 @@ def _ols_residual_and_clone_flag(
     return pd.Series(resid, index=pair.index), is_clone
 
 
+def _compute_rect_corr(
+    df: pd.DataFrame,
+    row_syms: list[str],
+    col_syms: list[str],
+    min_periods: int = 15,
+) -> pd.DataFrame:
+    """Compute exact Pearson correlation matrix of shape (len(row_syms), len(col_syms)) without O(N^2) blowup."""
+    r_valid = [s for s in row_syms if s in df.columns]
+    c_valid = [s for s in col_syms if s in df.columns]
+    if not r_valid or not c_valid:
+        return pd.DataFrame(index=r_valid, columns=c_valid, dtype=float)
+    if r_valid == c_valid:
+        return df[r_valid].corr(min_periods=min_periods)
+
+    sub_cols = df[c_valid]
+    out = pd.DataFrame(index=r_valid, columns=c_valid, dtype=float)
+    for r_sym in r_valid:
+        ser_r = df[r_sym]
+        mask_r = ser_r.notna()
+        if int(mask_r.sum()) < min_periods:
+            continue
+        sub_masked = sub_cols.loc[mask_r]
+        counts = sub_masked.notna().sum(axis=0)
+        corrs = sub_masked.corrwith(ser_r.loc[mask_r])
+        corrs = corrs.where(counts >= min_periods)
+        out.loc[r_sym] = corrs
+    return out
+
+
 def compute_correlation_matrix(
     histories: dict[str, pd.DataFrame],
     symbols: list[str] | None = None,
@@ -824,6 +853,7 @@ def compute_correlation_matrix(
     benchmark_symbol: str | None = "SPY",
     uk_benchmark_symbol: str | None = "ISF.L",
     eu_benchmark_symbol: str | None = "EXS1.DE",
+    against_symbols: list[str] | None = None,
 ) -> pd.DataFrame:
     """Compute pairwise correlation matrix, stripping regional market Beta when benchmark history is available.
 
@@ -872,14 +902,23 @@ def compute_correlation_matrix(
     if len(valid_syms) < 2:
         return pd.DataFrame()
 
-    raw_corr_1d = ret1_df[valid_syms].corr(min_periods=15)
-    raw_corr_2d = ret2_df[valid_syms].corr(min_periods=15)
-    raw_corr_5d = ret5_df[valid_syms].corr(min_periods=15)
+    if against_symbols is not None:
+        against_set = set(against_symbols)
+        row_syms = [s for s in valid_syms if s in against_set]
+        if not row_syms:
+            return pd.DataFrame()
+    else:
+        row_syms = valid_syms
+    col_syms = valid_syms
+
+    raw_corr_1d = _compute_rect_corr(ret1_df, row_syms, col_syms, min_periods=15)
+    raw_corr_2d = _compute_rect_corr(ret2_df, row_syms, col_syms, min_periods=15)
+    raw_corr_5d = _compute_rect_corr(ret5_df, row_syms, col_syms, min_periods=15)
 
     # For cross-timezone pairs (UK/EU 16:30 close vs US 21:00 close), compensate for closing lag via 2d/5d rolling corr
     raw_corr = raw_corr_1d.copy()
-    for a in valid_syms:
-        for b in valid_syms:
+    for a in row_syms:
+        for b in col_syms:
             if a == b or not _is_cross_timezone_pair(a, b):
                 continue
             best_v = raw_corr_1d.loc[a, b]
@@ -944,8 +983,12 @@ def compute_correlation_matrix(
     if resid1_df.empty:
         return raw_corr.round(2)
 
-    resid_corr_1d = resid1_df.corr(min_periods=15)
-    resid_corr_2d = resid2_df.corr(min_periods=15) if not resid2_df.empty else pd.DataFrame()
+    resid_corr_1d = _compute_rect_corr(resid1_df, row_syms, col_syms, min_periods=15)
+    resid_corr_2d = (
+        _compute_rect_corr(resid2_df, row_syms, col_syms, min_periods=15)
+        if not resid2_df.empty
+        else pd.DataFrame()
+    )
 
     combined = raw_corr.copy()
     for a in combined.index:

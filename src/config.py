@@ -146,8 +146,20 @@ class UniverseSection(BaseModel):
     isa_long_term: list[str] = Field(default_factory=list)
     invest_tactical: list[str] = Field(default_factory=list)
     etf_symbols: list[str] = Field(default_factory=list)
+    audition_enabled: bool = False
+    audition_target_size: int = Field(default=150, ge=20, le=500)
+    audition_sector_cap: int = Field(default=28, ge=5, le=200)
+    audition_min_uk_eu_slots: int = Field(default=30, ge=0, le=150)
+    audition_min_avg_dollar_vol_usd: float = Field(default=5_000_000.0, ge=0.0)
+    audition_fundamentals_ttl_days: int = Field(default=21, ge=1, le=90)
+    audition_info_concurrency: int = Field(default=2, ge=1, le=4)
+    audition_info_delay_seconds: float = Field(default=0.45, ge=0.0, le=5.0)
+    audition_indices: list[str] = Field(
+        default_factory=lambda: ["SP500", "NASDAQ100", "FTSE100", "FTSE250", "EUROSTOXX50"]
+    )
+    audition_sync_online_indices: bool = True
 
-    @field_validator("isa_long_term", "invest_tactical", "etf_symbols", mode="before")
+    @field_validator("isa_long_term", "invest_tactical", "etf_symbols", "audition_indices", mode="before")
     @classmethod
     def _clean_universe_symbols(cls, v: Any) -> list[str]:
         return _normalize_symbol_list(v)

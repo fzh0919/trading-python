@@ -744,7 +744,7 @@ class MarketDataService:
         ttl_seconds: int = 900,
         max_concurrency: int = 6,
         ops_notifier: Any = None,
-        max_cache_entries: int = 256,
+        max_cache_entries: int = 512,
         deep_intel_ttl_seconds: int = 21600,
         db: Any = None,
     ) -> None:
@@ -908,7 +908,7 @@ class MarketDataService:
             except YFRateLimitError as exc:
                 last_exc = exc
                 if attempt < max_retries:
-                    time.sleep(base_delay * (2 ** attempt))
+                    time.sleep(max(base_delay, 2.0) * (2 ** attempt))
                     continue
                 raise
             except Exception as exc:
@@ -1092,6 +1092,8 @@ class MarketDataService:
         batch_map: dict[str, pd.DataFrame] = {}
         chunk_size = 30
         for idx in range(0, len(symbols), chunk_size):
+            if idx > 0 and len(symbols) > 60:
+                await asyncio.sleep(0.35)
             chunk = symbols[idx : idx + chunk_size]
             async with self._sem:
                 chunk_res = await asyncio.to_thread(self._download_batch_sync, chunk, period)
@@ -1733,6 +1735,140 @@ class MarketDataService:
                 if intel:
                     out[sym] = intel
         return out
+
+    def _fetch_single_info_sync(self, symbol: str) -> dict[str, Any]:
+        """Fetch raw fundamental fields from yfinance.Ticker(symbol).info with safe retries."""
+        def _load_info() -> dict[str, Any]:
+            data = yf.Ticker(symbol).info or {}
+            return data if isinstance(data, dict) else {}
+
+        info = self._run_yf_call_with_retry(_load_info, max_retries=1, base_delay=2.0) or {}
+        if not info:
+            return {}
+        curr = _clean_text(info.get("currency"))
+        cur_price = (
+            _safe_float(info.get("currentPrice"))
+            or _safe_float(info.get("regularMarketPrice"))
+            or _safe_float(info.get("previousClose"))
+        )
+        return {
+            "symbol": symbol.strip().upper(),
+            "short_name": _clean_text(info.get("shortName")) or _clean_text(info.get("longName")) or symbol,
+            "exchange": _clean_text(info.get("exchange")) or _clean_text(info.get("fullExchangeName")),
+            "currency": curr,
+            "sector": _clean_text(info.get("sector")),
+            "industry": _clean_text(info.get("industry")),
+            "quote_type": _clean_text(info.get("quoteType")),
+            "market_cap": _safe_float(info.get("marketCap")),
+            "trailing_pe": _safe_float(info.get("trailingPE")),
+            "forward_pe": _safe_float(info.get("forwardPE")),
+            "roe_pct": _ratio_to_pct(info.get("returnOnEquity")),
+            "profit_margin_pct": _ratio_to_pct(info.get("profitMargins")),
+            "revenue_growth_pct": _ratio_to_pct(info.get("revenueGrowth")),
+            "debt_to_equity": _safe_float(info.get("debtToEquity")),
+            "dividend_yield_pct": _resolve_dividend_yield_pct(info, cur_price, curr),
+            "analyst_count": _safe_int(info.get("numberOfAnalystOpinions")),
+            "recommendation_key": _clean_text(info.get("recommendationKey")),
+            "beta": _safe_float(info.get("beta")),
+            "target_mean_price": _safe_float(info.get("targetMeanPrice")),
+            "updated_at_ms": int(time.time() * 1000),
+        }
+
+    async def get_fundamentals_cached(
+        self,
+        symbols: list[str],
+        *,
+        max_age_days: int = 21,
+        concurrency: int = 2,
+        delay_seconds: float = 0.45,
+        max_consecutive_429: int = 3,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Load cached fundamentals from SQLite and fetch stale/missing ones with rate-limit circuit breaker."""
+        clean_syms = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
+        results: dict[str, dict[str, Any]] = {}
+        if not clean_syms:
+            return results, {"cached": 0, "fetched": 0, "failed": 0, "skipped": 0, "rate_limited": False}
+
+        if self._db is not None and hasattr(self._db, "get_fundamentals_cache"):
+            try:
+                results.update(await self._db.get_fundamentals_cache(clean_syms, max_age_days=max_age_days))
+            except Exception as exc:
+                logger.warning("Failed reading fundamentals_cache: %s", exc)
+
+        cached_count = len(results)
+        missing = [s for s in clean_syms if s not in results]
+        if not missing:
+            return results, {
+                "cached": cached_count,
+                "fetched": 0,
+                "failed": 0,
+                "skipped": 0,
+                "rate_limited": False,
+            }
+
+        sem = asyncio.Semaphore(max(1, min(int(concurrency), 4)))
+        pending_flush: list[dict[str, Any]] = []
+        state = {"fetched": 0, "failed": 0, "skipped": 0, "consec_429": 0, "rate_limited": False}
+        state_lock = asyncio.Lock()
+
+        async def _flush_pending(force: bool = False) -> None:
+            if self._db is None or not hasattr(self._db, "upsert_fundamentals_cache"):
+                pending_flush.clear()
+                return
+            if not pending_flush or (not force and len(pending_flush) < 20):
+                return
+            batch = list(pending_flush)
+            pending_flush.clear()
+            try:
+                await self._db.upsert_fundamentals_cache(batch)
+            except Exception as exc:
+                logger.warning("Checkpoint fundamentals_cache flush failed: %s", exc)
+
+        async def _worker(sym: str) -> None:
+            async with sem:
+                async with state_lock:
+                    if state["rate_limited"]:
+                        state["skipped"] += 1
+                        return
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+                try:
+                    info = await asyncio.to_thread(self._fetch_single_info_sync, sym)
+                    async with state_lock:
+                        state["consec_429"] = 0
+                        if info:
+                            results[sym] = info
+                            pending_flush.append(info)
+                            state["fetched"] += 1
+                            await _flush_pending(force=False)
+                        else:
+                            state["failed"] += 1
+                except Exception as exc:
+                    msg = str(exc).lower()
+                    is_429 = isinstance(exc, YFRateLimitError) or "429" in msg or "too many requests" in msg
+                    async with state_lock:
+                        state["failed"] += 1
+                        if is_429:
+                            state["consec_429"] += 1
+                            if state["consec_429"] >= max(1, int(max_consecutive_429)):
+                                state["rate_limited"] = True
+                                logger.warning(
+                                    "Yahoo Finance .info circuit breaker tripped after %d consecutive 429s; "
+                                    "aborting remaining fetches safely.",
+                                    state["consec_429"],
+                                )
+                        else:
+                            state["consec_429"] = 0
+
+        await asyncio.gather(*(_worker(sym) for sym in missing))
+        await _flush_pending(force=True)
+        return results, {
+            "cached": cached_count,
+            "fetched": state["fetched"],
+            "failed": state["failed"],
+            "skipped": state["skipped"],
+            "rate_limited": state["rate_limited"],
+        }
 
     async def get_macro_snapshot(self) -> MacroSnapshot:
         now = time.monotonic()

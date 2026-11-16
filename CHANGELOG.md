@@ -40,7 +40,7 @@
 ## 二、版本修改日志（Changelog `v5.0.1` ~ `v5.2.0`）
 
 ### `v5.2.0`（2026-11-16）
-围绕 Intel N95 闲时算力与外部免费接口深度挖掘完成 `IMP-20 ~ IMP-22` 升级（0 新增重依赖、严守 Gemini \$10/月 预算与 5 条系统核心不变量，全套 `103 tests OK`）：
+围绕 Intel N95 闲时算力与外部免费接口深度挖掘完成 `IMP-20 ~ IMP-22` 升级及多市场 150 只精锐底池海选引擎（0 新增重依赖、严守 Gemini \$10/月 预算与 5 条系统核心不变量，全套 `111 tests OK`）：
 
 1. **本地 `2y` 日线增量缓存、T212 元数据/分红归档与盘前 `-10m` 静默预热（`IMP-20`）**：
    - `src/storage/db.py` 新增 `ohlcv_cache`、`t212_instruments_metadata`、`t212_dividend_archive`；`MarketDataService.get_histories()` 扩至 `2y` 并支持 `1mo` 增量合并与 `>0.5%` 拆股全量重拉。
@@ -52,8 +52,15 @@
    - `FredClient` 升级 `limit=25`（0 额外请求算 20d 利率动量 bps）并新增高收益债利差 `BAMLH0A0HYM2`；`get_us_deep_intel_batch()` 接入 `/report` 与 `/pick` Stage 2 打分；`run_forced_market_grounding()` 对临近财报/除息或涨跌 `>=3%` 持仓开启 1 对 1 独立深搜。
 3. **多窗口后验追踪（`T+5/10/20` + `MFE/MAE`）与周六离线量化体检（`IMP-22`）**：
    - 每日盘后结算同步记录 `MFE/MAE` 并 0-Token 自动追评已满 `T+10`/`T+20` 的延伸 Alpha；周六 `10:00~22:00 UK` 静默运行 `run_offline_universe_and_threshold_audit()` 并落库 `quant_health_audits`，在 `/stats` 看板完整呈现。
-4. **版本同步与全量回归验收（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `CHANGELOG.md`）**：
-   - 版本号升级至 `5.2.0`，增补 16 组纯离线单元测试（共 `103` 项全绿通过）与全仓编译验证。
+4. **多市场 0-Token 海选引擎（150 只精锐底池）、`N × H` 相关性优化与防限流熔断**：
+   - 新增 `src/engine/universe_seeds.py` 与 `config.yaml` 扩展配置：覆盖 **S&P 500 + NASDAQ 100 + FTSE 100 + FTSE 250 + Euro Stoxx 50** 基准池（内置兜底种子 + 30 天缓存依赖零新增 `HTMLParser` 同步），并将 LSE 英镑 UCITS ETF 独立底座扩至 25 只。
+   - `src/storage/db.py` 与 `src/data_providers/t212_client.py` 新增 `fundamentals_cache`（21 天 TTL）、`active_universe_pool`、`index_constituents_cache`，并按 52 秒冷却错峰同步 ISA/Invest 双账户元数据校验 `isa_eligible`/`invest_eligible`。
+   - `src/data_providers/market_data.py` 将 `max_cache_entries` 升至 `512`，新增带并发控制（`2` 并发 + `0.45s` 节流）、20 条断点落库与连续 3 次 429 自动熔断的 `get_fundamentals_cached()`，并对大批量日线分片增加 `0.35s` 间隔。
+   - `src/data_providers/analytics.py` 为 `compute_correlation_matrix()` 新增 `against_symbols` 矩形切片模式（仅算 `候选 × 持仓` 的 `N × H` 相关性，消除 `O(N²)` 性能瓶颈）。
+   - `src/engine/screener.py` 新增 `run_universe_audition()`（T212 可买性交集 → `1y` 流动性/趋势预筛 → 盈利/估值/规模/动量打分 + 单行业上限 `28` + 英欧最低 `30` 席位 → 精选 150 只个股），`run_quant_screener()` 接入共享精锐个股池、合规门控及 Stage 1 单行业上限，保留双轨非对称权重分层。
+   - 接通 `pick_agent.py`、`scheduler.py`（周六自动海选 + 日常预热动态池），并新增 Telegram `/refresh_pool` 与命令行 `python -m src.refresh_pool`（`src/refresh_pool.py`）手动触发入口。
+5. **版本同步与全量回归验收（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `CHANGELOG.md`, `tests/`）**：
+   - 版本号升级至 `5.2.0`，在 `IMP-20~22` 之上增补 `tests/test_universe_audition.py` 7 组单测（共 `111` 项全绿通过）与全仓编译验证。
 
 ### `v5.1.2`（2026-11-16）
 全面优化 `/report`、`/pick` 与日常单聊（`chat`）发给 Gemini 的 Prompt 上下文信噪比，消除重复打印、模板废话、低密度噪音与半截断残句（全套 `87 tests OK`）：

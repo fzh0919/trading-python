@@ -19,6 +19,7 @@ from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import T212Client
+from src.engine.screener import run_universe_audition
 from src.storage.db import AdvisorDatabase
 from src.version import APP_VERSION
 
@@ -129,6 +130,7 @@ class AdvisorBot:
             "• /stats — 查看近期历史选股与加减仓记录档案\n"
             "• 直接打字 — 全天单聊（自带今日晨报基线、实时查价与谷歌搜新闻工具）\n\n"
             "【运维与系统控制指令】\n"
+            "• /refresh_pool — 手动触发多市场底池海选（0-Token 筛选 150 只优质个股 + LSE ETF）\n"
             "• /health — 全链路实时自检（T212/行情/FRED/Finnhub/Gemini/DB 与近期告警）\n"
             "• /usage — 查看 Gemini Token 消耗、缓存命中率与本月 Google Search 免费额度进度\n"
             "• /clear — 清空今日对话记忆重新开始\n"
@@ -528,6 +530,31 @@ class AdvisorBot:
                     await self.tg.send_message(chat_id, reply)
                     return
 
+                if lower.startswith("/refresh_pool"):
+                    sync_online = "offline" not in lower
+                    status_msg_id = await self.tg.send_status(
+                        chat_id,
+                        "⏳ 正在执行多市场底池海选（T212 可买性交集 + 1y 流动性初筛 + 缓存基本面打分，约 1~4 分钟）...",
+                    )
+                    self._active_status_msg_id = status_msg_id
+                    if self.scheduler is not None and hasattr(self.scheduler, "run_pool_audition"):
+                        res = await self.scheduler.run_pool_audition(
+                            sync_online_indices=sync_online,
+                            sync_t212_metadata=True,
+                        )
+                    else:
+                        res = await run_universe_audition(
+                            self.cfg,
+                            self.t212,
+                            self.market_data,
+                            self.db,
+                            sync_online_indices=sync_online,
+                            sync_t212_metadata=True,
+                        )
+                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 选股底池海选更新完成：")
+                    await self.tg.send_message(chat_id, self._format_audition_reply(res))
+                    return
+
                 # Free-form chat
                 status_msg_id = await self.tg.send_status(chat_id, "⏳ 正在核对实盘数据并思考回复...")
                 self._active_status_msg_id = status_msg_id
@@ -639,4 +666,32 @@ class AdvisorBot:
             f"• 备援模型: {m.fallback_model} ({m.fallback_thinking_level}) | "
             f"早报搜索: {m.report_search_model} | 单聊/日常搜索: {m.search_model}"
         )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_audition_reply(res: dict[str, Any]) -> str:
+        reg = res.get("by_region") or {}
+        fstats = res.get("fundamentals_stats") or {}
+        sectors = list((res.get("by_sector") or {}).items())[:6]
+        sec_str = " | ".join(f"{k}:{v}" for k, v in sectors) if sectors else "无"
+        added = res.get("added_symbols") or []
+        removed = res.get("removed_symbols") or []
+        lines = [
+            f"🎯 多市场选股底池海选完成 ({res.get('updated_at_uk', '')} UK)",
+            f"• 漏斗: 基准池 {res.get('base_equities_count', 0)} → T212可买 {res.get('t212_tradable_count', 0)} → 流动性达标 {res.get('liquidity_passed_count', 0)} → 精选个股 {res.get('selected_equities_count', 0)} 只 + LSE ETF {res.get('selected_etfs_count', 0)} 只",
+            f"• 区域分布: 美股 {reg.get('US', 0)} | 英股 {reg.get('UK', 0)} | 欧股 {reg.get('EU', 0)}",
+            f"• 行业分布(前6): {sec_str}",
+            f"• 基本面缓存: 命中 {fstats.get('cached', 0)} | 新抓 {fstats.get('fetched', 0)} | 失败 {fstats.get('failed', 0)}",
+        ]
+        if fstats.get("rate_limited"):
+            lines.append(
+                f"⚠️ Yahoo .info 触发连续 429 熔断保护，已安全跳过剩余 {fstats.get('skipped', 0)} 只（已抓数据已落库，稍后重跑可断点续传）。"
+            )
+        if added or removed:
+            add_preview = ", ".join(added[:8]) + (f" 等{len(added)}只" if len(added) > 8 else "")
+            rem_preview = ", ".join(removed[:8]) + (f" 等{len(removed)}只" if len(removed) > 8 else "")
+            lines.append(f"• 池子变动: 新增 [{add_preview or '无'}] | 移出 [{rem_preview or '无'}]")
+        preview = res.get("top_preview") or []
+        if preview:
+            lines.append(f"• 综合质地前列: {', '.join(preview[:6])}")
         return "\n".join(lines)

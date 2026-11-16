@@ -409,14 +409,24 @@ class T212Client:
         isin = str(raw_isin).strip().upper() or None
         return clean, inst_curr, yahoo_sym, isin
 
-    async def fetch_instruments_metadata(self) -> list[dict[str, Any]]:
+    async def fetch_instruments_metadata(self, *, account_scope: str | None = None) -> list[dict[str, Any]]:
         """Fetch /equity/metadata/instruments (1 req / 50s bucket) and sync to SQLite archive if available."""
-        if self.isa_key and self.isa_secret:
+        scope = str(account_scope or "").strip().upper() or None
+        if scope == "ISA":
+            if not (self.isa_key and self.isa_secret):
+                return []
             api_key, api_secret = self.isa_key, self.isa_secret
-        elif self.invest_key and self.invest_secret:
+        elif scope == "INVEST":
+            if not (self.invest_key and self.invest_secret):
+                return []
             api_key, api_secret = self.invest_key, self.invest_secret
         else:
-            return []
+            if self.isa_key and self.isa_secret:
+                api_key, api_secret = self.isa_key, self.isa_secret
+            elif self.invest_key and self.invest_secret:
+                api_key, api_secret = self.invest_key, self.invest_secret
+            else:
+                return []
 
         client = self._get_client()
         headers = self._auth_headers(api_key, api_secret)
@@ -439,6 +449,9 @@ class T212Client:
         reset_ts = _parse_ratelimit_reset_ts(resp.headers)
         if remaining is not None and remaining <= 0 and reset_ts is None:
             self._rate_limit_resets[("metadata_instruments", urlparse(url).path)] = time.time() + 50.0
+        elif scope is not None:
+            # Proactively enforce T212 1 req / 50s cooldown before any subsequent account-scope call
+            self._rate_limit_resets[("metadata_instruments", urlparse(url).path)] = time.time() + 52.0
 
         if resp.status_code != 200:
             logger.warning("T212 /equity/metadata/instruments returned HTTP %d", resp.status_code)
@@ -486,10 +499,29 @@ class T212Client:
 
         if parsed_items and self._db is not None and hasattr(self._db, "upsert_t212_instruments"):
             try:
-                await self._db.upsert_t212_instruments(parsed_items)
+                if scope is not None:
+                    await self._db.upsert_t212_instruments(
+                        parsed_items,
+                        account_scope=scope,
+                        full_snapshot=True,
+                    )
+                else:
+                    await self._db.upsert_t212_instruments(parsed_items)
             except Exception as exc:
                 logger.warning("Failed persisting T212 instrument metadata: %s", exc)
         return parsed_items
+
+    async def sync_all_accounts_instruments_metadata(self) -> dict[str, int]:
+        """Sync both ISA & Invest instrument lists sequentially, respecting T212's 1 req / 50s bucket."""
+        isa_count = 0
+        invest_count = 0
+        if self.isa_key and self.isa_secret:
+            isa_items = await self.fetch_instruments_metadata(account_scope="ISA")
+            isa_count = len(isa_items)
+        if self.invest_key and self.invest_secret:
+            invest_items = await self.fetch_instruments_metadata(account_scope="INVEST")
+            invest_count = len(invest_items)
+        return {"isa_count": isa_count, "invest_count": invest_count}
 
     async def _notify_ops(
         self,
