@@ -1360,7 +1360,7 @@ def format_account_overview(acc: AccountSnapshot) -> str:
     curr = acc.account_currency
     stock_only_pnl = acc.unrealized_pnl - acc.total_fx_impact
     ret_pct = ((acc.unrealized_pnl / acc.investments_cost) * 100.0) if acc.investments_cost > 0 else 0.0
-    reserved_str = f", 挂单冻结: {acc.reserved_cash:.2f}" if acc.reserved_cash > 0 else ""
+    reserved_str = f", 挂单占用(未成交前仍计息): {acc.reserved_cash:.2f}" if acc.reserved_cash > 0 else ""
     note_str = f" {acc.cash_status_note}" if acc.cash_status_note else ""
     realized_str = f" | 累计已实现: {curr} {acc.realized_pnl:.2f}" if acc.realized_pnl is not None else ""
     fallback_head = (

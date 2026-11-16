@@ -551,7 +551,7 @@ async def generate_pick_radar(
         f"双账户总净值 £{portfolio.total_combined_value:,.2f} | "
         f"总现金 £{portfolio.total_combined_cash:,.2f} (占总资产 {total_cash_pct:.1f}%) | "
         f"立即可用 £{total_available:,.2f} (ISA £{portfolio.isa.available_to_trade:,.2f} + Invest £{portfolio.invest.available_to_trade:,.2f}) | "
-        f"挂单锁定 ISA £{portfolio.isa.reserved_cash:,.2f} / Invest £{portfolio.invest.reserved_cash:,.2f}"
+        f"挂单占用(未成交前仍计息) ISA £{portfolio.isa.reserved_cash:,.2f} / Invest £{portfolio.invest.reserved_cash:,.2f}"
     )
 
     cand_syms = list(

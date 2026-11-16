@@ -53,7 +53,14 @@
 6. **清理 `chat` 重复红线与半截断残句，并隔离 `/pick` 挂单审计指令（`src/agents/schemas.py`, `src/agents/chat_agent.py`, `src/agents/prompts.py`, `src/agents/pick_agent.py`）**：
    - 增强 `trim_text_at_line_boundary()` 在单行超长时按句末/分句标点优雅裁剪；`chat_agent.py` 全面替换字符硬切片，并通过 `_has_complete_embedded_vetoes()` 在早报正文已完整嵌入红线时跳过重复 `【今日风控红线】`。
    - 在 `build_investor_profile()` 与 `build_agent_system_instruction()` 新增 `include_order_audit_rule: bool = True` 开关，`/pick` 的 Researcher 与 Critic 显式关闭该条挂单撤改审计指令以专注增量选股。
-7. **版本与回归单测同步（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `tests/`）**：
+7. **修复 T212 旧称 `FB` 归一化至 `META`（`src/data_providers/t212_client.py`, `src/data_providers/analytics.py`）**：
+   - 在 `clean_t212_ticker()` 与 `to_yahoo_symbol()` 新增美股历史改名代码映射 `_LEGACY_US_TICKER_ALIASES`（`FB_US_EQ` → `ticker="META"`、`yahoo_symbol="META"`，不误伤非美股代码），并在 `_ISSUER_ALIASES` 同步补充 `"FB": "META"` 兜底，消除 Yahoo 错拉 `FB` ETF（`$44.64`）与克隆 ETF 暴露/跨账户统计污染。
+8. **打通 `/report` 与 `/pick` 持仓/挂单裁决同步与逆势硬护栏（`src/agents/report_agent.py`, `src/agents/pick_agent.py`, `src/engine/portfolio_rules.py`）**：
+   - `/report` 完结后将 `headline`、`top_actions`、`pending_order_audits` 与 `daily_vetoes` 写入 `context_pack["report_decision"]` 持久化；`/pick` 同步将早报持仓/挂单裁决及当前活动挂单注入 Stage 1 与 Stage 2 Prompt，并在初筛候选行打上 `⚠️今日早报已裁决` 标签（无盘中新变量不推翻早报挂单裁决）。
+   - `apply_risk_override_guardrail()` 新增 `report_actions` 联动，硬拦截与同日早报 `TRIM`/`STOP` 指令冲突的同账户逆势 `BUY`/`ADD`/`SWAP`。
+9. **明确挂单占用资金照常产生 4% 年化利息（`src/agents/prompts.py`, `src/agents/report_agent.py`, `src/data_providers/t212_client.py`, `src/agents/pick_agent.py`）**：
+   - 在 `build_investor_profile()` 与 `/report` `auditor_sys` 明确声明 Trading 212 买入限价挂单所占用资金在未成交前照常享有同等日息，严禁以“释放挂单资金吃息”为由阻止低位挂单或建议 `CANCEL`；并将账户与现金展示文案中的 `挂单冻结`/`挂单锁定` 统一调整为 `挂单占用(未成交前仍计息)`。
+10. **版本与回归单测同步（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `tests/`）**：
    - 版本号升级至 `5.1.2`；同步更新并增补 `test_t212_client.py`、`test_analytics_and_rules.py`、`test_db_and_end_to_end.py` 与 `test_v504_ops_and_grounding.py` 回归断言，全套 87 项单测通过。
 
 ### `v5.1.1`（2026-11-15）

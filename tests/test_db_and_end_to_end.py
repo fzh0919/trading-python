@@ -1421,6 +1421,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】", critic_call["prompt"])
             self.assertIn("SHEL.L", critic_call["prompt"])
             self.assertIn("当前活动挂单", critic_call["prompt"])
+            self.assertIn("挂单占用(未成交前仍计息)", research_call["prompt"])
+            self.assertIn("照常产生同等日息", research_call["system_instruction"])
             self.assertIn("NVDA(BUY→拦截)", out)
             self.assertIn("VWRP.L", out)
 

@@ -690,7 +690,8 @@ async def generate_morning_report(
         "3. 【活动挂单零情面独立审计】：逐一核查【当前活动挂单】！"
         "无论挂单是用户手动下单还是前序 AI 建议，结合当前现价、均线位置、分析师目标价、"
         f"{cfg.strategy.uk_stamp_duty_pct:.1f}% 印花税/{cfg.strategy.fx_fee_pct * 2:.2f}% 往返换汇费以及 {cfg.strategy.cash_interest_rate_pct:.1f}% 现金利息门槛——"
-        "只要限价过高、向上空间不足或逆势风险大，必须敢于直白裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！\n"
+        f"注意挂单占用资金在未成交前照常产生 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息，严禁以“释放冻结现金吃息”为由撤单；"
+        "仅当限价过高、成交后预期净空间跑不赢现金利息+摩擦或基本面/技术面风险过大时，必须敢于直白裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！\n"
         # [用户授权调整] 1200 字草稿集中用于异动/分歧/挂单；IMP-12 请保留。
         "4. 篇幅聚焦：常规无异常 HOLD 持仓合并略过，把 1200 字集中分配给异动标的、分歧标的与活动挂单。",
         cfg.strategy,

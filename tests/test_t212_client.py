@@ -745,6 +745,17 @@ class TestT212Client(unittest.IsolatedAsyncioTestCase):
         )
         empty_ctx = build_trade_context(empty_p)
         self.assertEqual(empty_ctx["cash_flow_summary_text"], "")
+        reserved_overview = format_account_overview(
+            AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=2000.0,
+                total_cash=2000.0,
+                available_to_trade=1500.0,
+                reserved_cash=500.0,
+            )
+        )
+        self.assertIn("挂单占用(未成交前仍计息): 500.00", reserved_overview)
         self.assertNotIn("资金流水与派息", empty_ctx["trade_summary_30d_text"])
         self.assertIn("活动挂单接口临时异常", empty_ctx["pending_orders_text"])
 
