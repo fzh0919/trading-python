@@ -2097,7 +2097,7 @@ async def run_universe_audition(
         # Exclude severe long-term structural collapse before spending .info calls
         if (
             tech.ma200
-            and tech.current_price < tech.ma200 * 0.55
+            and tech.last_close < tech.ma200 * 0.55
             and (tech.ret_60d_pct or 0.0) < -25.0
         ):
             continue

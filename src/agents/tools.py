@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from zoneinfo import ZoneInfo
 
 from google.genai import types
 
@@ -26,13 +29,16 @@ if TYPE_CHECKING:
     from src.storage.db import AdvisorDatabase
 
 logger = logging.getLogger(__name__)
+LONDON_TZ = ZoneInfo("Europe/London")
 
 _EU_SUFFIXES = (".DE", ".AS", ".PA", ".SW", ".MI", ".MC", ".BR", ".VI", ".ST", ".CO", ".HE", ".OL")
 # cache_key -> (stored_at_monotonic, expires_at_monotonic, output)
 _GROUNDING_CACHE: dict[str, tuple[float, float, str]] = {}
 _GROUNDING_CACHE_MAX_ENTRIES = 64
 _DEFAULT_GROUNDING_CONCURRENCY = 3
+_DEFAULT_PERSIST_TTL_SECONDS = 10800
 _INSPECT_TOOL_MAX_CHARS = 3800
+_TICKER_TOKEN_RE = re.compile(r"\b([A-Z]{1,6}(?:\.[A-Z]{1,3}|-[A-Z])?)\b")
 
 
 def _monotonic() -> float:
@@ -106,6 +112,10 @@ async def run_forced_market_grounding(
     ops_notifier: OpsNotifier | None = None,
     max_concurrent_searches: int = _DEFAULT_GROUNDING_CONCURRENCY,
     priority_symbols: list[str] | None = None,
+    db: AdvisorDatabase | None = None,
+    persist_ttl_seconds: int = _DEFAULT_PERSIST_TTL_SECONDS,
+    bypass_cache: bool = False,
+    per_symbol_out: dict[str, str] | None = None,
 ) -> str:
     """Run grouped concurrent Google Search Grounding across UK/EU/US equities, ETFs, and macro news."""
     if llm is None:
@@ -121,9 +131,10 @@ async def run_forced_market_grounding(
     )
     now = _monotonic()
     _prune_grounding_cache(now)
-    cached = _GROUNDING_CACHE.get(cache_key)
-    if cached and ttl_seconds > 0 and (now - cached[0]) < ttl_seconds and now < cached[1]:
-        return cached[2]
+    if not bypass_cache:
+        cached = _GROUNDING_CACHE.get(cache_key)
+        if cached and ttl_seconds > 0 and (now - cached[0]) < ttl_seconds and now < cached[1]:
+            return cached[2]
 
     qtypes = quote_types or {}
     uk_syms: list[str] = []
@@ -138,7 +149,9 @@ async def run_forced_market_grounding(
         else:
             us_syms.append(sym)
 
-    tasks_meta: list[tuple[str, str]] = []
+    uk_date = datetime.now(timezone.utc).astimezone(LONDON_TZ).date().isoformat()
+    # (title, prompt, db_cache_key, task_symbols, is_priority)
+    tasks_meta: list[tuple[str, str, str, list[str], bool]] = []
     usage_label = f"{scope}_grounding"
 
     if scope == "report":
@@ -146,13 +159,20 @@ async def run_forced_market_grounding(
             (
                 "【宏观与英/欧/美今日突发主线】",
                 "请通过 Google Search 检索过去 48 小时内影响英国(FTSE/BoE/英镑)、欧洲(ECB/欧元区)与美国(Fed/美债收益率/美股盘前盘后)的核心宏观突发新闻与重大政策动向，控制在 240 字以内。",
+                f"grounding:{uk_date}:macro",
+                [],
+                False,
             )
         )
     elif focus_query.strip():
+        fq_norm = focus_query.strip().lower()
         tasks_meta.append(
             (
                 f"【指定方向实时检索：{focus_query.strip()}】",
                 f"请通过 Google Search 检索围绕主题「{focus_query.strip()}」在美股、英股/LSE ETF 与欧股中的最新突发催化、行业景气数据与潜在监管风险，控制在 260 字以内。",
+                f"grounding:{uk_date}:focus:{fq_norm}",
+                [],
+                False,
             )
         )
 
@@ -173,12 +193,15 @@ async def run_forced_market_grounding(
                 f"请通过 Google Search 针对美股/ETF {sym} 进行 1 对 1 深度检索：核查近 72 小时隔夜突发新闻、"
                 "盘前盘后异动原因、最新财报预期/指引、分红及机构评级调整，给出日期与核心数字，控制在 180 字以内。"
             )
-        tasks_meta.append((f"【重点标的1对1深搜 · {sym}】", p_prompt))
+        tasks_meta.append(
+            (f"【重点标的1对1深搜 · {sym}】", p_prompt, f"grounding:{uk_date}:prio:{sym}", [sym], True)
+        )
 
     batch_size = 3
     region_specs = [
         (
             uk_syms,
+            "UK",
             "英股与 LSE ETF 联网新闻",
             "请通过 Google Search 检索以下伦敦交易所股票/ETF 近 7 天最新 RNS 监管公告、财报或派息动态、分析师评级变化与重大行业新闻：{syms}。"
             "有重大突发消息/公告/评级变动的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
@@ -186,6 +209,7 @@ async def run_forced_market_grounding(
         ),
         (
             eu_syms,
+            "EU",
             "欧股联网新闻",
             "请通过 Google Search 检索以下欧洲股票近 7 天最新监管公告、财报指引、订单/监管消息与机构评级变化：{syms}。"
             "有重大突发消息/公告/评级变动的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
@@ -193,19 +217,34 @@ async def run_forced_market_grounding(
         ),
         (
             us_syms,
+            "US",
             "美股与全球 ETF 联网新闻",
             "请通过 Google Search 检索以下美股/ETF 近 48~72 小时隔夜突发新闻、盘前盘后异动原因、财报指引修正、诉讼/回购与机构最新评级：{syms}。"
             "有真实异动或重大消息的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
             "无重大突发新闻的标的严禁逐个单列写长句，必须在末尾合并为一行略过（格式：近期无重大新公告：SYM1, SYM2）。",
         ),
     ]
-    for region_syms, title_base, prompt_tpl in region_specs:
+    for region_syms, region_code, title_base, prompt_tpl in region_specs:
         for idx, chunk in enumerate(_chunk_list(region_syms, batch_size), 1):
             suffix = f" #{idx}" if len(region_syms) > batch_size else ""
-            tasks_meta.append((f"【{title_base}{suffix}】", prompt_tpl.format(syms=", ".join(chunk))))
+            batch_key = f"grounding:{uk_date}:batch:{region_code}:{','.join(sorted(chunk))}"
+            tasks_meta.append(
+                (f"【{title_base}{suffix}】", prompt_tpl.format(syms=", ".join(chunk)), batch_key, list(chunk), False)
+            )
 
     if not tasks_meta:
         return ""
+
+    db_cached: dict[str, str] = {}
+    if db is not None and not bypass_cache and persist_ttl_seconds > 0 and hasattr(db, "get_grounding_news_cache"):
+        try:
+            db_cached = await db.get_grounding_news_cache(
+                [item[2] for item in tasks_meta],
+                max_age_seconds=persist_ttl_seconds,
+            )
+        except Exception as exc:
+            logger.debug("Failed loading grounding_news_cache: %s", exc)
+            db_cached = {}
 
     sem = asyncio.Semaphore(max(1, max_concurrent_searches))
 
@@ -218,22 +257,62 @@ async def run_forced_market_grounding(
                 usage_label=usage_label,
             )
 
-    raw_results = await asyncio.gather(
-        *(_bounded_search(p) for _, p in tasks_meta),
-        return_exceptions=True,
-    )
+    missing_indices = [idx for idx, item in enumerate(tasks_meta) if item[2] not in db_cached]
+    raw_by_idx: dict[int, Any] = {}
+    if missing_indices:
+        fetched_results = await asyncio.gather(
+            *(_bounded_search(tasks_meta[idx][1]) for idx in missing_indices),
+            return_exceptions=True,
+        )
+        for idx, res in zip(missing_indices, fetched_results):
+            raw_by_idx[idx] = res
 
     sections: list[str] = []
     errors: list[str] = []
-    for (title, _), res in zip(tasks_meta, raw_results):
-        if isinstance(res, Exception):
-            errors.append(f"{title}: {type(res).__name__}")
-            continue
-        text = str(res or "").strip()
-        if not text or text.startswith("⚠️"):
-            errors.append(f"{title}: {text[:120] or 'empty'}")
-            continue
+    db_entries_to_save: list[dict[str, Any]] = []
+    for idx, (title, _, t_key, t_syms, is_prio) in enumerate(tasks_meta):
+        if t_key in db_cached:
+            text = db_cached[t_key].strip()
+        else:
+            res = raw_by_idx.get(idx)
+            if isinstance(res, Exception):
+                errors.append(f"{title}: {type(res).__name__}")
+                continue
+            text = str(res or "").strip()
+            if not text or text.startswith("⚠️"):
+                errors.append(f"{title}: {text[:120] or 'empty'}")
+                continue
+            if db is not None and persist_ttl_seconds > 0 and hasattr(db, "upsert_grounding_news_cache"):
+                db_entries_to_save.append(
+                    {
+                        "cache_key": t_key,
+                        "scope": scope,
+                        "symbol": t_syms[0] if len(t_syms) == 1 else "",
+                        "summary_text": text,
+                    }
+                )
+                for s in t_syms:
+                    sym_key = f"grounding:{uk_date}:sym:{s}"
+                    if is_prio or sym_key != t_key:
+                        db_entries_to_save.append(
+                            {
+                                "cache_key": sym_key,
+                                "scope": scope,
+                                "symbol": s,
+                                "summary_text": text,
+                            }
+                        )
         sections.append(f"{title}\n{text}")
+        if per_symbol_out is not None and t_syms:
+            for s in t_syms:
+                if is_prio or s not in per_symbol_out:
+                    per_symbol_out[s] = text
+
+    if db_entries_to_save and db is not None and hasattr(db, "upsert_grounding_news_cache"):
+        try:
+            await db.upsert_grounding_news_cache(db_entries_to_save)
+        except Exception as exc:
+            logger.debug("Failed saving grounding_news_cache: %s", exc)
 
     if errors and ops_notifier is not None:
         sev = "CRITICAL" if not sections else "WARN"
@@ -338,6 +417,8 @@ class MarketToolkit:
         search_model: str = "gemini-4-hydrogen",
         ops_notifier: OpsNotifier | None = None,
         db: AdvisorDatabase | None = None,
+        allow_search_tool: bool = True,
+        search_cache_ttl_seconds: int = _DEFAULT_PERSIST_TTL_SECONDS,
     ) -> None:
         self.market_data = market_data
         self.portfolio = portfolio
@@ -345,6 +426,10 @@ class MarketToolkit:
         self.search_model = search_model
         self.ops_notifier = ops_notifier
         self.db = db
+        self.allow_search_tool = bool(allow_search_tool)
+        self.search_cache_ttl_seconds = max(0, int(search_cache_ttl_seconds))
+        self._inspect_cache: dict[str, dict[str, Any]] = {}
+        self._corr_cache: dict[str, dict[str, Any]] = {}
 
     def _find_holding_context(self, sym: str) -> tuple[str | None, str | None]:
         """Return (isin, created_at) from current portfolio positions for a Yahoo symbol."""
@@ -394,7 +479,7 @@ class MarketToolkit:
                 parameters={"type": "OBJECT", "properties": {}},
             ),
         ]
-        if self.llm is not None:
+        if self.llm is not None and self.allow_search_tool:
             decls.append(
                 types.FunctionDeclaration(
                     name="search_market_news",
@@ -421,6 +506,8 @@ class MarketToolkit:
             sym = str(args.get("symbol") or "").strip().upper()
             if not sym:
                 return {"error": "symbol is required"}
+            if sym in self._inspect_cache:
+                return self._inspect_cache[sym]
             pos_isin, pos_created_at = self._find_holding_context(sym)
             isin_map = {sym: pos_isin} if pos_isin else None
             histories, bundles = await self.market_data.get_bundles(
@@ -488,13 +575,17 @@ class MarketToolkit:
                 # [用户授权调整] 保持 inspect_ticker 返回紧凑（新闻截前 3 条）；控制整包 < 4000 字符以免触发裁剪。
                 "news": (bundle.news[:3] if bundle else []),
             }
-            return _compact_inspect_payload(payload)
+            compacted = _compact_inspect_payload(payload)
+            self._inspect_cache[sym] = compacted
+            return compacted
 
         if name == "check_portfolio_correlation":
             sym = str(args.get("symbol") or "").strip().upper()
             held_syms = self.portfolio.unique_yahoo_symbols()
             if not sym:
                 return {"error": "symbol is required"}
+            if sym in self._corr_cache:
+                return self._corr_cache[sym]
             if not held_syms:
                 return {"symbol": sym, "note": "当前无持仓可比对"}
             all_syms = list(dict.fromkeys([*held_syms, sym]))
@@ -514,11 +605,13 @@ class MarketToolkit:
                 eu_benchmark_symbol="EXS1.DE",
             )
             most_sym, corr_val = max_correlation_against_portfolio(corr, sym, held_syms)
-            return {
+            res_corr = {
                 "candidate": sym,
                 "most_correlated_holding": most_sym,
                 "max_correlation_60d": corr_val,
             }
+            self._corr_cache[sym] = res_corr
+            return res_corr
 
         if name == "get_macro_snapshot":
             snap = await self.market_data.get_macro_snapshot()
@@ -530,19 +623,74 @@ class MarketToolkit:
                 return {"error": "query is required"}
             if self.llm is None:
                 return {"error": "Google Search backend unavailable"}
+
+            norm_q = query.lower()
+            mem_key = f"tool_search:{norm_q}"
+            now = _monotonic()
+            _prune_grounding_cache(now)
+            mem_hit = _GROUNDING_CACHE.get(mem_key)
+            if mem_hit and now < mem_hit[1]:
+                return {"query": query, "summary": mem_hit[2], "cached": True}
+
+            uk_date = datetime.now(timezone.utc).astimezone(LONDON_TZ).date().isoformat()
+            tok_match = _TICKER_TOKEN_RE.search(query)
+            sym_tok = tok_match.group(1) if tok_match else ""
+            db_keys = [f"tool_search:{uk_date}:{norm_q}"]
+            if sym_tok and len(query.split()) <= 5:
+                db_keys.extend(
+                    [
+                        f"grounding:{uk_date}:prio:{sym_tok}",
+                        f"grounding:{uk_date}:sym:{sym_tok}",
+                    ]
+                )
+            if self.db is not None and self.search_cache_ttl_seconds > 0 and hasattr(self.db, "get_grounding_news_cache"):
+                try:
+                    cached_map = await self.db.get_grounding_news_cache(
+                        db_keys,
+                        max_age_seconds=self.search_cache_ttl_seconds,
+                    )
+                    for k in db_keys:
+                        if k in cached_map:
+                            cached_val = cached_map[k]
+                            _GROUNDING_CACHE[mem_key] = (now, now + 900.0, cached_val)
+                            _prune_grounding_cache(now)
+                            return {"query": query, "summary": cached_val, "cached": True}
+                except Exception as exc:
+                    logger.debug("search_market_news cache lookup failed: %s", exc)
+
             res = await _single_search_query(
                 llm=self.llm,
                 model=self.search_model,
                 prompt=f"请通过 Google Search 检索以下主题或标的的最新财经新闻、公告与市场催化（含关键日期与数字，控制在 280 字内）：{query}",
                 usage_label="search_tool",
             )
-            if res.startswith("⚠️") and self.ops_notifier is not None:
-                await self.ops_notifier.notify(
-                    severity="WARN",
-                    source="tool:search_market_news",
-                    alert_key="search_tool_failed",
-                    message=f"search_market_news 联网搜索失败（{query[:40]}）：{res[:160]}",
-                )
+            if res.startswith("⚠️"):
+                if self.ops_notifier is not None:
+                    await self.ops_notifier.notify(
+                        severity="WARN",
+                        source="tool:search_market_news",
+                        alert_key="search_tool_failed",
+                        message=f"search_market_news 联网搜索失败（{query[:40]}）：{res[:160]}",
+                    )
+                return {"query": query, "summary": res}
+
+            write_now = _monotonic()
+            _GROUNDING_CACHE[mem_key] = (write_now, write_now + 900.0, res)
+            _prune_grounding_cache(write_now)
+            if self.db is not None and self.search_cache_ttl_seconds > 0 and hasattr(self.db, "upsert_grounding_news_cache"):
+                try:
+                    await self.db.upsert_grounding_news_cache(
+                        [
+                            {
+                                "cache_key": f"tool_search:{uk_date}:{norm_q}",
+                                "scope": "search_tool",
+                                "symbol": sym_tok,
+                                "summary_text": res,
+                            }
+                        ]
+                    )
+                except Exception as exc:
+                    logger.debug("search_market_news cache write failed: %s", exc)
             return {"query": query, "summary": res}
 
         return {"error": f"Unknown tool: {name}"}

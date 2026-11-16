@@ -112,7 +112,7 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
             await ops.send_startup_notice(
                 version=APP_VERSION,
                 summary_lines=[
-                    f"核心路由: {cfg.models.report_model} ({cfg.models.report_thinking_level}) | 备援: {cfg.models.fallback_model}",
+                    f"核心路由: Bear挑刺 {cfg.models.report_auditor_model} ({cfg.models.report_auditor_thinking_level}) | PM/选股 {cfg.models.report_model} ({cfg.models.report_thinking_level}) | 备援: {cfg.models.fallback_model}",
                     f"全市场强制联网搜索: {'开启' if cfg.models.enable_forced_search_grounding else '关闭'} "
                     f"(早报 {cfg.models.report_search_model} | 日常 {cfg.models.search_model})",
                     f"晨报日程: 工作日 {cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK",

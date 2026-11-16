@@ -676,6 +676,64 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertIn("51 只候选", latest["summary_text"])
             self.assertEqual(latest["payload"]["overlap_candidates"][0]["symbol"], "AMD")
 
+    async def test_grounding_news_cache_ttl_and_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "grounding_cache.db")
+            await db.init()
+
+            now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+            now_ms = int(now.timestamp() * 1000)
+            old_ms = int((now - timedelta(days=100)).timestamp() * 1000)
+            # Current wall clock for max_age_seconds check
+            live_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+            saved = await db.upsert_grounding_news_cache(
+                [
+                    {
+                        "cache_key": "grounding:2026-11-16:prio:NVDA",
+                        "scope": "report",
+                        "symbol": "NVDA",
+                        "summary_text": "NVDA 业绩指引上调",
+                        "fetched_at_ms": live_ms,
+                    },
+                    {
+                        "cache_key": "grounding:2026-11-16:sym:EXPIRED",
+                        "scope": "report",
+                        "symbol": "EXPIRED",
+                        "summary_text": "过期新闻",
+                        "fetched_at_ms": live_ms - 20_000_000,
+                    },
+                    {
+                        "cache_key": "grounding:2026-11-16:sym:OLD",
+                        "scope": "report",
+                        "symbol": "OLD",
+                        "summary_text": "超90天旧记录",
+                        "fetched_at_ms": old_ms,
+                    },
+                    {
+                        "cache_key": "grounding:2026-11-16:sym:ERR",
+                        "scope": "report",
+                        "symbol": "ERR",
+                        "summary_text": "⚠️ 失败不得缓存",
+                        "fetched_at_ms": live_ms,
+                    },
+                ]
+            )
+            self.assertEqual(saved, 3)
+
+            hits = await db.get_grounding_news_cache(
+                [
+                    "grounding:2026-11-16:prio:NVDA",
+                    "grounding:2026-11-16:sym:EXPIRED",
+                    "grounding:2026-11-16:sym:ERR",
+                ],
+                max_age_seconds=10800,
+            )
+            self.assertEqual(hits, {"grounding:2026-11-16:prio:NVDA": "NVDA 业绩指引上调"})
+
+            pruned = await db.prune_old_records(retention_days=90, now_utc=now)
+            self.assertEqual(pruned["grounding_news_cache"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

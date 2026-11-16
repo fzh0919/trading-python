@@ -34,13 +34,15 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         cfg = load_config("config.yaml", env_file=None)
         self.assertEqual(cfg.models.report_analyst_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_analyst_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_model, "gemini-4-argon")
+        self.assertEqual(cfg.models.report_auditor_model, "gemini-4-argon")
+        self.assertEqual(cfg.models.report_auditor_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.report_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_thinking_level, "HIGH")
         self.assertEqual(cfg.models.us_sentinel_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.us_thinking_level, "MEDIUM")
         self.assertEqual(cfg.models.pick_researcher_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.pick_researcher_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.pick_model, "gemini-4-argon")
+        self.assertEqual(cfg.models.pick_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.pick_thinking_level, "HIGH")
         self.assertEqual(cfg.models.chat_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.chat_thinking_level, "LOW")
@@ -48,10 +50,11 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         self.assertEqual(cfg.models.chat_deep_thinking_level, "HIGH")
         self.assertEqual(cfg.models.fallback_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.fallback_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_search_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.report_search_model, "gemini-3.5-flash-lite")
         self.assertEqual(cfg.models.search_model, "gemini-3.5-flash-lite")
         self.assertTrue(cfg.models.enable_forced_search_grounding)
-        self.assertEqual(cfg.models.report_max_tool_rounds, 6)
+        self.assertEqual(cfg.models.report_max_tool_rounds, 2)
+        self.assertEqual(cfg.app.grounding_cache_ttl_seconds, 10800)
         self.assertEqual(cfg.models.google_search_free_quota_monthly, 5000)
         self.assertAlmostEqual(cfg.models.google_search_warn_pct, 85.0)
 
@@ -450,6 +453,17 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(tg.sent), 2)
             self.assertIn("10 / 10", tg.sent[1][1])
             self.assertIn("免费额度上限", tg.sent[1][1])
+
+    def test_candidate_chain_never_upgrades_hydrogen_to_argon(self) -> None:
+        client = GeminiClient(api_key="dummy-key", fallback_model="gemini-4-hydrogen")
+        self.assertEqual(
+            client._candidate_chain("gemini-4-hydrogen", "HIGH"),
+            [("gemini-4-hydrogen", "HIGH"), ("gemini-3.5-flash-lite", "LOW")],
+        )
+        self.assertEqual(
+            client._candidate_chain("gemini-4-argon", "HIGH"),
+            [("gemini-4-argon", "HIGH"), ("gemini-4-hydrogen", "HIGH")],
+        )
 
 
 if __name__ == "__main__":

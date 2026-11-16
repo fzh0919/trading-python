@@ -6,22 +6,25 @@ app:
   log_level: "INFO"
   cache_ttl_seconds: 120
   market_data_ttl_seconds: 900
+  grounding_cache_ttl_seconds: 10800  # 3h SQLite 跨指令新闻搜索快照有效期
   ops_warn_cooldown_seconds: 1800
 
 models:
-  # 关键风控与最终拍板统一使用 gemini-4-argon + HIGH；多轮工具/机会归纳/备援使用 gemini-4-hydrogen
+  # [用户授权调整 v5.2.0] 仅保留 /report Step 2B Bear 挑刺审计官使用 gemini-4-argon + HIGH；其余 PM/选股终审切换至 gemini-4-hydrogen + HIGH，搜索切换至 gemini-3.5-flash-lite
   report_analyst_model: "gemini-4-hydrogen"
-  report_model: "gemini-4-argon"          # /report Step 2B 风控审计官 + Step 3 PM 拍板
-  us_sentinel_model: "gemini-4-hydrogen"  # /us 与盘前增量哨兵
-  pick_researcher_model: "gemini-4-hydrogen"  # /pick Stage 1 多轮工具投研探测
-  pick_model: "gemini-4-argon"            # /pick Stage 2 风控官终审拍板
-  chat_model: "gemini-4-hydrogen"         # Telegram 日常单聊
-  chat_deep_model: "gemini-4-hydrogen"    # /deep 深度单聊升级模型
-  fallback_model: "gemini-4-hydrogen"     # 主模型失败时自动降级备援模型
-  report_search_model: "gemini-4-hydrogen" # /report 强制联网与深挖搜索模型（保精度）
-  search_model: "gemini-3.5-flash-lite"   # 单聊 / /pick / /us 联网搜索模型（高性价比）
+  report_auditor_model: "gemini-4-argon"  # /report Step 2B 独立风控 Bear 挑刺审计官
+  report_model: "gemini-4-hydrogen"         # /report Step 3 PM 拍板
+  us_sentinel_model: "gemini-4-hydrogen"    # /us 与盘前增量哨兵
+  pick_researcher_model: "gemini-4-hydrogen"  # /pick Stage 1 投研探测
+  pick_model: "gemini-4-hydrogen"           # /pick Stage 2 风控官终审拍板
+  chat_model: "gemini-4-hydrogen"           # Telegram 日常单聊
+  chat_deep_model: "gemini-4-hydrogen"      # /deep 深度单聊升级模型
+  fallback_model: "gemini-4-hydrogen"       # 主模型失败时自动降级备援模型
+  report_search_model: "gemini-3.5-flash-lite"  # /report 强制联网与深挖搜索模型（0 思考高性价比）
+  search_model: "gemini-3.5-flash-lite"         # 单聊 / /pick / /us 联网搜索模型
 
   report_analyst_thinking_level: "HIGH"     # 深度分析晨报（不追求速度）
+  report_auditor_thinking_level: "HIGH"     # Bear 挑刺审计深度
   report_thinking_level: "HIGH"             # LOW | MEDIUM | HIGH
   us_thinking_level: "MEDIUM"               # LOW | MEDIUM | HIGH
   pick_researcher_thinking_level: "HIGH"    # LOW | MEDIUM | HIGH | XHIGH
@@ -31,7 +34,7 @@ models:
   fallback_thinking_level: "HIGH"
 
   enable_forced_search_grounding: true
-  report_max_tool_rounds: 6
+  report_max_tool_rounds: 2
   google_search_free_quota_monthly: 5000    # Google Search Grounding 月免费额度参考线
   google_search_warn_pct: 85.0              # 达到月免费额度该百分比时预警提醒
 

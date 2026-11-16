@@ -324,6 +324,15 @@ class AdvisorDatabase:
                     source_url TEXT NOT NULL DEFAULT '',
                     updated_at_ms INTEGER NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS grounding_news_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL DEFAULT '',
+                    symbol TEXT NOT NULL DEFAULT '',
+                    summary_text TEXT NOT NULL DEFAULT '',
+                    fetched_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_grounding_news_fetched ON grounding_news_cache(fetched_at_ms);
                 """
             )
             await _ensure_columns(
@@ -1231,12 +1240,17 @@ class AdvisorDatabase:
                 "DELETE FROM ohlcv_cache WHERE updated_at_ms < ?",
                 (cutoff_ms,),
             )
+            cur_grounding = await db.execute(
+                "DELETE FROM grounding_news_cache WHERE fetched_at_ms < ?",
+                (cutoff_ms,),
+            )
             await db.commit()
             return {
                 "portfolio_snapshots": int(cur_snap.rowcount or 0),
                 "llm_usage_logs": int(cur_usage.rowcount or 0),
                 "ops_events": int(cur_ops.rowcount or 0),
                 "ohlcv_cache": int(cur_ohlcv.rowcount or 0),
+                "grounding_news_cache": int(cur_grounding.rowcount or 0),
             }
 
     async def has_scheduler_job_fired(self, job_name: str, uk_date: str) -> bool:
@@ -1904,3 +1918,65 @@ class AdvisorDatabase:
             "payload_json": raw_payload,
             "payload": parsed,
         }
+
+    async def get_grounding_news_cache(
+        self,
+        cache_keys: list[str],
+        *,
+        max_age_seconds: int = 10800,
+    ) -> dict[str, str]:
+        """Load non-expired persisted Google Search summaries keyed by cache_key."""
+        clean_keys = list(dict.fromkeys(str(k or "").strip() for k in cache_keys if str(k or "").strip()))
+        if not clean_keys or max_age_seconds <= 0:
+            return {}
+        cutoff_ms = int(time.time() * 1000) - int(max_age_seconds) * 1000
+        placeholders = ",".join("?" for _ in clean_keys)
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"""
+                SELECT cache_key, summary_text
+                FROM grounding_news_cache
+                WHERE cache_key IN ({placeholders})
+                  AND fetched_at_ms >= ?
+                  AND TRIM(summary_text) != ''
+                """,
+                (*clean_keys, cutoff_ms),
+            )
+            rows = await cur.fetchall()
+        return {str(r[0]): str(r[1]) for r in rows if r and r[0] and r[1]}
+
+    async def upsert_grounding_news_cache(self, entries: list[dict[str, Any]]) -> int:
+        """Persist Google Search grounding summaries idempotently by cache_key."""
+        if not entries:
+            return 0
+        now_ms = int(time.time() * 1000)
+        rows: list[tuple[str, str, str, str, int]] = []
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            ckey = str(item.get("cache_key") or "").strip()
+            summary = str(item.get("summary_text") or "").strip()
+            if not ckey or not summary or summary.startswith("⚠️"):
+                continue
+            rows.append(
+                (
+                    ckey,
+                    str(item.get("scope") or "").strip(),
+                    str(item.get("symbol") or "").strip().upper(),
+                    summary,
+                    int(item.get("fetched_at_ms") or now_ms),
+                )
+            )
+        if not rows:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO grounding_news_cache (
+                    cache_key, scope, symbol, summary_text, fetched_at_ms
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            await db.commit()
+        return len(rows)

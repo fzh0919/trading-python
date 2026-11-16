@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from src.ops_notifier import OpsNotifier
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import (
+    AccountSnapshot,
     PortfolioData,
     T212Client,
     build_trade_context,
@@ -405,6 +406,10 @@ def _format_context_pack_symbol_slice(sym: str, entry: dict[str, Any]) -> str:
             if titles:
                 lines.append(f"  近期新闻: {titles}")
 
+    grounding_news = str(entry.get("grounding_news") or "").strip()
+    if grounding_news:
+        lines.append(f"  联网新闻快照: {trim_text_at_line_boundary(grounding_news, 260)}")
+
     evals = entry.get("evaluations") or []
     if isinstance(evals, list):
         for ev in evals[:2]:
@@ -578,6 +583,52 @@ def _has_complete_embedded_vetoes(morning_block: str, guardrails: list[str]) -> 
     return False
 
 
+def _format_account_positions_for_chat(
+    account: AccountSnapshot,
+    target_symbols: tuple[str, ...],
+    *,
+    compact_non_target: bool,
+) -> str:
+    """Format full positions or compact non-target routine holdings when user asks about specific tickers."""
+    if not compact_non_target or not account.ok or not account.positions:
+        return format_positions_text(account)
+
+    target_set = {s.strip().upper() for s in target_symbols if s and s.strip()}
+    if not target_set:
+        return format_positions_text(account)
+
+    focused_positions = []
+    other_count = 0
+    other_value = 0.0
+    other_weight = 0.0
+    for pos in account.positions:
+        y_sym = pos.yahoo_symbol.strip().upper()
+        is_notable = (
+            y_sym in target_set
+            or pos.weight_pct >= 20.0
+            or pos.return_pct >= 25.0
+            or pos.return_pct <= -10.0
+        )
+        if is_notable:
+            focused_positions.append(pos)
+        else:
+            other_count += 1
+            other_value += float(pos.current_value or 0.0)
+            other_weight += float(pos.weight_pct or 0.0)
+
+    if other_count == 0:
+        return format_positions_text(account)
+
+    parts: list[str] = []
+    if focused_positions:
+        parts.append(format_positions_text(account.model_copy(update={"positions": focused_positions})))
+    parts.append(
+        f"• 其余 {other_count} 只常规持仓（非本次提问焦点/无明显异动）："
+        f"合计市值 {account.account_currency} {other_value:,.2f}（占比 {other_weight:.1f}%）"
+    )
+    return "\n".join(parts)
+
+
 async def answer_user_chat(
     user_query: str,
     cfg: AppConfig,
@@ -592,13 +643,15 @@ async def answer_user_chat(
     trade_ctx = build_trade_context(portfolio, history_days=7, max_recent_lines=3, max_summary_lines=0)
 
     (
-        (morning_full_text, morning_conclusion),
+        (morning_static_text, morning_conclusion),
+        (morning_with_pre_text, _),
         guardrails,
         (pick_ts, pick_text),
         history_turns,
         prev_cycle_turns,
         context_pack,
     ) = await asyncio.gather(
+        db.get_morning_context(include_premarket=False),
         db.get_morning_context(include_premarket=True),
         db.get_daily_guardrails(),
         db.get_latest_pick_radar(),
@@ -607,26 +660,32 @@ async def answer_user_chat(
         db.get_context_pack(allow_fallback=True),
     )
 
-    history_block = _format_chat_history_compact(history_turns)
+    is_deep_query = user_query.strip().lower().startswith("/deep")
+    history_block = _format_chat_history_compact(history_turns, recent_full_turns=3 if is_deep_query else 2)
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（无）"
     sched = get_us_market_schedule_uk()
     calendar_alerts = get_market_calendar_alerts()
     calendar_inline = ("｜" + "；".join(calendar_alerts)) if calendar_alerts else ""
     morning_block = (
-        trim_text_at_line_boundary(morning_full_text, 2050)
-        if morning_full_text
+        trim_text_at_line_boundary(morning_static_text, 2050)
+        if morning_static_text
         else (morning_conclusion or "（暂无）")
     )
+    premarket_marker = "【今日美股开盘前哨补充】"
+    premarket_tail = ""
+    if morning_with_pre_text and premarket_marker in morning_with_pre_text:
+        idx_pm = morning_with_pre_text.index(premarket_marker)
+        premarket_tail = trim_text_at_line_boundary(morning_with_pre_text[idx_pm:].strip(), 600)
+
     veto_section = "" if _has_complete_embedded_vetoes(morning_block, guardrails) else f"【今日风控红线】：\n{veto_block}\n\n"
     pick_block = trim_text_at_line_boundary(pick_text, 1050) if pick_text else ""
     reset_str = f"{cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK"
 
     # [用户授权调整] /deep 单聊 Prompt 软约束放宽至 1000~1200 字，普通单聊保持 500 字以内（均不做代码截断）
-    is_deep_query = user_query.strip().lower().startswith("/deep")
     length_rule = "1000~1200 字以内（深度解析可展开多维证据与执行预案）" if is_deep_query else "500 字以内"
     chat_model = cfg.models.chat_deep_model if is_deep_query else cfg.models.chat_model
     chat_thinking = cfg.models.chat_deep_thinking_level if is_deep_query else cfg.models.chat_thinking_level
-    max_rounds = 4 if is_deep_query else 3
+    max_rounds = 4 if is_deep_query else 2
 
     resolution = decide_chat_objects(
         user_query,
@@ -662,13 +721,14 @@ async def answer_user_chat(
         "你是用户的全天候私人量化投资顾问。\n"
         "交互与成本纪律：\n"
         "• 上来第一句先给明确结论与建议，后面再简要解释。\n"
-        "• 上下文已包含今日早报、风控红线、最新持仓占比/浮盈、活动挂单及已匹配提问标的的本地 ContextPack 快照切片（含技术/筹码/分歧/历史教训）；若已有信息足以回答（如仓位诊断、挂单看法、策略解读、已注入切片的标的问询），请直接一轮作答，严禁无故调用工具。\n"
-        "• 仅当用户询问持仓与 ContextPack 外的新标的，或确实缺少突发实时公告/组合相关性时，才按需调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`；禁止连续重复调用相同工具。\n"
+        "• 上下文已包含今日早报、风控红线、最新持仓占比/浮盈、活动挂单及已匹配提问标的的本地 ContextPack 快照切片（含技术/筹码/分歧/联网新闻快照/历史教训）；若已有信息足以回答（如仓位诊断、挂单看法、策略解读、已注入切片与新闻快照的标的问询），请直接一轮作答，严禁无故调用工具。\n"
+        "• 仅当用户询问持仓与 ContextPack 外的新标的，或明确追问早报之后的突发实时公告/组合相关性时，才按需调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`；禁止连续重复调用相同工具。\n"
         f"• 直白客观（不迎合已有挂单或前序决定），禁用 Markdown # 和 **，用 • 和【】排版，控制在 {length_rule}。",
         cfg.strategy,
     )
 
     # Static cycle-invariant prefix FIRST to maximize Gemini Implicit Cache prefix hits across turns
+    # (premarket_note is placed in dynamic_tail so afternoon /us runs never invalidate morning report cache)
     static_prefix = (
         f"【今日早报及美股哨兵纪要】：\n{morning_block}\n\n"
         + veto_section
@@ -677,11 +737,20 @@ async def answer_user_chat(
         + _format_cycle_baseline_section(context_pack, prev_cycle_turns)
     )
 
+    compact_non_target = (not is_deep_query) and bool(resolution.target_symbols)
+    isa_pos_text = _format_account_positions_for_chat(
+        portfolio.isa, resolution.target_symbols, compact_non_target=compact_non_target
+    )
+    invest_pos_text = _format_account_positions_for_chat(
+        portfolio.invest, resolution.target_symbols, compact_non_target=compact_non_target
+    )
+
     dynamic_tail = (
         f"当前英国时间 {sched.uk_date} ({get_uk_weekday_label()}{calendar_inline})，"
         f"美股状态：{sched.phase}（常规开盘 {sched.open_time_uk} UK，收盘 {sched.close_time_uk} UK）。\n\n"
-        f"【ISA 账户】\n{format_account_overview(portfolio.isa)}\n{format_positions_text(portfolio.isa)}\n\n"
-        f"【Invest 账户】\n{format_account_overview(portfolio.invest)}\n{format_positions_text(portfolio.invest)}\n\n"
+        + (f"{premarket_tail}\n\n" if premarket_tail else "")
+        + f"【ISA 账户】\n{format_account_overview(portfolio.isa)}\n{isa_pos_text}\n\n"
+        f"【Invest 账户】\n{format_account_overview(portfolio.invest)}\n{invest_pos_text}\n\n"
         f"【当前挂单与近7日成交】\n{trade_ctx['pending_orders_text']}\n{trade_ctx['recent_trades_text']}\n\n"
         + target_slice_section
         + f"【今日对话记录（{reset_str} 晨报周期自动重置）】：\n{history_block}\n\n"
@@ -697,6 +766,7 @@ async def answer_user_chat(
         search_model=cfg.models.search_model,
         ops_notifier=ops_notifier,
         db=db,
+        search_cache_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
     )
     reply = await llm.generate(
         model=chat_model,

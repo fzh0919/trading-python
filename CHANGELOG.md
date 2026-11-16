@@ -60,7 +60,11 @@
    - `src/engine/screener.py` 新增 `run_universe_audition()`（T212 可买性交集 → `1y` 流动性/趋势预筛 → 盈利/估值/规模/动量打分 + 单行业上限 `28` + 英欧最低 `30` 席位 → 精选 150 只个股），`run_quant_screener()` 接入共享精锐个股池、合规门控及 Stage 1 单行业上限，保留双轨非对称权重分层。
    - 接通 `pick_agent.py`、`scheduler.py`（周六自动海选 + 日常预热动态池），并新增 Telegram `/refresh_pool` 与命令行 `python -m src.refresh_pool`（`src/refresh_pool.py`）手动触发入口。
 5. **版本同步与全量回归验收（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `CHANGELOG.md`, `tests/`）**：
-   - 版本号升级至 `5.2.0`，在 `IMP-20~22` 之上增补 `tests/test_universe_audition.py` 7 组单测（共 `111` 项全绿通过）与全仓编译验证。
+   - 版本号升级至 `5.2.0`，在 `IMP-20~22` 之上增补 `tests/test_universe_audition.py` 7 组单测。
+6. **API 路由成本优化与本地缓存升级（用户授权归入 `v5.2.0`）**：
+   - **模型路由与备援防升档（`config.yaml`, `src/config.py`, `src/agents/llm_client.py`）**：新增 `report_auditor_model: "gemini-4-argon"` 专门保留给 `/report` Step 2B Bear 挑刺审计；`report_model`（PM 拍板）与 `pick_model`（`/pick` 终审）统一切换为 `gemini-4-hydrogen` (`HIGH`)；`report_search_model` 切换为 `gemini-3.5-flash-lite`（消除搜索阶段思考 Token 浪费）；`_candidate_chain` 修复 `Hydrogen` 失败时禁止反向升级回 `Argon`。
+   - **SQLite 持久化搜索快照与工具收口（`src/storage/db.py`, `src/agents/tools.py`, `src/agents/report_agent.py`）**：新增 `grounding_news_cache`（默认 `3h` TTL，`prune_old_records` 自动清理），打通 `run_forced_market_grounding` 与 `MarketToolkit.search_market_news` 跨指令/跨重启复用；`/report` Step 2 禁用 `search_market_news`、收敛 `report_max_tool_rounds=2`，并在 `FactSheet` 与 `ContextPack` 预注更多 Finnhub 新闻与 `grounding_news` 快照。
+   - **`/pick` 与 `chat` 本地切片省流（`src/agents/pick_agent.py`, `src/agents/chat_agent.py`）**：`/pick` 在 Stage 1 前本地预聚合 Top 候选 Finnhub 新闻与深度评级并收敛工具轮次；`chat` 将 `premarket_note` 移出静态前缀以保护全天早报隐式缓存不被 `/us` 打碎，并对常规指定标的问询折叠非焦点平稳持仓（`114 tests OK`）。
 
 ### `v5.1.2`（2026-11-16）
 全面优化 `/report`、`/pick` 与日常单聊（`chat`）发给 Gemini 的 Prompt 上下文信噪比，消除重复打印、模板废话、低密度噪音与半截断残句（全套 `87 tests OK`）：

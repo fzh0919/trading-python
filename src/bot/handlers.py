@@ -379,7 +379,8 @@ class AdvisorBot:
             else ("✅ 已配置正常" if self.market_data.fred.enabled else "➖ 未配置")
         )
         gemini_status = (
-            f"✅ Key 已配置 | 主板 {self.cfg.models.report_model} | 备援 {self.cfg.models.fallback_model} | "
+            f"✅ Key 已配置 | Bear挑刺 {self.cfg.models.report_auditor_model} | "
+            f"PM拍板 {self.cfg.models.report_model} | 备援 {self.cfg.models.fallback_model} | "
             f"早报搜索 {self.cfg.models.report_search_model} | 日常搜索 {self.cfg.models.search_model}"
             if self.cfg.env.gemini_api_key.strip()
             else "🚨 GEMINI_API_KEY 缺失"
@@ -659,7 +660,8 @@ class AdvisorBot:
         lines.append(
             "\n【当前模型路由】\n"
             f"• 早报分析: {m.report_analyst_model} ({m.report_analyst_thinking_level}) | "
-            f"风控/PM: {m.report_model} ({m.report_thinking_level})\n"
+            f"Bear挑刺: {m.report_auditor_model} ({m.report_auditor_thinking_level}) | "
+            f"PM拍板: {m.report_model} ({m.report_thinking_level})\n"
             f"• 美股哨兵: {m.us_sentinel_model} ({m.us_thinking_level}) | "
             f"单聊: {m.chat_model} ({m.chat_thinking_level}) / deep: {m.chat_deep_model} ({m.chat_deep_thinking_level})\n"
             f"• 选股初研: {m.pick_researcher_model} ({m.pick_researcher_thinking_level}) | "

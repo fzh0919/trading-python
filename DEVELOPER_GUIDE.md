@@ -8,7 +8,7 @@
 
 1. **`/report` 核心基石地位（严禁降级铁律）**：
    - `/report` 是全系统唯一的全景事实底座与风控总纲，是同交易周期（每日 `07:30 UK` 切换）内 `/pick`、`/us` 与自由聊天框的**绝对参照物（Single Source of Truth）**。
-   - **任何优化严禁降低 `/report` 的规模、上下文完整性、模型档位（`Argon HIGH` + `Hydrogen HIGH`）、工具调用轮次（`6` 轮）或全市场分域联网检索深度**。
+   - **任何优化严禁降低 `/report` 的规模、上下文完整性与全市场分域联网检索深度**；按用户授权（`v5.2.0`），`/report` 保留三步对话结构，仅将 Bear 挑刺审计（`report_auditor_model`）锁定 `Argon HIGH`，PM 拍板与 `/pick` 终审切换 `Hydrogen HIGH`，全市场联网检索切换 `gemini-3.5-flash-lite` 并通过 SQLite 搜索快照与工具收口减少重复调用。
 2. **N95 本地重算换 Token 策略（定时任务不怕慢，日常交互极速轻量）**：
    - **硬件算力与运行定位**：`IMP-01 ~ IMP-22` 已全部完成并通过全链路验收，面向英国本地常驻主机 **Intel N95 + 16GB RAM + 512GB SSD** 的 Docker Compose 容器化运行（GCP 旧版停服后经 `sqlite3 .backup` 统一切割），本地 CPU 与内存算力完全充裕。
    - **核心原则**：`/report`、`/pick`、`/us` 为后台定时任务，本地 Python 多算 10~30 秒完全无感。因此必须将**筹码分布（CYQ）、周线共振、K 线突破形态、公司身份与财报/除息日历锚定、本地多空证据冲突表（Disagreement）、T+5/T+10 历史建议 Alpha 结算**全部放在本地 Python 0-Token 算完，组装成高密度 `AnalysisContextPack` 喂给大模型，从而减少大模型盲目调工具的轮数；而**日常自由聊天与平淡交易日的 `/us` 则复用今日快照并默认采用轻量模型（`Hydrogen LOW`）**。
@@ -86,14 +86,14 @@ trading-python/                     # [当前主项目]
 ### 3.1 Agent 模型路由与输出契约（`config.yaml` -> `src/agents/`）
 | 业务流 / 节点 | 配置槽位 (`models.*`) | 默认模型 & 思考深度 | 工具 / 运行策略 | 最终输出硬上限 |
 | :--- | :--- | :--- | :--- | :--- |
-| **`/report` Step 1 联网（核心）** | `report_search_model` | `gemini-4-hydrogen` (`LOW`) | `GoogleSearch`（每批 `<=3` 标的，`Semaphore(3)`） | 注入内部上下文 |
-| **`/report` Step 2A 机会（核心）** | `report_analyst_model` | `gemini-4-hydrogen` (`HIGH`) | 本地全维 `ContextPack` + `MarketToolkit`（`<=6` 轮） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 2B 风控（核心）** | `report_model` | `gemini-4-argon` (`HIGH`) | 本地全维 `ContextPack` + `MarketToolkit`（`<=6` 轮） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-argon` (`HIGH`) | `MorningReportDecision` + 自修复 + `RiskOverride` | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
-| **`/pick` Stage 1 投研员** | `pick_researcher_model` | `gemini-4-hydrogen` (`HIGH`) | 本地四维量化+筹码 Top 候选 + `MarketToolkit`（`<=4` 轮）| 内部提案 |
-| **`/pick` Stage 2 风控官** | `pick_model` | `gemini-4-argon` (`HIGH`) | `PickDecision` + 自修复 + Post-Screen 确定性校验 | **Telegram `<=1000` 字** |
+| **`/report` Step 1 联网（核心）** | `report_search_model` | `gemini-3.5-flash-lite` (`LOW`) | `GoogleSearch`（每批 `<=3` 标的，`Semaphore(3)`，3h SQLite 持久化快照） | 注入内部上下文 |
+| **`/report` Step 2A 机会（核心）** | `report_analyst_model` | `gemini-4-hydrogen` (`HIGH`) | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
+| **`/report` Step 2B 风控（核心）** | `report_auditor_model` | `gemini-4-argon` (`HIGH`) | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
+| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-hydrogen` (`HIGH`) | `MorningReportDecision` + 自修复 + `RiskOverride` | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
+| **`/pick` Stage 1 投研员** | `pick_researcher_model` | `gemini-4-hydrogen` (`HIGH`) | 本地四维量化+新闻/评级预聚合 + `MarketToolkit`（`<=2` 轮，带方向 `<=3` 轮）| 内部提案 |
+| **`/pick` Stage 2 风控官** | `pick_model` | `gemini-4-hydrogen` (`HIGH`) | `PickDecision` + 自修复 + Post-Screen 确定性校验 | **Telegram `<=1000` 字** |
 | **`/us` 美股增量哨兵（分级门控）** | `us_sentinel_model` | 平稳日 `Hydrogen LOW` / 异动日 `Hydrogen MEDIUM` (或 `Argon MEDIUM`) | 本地异动门控（Anomaly Gate）：无异动免强搜极简播报；有异动深挖 | **平稳 `<=450` / 异动 `<=600` 字** |
-| **日常自由单聊（默认轻量）** | `chat_model` | `gemini-4-hydrogen` (`LOW`)（`/deep` 切高阶） | 本地提取提及标的切片今日快照 + 按需工具（`<=3` 轮） | **Prompt `<=500` 字（`/deep` `1000~1200`）** |
+| **日常自由单聊（默认轻量）** | `chat_model` | `gemini-4-hydrogen` (`LOW`)（`/deep` 切高阶） | 本地切片（含新闻快照与常规持仓折叠）+ 按需工具（`<=2` 轮，`/deep <=4`） | **Prompt `<=500` 字（`/deep` `1000~1200`）** |
 | **盘后 T+5 复盘微反思** | `search_model` / `chat_model` | `gemini-4-hydrogen` (`LOW`) | 本地 0-Token 算完 T+5 Alpha 后生成 `2~4` 句（`<80 tokens`）教训 | 存入 SQLite 记忆列 |
 
 ### 3.2 SQLite 数据库核心表速查（`data/advisor.db`，周期切换点 `07:30 UK`）

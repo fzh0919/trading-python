@@ -479,7 +479,14 @@ async def _assemble_fact_sheet_bundle(
     for sym in tracked_syms:
         b = bundles.get(sym)
         if b and b.news and b.quote_type.upper() != "ETF":
-            titles = " / ".join(f"[{n['date']}] {n['title']}" for n in b.news[:1])
+            t = tech_map.get(sym)
+            is_high_interest = (
+                sym not in held_syms_set
+                or (b.days_to_earnings is not None and 0 <= int(b.days_to_earnings) <= 7)
+                or (t is not None and t.ret_1d_pct is not None and abs(float(t.ret_1d_pct)) >= 3.0)
+            )
+            max_news = 3 if is_high_interest else 1
+            titles = " / ".join(f"[{n['date']}] {n['title']}" for n in b.news[:max_news])
             news_lines.append(f"• {sym}: {titles}")
 
     calendar_section = (
@@ -664,6 +671,7 @@ async def generate_morning_report(
         for sym in tracked_syms
         if sym in bundles and bundles[sym].quote_type
     }
+    grounding_per_symbol: dict[str, str] = {}
     grounding_brief = (
         await run_forced_market_grounding(
             llm=llm,
@@ -674,10 +682,18 @@ async def generate_morning_report(
             priority_symbols=priority_symbols or None,
             ttl_seconds=cfg.app.market_data_ttl_seconds,
             ops_notifier=ops_notifier,
+            db=db,
+            persist_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
+            per_symbol_out=grounding_per_symbol,
         )
         if cfg.models.enable_forced_search_grounding
         else ""
     )
+    if grounding_per_symbol and isinstance(context_pack.get("symbols"), dict):
+        for g_sym, g_text in grounding_per_symbol.items():
+            entry = context_pack["symbols"].get(g_sym)
+            if isinstance(entry, dict) and g_text:
+                entry["grounding_news"] = trim_text_at_line_boundary(g_text, 320)
 
     trade_ctx = build_trade_context(
         portfolio,
@@ -734,6 +750,8 @@ async def generate_morning_report(
         search_model=cfg.models.report_search_model,
         ops_notifier=ops_notifier,
         db=db,
+        allow_search_tool=False,
+        search_cache_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
     )
 
     # ---------- Step 2A: Opportunity & Portfolio Analyst ----------
@@ -743,8 +761,8 @@ async def generate_morning_report(
         "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
         "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
         "4. 近 7 日财报事件应对预案。\n"
-        "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与实时 Google Search 摘要已涵盖持仓及挂单的量价、目标价、财报日与最新新闻，"
-        "对数据已完整且无异常的持仓切勿重复调用工具；仅当某只活动挂单、临近财报股、异常波动或英欧美标的出现疑点/信息冲突时，主动调用 inspect_ticker 或 search_market_news 深入核查。",
+        "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与 Step 1 全市场 Google Search 摘要已涵盖全部持仓及挂单的量价、CYQ、目标价、财报日、深度情报与最新新闻，"
+        "严禁对已列出数据的持仓重复调用 `inspect_ticker`；仅当文中明确缺失某未入表新代码数据时才允许调用工具。",
         cfg.strategy,
     )
     analyst_prompt = f"【任务：组合机会分析师（Bull 视角，深度推理并保留关键数字/支撑位，1200 字内）】\n{shared_context}"
@@ -752,9 +770,9 @@ async def generate_morning_report(
     # ---------- Step 2B: Ruthless Risk & Pending-Order Auditor ----------
     auditor_sys = build_agent_system_instruction(
         "你是独立风控与挂单审计官（Bear/Conservative 视角）。你的唯一任务是冷酷挑刺与风险一票否决，提供完整内部审计草稿供 PM 拍板（1200 字内）：\n"
-        "1. 行业集中度与跨账户重叠审计：基于 Python 算出的行业权重与跨账户重叠，明确哪些行业/标的是否已超载、今天必须冻结禁止加码（列出红线）。\n"
+        "1. 行业集中度与跨账户重叠审计：基于 Python 算出的行业权重、CVaR 与跨账户重叠，明确哪些行业/标的是否已超载、今天必须冻结禁止加码（列出红线）。\n"
         "2. 破位与弱势持仓审计：跌破 MA200 或触及止损线（尤其 Invest 短线仓）或临近 5 日内财报的标的，明确减仓/硬止损/严禁补仓指令；"
-        "常规持仓无需重复调工具，但如发现未披露利空、监管传闻或挂单定价值得怀疑，务必调用 search_market_news 或 inspect_ticker 二次交叉验证。\n"
+        "所有持仓的技术面、Finnhub 新闻与 Step 1 全市场 Google Search 摘要已完整注入上方上下文，常规持仓严禁重复调 `inspect_ticker`，直接依据既有证据严格审计即可。\n"
         "3. 【活动挂单零情面独立审计】：逐一核查【当前活动挂单】！"
         "无论挂单是用户手动下单还是前序 AI 建议，结合当前现价、均线位置、分析师目标价、"
         f"{cfg.strategy.uk_stamp_duty_pct:.1f}% 印花税/{cfg.strategy.fx_fee_pct * 2:.2f}% 往返换汇费以及 {cfg.strategy.cash_interest_rate_pct:.1f}% 现金利息门槛——"
@@ -780,10 +798,10 @@ async def generate_morning_report(
             usage_label="report_analyst",
         ),
         llm.generate(
-            model=cfg.models.report_model,
+            model=cfg.models.report_auditor_model,
             prompt=auditor_prompt,
             system_instruction=auditor_sys,
-            thinking_level=cfg.models.report_thinking_level,
+            thinking_level=cfg.models.report_auditor_thinking_level,
             tools=toolkit.declarations(),
             tool_executor=toolkit.as_executor(),
             temperature=0.15,
@@ -1101,6 +1119,9 @@ async def generate_us_sentinel(
                 symbols=search_targets,
                 ttl_seconds=cfg.app.market_data_ttl_seconds,
                 ops_notifier=ops_notifier,
+                db=db,
+                persist_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
+                bypass_cache=True,
             )
 
     trade_ctx = build_trade_context(
@@ -1163,6 +1184,7 @@ async def generate_us_sentinel(
             search_model=cfg.models.search_model,
             ops_notifier=ops_notifier,
             db=db,
+            search_cache_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
         )
         tools = toolkit.declarations()
         tool_executor = toolkit.as_executor()

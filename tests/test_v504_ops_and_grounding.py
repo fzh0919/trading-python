@@ -1399,6 +1399,82 @@ class TestImp18MainAndTelegramClient(unittest.IsolatedAsyncioTestCase):
             # Verify all resources closed even when t212.close() raised
             self.assertEqual(closed_resources, ["t212", "market_data", "ops", "tg", "db"])
 
+    async def test_sqlite_grounding_cache_reuse_and_toolkit_controls(self) -> None:
+        clear_grounding_cache()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "tools_cache.db")
+            await db.init()
+
+            search_calls: list[str] = []
+
+            class _CountingSearchLLM:
+                async def generate(self, **kwargs) -> str:
+                    search_calls.append(str(kwargs.get("prompt") or ""))
+                    return f"NVDA 最新催化摘要 #{len(search_calls)}"
+
+            llm = _CountingSearchLLM()
+            per_sym: dict[str, str] = {}
+            out1 = await run_forced_market_grounding(
+                llm=llm,
+                search_model="gemini-3.5-flash-lite",
+                scope="report",
+                symbols=["NVDA"],
+                priority_symbols=["NVDA"],
+                ttl_seconds=900,
+                db=db,
+                persist_ttl_seconds=10800,
+                per_symbol_out=per_sym,
+            )
+            self.assertEqual(len(search_calls), 2)  # 1 macro + 1 priority NVDA
+            self.assertIn("NVDA 最新催化摘要", per_sym["NVDA"])
+
+            # Simulate container restart (clear in-memory cache) -> DB cache serves 0-LLM hits
+            clear_grounding_cache()
+            out2 = await run_forced_market_grounding(
+                llm=llm,
+                search_model="gemini-3.5-flash-lite",
+                scope="report",
+                symbols=["NVDA"],
+                priority_symbols=["NVDA"],
+                ttl_seconds=900,
+                db=db,
+                persist_ttl_seconds=10800,
+            )
+            self.assertEqual(len(search_calls), 2)
+            self.assertEqual(out1, out2)
+
+            # MarketToolkit with allow_search_tool=False omits search_market_news
+            md_mock = SimpleNamespace()
+            pf_mock = PortfolioData(
+                fetched_at_uk="2026-11-16 07:30",
+                fetched_at_ms=1,
+                isa=AccountSnapshot(ok=True, account_label="ISA"),
+                invest=AccountSnapshot(ok=True, account_label="Invest"),
+            )
+            tk_no_search = MarketToolkit(md_mock, pf_mock, llm=llm, db=db, allow_search_tool=False)
+            self.assertNotIn("search_market_news", [d.name for d in tk_no_search.declarations()])
+
+            # MarketToolkit search_market_news reuses DB symbol grounding cache with 0 LLM calls
+            tk_with_search = MarketToolkit(md_mock, pf_mock, llm=llm, db=db, allow_search_tool=True)
+            tool_res = await tk_with_search.execute("search_market_news", {"query": "NVDA earnings"})
+            self.assertTrue(tool_res.get("cached"))
+            self.assertIn("NVDA 最新催化摘要", tool_res.get("summary", ""))
+            self.assertEqual(len(search_calls), 2)
+
+            # bypass_cache=True forces fresh grounding search
+            await run_forced_market_grounding(
+                llm=llm,
+                search_model="gemini-3.5-flash-lite",
+                scope="us",
+                symbols=["NVDA"],
+                ttl_seconds=900,
+                db=db,
+                persist_ttl_seconds=10800,
+                bypass_cache=True,
+            )
+            self.assertEqual(len(search_calls), 3)
+        clear_grounding_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

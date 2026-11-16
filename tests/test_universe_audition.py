@@ -247,11 +247,11 @@ class TestUniverseAudition(unittest.TestCase):
                         out: dict[str, pd.DataFrame] = {}
                         for i, sym in enumerate(symbols):
                             if sym == "ILLIQ":
-                                out[sym] = _make_ohlcv(160, 10.0, 0.0001, volume=1_000.0, seed=10)  # $10k/day -> filtered
+                                out[sym] = _make_ohlcv(230, 10.0, 0.0001, volume=1_000.0, seed=10)  # $10k/day -> filtered
                             elif sym == "UK1.L":
-                                out[sym] = _make_ohlcv(160, 10000.0, 0.001, volume=100_000.0, seed=11)  # £100/sh * 100k = $12.5M/day
+                                out[sym] = _make_ohlcv(230, 10000.0, 0.001, volume=100_000.0, seed=11)  # £100/sh * 100k = $12.5M/day
                             else:
-                                out[sym] = _make_ohlcv(160, 100.0, 0.001, volume=500_000.0, seed=20 + i)
+                                out[sym] = _make_ohlcv(230, 100.0, 0.001, volume=500_000.0, seed=20 + i)
                         return out
 
                 class _FakeT212:

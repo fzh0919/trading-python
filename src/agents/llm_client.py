@@ -235,8 +235,11 @@ class GeminiClient:
         chain: list[tuple[str, str]] = [(primary_model, primary_thinking)]
         if self.fallback_model and self.fallback_model != primary_model:
             chain.append((self.fallback_model, self.fallback_thinking_level))
-        elif primary_model != "gemini-4-argon":
-            chain.append(("gemini-4-argon", "MEDIUM"))
+        elif "argon" in (primary_model or "").lower():
+            chain.append(("gemini-4-hydrogen", "HIGH"))
+        elif "flash-lite" not in (primary_model or "").lower():
+            # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon
+            chain.append(("gemini-3.5-flash-lite", "LOW"))
         return chain
 
     @staticmethod

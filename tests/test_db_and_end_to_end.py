@@ -657,15 +657,23 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 pipeline_calls = [c for c in report_calls if c.get("usage_label") != "report_grounding"]
                 self.assertEqual(len(grounding_calls), 3)
                 self.assertTrue(all(c.get("use_google_search") for c in grounding_calls))
-                self.assertTrue(all(c.get("model") == "gemini-4-hydrogen" for c in grounding_calls))
+                self.assertTrue(all(c.get("model") == "gemini-3.5-flash-lite" for c in grounding_calls))
                 self.assertEqual(
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pipeline_calls],
                     [
                         ("report_analyst", "gemini-4-hydrogen", "HIGH"),
                         ("report_auditor", "gemini-4-argon", "HIGH"),
-                        ("report_pm", "gemini-4-argon", "HIGH"),
+                        ("report_pm", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
+                self.assertTrue(
+                    all(
+                        "search_market_news" not in [d.name for d in (c.get("tools") or [])]
+                        for c in pipeline_calls[:2]
+                    )
+                )
+                self.assertEqual(pipeline_calls[0].get("max_tool_rounds"), 2)
+                self.assertEqual(pipeline_calls[1].get("max_tool_rounds"), 2)
                 self.assertTrue(all(c.get("system_instruction") for c in pipeline_calls))
                 self.assertTrue(all("必须直白建议撤单（CANCEL）" in c["system_instruction"] for c in pipeline_calls))
                 self.assertIn("实时 Google Search", pipeline_calls[0]["prompt"])
@@ -679,6 +687,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(saved_pack)
                 self.assertIn("NVDA", saved_pack["symbols"])
                 self.assertIn("ULVR.L", saved_pack["symbols"])
+                self.assertTrue(saved_pack["symbols"]["NVDA"].get("grounding_news"))
 
                 # 4. /us Delta Sentinel receives full /report, filters out non-US orders (ULVR.L), calm day uses LOW without extra search
                 calls_before_us = len(llm.calls)
@@ -695,7 +704,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("【活动挂单裁决】", us_call["prompt"])
                 self.assertIn("【美股活动挂单】：\n（当前无未成交活动挂单）", us_call["prompt"])
 
-                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Argon HIGH), <= 1000 chars
+                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Hydrogen HIGH), <= 1000 chars
                 calls_before = len(llm.calls)
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pick 英国ETF"}}, wait=True)
                 pick_calls = llm.calls[calls_before:]
@@ -707,7 +716,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pick_pipeline],
                     [
                         ("pick_researcher", "gemini-4-hydrogen", "HIGH"),
-                        ("pick_critic", "gemini-4-argon", "HIGH"),
+                        ("pick_critic", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
                 self.assertIn("Invest半导体占比超限", pick_pipeline[0]["prompt"])
@@ -1634,9 +1643,11 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(c1["model"], "gemini-4-hydrogen")
                 self.assertEqual(c1["thinking_level"], "LOW")
-                self.assertEqual(c1["max_tool_rounds"], 3)
+                self.assertEqual(c1["max_tool_rounds"], 2)
                 self.assertIn("500 字以内", c1["system_instruction"])
                 self.assertEqual(captured_toolkit_dbs[-1], db)
+                # Normal targeted query compacts non-target routine holdings
+                self.assertIn("其余 1 只常规持仓", p1)
 
                 # Static prefix order: morning report & guardrails & pick & baseline BEFORE live time / ISA / current query
                 idx_report = p1.index("【今日早报及美股哨兵纪要】")
@@ -1664,8 +1675,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("🇺🇸 今日美股半日市", p1)
                 self.assertIn("_END_PICK", p1)
 
-                # Turn 2: Mutate live portfolio price & use /deep follow-up -> static prefix byte-identical!
+                # Turn 2: Mutate live portfolio price, append /us premarket_note, & use /deep -> static prefix STILL byte-identical!
                 portfolio.isa.positions[0].cur_price = 148.5
+                await db.append_premarket_note("✅ 维持早报计划：美股盘前平稳")
                 await answer_user_chat("/deep 它止损设多少合适？", cfg, t212, md, llm, db)
                 c2 = llm.calls[-1]
                 p2 = c2["prompt"]
@@ -1675,6 +1687,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(c2["max_tool_rounds"], 4)
                 self.assertIn("1000~1200 字以内", c2["system_instruction"])
                 self.assertEqual(p1[: p1.index("当前英国时间 ")], p2[: p2.index("当前英国时间 ")])
+                self.assertIn("【今日美股开盘前哨补充】", p2)
                 # Follow-up recovered NVDA slice from Turn 1
                 self.assertIn("上下文沿用", p2)
                 self.assertIn("90%筹码带 115.00-145.00", p2)

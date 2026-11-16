@@ -55,23 +55,26 @@ class AppSection(BaseModel):
     log_level: str = "INFO"
     cache_ttl_seconds: int = 120
     market_data_ttl_seconds: int = 900
+    grounding_cache_ttl_seconds: int = Field(default=10800, ge=0)
     ops_warn_cooldown_seconds: int = 1800
 
 
 class ModelsSection(BaseModel):
-    # Role-based Gemini 4 routing (flagship decisions anchored on Argon HIGH; fast/tool-heavy steps on Hydrogen)
+    # Role-based Gemini 4 routing (Bear auditor anchored on Argon HIGH; PM/Pick/Search optimized for cost)
     report_analyst_model: str = "gemini-4-hydrogen"
-    report_model: str = "gemini-4-argon"
+    report_auditor_model: str = "gemini-4-argon"
+    report_model: str = "gemini-4-hydrogen"
     us_sentinel_model: str = "gemini-4-hydrogen"
     pick_researcher_model: str = "gemini-4-hydrogen"
-    pick_model: str = "gemini-4-argon"
+    pick_model: str = "gemini-4-hydrogen"
     chat_model: str = "gemini-4-hydrogen"
     chat_deep_model: str = "gemini-4-hydrogen"
     fallback_model: str = "gemini-4-hydrogen"
-    report_search_model: str = "gemini-4-hydrogen"
+    report_search_model: str = "gemini-3.5-flash-lite"
     search_model: str = "gemini-3.5-flash-lite"
 
     report_analyst_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_auditor_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_thinking_level: ThinkingLevelLiteral = "HIGH"
     us_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     pick_researcher_thinking_level: ThinkingLevelLiteral = "HIGH"
@@ -81,7 +84,7 @@ class ModelsSection(BaseModel):
     fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
 
     enable_forced_search_grounding: bool = True
-    report_max_tool_rounds: int = Field(default=6, ge=1)
+    report_max_tool_rounds: int = Field(default=2, ge=1)
     google_search_free_quota_monthly: int = Field(default=5000, ge=0)
     google_search_warn_pct: float = Field(default=85.0, gt=0.0, le=100.0)
 

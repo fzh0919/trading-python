@@ -13,7 +13,7 @@ import pandas as pd
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction
 from src.agents.schemas import PickDecision, parse_or_repair_structured_json, render_pick_report
-from src.agents.tools import MarketToolkit, run_forced_market_grounding
+from src.agents.tools import MarketToolkit, _format_us_deep_intel, run_forced_market_grounding
 from src.config import AppConfig
 
 if TYPE_CHECKING:
@@ -581,6 +581,31 @@ async def generate_pick_radar(
     async def _empty_grounding() -> str:
         return ""
 
+    async def _fetch_cand_bundles_cached() -> dict[str, TickerMarketBundle]:
+        missing_cands = [s for s in cand_syms if s not in held_bundles]
+        if not missing_cands:
+            return {}
+        try:
+            _, bmap = await market_data.get_bundles(
+                missing_cands,
+                include_news=True,
+                include_earnings=True,
+            )
+            return bmap
+        except Exception as exc:
+            logger.debug("Pre-populating candidate bundles failed in /pick: %s", exc)
+            return {}
+
+    async def _fetch_cand_deep_intel() -> dict[str, dict[str, Any]]:
+        us_cands = [s for s in cand_syms if "." not in s and hasattr(market_data, "get_us_deep_intel_batch")]
+        if not us_cands or not hasattr(market_data, "get_us_deep_intel_batch"):
+            return {}
+        try:
+            return await market_data.get_us_deep_intel_batch(us_cands)
+        except Exception as exc:
+            logger.debug("Pre-populating candidate US deep intel failed in /pick: %s", exc)
+            return {}
+
     grounding_coro = (
         run_forced_market_grounding(
             llm=llm,
@@ -590,13 +615,36 @@ async def generate_pick_radar(
             focus_query=focus_query,
             ttl_seconds=cfg.app.market_data_ttl_seconds,
             ops_notifier=ops_notifier,
+            db=db,
+            persist_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
         )
         if cfg.models.enable_forced_search_grounding
         else _empty_grounding()
     )
-    grounding_brief, symbol_lessons = await asyncio.gather(
+    grounding_brief, symbol_lessons, extra_cand_bundles, cand_intel_map = await asyncio.gather(
         grounding_coro,
         _fetch_candidate_symbol_lessons(db, lesson_syms, pack_symbols),
+        _fetch_cand_bundles_cached(),
+        _fetch_cand_deep_intel(),
+    )
+    merged_cand_bundles = {**held_bundles, **extra_cand_bundles}
+    cand_detail_lines: list[str] = []
+    for sym in cand_syms:
+        b = merged_cand_bundles.get(sym)
+        parts: list[str] = []
+        intel_str = _format_us_deep_intel(cand_intel_map.get(sym) or {})
+        if intel_str:
+            parts.append(intel_str)
+        if b is not None and b.news:
+            news_str = " / ".join(f"[{n['date']}] {n['title'][:70]}" for n in b.news[:2] if n.get("title"))
+            if news_str:
+                parts.append(f"新闻: {news_str}")
+        if parts:
+            cand_detail_lines.append(f"• {sym}: " + " | ".join(parts))
+    cand_details_section = (
+        "\n\n【Top 候选近期新闻与机构评级补充（0-Token 本地聚合）】：\n" + "\n".join(cand_detail_lines)
+        if cand_detail_lines
+        else ""
     )
 
     lessons_text = _format_lessons_section(
@@ -618,6 +666,7 @@ async def generate_pick_radar(
         search_model=cfg.models.search_model,
         ops_notifier=ops_notifier,
         db=db,
+        search_cache_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
     )
 
     # ---------- Stage 1: Incremental Opportunity Researcher ----------
@@ -657,9 +706,11 @@ async def generate_pick_radar(
         f"【现有持仓触发信号】：\n{evals_text}\n\n"
         f"【Python 初筛 Top 候选 — ISA 长线赛道（含 LSE ETF 与美/英/欧龙头）】：\n{isa_cands_text}\n\n"
         f"【Python 初筛 Top 候选 — Invest 短线机动赛道】：\n{invest_cands_text}"
+        + cand_details_section
         + (f"\n\n【实时 Google Search 候选与方向催化摘要】：\n{grounding_brief}" if grounding_brief else "")
     )
 
+    research_rounds = 3 if focus_query.strip() else 2
     research_output = await llm.generate(
         model=cfg.models.pick_researcher_model,
         prompt=researcher_prompt,
@@ -668,7 +719,7 @@ async def generate_pick_radar(
         tools=toolkit.declarations(),
         tool_executor=toolkit.as_executor(),
         temperature=0.25,
-        max_tool_rounds=4,
+        max_tool_rounds=research_rounds,
         usage_label="pick_researcher",
     )
     if research_output.startswith("⚠️"):
