@@ -112,11 +112,33 @@ class AdvisorBot:
             return True
         return False
 
-    async def _send_reply(self, chat_id: str | int, text: str, *, remove_keyboard: bool = False) -> None:
-        if remove_keyboard:
-            await self.tg.send_message(chat_id, text, reply_markup=REMOVE_KEYBOARD_MARKUP)
-        else:
-            await self.tg.send_message(chat_id, text)
+    async def _deliver(self, chat_id: str | int, text: str, *, remove_keyboard: bool = False) -> bool:
+        """Send a Telegram reply and raise a CRITICAL ops alert when the upstream drops it."""
+        reply_markup = REMOVE_KEYBOARD_MARKUP if remove_keyboard else None
+        try:
+            delivered = await self.tg.send_message(chat_id, text, reply_markup=reply_markup)
+        except Exception as exc:
+            logger.warning("Telegram reply delivery raised (%s: %s)", type(exc).__name__, exc)
+            delivered = False
+        if not delivered:
+            logger.error("Telegram reply undelivered (chat_id=%s, chars=%d)", chat_id, len(text))
+            if self.ops is not None:
+                try:
+                    await self.ops.notify(
+                        severity="CRITICAL",
+                        source="telegram:delivery",
+                        alert_key="telegram_reply_undelivered",
+                        message=(
+                            f"回复未送达 chat_id={chat_id}（{len(text)} 字符）：Telegram 上游 5xx 或网络中断。"
+                            "请检查 getUpdates 轮询日志，恢复后手动重发该问题。"
+                        ),
+                    )
+                except Exception as alert_exc:
+                    logger.warning("Failed raising undelivered-reply alert: %s", alert_exc)
+        return delivered
+
+    async def _send_reply(self, chat_id: str | int, text: str, *, remove_keyboard: bool = False) -> bool:
+        return await self._deliver(chat_id, text, remove_keyboard=remove_keyboard)
 
     @staticmethod
     def _build_help_text() -> str:
@@ -457,7 +479,7 @@ class AdvisorBot:
                     if self.execution_lock.locked():
                         active_job = getattr(self.scheduler, "current_job_name", None)
                         job_hint = f"（{active_job}）" if active_job else ""
-                        await self.tg.send_message(
+                        await self._deliver(
                             chat_id,
                             f"⏳ 后台定时任务{job_hint}或另一项 AI 分析正在执行中，为避免重复消耗额度与并发冲突，请稍候完成后再试。",
                         )
@@ -471,7 +493,7 @@ class AdvisorBot:
                     self._active_status_msg_id = status_msg_id
                     reply = await format_positions_instant(self.cfg, self.t212)
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 持仓快照已就绪：")
-                    await self.tg.send_message(chat_id, reply)
+                    await self._deliver(chat_id, reply)
                     return
 
                 if lower.startswith("/health") or lower.startswith("/heath"):
@@ -479,7 +501,7 @@ class AdvisorBot:
                     self._active_status_msg_id = status_msg_id
                     reply = await self._run_health_check()
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 运维自检报告已生成：")
-                    await self.tg.send_message(chat_id, reply)
+                    await self._deliver(chat_id, reply)
                     return
 
                 if lower.startswith("/report"):
@@ -491,7 +513,7 @@ class AdvisorBot:
                         self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
                     )
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 全景晨报分析完成：")
-                    await self.tg.send_message(chat_id, reply)
+                    await self._deliver(chat_id, reply)
                     return
 
                 if lower.startswith("/us"):
@@ -507,7 +529,7 @@ class AdvisorBot:
                         ops_notifier=self.ops,
                     )
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 美股盯盘简报完成：")
-                    await self.tg.send_message(chat_id, reply)
+                    await self._deliver(chat_id, reply)
                     return
 
                 if lower.startswith("/pick"):
@@ -528,7 +550,7 @@ class AdvisorBot:
                         ops_notifier=self.ops,
                     )
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 投研选股 + 风控官双审完成：")
-                    await self.tg.send_message(chat_id, reply)
+                    await self._deliver(chat_id, reply)
                     return
 
                 if lower.startswith("/refresh_pool"):
@@ -554,7 +576,7 @@ class AdvisorBot:
                             sync_t212_metadata=True,
                         )
                     await self.tg.edit_status(chat_id, status_msg_id, "✅ 选股底池海选更新完成：")
-                    await self.tg.send_message(chat_id, self._format_audition_reply(res))
+                    await self._deliver(chat_id, self._format_audition_reply(res))
                     return
 
                 # Free-form chat
@@ -564,7 +586,7 @@ class AdvisorBot:
                     text, self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
                 )
                 await self.tg.edit_status(chat_id, status_msg_id, "✅ 回复如下：")
-                await self.tg.send_message(chat_id, reply)
+                await self._deliver(chat_id, reply)
         except asyncio.CancelledError:
             logger.info("Task cancelled for query: %s", text[:40])
             raise
@@ -579,7 +601,7 @@ class AdvisorBot:
                     alert_key="bot_handler_crash",
                     message=f"处理指令「{text[:40]}」时发生异常：{type(exc).__name__}: {exc}",
                 )
-            await self.tg.send_message(chat_id, f"⚠️ 执行出错：{exc}")
+            await self._deliver(chat_id, f"⚠️ 执行出错：{exc}")
         finally:
             self._active_status_msg_id = None
 

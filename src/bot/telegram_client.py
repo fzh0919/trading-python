@@ -11,6 +11,16 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class TelegramPollError(httpx.HTTPError):
+    """Upstream getUpdates failure (e.g. HTTP 502) surfaced to the polling supervisor."""
+
+    def __init__(self, method: str, error_code: int | None, description: str) -> None:
+        self.method = method
+        self.error_code = error_code
+        self.description = description
+        super().__init__(f"{method} upstream failure (error_code={error_code}): {description}")
+
+
 def _parse_json_dict(res: httpx.Response) -> dict[str, Any] | None:
     try:
         parsed = res.json()
@@ -48,12 +58,14 @@ class TelegramClient:
         max_retries: int = 2,
         base_backoff_s: float = 0.5,
         max_retry_wait_s: float = 30.0,
+        delivery_max_retries: int = 4,
     ) -> None:
         self.bot_token = bot_token.strip()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
         self._max_retries = max(0, int(max_retries))
+        self._delivery_max_retries = max(self._max_retries, int(delivery_max_retries))
         self._base_backoff_s = max(0.0, float(base_backoff_s))
         self._max_retry_wait_s = max(0.0, float(max_retry_wait_s))
 
@@ -92,13 +104,20 @@ class TelegramClient:
                 pass
         return self._compute_backoff_s(attempt)
 
-    async def _post(self, method: str, payload: dict[str, Any], timeout: float = 20.0) -> dict[str, Any]:
+    async def _post(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        timeout: float = 20.0,
+        max_retries: int | None = None,
+    ) -> dict[str, Any]:
         if not self.bot_token:
             return {"ok": False, "description": "TELEGRAM_BOT_TOKEN missing"}
         client = self._get_client()
         url = f"{self.base_url}/{method}"
+        retry_budget = self._max_retries if max_retries is None else max(0, int(max_retries))
 
-        for attempt in range(self._max_retries + 1):
+        for attempt in range(retry_budget + 1):
             try:
                 res = await client.post(url, json=payload, timeout=timeout)
                 data = _parse_json_dict(res)
@@ -107,7 +126,7 @@ class TelegramClient:
                     isinstance(data, dict) and data.get("error_code") == 429
                 )
                 if is_rate_limited:
-                    if attempt >= self._max_retries:
+                    if attempt >= retry_budget:
                         return data or {
                             "ok": False,
                             "error_code": 429,
@@ -119,7 +138,7 @@ class TelegramClient:
                     continue
 
                 if 500 <= res.status_code < 600:
-                    if attempt >= self._max_retries:
+                    if attempt >= retry_budget:
                         return data or {
                             "ok": False,
                             "error_code": res.status_code,
@@ -156,6 +175,18 @@ class TelegramClient:
     async def delete_webhook(self, drop_pending_updates: bool = False) -> dict[str, Any]:
         return await self._post("deleteWebhook", {"drop_pending_updates": drop_pending_updates})
 
+    @staticmethod
+    def _is_poll_transport_failure(data: dict[str, Any]) -> bool:
+        """True when a non-ok getUpdates payload means the transport/upstream is broken (not a client-side rejection)."""
+        raw_code = data.get("error_code")
+        if raw_code is None:
+            return True
+        try:
+            code = int(raw_code)
+        except (TypeError, ValueError):
+            return True
+        return code >= 500 or code in (401, 403)
+
     async def get_updates(self, offset: int | None = None, timeout_s: int = 25) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": timeout_s, "allowed_updates": ["message"]}
         if offset is not None:
@@ -163,6 +194,12 @@ class TelegramClient:
         data = await self._post("getUpdates", payload, timeout=float(timeout_s + 10))
         if not data.get("ok"):
             logger.warning("Telegram getUpdates error: %s", data)
+            if self._is_poll_transport_failure(data):
+                raise TelegramPollError(
+                    "getUpdates",
+                    data.get("error_code"),
+                    str(data.get("description") or "unknown upstream failure"),
+                )
             return []
         return list(data.get("result") or [])
 
@@ -213,7 +250,12 @@ class TelegramClient:
             }
             if reply_markup is not None and idx == len(chunks) - 1:
                 payload["reply_markup"] = reply_markup
-            data = await self._post("sendMessage", payload, timeout=20.0)
+            data = await self._post(
+                "sendMessage",
+                payload,
+                timeout=20.0,
+                max_retries=self._delivery_max_retries,
+            )
             if not data.get("ok"):
                 all_ok = False
                 logger.warning("Telegram sendMessage failed: %s", data)

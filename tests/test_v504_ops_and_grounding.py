@@ -22,7 +22,7 @@ from src.agents.schemas import MorningReportDecision, ReportActionItem, parse_or
 from src.agents.tools import MarketToolkit, clear_grounding_cache, run_forced_market_grounding
 from src.bot.handlers import BOT_COMMANDS, REMOVE_KEYBOARD_MARKUP, AdvisorBot
 from src.bot.scheduler import TradingScheduler
-from src.bot.telegram_client import TelegramClient
+from src.bot.telegram_client import TelegramClient, TelegramPollError
 from src.config import AppConfig, AppSection, EnvSettings
 from src.data_providers.market_data import MacroSnapshot, MarketDataService
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData, T212Client
@@ -1500,6 +1500,89 @@ class TestImp18MainAndTelegramClient(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(len(search_calls), 4)
         clear_grounding_cache()
+
+
+class TestTelegram502SilentFailureFix(unittest.IsolatedAsyncioTestCase):
+    """P0: upstream 502 must break out of getUpdates, and undelivered replies must alert ops."""
+
+    async def test_getupdates_502_raises_poll_error_instead_of_empty_list(self) -> None:
+        calls = 0
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(502, json={"ok": False, "error_code": 502, "description": "Bad Gateway"})
+
+        tg = TelegramClient("tok", transport=httpx.MockTransport(_handler), max_retries=1, base_backoff_s=0.0)
+        try:
+            with self.assertRaises(TelegramPollError) as ctx:
+                await tg.get_updates(offset=5, timeout_s=1)
+            self.assertIsInstance(ctx.exception, httpx.HTTPError)
+            self.assertEqual(ctx.exception.error_code, 502)
+            self.assertIn("Bad Gateway", str(ctx.exception))
+            self.assertEqual(calls, 2)
+        finally:
+            await tg.close()
+
+    async def test_getupdates_client_side_rejection_keeps_empty_list(self) -> None:
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"ok": False, "error_code": 400, "description": "Bad Request"})
+
+        tg = TelegramClient("tok", transport=httpx.MockTransport(_handler), max_retries=1, base_backoff_s=0.0)
+        try:
+            self.assertEqual(await tg.get_updates(offset=1, timeout_s=1), [])
+        finally:
+            await tg.close()
+
+    async def test_sendmessage_rides_out_transient_502_with_delivery_budget(self) -> None:
+        attempts = 0
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 4:
+                return httpx.Response(502, json={"ok": False, "error_code": 502, "description": "Bad Gateway"})
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
+
+        tg = TelegramClient("tok", transport=httpx.MockTransport(_handler), max_retries=2, base_backoff_s=0.0)
+        try:
+            self.assertTrue(await tg.send_message("999", "hello"))
+            self.assertEqual(attempts, 5)
+        finally:
+            await tg.close()
+
+    async def test_undelivered_reply_raises_critical_ops_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "delivery_p0.db")
+            await db.init()
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999", gemini_api_key="k"))
+            tg = _StubTelegram(fail_delivery=True)
+            ops = OpsNotifier(
+                telegram=tg,
+                chat_id="999",
+                db=db,
+                warn_cooldown_seconds=0,
+                critical_cooldown_seconds=0,
+            )
+            bot = AdvisorBot(cfg, _FakeT212Healthy(), _FakeMarketHealthy(), object(), db, tg, ops_notifier=ops)
+            try:
+                self.assertFalse(await bot._send_reply("999", "答案正文"))
+                events = await db.get_recent_ops_events(limit=5)
+                undelivered = [e for e in events if e["alert_key"] == "telegram_reply_undelivered"]
+                self.assertEqual(len(undelivered), 1)
+                self.assertEqual(undelivered[0]["severity"], "CRITICAL")
+                self.assertEqual(undelivered[0]["source"], "telegram:delivery")
+
+                tg.fail_delivery = False
+                self.assertTrue(await bot._send_reply("999", "第二次答案"))
+                events_after = await db.get_recent_ops_events(limit=5)
+                self.assertEqual(
+                    sum(1 for e in events_after if e["alert_key"] == "telegram_reply_undelivered"),
+                    1,
+                )
+                self.assertEqual(tg.sent[-1][1], "第二次答案")
+            finally:
+                await db.close()
 
 
 if __name__ == "__main__":

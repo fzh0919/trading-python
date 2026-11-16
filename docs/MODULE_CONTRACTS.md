@@ -82,8 +82,10 @@
   - `await scheduler.run_prewarm(scope, now_utc=None) -> dict[str, Any]`（工作日早报/美股哨兵/周五 `/pick` 前 10 分钟写入 `scheduler_runs` 锁静默预热持仓+候选池 `2y` 日线、宏观快照，并每日同步 1 次 T212 `instruments` 元数据与分红归档）
   - `await scheduler.run_daily_settlement(now_utc=None) -> dict[str, Any]`（每日 `22:00~23:30 UK` 自动对满 `T+N` 且已收盘的 `pick_recommendations` 算真实收益/Alpha 与初始 MFE/MAE，调用 `Hydrogen LOW` 微反思写回，并 0-Token 追评 `T+10`/`T+20` 延伸 Alpha 与极值 + `prune_old_records(90)`）；`await scheduler.run_weekly_quant_audit(now_utc=None)`（每周六闲时或周中补跑静默落库）；早报 `07:30~09:30 UK` 断网补发与冷却重试（成功才锁 `scheduler_runs`）
   - `/usage` 切 `this_month` 自然月额度与缓存/思考占比；`/stats` 接 `get_recommendation_stats`/`get_recent_lessons`/本地现价与 `GBp/GBP` 100 倍校验、多窗口 Alpha 轨迹（T+5/10/20）、MFE/MAE 极值分布与 `get_latest_quant_audit`；`/health` 报 `is_fallback`/`is_stale`/未送达静默告警与 `ops-notify` 状态
-- **`src/bot/telegram_client.py` & `src/main.py`（`IMP-18`）**：
-  - `TelegramClient(..., max_retries=2, base_backoff_s=0.5, max_retry_wait_s=30.0)`（`_post` 遇 `429` 按 `parameters.retry_after`/`Retry-After` 等待，遇 `5xx`/网络瞬断指数退避重试，耗时仍耗尽时 `httpx.HTTPError` 照常上抛）
+- **`src/bot/telegram_client.py` & `src/main.py`（`IMP-18`、`P0-502`）**：
+  - `TelegramClient(..., max_retries=2, base_backoff_s=0.5, max_retry_wait_s=30.0, delivery_max_retries=4)`（`_post` 遇 `429` 按 `parameters.retry_after`/`Retry-After` 等待，遇 `5xx`/网络瞬断指数退避重试，耗时仍耗尽时 `httpx.HTTPError` 照常上抛；`_post(..., max_retries=None)` 可按调用覆盖重试预算，`send_message` 固定使用 `delivery_max_retries`）
+  - `await tg.get_updates(offset=None, timeout_s=25) -> list[dict]`：上游 `error_code >= 500` 或缺失 `error_code` 或 `401`/`403` 时抛 `TelegramPollError(httpx.HTTPError)`（携带 `method`/`error_code`/`description`），由 `run_app._poll_loop` 的 `httpx.HTTPError` 分支做连续失败计数 + `record_offline_incident` + 5s 退避；客户端类 4xx 仍返回 `[]`（保持原语义）
+  - `AdvisorBot._deliver(chat_id, text, *, remove_keyboard=False) -> bool`：统一回复出口，`send_message` 返回 `False` 或抛异常时写 `ERROR` 日志并 `ops.notify(severity="CRITICAL", source="telegram:delivery", alert_key="telegram_reply_undelivered")`；`_send_reply` 为其薄封装
   - `await run_app(stop_event=None)`（注入 `T212Client(..., snapshot_loader=db.get_latest_snapshot)`，启动就绪后执行 `await ops.flush_pending()`，`finally` 依次容错释放 `t212`/`market_data`/`ops`/`tg`/`db`）
 
 ### 3.4 模块 ↔ 测试文件 ↔ 共享 Mock 桩映射表（改哪块跑哪个文件）
