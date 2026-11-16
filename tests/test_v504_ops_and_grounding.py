@@ -252,10 +252,12 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
         tg = _StubTelegram()
         ops = OpsNotifier(telegram=tg, chat_id="999", warn_cooldown_seconds=0)
         prompts_seen: list[str] = []
+        sys_seen: list[str] = []
 
         class _GroundingLLM:
             async def generate(self, **kwargs) -> str:
                 prompts_seen.append(kwargs["prompt"])
+                sys_seen.append(str(kwargs.get("system_instruction") or ""))
                 self_search = kwargs.get("use_google_search")
                 assert self_search is True
                 return f"搜索摘要({len(prompts_seen)})"
@@ -273,6 +275,8 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
         self.assertIn("【欧股联网新闻】", brief1)
         self.assertIn("【美股与全球 ETF 联网新闻】", brief1)
         self.assertEqual(len(prompts_seen), 4)
+        self.assertTrue(all("primary English financial" in s and "Simplified Chinese" in s for s in sys_seen))
+        self.assertTrue(any("Search Google for key macro catalysts" in p for p in prompts_seen))
         self.assertTrue(any("近期无重大新公告：" in p for p in prompts_seen))
 
         # Cached second call hits memory cache without triggering new LLM calls
@@ -661,7 +665,10 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(max_active, 3)
 
         # Priority symbols must NOT appear in the grouped 3-symbol prompts
-        grouped_prompts = [p for p in prompts_seen if "1 对 1 深度检索" not in p and "过去 48 小时内影响英国" not in p]
+        grouped_prompts = [
+            p for p in prompts_seen
+            if "1-to-1 Google Search deep dive" not in p and "key macro catalysts" not in p
+        ]
         self.assertEqual(len(grouped_prompts), 1)  # Only AAPL, MSFT, AMD remain -> 1 US batch
         self.assertIn("AAPL, MSFT, AMD", grouped_prompts[0])
         self.assertNotIn("NVDA", grouped_prompts[0])
@@ -1456,10 +1463,19 @@ class TestImp18MainAndTelegramClient(unittest.IsolatedAsyncioTestCase):
 
             # MarketToolkit search_market_news reuses DB symbol grounding cache with 0 LLM calls
             tk_with_search = MarketToolkit(md_mock, pf_mock, llm=llm, db=db, allow_search_tool=True)
+            decls = tk_with_search.declarations()
+            self.assertTrue(all(d.description.isascii() for d in decls))
             tool_res = await tk_with_search.execute("search_market_news", {"query": "NVDA earnings"})
             self.assertTrue(tool_res.get("cached"))
             self.assertIn("NVDA 最新催化摘要", tool_res.get("summary", ""))
             self.assertEqual(len(search_calls), 2)
+
+            # Live search_market_news prompt uses English search instructions + Chinese output constraint
+            live_res = await tk_with_search.execute("search_market_news", {"query": "AZN.L RNS trading update"})
+            self.assertFalse(live_res.get("cached"))
+            self.assertEqual(len(search_calls), 3)
+            self.assertIn("Use Google Search", search_calls[-1])
+            self.assertIn("Simplified Chinese", search_calls[-1])
 
             # bypass_cache=True forces fresh grounding search
             await run_forced_market_grounding(
@@ -1472,7 +1488,7 @@ class TestImp18MainAndTelegramClient(unittest.IsolatedAsyncioTestCase):
                 persist_ttl_seconds=10800,
                 bypass_cache=True,
             )
-            self.assertEqual(len(search_calls), 3)
+            self.assertEqual(len(search_calls), 4)
         clear_grounding_cache()
 
 

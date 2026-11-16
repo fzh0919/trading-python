@@ -77,6 +77,16 @@ def _chunk_list(items: list[str], chunk_size: int) -> list[list[str]]:
     return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
+_GROUNDING_OUTPUT_CONTRACT = (
+    "Output strictly in compact Simplified Chinese plain text (no Markdown '#' or '**'): "
+    "for tickers with verified material catalysts, write 1-2 factual bullets each "
+    "(include exact date, key figures, source/analyst firm, and bull/bear impact). "
+    "For tickers with no material breaking news, regulatory filings, or rating changes "
+    "(including routine ETF NAV updates), do NOT write individual sentences; "
+    "merge them into a single trailing line formatted exactly as: 近期无重大新公告：SYM1, SYM2."
+)
+
+
 async def _single_search_query(
     *,
     llm: LLMBackend,
@@ -88,10 +98,11 @@ async def _single_search_query(
         model=model,
         prompt=prompt,
         system_instruction=(
-            "你是实时财经新闻与监管公告检索员。请必须通过 Google Search 核查最新真实新闻、监管公告（RNS/SEC/欧股公告）、"
-            "财报日期、业绩指引修正、诉讼/回购与机构评级变动。严禁编造消息、凑数输出已知静态 NAV/收盘价或展开空泛长篇评论；"
-            "仅对有真实异动或重大消息的标的按 1~2 条干货事实输出（注明具体日期/关键数字/评级机构与多空影响）；"
-            "无重大突发新闻/监管公告/评级变动的标的严禁逐个单列写长句，必须在段落末尾统一合并为一行略过（如：近期无重大新公告：IUKD.L, IBTA.L, UNH），纯文本禁用 # 与 **。"
+            "You are a real-time financial news and regulatory filings researcher covering US, UK (LSE), and European equities/ETFs. "
+            "Use Google Search to query primary English financial and regulatory sources (RNS announcements, SEC filings, "
+            "European exchange disclosures, earnings dates, guidance revisions, M&A/litigation, buybacks/dividends, and institutional rating changes). "
+            "Never fabricate news, pad with known static NAV/closing prices, or write generic commentary. "
+            + _GROUNDING_OUTPUT_CONTRACT
         ),
         thinking_level="LOW",
         use_google_search=True,
@@ -158,7 +169,9 @@ async def run_forced_market_grounding(
         tasks_meta.append(
             (
                 "【宏观与英/欧/美今日突发主线】",
-                "请通过 Google Search 检索过去 48 小时内影响英国(FTSE/BoE/英镑)、欧洲(ECB/欧元区)与美国(Fed/美债收益率/美股盘前盘后)的核心宏观突发新闻与重大政策动向，控制在 240 字以内。",
+                "Search Google for key macro catalysts and major policy/rate developments over the past 48 hours affecting the UK (FTSE/BoE/GBP), "
+                "Europe (ECB/Eurozone), and the US (Fed/Treasury yields/US pre-market & after-hours movers). "
+                "Summarize the verified facts concisely in Simplified Chinese within 240 Chinese characters (plain text, no '#' or '**').",
                 f"grounding:{uk_date}:macro",
                 [],
                 False,
@@ -169,7 +182,9 @@ async def run_forced_market_grounding(
         tasks_meta.append(
             (
                 f"【指定方向实时检索：{focus_query.strip()}】",
-                f"请通过 Google Search 检索围绕主题「{focus_query.strip()}」在美股、英股/LSE ETF 与欧股中的最新突发催化、行业景气数据与潜在监管风险，控制在 260 字以内。",
+                f"Search Google for the latest breaking catalysts, sector demand/supply data, and regulatory risks around '{focus_query.strip()}' "
+                "across US equities, UK equities/LSE ETFs, and European equities. "
+                "Summarize the verified facts concisely in Simplified Chinese within 260 Chinese characters (plain text, no '#' or '**').",
                 f"grounding:{uk_date}:focus:{fq_norm}",
                 [],
                 False,
@@ -180,18 +195,24 @@ async def run_forced_market_grounding(
         region = _classify_symbol_region(sym, qtypes.get(sym, ""))
         if region in {"UK", "UK_ETF"}:
             p_prompt = (
-                f"请通过 Google Search 针对伦敦交易所标的 {sym} 进行 1 对 1 深度检索：核查近 7 天 RNS 监管公告、"
-                "财报/派息动态、突发异动原因及机构最新评级变化，给出日期与核心数字，控制在 180 字以内。"
+                f"Perform a 1-to-1 Google Search deep dive for London Stock Exchange ticker {sym}: "
+                "check RNS regulatory announcements, trading updates, earnings/dividend/ex-dividend news, sudden price-move drivers, "
+                "and recent analyst rating changes over the past 7 days. "
+                "Output verified dates and key numbers concisely in Simplified Chinese within 180 Chinese characters."
             )
         elif region == "EU":
             p_prompt = (
-                f"请通过 Google Search 针对欧洲标的 {sym} 进行 1 对 1 深度检索：核查近 7 天监管公告、"
-                "财报指引、订单/监管消息、突发异动原因及机构评级变化，给出日期与核心数字，控制在 180 字以内。"
+                f"Perform a 1-to-1 Google Search deep dive for European ticker {sym}: "
+                "check exchange regulatory filings, earnings guidance, order/contract or regulatory news, sudden move drivers, "
+                "and analyst rating changes over the past 7 days. "
+                "Output verified dates and key numbers concisely in Simplified Chinese within 180 Chinese characters."
             )
         else:
             p_prompt = (
-                f"请通过 Google Search 针对美股/ETF {sym} 进行 1 对 1 深度检索：核查近 72 小时隔夜突发新闻、"
-                "盘前盘后异动原因、最新财报预期/指引、分红及机构评级调整，给出日期与核心数字，控制在 180 字以内。"
+                f"Perform a 1-to-1 Google Search deep dive for US stock/ETF {sym}: "
+                "check overnight breaking news, pre-market/after-hours move drivers, SEC filings, latest earnings guidance/estimates, "
+                "dividends/buybacks, and analyst rating changes over the past 72 hours. "
+                "Output verified dates and key numbers concisely in Simplified Chinese within 180 Chinese characters."
             )
         tasks_meta.append(
             (f"【重点标的1对1深搜 · {sym}】", p_prompt, f"grounding:{uk_date}:prio:{sym}", [sym], True)
@@ -203,25 +224,25 @@ async def run_forced_market_grounding(
             uk_syms,
             "UK",
             "英股与 LSE ETF 联网新闻",
-            "请通过 Google Search 检索以下伦敦交易所股票/ETF 近 7 天最新 RNS 监管公告、财报或派息动态、分析师评级变化与重大行业新闻：{syms}。"
-            "有重大突发消息/公告/评级变动的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
-            "无重大新公告的标的（含平稳 ETF 的日常 NAV）严禁逐个单列写长句，必须在末尾合并为一行略过（格式：近期无重大新公告：SYM1, SYM2）。",
+            "Use Google Search to check the following London Stock Exchange equities/ETFs over the past 7 days for RNS regulatory filings, "
+            "trading updates, earnings or dividend/ex-dividend news, analyst rating changes, and material sector catalysts: {syms}. "
+            + _GROUNDING_OUTPUT_CONTRACT,
         ),
         (
             eu_syms,
             "EU",
             "欧股联网新闻",
-            "请通过 Google Search 检索以下欧洲股票近 7 天最新监管公告、财报指引、订单/监管消息与机构评级变化：{syms}。"
-            "有重大突发消息/公告/评级变动的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
-            "无重大新公告的标的严禁逐个单列写长句，必须在末尾合并为一行略过（格式：近期无重大新公告：SYM1, SYM2）。",
+            "Use Google Search to check the following European equities over the past 7 days for regulatory filings, "
+            "earnings guidance, order/regulatory news, and institutional rating changes: {syms}. "
+            + _GROUNDING_OUTPUT_CONTRACT,
         ),
         (
             us_syms,
             "US",
             "美股与全球 ETF 联网新闻",
-            "请通过 Google Search 检索以下美股/ETF 近 48~72 小时隔夜突发新闻、盘前盘后异动原因、财报指引修正、诉讼/回购与机构最新评级：{syms}。"
-            "有真实异动或重大消息的标的逐一用 1~2 行精华事实输出（含日期与核心数字）；"
-            "无重大突发新闻的标的严禁逐个单列写长句，必须在末尾合并为一行略过（格式：近期无重大新公告：SYM1, SYM2）。",
+            "Use Google Search to check the following US equities/ETFs over the past 48-72 hours for overnight breaking news, "
+            "pre-market/after-hours move drivers, SEC filings, earnings guidance revisions, litigation/buybacks, and analyst ratings: {syms}. "
+            + _GROUNDING_OUTPUT_CONTRACT,
         ),
     ]
     for region_syms, region_code, title_base, prompt_tpl in region_specs:
@@ -445,15 +466,17 @@ class MarketToolkit:
             types.FunctionDeclaration(
                 name="inspect_ticker",
                 description=(
-                    "获取任意股票或ETF的实时确定性行情、CYQ筹码获利盘/集中度、周线趋势、MA20/50/200、RSI14、52周回撤、PE估值、财报/除息日、历史复盘教训及最近新闻。"
-                    "美股直接传代码如 'NVDA'；英股/LSE ETF 加 '.L' 如 'AZN.L'、'VWRP.L'；欧股加 '.DE'/'.AS'/'.PA'。"
+                    "Fetch deterministic market data, CYQ chip profit/concentration, weekly trend, MA20/50/200, RSI14, "
+                    "52-week drawdown, PE valuation, earnings/ex-dividend dates, past reflection lessons, and recent news for a stock or ETF. "
+                    "Pass US tickers directly (e.g. 'NVDA'), append '.L' for UK/LSE ETFs (e.g. 'AZN.L', 'VWRP.L'), "
+                    "and append '.DE'/'.AS'/'.PA' for European tickers."
                 ),
                 parameters={
                     "type": "OBJECT",
                     "properties": {
                         "symbol": {
                             "type": "STRING",
-                            "description": "Yahoo Finance 标的代码，如 AAPL, RR.L, VWRP.L, ASML.AS",
+                            "description": "Yahoo Finance ticker symbol, e.g. AAPL, RR.L, VWRP.L, ASML.AS",
                         }
                     },
                     "required": ["symbol"],
@@ -461,13 +484,16 @@ class MarketToolkit:
             ),
             types.FunctionDeclaration(
                 name="check_portfolio_correlation",
-                description="计算候选股票或ETF与用户当前实盘持仓近60个交易日收益率的最高相关系数，用于判断是否重复暴露或适合分散风险。",
+                description=(
+                    "Compute the maximum 60-trading-day return correlation between a candidate stock/ETF and current holdings "
+                    "to check for duplicate exposure or diversification fit."
+                ),
                 parameters={
                     "type": "OBJECT",
                     "properties": {
                         "symbol": {
                             "type": "STRING",
-                            "description": "候选标的 Yahoo 代码，如 VWRP.L, QQQ, TSM, AZN.L",
+                            "description": "Candidate Yahoo Finance symbol, e.g. VWRP.L, QQQ, TSM, AZN.L",
                         }
                     },
                     "required": ["symbol"],
@@ -475,7 +501,10 @@ class MarketToolkit:
             ),
             types.FunctionDeclaration(
                 name="get_macro_snapshot",
-                description="获取最新 GBP/USD、EUR/GBP 汇率、美10年期国债收益率、Fed 利率、VIX 及 SPY/QQQ/ISF.L 近5日涨跌。",
+                description=(
+                    "Fetch the latest GBP/USD, EUR/GBP FX rates, US 10Y/2Y Treasury yields, Fed funds rate, VIX, "
+                    "and 5-day moves for SPY, QQQ, and ISF.L."
+                ),
                 parameters={"type": "OBJECT", "properties": {}},
             ),
         ]
@@ -484,15 +513,16 @@ class MarketToolkit:
                 types.FunctionDeclaration(
                     name="search_market_news",
                     description=(
-                        "通过 Google Search 实时检索美股、英股(.L)、欧股(.DE/.AS/.PA)、LSE ETF 或宏观突发新闻、"
-                        "监管公告(RNS/SEC)、财报指引与机构最新评级。发现疑点或用户询问最新事件时主动调用。"
+                        "Run a live Google Search for breaking news, regulatory filings (RNS/SEC/EU), earnings guidance revisions, "
+                        "or institutional rating changes for US, UK (.L), European (.DE/.AS/.PA), LSE ETFs, or macro events. "
+                        "Always formulate the query in concise English financial keywords."
                     ),
                     parameters={
                         "type": "OBJECT",
                         "properties": {
                             "query": {
                                 "type": "STRING",
-                                "description": "要检索的标的代码、公司名或事件关键词，如 'AZN.L RNS news' 或 'NVDA earnings guidance'",
+                                "description": "English search query with ticker, company name, or event keywords, e.g. 'AZN.L RNS news' or 'NVDA earnings guidance'",
                             }
                         },
                         "required": ["query"],
@@ -661,7 +691,10 @@ class MarketToolkit:
             res = await _single_search_query(
                 llm=self.llm,
                 model=self.search_model,
-                prompt=f"请通过 Google Search 检索以下主题或标的的最新财经新闻、公告与市场催化（含关键日期与数字，控制在 280 字内）：{query}",
+                prompt=(
+                    "Use Google Search to retrieve the latest financial news, regulatory filings (RNS/SEC/EU), and market catalysts "
+                    f"for: {query}. Output verified facts with exact dates and key figures concisely in Simplified Chinese within 280 Chinese characters."
+                ),
                 usage_label="search_tool",
             )
             if res.startswith("⚠️"):

@@ -1,0 +1,45 @@
+# Trading 212 × Gemini AI Advisor — 工作区开发入口 (AGENTS)
+
+> 本文件为 Antigravity 自动加载的热启动骨架；仅在需要时按需查阅 [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md)（模型路由 & DB 表）、[`docs/MODULE_CONTRACTS.md`](./docs/MODULE_CONTRACTS.md)（接口签名字典）或 [`CHANGELOG.md`](./CHANGELOG.md)（近期变更）。
+
+## 一、不可破坏的系统铁律
+
+1. **SQLite 写锁单入口**：所有写库必须走 `AdvisorDatabase._connect(write=True)`，严禁私建连接绕过 `self._write_lock`。
+2. **降级数据不回写**：`portfolio.is_fallback` 或 `macro.is_stale` 为 `True` 时严禁调用 `db.save_snapshot()` 或覆盖有效缓存；空 DataFrame 或全挂宏观响应不得写入缓存。
+3. **双币种严格隔离**：账户现金/净值/盈亏固定 `GBP`，标的现价/均价/止损用本地货币（`USD`/`EUR`/`GBp`/`GBP`），英股须防 `GBp` 与 `GBP` 100 倍量级错位，严禁交给 LLM 口算。
+4. **`/report` 基石与纯文本控字**：`07:30 UK` `/report` 是全天 `Single Source of Truth`，严禁降低其深度；Telegram 输出禁用 `#` 与 `**`，受字数硬上限（`/report<=1800`、`/pick<=1000`、`/us<=450|600`）。
+5. **英文检索 → 中文输出解耦**：`src/agents/tools.py` 的联网检索指令与 `MarketToolkit.declarations()` 工具声明保持英文（对齐 RNS/SEC 一手信源），检索结果与终端决策保持紧凑简体中文。
+6. **数据库延续**：线上 `data/advisor.db` 只做幂等迁移（`CREATE TABLE IF NOT EXISTS` / `_ensure_columns`），严禁删库；发布版本同步 `src/version.py` 与 `pyproject.toml`。
+
+## 二、模块 ↔ 职责 ↔ 单测总索引
+
+> 修改前先用 `rg -n "^(class |async def |def |    async def |    def )" <文件>` 定位行号再按 100~150 行分段读取，禁止整篇读取 >400 行大文件。
+
+| 源码模块 (`src/`) | 核心职责 | 对应单测 (`tests/`) |
+| :--- | :--- | :--- |
+| `config.py`, `config.yaml`, `version.py` | Pydantic 配置、`.env`、热重载自选/选股池、版本号 | `test_llm_pricing_and_usage.py` |
+| `engine/calendar_utils.py` | `US/UK/XETRA/EURONEXT` 交易日历、半日市、夏令时错位周 | `test_calendar_and_scheduler.py` |
+| `storage/db.py` | SQLite `WAL` 异步仓、周期/快照/结算/行情与搜索缓存 | `test_db_storage.py` |
+| `data_providers/t212_client.py` | T212 双账户只读、限流退避、挂单量化与元/分红归档 | `test_t212_client.py` |
+| `data_providers/market_data.py` | Yahoo+Finnhub+FRED 并发聚合、`2y` 缓存、盘前 15m 跳空 | `test_market_data.py` |
+| `data_providers/analytics.py` | 复权自愈、CYQ、周线/ATR/ADX、去 Beta 相关性、CVaR | `test_analytics_and_rules.py` |
+| `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride` | `test_analytics_and_rules.py` |
+| `engine/screener.py`, `engine/universe_seeds.py`, `refresh_pool.py` | 四维双轨量化选股、150 只海选底池、VPVR/Stage2/VCP | `test_analytics_and_rules.py`, `test_universe_audition.py` |
+| `agents/llm_client.py` | `GeminiClient`、Thinking 钳位、工具并发裁剪、Search 额度预警 | `test_llm_pricing_and_usage.py` |
+| `agents/prompts.py`, `agents/schemas.py` | 投资者画像、JSON 自修复、`[🛡️风控护栏修正]` 倒金字塔渲染 | `test_db_and_end_to_end.py` |
+| `agents/tools.py` | 分域 Google 强搜（英文搜/中文出）与 `MarketToolkit` | `test_v504_ops_and_grounding.py` |
+| `agents/report_agent.py` | `/report` 三步流水线、`AnalysisContextPack`、`/us` 异动门控 | `test_db_and_end_to_end.py` |
+| `agents/pick_agent.py` | `/pick` Researcher -> Risk Critic -> Post-Screen 硬拦截落库 | `test_db_and_end_to_end.py` |
+| `agents/chat_agent.py` | `/pos` 0-Token 查仓、Implicit Cache 前缀、标的切片与 `/deep` | `test_db_and_end_to_end.py` |
+| `bot/handlers.py`, `bot/scheduler.py`, `bot/telegram_client.py` | 指令路由、`execution_lock` 互斥、自动日程、`T+5/10/20` 结算 | `test_calendar_and_scheduler.py`, `test_db_and_end_to_end.py` |
+| `ops_notifier.py`, `healthcheck.py`, `main.py` | `ops-notify` 双态告警、心跳/只读 DB 探活、生命周期管理 | `test_v504_ops_and_grounding.py` |
+
+## 三、开发验收命令
+
+```bash
+.\.venv\Scripts\python.exe -m compileall -q src tests
+.\.venv\Scripts\python.exe -m tests.run_tests tests
+```
+
+- 单文件快测：`.\.venv\Scripts\python.exe -m unittest tests.<模块名>`（全部离线 Mock，无真实网络请求；行情桩须含 `Open/High/Low/Close/Volume`）。
+- 每次功能迭代完成后，将变更追加至 [`CHANGELOG.md`](./CHANGELOG.md) 顶部当前版本下。
