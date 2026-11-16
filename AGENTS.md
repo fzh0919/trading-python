@@ -43,3 +43,8 @@
 
 - 单文件快测：`.\.venv\Scripts\python.exe -m unittest tests.<模块名>`（全部离线 Mock，无真实网络请求；行情桩须含 `Open/High/Low/Close/Volume`）。
 - 每次功能迭代完成后，将变更追加至 [`CHANGELOG.md`](./CHANGELOG.md) 顶部当前版本下。
+
+## 四、部署与容器
+
+- 容器名 `t212-ai-advisor`；发版统一走根目录 `scripts\deploy-n95.ps1`（见根 `AGENTS.md` 红线第 6 条：自研项目走 Git + 脚本发版，严禁在 Dockge 网页端直接修改本项目 `docker-compose.yml`）。
+- 本项目无宿主机映射端口（纯出站：T212 只读 API + Telegram Long Polling），容器登记见根 `DEPLOYMENT_CHEATSHEET.md` 的「核心运维与现有容器入口总览」表。
