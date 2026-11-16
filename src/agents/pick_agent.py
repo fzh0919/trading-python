@@ -73,6 +73,90 @@ def _lookup_ci(mapping: dict[str, Any], symbol: str) -> Any:
     return None
 
 
+def _extract_morning_audit_context(
+    context_pack: dict[str, Any] | None,
+    morning_report_full: str = "",
+) -> tuple[str, dict[str, list[str]], list[dict[str, Any]]]:
+    """Extract /report top_actions & pending_order_audits for /pick alignment and screener tagging."""
+    report_dec = (
+        context_pack.get("report_decision")
+        if isinstance(context_pack, dict) and isinstance(context_pack.get("report_decision"), dict)
+        else {}
+    )
+    top_actions = [
+        item for item in (report_dec.get("top_actions") or []) if isinstance(item, dict)
+    ]
+    pending_audits = [
+        item for item in (report_dec.get("pending_order_audits") or []) if isinstance(item, dict)
+    ]
+
+    lines: list[str] = []
+    symbol_tags: dict[str, list[str]] = {}
+
+    for act in top_actions:
+        sym = str(act.get("symbol") or "").strip().upper()
+        acct = str(act.get("account") or "").strip()
+        verb = str(act.get("action") or "").strip().upper()
+        pz = str(act.get("price_zone") or "").strip()
+        reason = str(act.get("reason") or "").strip()
+        if not sym or sym == "CASH":
+            continue
+        pz_part = f" @ {pz}" if pz else ""
+        lines.append(f"• [持仓裁决] [{acct}] {verb} {sym}{pz_part} — {reason}")
+        if verb in {"TRIM", "STOP", "HOLD"}:
+            symbol_tags.setdefault(sym, []).append(f"持仓{verb}({acct})")
+
+    for aud in pending_audits:
+        sym = str(aud.get("symbol") or "").strip().upper()
+        acct = str(aud.get("account") or "").strip()
+        verdict = str(aud.get("verdict") or "").strip().upper()
+        summary = str(aud.get("order_summary") or "").strip()
+        reason = str(aud.get("reason") or "").strip()
+        if not sym:
+            continue
+        lines.append(f"• [挂单裁决] [{acct}] {sym} ({summary}) →【{verdict}】{reason}")
+        if verdict in {"CANCEL", "MODIFY", "KEEP"}:
+            symbol_tags.setdefault(sym, []).append(f"挂单{verdict}({acct})")
+
+    if lines:
+        return "\n".join(lines), symbol_tags, top_actions
+
+    # Fallback for legacy morning_reports rows without ContextPack.report_decision
+    if morning_report_full:
+        sec_lines: list[str] = []
+        in_core = False
+        for raw_line in morning_report_full.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("【今日核心行动与挂单裁决】"):
+                in_core = True
+                continue
+            if in_core and stripped.startswith("【宏观"):
+                break
+            if in_core and stripped:
+                sec_lines.append(stripped)
+        if sec_lines:
+            return "\n".join(sec_lines)[:900], symbol_tags, top_actions
+
+    return "", symbol_tags, top_actions
+
+
+def _format_candidates_with_morning_tags(
+    candidates: list[ScreenerCandidate],
+    symbol_tags: dict[str, list[str]],
+    empty_msg: str,
+) -> str:
+    if not candidates:
+        return empty_msg
+    lines: list[str] = []
+    for c in candidates:
+        line = c.summary_line
+        tags = symbol_tags.get(c.symbol.strip().upper())
+        if tags:
+            line = f"{line} | ⚠️今日早报已裁决: {' / '.join(dict.fromkeys(tags))}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _format_lessons_section(
     recent_lessons: list[dict[str, Any]],
     symbol_lessons: dict[str, list[dict[str, Any]]],
@@ -155,7 +239,7 @@ def _build_holding_identity_section(
     isin_map: dict[str, str],
     pack_symbols: dict[str, Any],
 ) -> str:
-    """Build compact identity & ex-dividend anchor lines for held/pending symbols."""
+    """Build compact identity & ex-dividend anchor lines only for symbols near ex-dividend."""
     lines: list[str] = []
     for sym in tracked_syms:
         b = held_bundles.get(sym)
@@ -174,12 +258,17 @@ def _build_holding_identity_section(
             if isinstance(bsum, dict):
                 ex_div_date = bsum.get("ex_dividend_date")
                 days_to_ex_div = bsum.get("days_to_ex_dividend")
-        if not anchor and not ex_div_date:
+        if days_to_ex_div is None:
+            continue
+        try:
+            days_val = int(days_to_ex_div)
+        except (TypeError, ValueError):
+            continue
+        if not (-3 <= days_val <= 7):
             continue
         ex_note = ""
         if ex_div_date:
-            days_str = f"({days_to_ex_div}天后)" if days_to_ex_div is not None else ""
-            ex_note = f" | 除息日 {ex_div_date}{days_str}"
+            ex_note = f" | 除息日 {ex_div_date}({days_val}天后)"
         lines.append(f"• {anchor or sym}{ex_note}")
     return "\n".join(lines)
 
@@ -257,6 +346,7 @@ async def _post_screen_validate_decision(
     isa_cands: list[ScreenerCandidate],
     invest_cands: list[ScreenerCandidate],
     guardrails: list[str],
+    report_actions: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Backfill native entry_price, apply deterministic risk override guardrail, and render."""
     all_bundles = dict(held_bundles)
@@ -321,6 +411,7 @@ async def _post_screen_validate_decision(
         evals=evals,
         high_correlation_symbols=high_corr_syms,
         daily_vetoes=guardrails,
+        report_actions=report_actions,
     )
     resolved_decision = (
         override_res.decision
@@ -370,7 +461,7 @@ async def generate_pick_radar(
     (
         (held_histories, held_bundles),
         macro,
-        (_, morning_conclusion),
+        (morning_report_full, morning_conclusion),
         guardrails,
         context_pack,
         recent_lessons,
@@ -425,8 +516,16 @@ async def generate_pick_radar(
     exposure_text = compute_exposure_summary(portfolio, held_bundles)
     trade_ctx = build_trade_context(portfolio, max_recent_lines=6, max_summary_lines=6, bundles=held_bundles)
 
-    isa_cands_text = "\n".join(c.summary_line for c in isa_cands) or "（ISA 候选池暂无达标标的）"
-    invest_cands_text = "\n".join(c.summary_line for c in invest_cands) or "（Invest 候选池暂无达标标的）"
+    morning_audits_text, morning_symbol_tags, report_top_actions = _extract_morning_audit_context(
+        context_pack,
+        morning_report_full,
+    )
+    isa_cands_text = _format_candidates_with_morning_tags(
+        isa_cands, morning_symbol_tags, "（ISA 候选池暂无达标标的）"
+    )
+    invest_cands_text = _format_candidates_with_morning_tags(
+        invest_cands, morning_symbol_tags, "（Invest 候选池暂无达标标的）"
+    )
     focus_line = (
         f"用户指定扫描方向：【{focus_query}】（若预设列表未覆盖，请务必调用 inspect_ticker 与 check_portfolio_correlation 实查该方向的具体股票或 LSE ETF！）"
         if focus_query.strip()
@@ -504,12 +603,20 @@ async def generate_pick_radar(
 
     # ---------- Stage 1: Incremental Opportunity Researcher ----------
     researcher_sys = build_agent_system_instruction(
-        "你是增量选股投研员（Researcher Agent）。存量持仓体检与老挂单审计已由 `/report` 完成，你专注于结合今日风控红线，"
+        "你是增量选股投研员（Researcher Agent）。存量持仓体检与老挂单审计已由 `/report` 完成，你专注于结合今日风控红线与早报裁决，"
         "从全市场（美/英/欧个股与 LSE 英镑 ETF）中挖掘最值得新买入的配置或高确定性卖弱换强机会。\n"
+        "对今日 `/report` 已裁决【CANCEL】或【MODIFY】的活动挂单，以及已裁决【TRIM】/【STOP】的持仓，默认必须严格遵循不得推翻；"
+        "仅当你通过工具实查到早报生成之后的突发新公告或股价已显著回落至早报认可区间时，才可提出修正并写明最新依据。\n"
         f"请参考历史 T+{cfg.strategy.settlement_holding_days} 交易日选股复盘教训，避免对近期连续失效的板块或追高形态重复推荐。\n"
         "请给出不超过 3 条核心提案（ISA 新股或 LSE ETF / Invest 短线催化 / 必要时的卖弱换强），"
         "每条写清逻辑、介入区间、止损、目标；若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
         cfg.strategy,
+        include_order_audit_rule=False,
+    )
+    morning_audit_block = (
+        f"早报持仓与挂单裁决（无盘中新变量不得推翻）：\n{morning_audits_text}\n"
+        if morning_audits_text
+        else ""
     )
     researcher_prompt = (
         f"【任务：增量选股投研员】\n"
@@ -517,6 +624,7 @@ async def generate_pick_radar(
         f"方向：{focus_line}\n\n"
         f"=== 今日 /report 审计基线与风控红线（必须严格继承，除非有盘中新数据证明必须修正）===\n"
         f"早报基调：{morning_conclusion or '（暂无）'}\n"
+        f"{morning_audit_block}"
         f"红线清单：\n{veto_block}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训（禁止重蹈覆辙）】：\n{lessons_text}\n\n"
         f"【精确现金底座（禁止自行估算比例）】：{exact_cash_summary}\n"
@@ -555,17 +663,22 @@ async def generate_pick_radar(
         f"1. 现金与 {cfg.strategy.cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税）：跑不赢现金利息的平庸机会直接枪毙。\n"
         f"2. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
         "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
-        "4. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线（仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
+        "4. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线与挂单/持仓裁决"
+        "（对早报已裁决 CANCEL/MODIFY 的活动挂单及 TRIM/STOP 的持仓，除非投研员提供早报之后的新催化或股价显著跌至早报认可区间的新证据，否则不得推翻或继续按早报否决的旧价位推荐；"
+        "仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
         "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
         "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
         "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
         f"若无优质机会，直接让 `selected_actions` 为空数组 `[]`，并在 headline 直说“本轮无推荐，建议现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
         cfg.strategy,
+        include_order_audit_rule=False,
     )
     critic_prompt = (
         f"【时段状态】：{market_phase_note}\n"
         f"【今日 /report 基线】：{morning_conclusion or '（暂无）'}\n"
-        f"【今日红线】：\n{veto_block}\n\n"
+        + (f"【今日 /report 持仓与挂单裁决（默认遵循）】：\n{morning_audits_text}\n" if morning_audits_text else "")
+        + f"【今日红线】：\n{veto_block}\n\n"
+        f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
         f"【行业暴露】：\n{exposure_text}\n\n"
@@ -607,6 +720,7 @@ async def generate_pick_radar(
             isa_cands=isa_cands,
             invest_cands=invest_cands,
             guardrails=guardrails,
+            report_actions=report_top_actions,
         )
     else:
         logger.warning("Pick Critic structured parse fell back to plain text.")

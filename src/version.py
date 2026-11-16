@@ -1,3 +1,3 @@
 """Single source of truth for runtime application version."""
 
-APP_VERSION = "5.1.1"
+APP_VERSION = "5.1.2"

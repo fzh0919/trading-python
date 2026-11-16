@@ -273,6 +273,7 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
         self.assertIn("【欧股联网新闻】", brief1)
         self.assertIn("【美股与全球 ETF 联网新闻】", brief1)
         self.assertEqual(len(prompts_seen), 4)
+        self.assertTrue(any("近期无重大新公告：" in p for p in prompts_seen))
 
         # Cached second call hits memory cache without triggering new LLM calls
         brief2 = await run_forced_market_grounding(

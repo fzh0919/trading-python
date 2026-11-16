@@ -53,7 +53,7 @@ class RiskOverrideRecord(BaseModel):
     symbol: str
     from_action: str
     to_action: str
-    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP
+    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT
     reason: str
 
 
@@ -694,12 +694,20 @@ def format_disagreement_matrix_text(items: list[DisagreementItem]) -> str:
     """Format disagreement items into compact plain-text rows for PM/ContextPack."""
     if not items:
         return "（当前持仓信号基本一致，无显著多空证据冲突）"
+    high_priority = [it for it in items if it.conflict_type != "SUPPORT_VS_WEAK_TREND"]
+    weak_items = [it for it in items if it.conflict_type == "SUPPORT_VS_WEAK_TREND"]
     lines = []
-    for it in items:
+    for it in high_priority:
         bull = " / ".join(it.bull_points)
         bear = " / ".join(it.bear_points)
         lines.append(
             f"• [{it.account}] {it.ticker} ({it.conflict_type}) | 多方：{bull} ⚔️ 空方/风险：{bear} → 提示：{it.decision_hint}"
+        )
+    if weak_items:
+        tickers_str = ", ".join(f"{it.ticker}[{it.account}]" for it in weak_items)
+        lines.append(
+            f"• [SUPPORT_VS_WEAK_TREND 合并 x{len(weak_items)}] {tickers_str} | "
+            f"多方：估值/超卖或目标价有修复空间 ⚔️ 空方/风险：日/周线趋势偏弱或上方套牢 → 提示：{_CONFLICT_HINTS['SUPPORT_VS_WEAK_TREND']}"
         )
     return "\n".join(lines)
 
@@ -741,6 +749,44 @@ def _extract_vetoed_symbols(daily_vetoes: list[str] | None) -> dict[str, str]:
     return vetoed
 
 
+def _build_report_action_blocks(
+    report_actions: list[Any] | None,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Index same-day /report TRIM/STOP directives by (ACCOUNT, SYMBOL_OR_ROOT) for hard reversal blocking."""
+    blocks: dict[tuple[str, str], tuple[str, str]] = {}
+    for item in report_actions or []:
+        if isinstance(item, dict):
+            raw_acct = str(item.get("account") or "").strip().upper()
+            raw_sym = str(item.get("symbol") or "").strip().upper()
+            raw_act = str(item.get("action") or "").strip().upper()
+            raw_reason = str(item.get("reason") or "").strip()
+        else:
+            raw_acct = str(getattr(item, "account", "") or "").strip().upper()
+            raw_sym = str(getattr(item, "symbol", "") or "").strip().upper()
+            raw_act = str(getattr(item, "action", "") or "").strip().upper()
+            raw_reason = str(getattr(item, "reason", "") or "").strip()
+
+        if raw_act not in {"TRIM", "STOP"} or not raw_sym or raw_sym == "CASH":
+            continue
+
+        if raw_acct in {"双账户", "BOTH", "ALL", ""} or ("ISA" in raw_acct and "INVEST" in raw_acct):
+            accts = ("ISA", "INVEST")
+        elif "INVEST" in raw_acct:
+            accts = ("INVEST",)
+        elif "ISA" in raw_acct:
+            accts = ("ISA",)
+        else:
+            accts = (raw_acct,)
+
+        base = raw_sym.split(".")[0]
+        root = normalize_issuer_root(base)
+        keys = {k for k in (raw_sym, base, root) if k}
+        for acct in accts:
+            for key in keys:
+                blocks.setdefault((acct, key), (raw_act, raw_reason))
+    return blocks
+
+
 def apply_risk_override_guardrail(
     decision: Any,
     *,
@@ -751,6 +797,7 @@ def apply_risk_override_guardrail(
     evals: list[HoldingEvaluation] | None = None,
     high_correlation_symbols: set[str] | None = None,
     daily_vetoes: list[str] | None = None,
+    report_actions: list[Any] | None = None,
     vix_danger_threshold: float = 28.0,
 ) -> RiskOverrideResult:
     """Apply deterministic post-LLM risk override guardrails to MorningReportDecision or PickDecision."""
@@ -768,6 +815,7 @@ def apply_risk_override_guardrail(
     if hasattr(decision, "daily_vetoes") and getattr(decision, "daily_vetoes"):
         merged_vetoes.extend(getattr(decision, "daily_vetoes"))
     vetoed_map = _extract_vetoed_symbols(merged_vetoes)
+    report_action_blocks = _build_report_action_blocks(report_actions)
 
     # Precompute current + pending BUY weights by issuer root and by (account, symbol)
     issuer_weights: dict[str, float] = {}
@@ -831,6 +879,18 @@ def apply_risk_override_guardrail(
 
         if sym_up in vetoed_map or base in vetoed_map:
             return "DAILY_VETO", f"违背今日早报红线({vetoed_map.get(sym_up) or vetoed_map.get(base)})"
+
+        if report_action_blocks:
+            root = normalize_issuer_root(base)
+            hit = (
+                report_action_blocks.get((acct_up, sym_up))
+                or report_action_blocks.get((acct_up, base))
+                or report_action_blocks.get((acct_up, root))
+            )
+            if hit is not None:
+                rep_act, rep_reason = hit
+                reason_tail = f"：{rep_reason}" if rep_reason else ""
+                return "REPORT_ACTION_CONFLICT", f"今日早报已对该账户持仓裁决 {rep_act}{reason_tail}，禁止逆势买入/加仓"
 
         if sym_up in corr_set or base in corr_bases:
             return "CORRELATION_OVERLAP", f"与现有持仓相关性触发≥{strat.overlap_correlation_threshold:.2f}重叠拦截"
@@ -943,6 +1003,26 @@ def apply_risk_override_guardrail(
 
 
 _DEFAULT_HOLD_REASON = "技术面与仓位均在常规区间,默认持有观望"
+_HIGH_PRIORITY_HOLD_KEYWORDS = (
+    "距财报仅",
+    "⚠️",
+    "集中度风险",
+    "≥上限",
+    "止损",
+    "深套复核线",
+    "放量下挫",
+    "超买区",
+    "短期筹码拥挤",
+    "大幅正乖离",
+    "分批止盈",
+)
+
+
+def _is_routine_hold(ev: HoldingEvaluation) -> bool:
+    if ev.action_bias != "HOLD":
+        return False
+    joined_reasons = "；".join(ev.reasons)
+    return not any(kw in joined_reasons for kw in _HIGH_PRIORITY_HOLD_KEYWORDS)
 
 
 def format_evaluations_text(evals: list[HoldingEvaluation], compact_hold: bool = True) -> str:
@@ -957,13 +1037,7 @@ def format_evaluations_text(evals: list[HoldingEvaluation], compact_hold: bool =
     lines: list[str] = []
     routine_holds: list[str] = []
     for ev in evals:
-        is_routine_hold = (
-            compact_hold
-            and ev.action_bias == "HOLD"
-            and len(ev.reasons) == 1
-            and ev.reasons[0] == _DEFAULT_HOLD_REASON
-        )
-        if is_routine_hold:
+        if compact_hold and _is_routine_hold(ev):
             routine_holds.append(f"{ev.ticker}[{ev.account} {ev.weight_pct:.1f}%/{ev.return_pct:+.1f}%]")
             continue
         lines.append(

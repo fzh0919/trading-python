@@ -422,6 +422,12 @@ async def _assemble_fact_sheet_bundle(
         b = bundles.get(sym)
         if b is None:
             continue
+        is_etf = b.quote_type.upper() == "ETF"
+        is_pending_only = sym not in held_syms_set
+        near_ex_div = b.days_to_ex_dividend is not None and -3 <= int(b.days_to_ex_dividend) <= 7
+        near_earnings = b.days_to_earnings is not None and 0 <= int(b.days_to_earnings) <= 7
+        if not (is_etf or is_pending_only or near_ex_div or near_earnings):
+            continue
         anchor = b.identity_summary or b.build_identity_anchor(isin_override=isin_map.get(sym))
         if anchor:
             identity_lines.append(f"• {anchor}")
@@ -445,8 +451,8 @@ async def _assemble_fact_sheet_bundle(
     news_lines = []
     for sym in tracked_syms:
         b = bundles.get(sym)
-        if b and b.news:
-            titles = " / ".join(f"[{n['date']}] {n['title']}" for n in b.news[:2])
+        if b and b.news and b.quote_type.upper() != "ETF":
+            titles = " / ".join(f"[{n['date']}] {n['title']}" for n in b.news[:1])
             news_lines.append(f"• {sym}: {titles}")
 
     calendar_section = (
@@ -782,6 +788,12 @@ async def generate_morning_report(
             evals=evals,
         )
         resolved_decision = override_res.decision if isinstance(override_res.decision, MorningReportDecision) else decision
+        context_pack["report_decision"] = {
+            "headline": resolved_decision.headline,
+            "top_actions": [a.model_dump() for a in resolved_decision.top_actions],
+            "pending_order_audits": [a.model_dump() for a in resolved_decision.pending_order_audits],
+            "daily_vetoes": list(resolved_decision.daily_vetoes),
+        }
         final_report = holiday_banner + render_morning_report(
             resolved_decision,
             max_chars=max_body_chars,

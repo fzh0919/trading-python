@@ -554,11 +554,17 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(rendered_default), 1800)
         self.assertIn("其余长线底仓持有", rendered_default)
 
-        # 2) trim_text_at_line_boundary cleanly trims on newline without leaving dangling 【...】
+        # 2) trim_text_at_line_boundary cleanly trims on newline without leaving dangling 【...】 or mid-clause breaks
         multiline = "✅ 维持早报计划\n• 要点1：正常\n【分段】\n• 要点2：" + ("长内容" * 150)
         trimmed = trim_text_at_line_boundary(multiline, 450)
         self.assertLessEqual(len(trimmed), 450)
         self.assertNotIn("【分段】", trimmed)
+
+        single_long = "• 克隆ETF底层暴露归并 [S&P 500 (美股标普500)]：ISA VUAG £2,700 + Invest CSP1 £1,800；建议保持分散，暂不加码。"
+        trimmed_single = trim_text_at_line_boundary(single_long, 56)
+        self.assertLessEqual(len(trimmed_single), 56)
+        self.assertFalse(trimmed_single.endswith("S&P…"))
+        self.assertIn("；", single_long[len(trimmed_single) - 1 :])
 
         # 3) /us sentinel: calm day <= 450, anomaly day (🚨) allows up to 600 chars
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -658,6 +664,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
                 self.assertTrue(all(c.get("system_instruction") for c in pipeline_calls))
+                self.assertTrue(all("必须直白建议撤单（CANCEL）" in c["system_instruction"] for c in pipeline_calls))
                 self.assertIn("实时 Google Search", pipeline_calls[0]["prompt"])
                 report_msg = tg.messages[-1]
                 self.assertLessEqual(len(report_msg), 1800)
@@ -702,6 +709,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("Invest半导体占比超限", pick_pipeline[0]["prompt"])
                 self.assertIn("实时 Google Search", pick_pipeline[0]["prompt"])
+                self.assertTrue(
+                    all("必须直白建议撤单（CANCEL）" not in c["system_instruction"] for c in pick_pipeline)
+                )
                 pick_msg = tg.messages[-1]
                 self.assertLessEqual(len(pick_msg), 1000)
                 self.assertTrue(pick_msg.startswith("【本轮精选行动（四要素直给）】"))
@@ -744,6 +754,11 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(chat_call["model"], "gemini-4-hydrogen")
                 self.assertEqual(chat_call["thinking_level"], "LOW")
                 self.assertTrue(chat_call.get("system_instruction"))
+                self.assertIn("必须直白建议撤单（CANCEL）", chat_call["system_instruction"])
+                # morning_report already embeds "• 今日风控红线：..." so chat skips duplicate 【今日风控红线】
+                self.assertNotIn("【今日风控红线】", chat_call["prompt"])
+                self.assertIn("Invest半导体占比超限，冻结新开芯片仓", chat_call["prompt"])
+                self.assertEqual(chat_call["prompt"].count("Invest半导体占比超限，冻结新开芯片仓"), 1)
                 self.assertIn("【今日美股开盘前哨补充】", chat_call["prompt"])
                 self.assertNotIn("【持仓量化技术面、目标价与财报雷达】", chat_call["prompt"])
                 self.assertNotIn("【Python 规则引擎：加仓 / 减仓 / 止损复核信号】", chat_call["prompt"])
@@ -925,8 +940,11 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[🛡️风控护栏修正]", report)
             self.assertIn("HOLD NVDA", report)
 
-            # 2) isin_map passed to get_bundles; Disagreement + calendar alerts injected into PM prompt
+            # 2) isin_map passed to get_bundles; Disagreement + calendar alerts injected into PM prompt; cash flow printed once in analyst prompt
             self.assertTrue(any(m and m.get("NVDA") == "US67066G1040" for m in md.seen_isin_maps))
+            analyst_call = next(c for c in llm.calls if c.get("usage_label") == "report_analyst")
+            self.assertEqual(analyst_call["prompt"].count("[资金流水与派息"), 1)
+            self.assertEqual(analyst_call["prompt"].count("外部入金 +800.00 GBP"), 1)
             pm_call = next(c for c in llm.calls if c.get("usage_label") == "report_pm")
             self.assertIn("Disagreement Matrix", pm_call["prompt"])
             self.assertIn("美股半日市", pm_call["prompt"])
@@ -937,11 +955,14 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(latest_snap)
             self.assertEqual(latest_snap.fetched_at_ms, prev_port.fetched_at_ms)
 
-            # 4) AnalysisContextPack persisted with identity, technical (CYQ/weekly/ex_div), disagreements & lessons
+            # 4) AnalysisContextPack persisted with identity, technical (CYQ/weekly/ex_div), disagreements, lessons & report_decision
             pack = await db.get_context_pack(allow_fallback=False)
             self.assertIsNotNone(pack)
             self.assertEqual(pack["pack_version"], "1.0")
             self.assertTrue(pack["is_fallback"])
+            self.assertIn("report_decision", pack)
+            self.assertEqual(pack["report_decision"]["top_actions"][0]["symbol"], "NVDA")
+            self.assertEqual(pack["report_decision"]["top_actions"][0]["action"], "HOLD")
             nvda_pack = pack["symbols"]["NVDA"]
             self.assertIn("ISIN:US67066G1040", nvda_pack["identity_summary"])
             self.assertIsNotNone(nvda_pack["technical"])
@@ -1276,6 +1297,132 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(vwrp_recs[0]["entry_price"], 118.25, places=2)
             self.assertEqual(vwrp_recs[0]["horizon_days"], 7)
             self.assertEqual(vwrp_recs[0]["benchmark_symbol"], "SPY")
+
+    async def test_pick_syncs_report_pending_audits_and_blocks_trim_reversal(self) -> None:
+        from src.agents.pick_agent import generate_pick_radar
+        from src.config import StrategySection
+        from src.data_providers.t212_client import PendingOrderItem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "sync_report_pick.db")
+            await db.init()
+
+            seeded_pack = {
+                "pack_version": "1.0",
+                "report_decision": {
+                    "headline": "冻结科技，撤除高摩擦挂单",
+                    "top_actions": [
+                        {
+                            "account": "ISA",
+                            "symbol": "NVDA",
+                            "action": "TRIM",
+                            "price_zone": "168-170 USD",
+                            "reason": "财报前借反抽减仓",
+                        }
+                    ],
+                    "pending_order_audits": [
+                        {
+                            "account": "Invest",
+                            "symbol": "SHEL.L",
+                            "verdict": "CANCEL",
+                            "order_summary": "BUY 3675 GBp",
+                            "reason": "扣0.5%印花税后净空间不足以跑赢4%利息",
+                        },
+                        {
+                            "account": "ISA",
+                            "symbol": "AZN.L",
+                            "verdict": "MODIFY",
+                            "order_summary": "BUY 13400 GBp",
+                            "reason": "RSI偏热，下调至12850p靠拢MA50",
+                        },
+                    ],
+                    "daily_vetoes": ["严守4%现金门槛，不追高"],
+                },
+                "symbols": {},
+            }
+            await db.save_morning_report(
+                "【今日核心行动与挂单裁决】\n• [Invest] SHEL.L →【CANCEL】",
+                "冻结科技，撤除高摩擦挂单",
+                guardrails=["严守4%现金门槛，不追高"],
+                context_pack=seeded_pack,
+            )
+
+            portfolio = _sample_portfolio()
+            portfolio.invest.pending_orders = [
+                PendingOrderItem(
+                    id="ord-shel",
+                    account="Invest",
+                    raw_ticker="SHELl_EQ",
+                    ticker="SHEL",
+                    yahoo_symbol="SHEL.L",
+                    name="Shell PLC",
+                    side="BUY",
+                    order_type="LIMIT",
+                    quantity=10.0,
+                    value=367.5,
+                    limit_price=3675.0,
+                    currency="GBp",
+                    time_in_force="GTC",
+                )
+            ]
+
+            class _SyncPickLLM:
+                def __init__(self) -> None:
+                    self.calls: list[dict] = []
+
+                async def generate(self, **kwargs) -> str:
+                    self.calls.append(kwargs)
+                    schema = kwargs.get("response_schema")
+                    if getattr(schema, "__name__", "") == "PickDecision":
+                        return PickDecision(
+                            headline="严格延续早报风控",
+                            selected_actions=[
+                                PickActionItem(
+                                    account="ISA",
+                                    symbol="NVDA",
+                                    action="BUY",
+                                    thesis="尝试抄底",
+                                    entry_zone="162 USD",
+                                    stop_condition="150",
+                                    target_window="190",
+                                    entry_price=162.0,
+                                ),
+                                PickActionItem(
+                                    account="ISA",
+                                    symbol="VWRP.L",
+                                    action="BUY",
+                                    thesis="免税宽基长线定投",
+                                    entry_zone="118 GBP",
+                                    stop_condition="跌破MA200",
+                                    target_window="长线",
+                                    entry_price=118.0,
+                                ),
+                            ],
+                            rejected_or_frozen=[],
+                            consistency_and_cash_note="保留现金吃4%利息",
+                        ).model_dump_json()
+                    return "投研员提案：关注 VWRP.L，尊重早报对 SHEL.L 与 AZN.L 的挂单裁决。"
+
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+                models={"enable_forced_search_grounding": False},
+                universe=UniverseSection(isa_long_term=["VWRP.L", "AZN.L"], invest_tactical=["SHEL.L"]),
+                strategy=StrategySection(overlap_correlation_threshold=0.95),
+            )
+            llm = _SyncPickLLM()
+            clear_grounding_cache()
+            out = await generate_pick_radar(cfg, _FakeT212(portfolio), _FakeMarketData(), llm, db)
+
+            research_call = next(c for c in llm.calls if c.get("usage_label") == "pick_researcher")
+            critic_call = next(c for c in llm.calls if c.get("usage_label") == "pick_critic")
+            self.assertIn("[Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】", research_call["prompt"])
+            self.assertIn("[ISA] AZN.L (BUY 13400 GBp) →【MODIFY】", research_call["prompt"])
+            self.assertIn("⚠️今日早报已裁决: 挂单MODIFY(ISA)", research_call["prompt"])
+            self.assertIn("[Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】", critic_call["prompt"])
+            self.assertIn("SHEL.L", critic_call["prompt"])
+            self.assertIn("当前活动挂单", critic_call["prompt"])
+            self.assertIn("NVDA(BUY→拦截)", out)
+            self.assertIn("VWRP.L", out)
 
     async def test_imp14_chat_object_slicing_implicit_cache_deep_and_cross_cycle(self) -> None:
         from unittest.mock import patch

@@ -1,4 +1,4 @@
-# Trading 212 × Gemini AI 私人量化投顾 (v5.1.1)
+# Trading 212 × Gemini AI 私人量化投顾 (v5.1.2)
 
 面向英国个人投资者（Trading 212 **Stocks ISA** 免税长线账户 + **Invest** 应税短线账户，每账户约 10 只持仓，双账户均**仅保留 `GBP` 英镑现金**、不使用 Pie、不开启分红自动再投资）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling 常驻、零公网端口暴露、Docker 容器化部署）。
 
@@ -51,7 +51,7 @@ uv python install 3.12.13
 uv venv --python 3.12.13
 uv pip install -r requirements.txt
 
-# 日常编译、全套纯离线单测（86 tests）与 Git 同步
+# 日常编译、全套纯离线单测（87 tests）与 Git 同步
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m tests.run_tests tests
 git add -A && git commit -m "<msg>" && git push

@@ -1,6 +1,6 @@
 # Trading 212 × Gemini AI Advisor — 历史变更与模块执行归档日志 (CHANGELOG)
 
-> 说明：本文件归档历史版本修改日志（`v5.0.1` ~ `v5.1.1`）及已完成 `IMP-xx` 模块的完整实现细节，以保持主开发手册 [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) 精简紧凑、节省 AI 助手上下文 Token。
+> 说明：本文件归档历史版本修改日志（`v5.0.1` ~ `v5.1.2`）及已完成 `IMP-xx` 模块的完整实现细节，以保持主开发手册 [`DEVELOPER_GUIDE.md`](./DEVELOPER_GUIDE.md) 精简紧凑、节省 AI 助手上下文 Token。
 
 ---
 
@@ -34,7 +34,27 @@
 
 ---
 
-## 二、版本修改日志（Changelog `v5.0.1` ~ `v5.1.1`）
+## 二、版本修改日志（Changelog `v5.0.1` ~ `v5.1.2`）
+
+### `v5.1.2`（2026-11-16）
+全面优化 `/report`、`/pick` 与日常单聊（`chat`）发给 Gemini 的 Prompt 上下文信噪比，消除重复打印、模板废话、低密度噪音与半截断残句（全套 `87 tests OK`）：
+
+1. **消除 `/report` 资金流水重复打印（`src/data_providers/t212_client.py`）**：
+   - 修复 `build_trade_context()` 将 `cash_flow_summary_text` 重复拼接到 `trade_summary_30d_text` 末尾导致的双倍打印 Bug，`shared_context` 仅保留独立 `【近30天出入金与派息流水】` 一处明细。
+2. **压缩常规 `HOLD` 与模板化 `SUPPORT_VS_WEAK_TREND` 刷屏（`src/engine/portfolio_rules.py`）**：
+   - 在 `format_evaluations_text()` 新增 `_is_routine_hold()`（排除近财报、`≥上限`、止损、深套、放量下挫、超买拥挤等高优警告词），将仅含常规说明的 `HOLD` 持仓统一合并为一行 `⚪ [常规持有 xN 只均无异常]`。
+   - 在 `format_disagreement_matrix_text()` 优先逐条保留 `STOP_VS_EX_DIV`/`BULL_VS_OVERWEIGHT`/`BULL_VS_EARNINGS_RISK`/`TREND_VS_CROWDED` 等高价值冲突，将同质化的 `SUPPORT_VS_WEAK_TREND` 折叠为单行标的名录。
+3. **精简 `/pick` 与 `/report` 全量 ISIN 身份列表与新闻噪音（`src/agents/pick_agent.py`, `src/agents/report_agent.py`）**：
+   - `/pick` 的 `_build_holding_identity_section()` 仅注入处于近除息窗口（`-3 <= days_to_ex_dividend <= 7`）的存量标的锚点；`/report` 的 `_assemble_fact_sheet_bundle()` 仅对 ETF、仅挂单未持仓标的、近 7 日除息或近 7 日财报标的保留主 Prompt 身份锚点，并跳过 ETF 新闻、将个股 `news_lines` 收敛至最新 1 条标题；全量 ISIN 仍在 `ContextPack` 与 `inspect_ticker` 中完整保留。
+4. **去除 `/pick` 初筛候选摘要数字左右重复（`src/engine/screener.py`）**：
+   - 保持四维打分权重与分值计算完全不变，清理 `score_candidate()` 中与前半段指标重复的数值型 `pros`/`cons` 标签（PE/ROE/股息率/目标价空间/RSI/52 周回撤/20 日 RS/相关性与波动率数值），仅保留定性形态与结构结论。
+5. **收敛 Google Search Grounding 无新闻套话（`src/agents/tools.py`）**：
+   - 更新 `_single_search_query()` 与 `run_forced_market_grounding()` 分域检索指令，明确要求将无重大突发新闻、监管公告或评级变动的标的统一合并为一行（如 `近期无重大新公告：IUKD.L, IBTA.L, UNH`），集中篇幅呈现真实催化与异动。
+6. **清理 `chat` 重复红线与半截断残句，并隔离 `/pick` 挂单审计指令（`src/agents/schemas.py`, `src/agents/chat_agent.py`, `src/agents/prompts.py`, `src/agents/pick_agent.py`）**：
+   - 增强 `trim_text_at_line_boundary()` 在单行超长时按句末/分句标点优雅裁剪；`chat_agent.py` 全面替换字符硬切片，并通过 `_has_complete_embedded_vetoes()` 在早报正文已完整嵌入红线时跳过重复 `【今日风控红线】`。
+   - 在 `build_investor_profile()` 与 `build_agent_system_instruction()` 新增 `include_order_audit_rule: bool = True` 开关，`/pick` 的 Researcher 与 Critic 显式关闭该条挂单撤改审计指令以专注增量选股。
+7. **版本与回归单测同步（`src/version.py`, `pyproject.toml`, `README.md`, `DEVELOPER_GUIDE.md`, `tests/`）**：
+   - 版本号升级至 `5.1.2`；同步更新并增补 `test_t212_client.py`、`test_analytics_and_rules.py`、`test_db_and_end_to_end.py` 与 `test_v504_ops_and_grounding.py` 回归断言，全套 87 项单测通过。
 
 ### `v5.1.1`（2026-11-15）
 修复 `/pick` 量化初筛阶段跨源/跨时区 K 线合并报错（`TypeError: Cannot join tz-naive with tz-aware DatetimeIndex`），并收紧 `/pick` 输出契约禁止内部风控淘汰对话外泄（全套 `86 tests OK`）：

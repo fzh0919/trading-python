@@ -279,7 +279,7 @@ def _fit_max_chars(sections: list[str], max_chars: int) -> str:
 
 
 def trim_text_at_line_boundary(text: str, max_chars: int) -> str:
-    """Trim multi-line text at newline boundaries before falling back to hard slicing."""
+    """Trim multi-line text at newline boundaries, then sentence/clause boundaries before hard slicing."""
     cleaned = text.strip()
     if max_chars <= 0:
         return ""
@@ -295,7 +295,22 @@ def trim_text_at_line_boundary(text: str, max_chars: int) -> str:
         return candidate
     if max_chars == 1:
         return cleaned[:1]
-    return cleaned[: max_chars - 1].rstrip() + "…"
+
+    target = candidate or cleaned
+    min_cut = max(1, max_chars // 2)
+    head_full = target[:max_chars]
+    for sep in ("。", "！", "？"):
+        pos = head_full.rfind(sep)
+        if pos >= min_cut:
+            return target[: pos + 1].rstrip()
+    head = target[: max_chars - 1]
+    for sep in ("；", ";", " | ", "，", ",", "：", ":", " "):
+        pos = head.rfind(sep)
+        if pos >= min_cut:
+            cut = target[:pos].rstrip()
+            if cut:
+                return cut + "…"
+    return head.rstrip() + "…"
 
 
 def _format_guardrail_note(text: str) -> str:

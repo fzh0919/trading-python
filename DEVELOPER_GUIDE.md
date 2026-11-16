@@ -51,7 +51,7 @@ trading-python/                     # [当前主项目]
 ├── src/
     │   ├── main.py                 # 入口：初始化 SQLite/OpsNotifier/各Client，维护 /tmp 心跳、致命崩溃兜底与长轮询
     │   ├── healthcheck.py          # 纯 Python 容器探活：校验 /tmp/advisor.heartbeat 新鲜度与只读 SQLite 状态
-    │   ├── version.py              # 版本号单一真源 (APP_VERSION = "5.1.1")
+    │   ├── version.py              # 版本号单一真源 (APP_VERSION = "5.1.2")
     │   ├── config.py               # Pydantic 配置加载 (.env + config.yaml)
     │   ├── ops_notifier.py         # 统一运维告警（ops-notify 双态分流、WARN 冷却、CRITICAL 防抖与离线缓冲）
     │   ├── data_providers/
@@ -154,8 +154,8 @@ trading-python/                     # [当前主项目]
   - `compute_correlation_matrix(histories, symbols=None, lookback_days=60, benchmark_symbol="SPY", uk_benchmark_symbol="ISF.L", eu_benchmark_symbol="EXS1.DE") -> pd.DataFrame`
   - `infer_etf_index_family(symbol, bundle=None, name_hint="") -> str | None` | `compute_exposure_summary(portfolio, bundle_map) -> str`
 - **`src/engine/portfolio_rules.py`（`IMP-07`）**：
-  - `evaluate_holding(..., hist=None, pending_orders=None, account_total_value=None, total_portfolio_value=None) -> HoldingEvaluation`（新增 `native_return_pct`, `effective_stop_pct`, `pending_buy_weight_pct`, `has_pending_stop`, `ex_div_guarded`）；`evaluate_portfolio(..., histories=None)`
-  - `build_disagreement_matrix(data, tech_map, bundle_map, strategy, evals=None) -> list[DisagreementItem]` | `format_disagreement_matrix_text(items) -> str`
+  - `evaluate_holding(..., hist=None, pending_orders=None, account_total_value=None, total_portfolio_value=None) -> HoldingEvaluation`（新增 `native_return_pct`, `effective_stop_pct`, `pending_buy_weight_pct`, `has_pending_stop`, `ex_div_guarded`）；`evaluate_portfolio(..., histories=None)`；`format_evaluations_text(..., compact_hold=True)` 合并无高优风险的常规 `HOLD`
+  - `build_disagreement_matrix(data, tech_map, bundle_map, strategy, evals=None) -> list[DisagreementItem]` | `format_disagreement_matrix_text(items) -> str`（单行折叠同质 `SUPPORT_VS_WEAK_TREND`）
   - `apply_risk_override_guardrail(decision, *, portfolio=None, macro=None, strategy=None, bundle_map=None, evals=None, high_correlation_symbols=None, daily_vetoes=None, vix_danger_threshold=28.0) -> RiskOverrideResult`（含 `overrides: list[RiskOverrideRecord]`, `notes: list[str]`）
 - **`src/engine/screener.py`（`IMP-08`）**：
   - `ScreenerCandidate` 字段：`is_recent_traded: bool = False`, `rs_20d_pct: float | None = None`, `marginal_vol_delta_pct: float | None = None`, `regime_tag: str = ""`, `dimension_scores: dict[str, float]`, `dimension_pct: dict[str, float]`, `pros: list[str]`, `cons: list[str]`, `pattern_signals: list[str]`
@@ -164,9 +164,10 @@ trading-python/                     # [当前主项目]
 - **`src/agents/llm_client.py`（`IMP-01` & `IMP-09`）**：
   - `normalize_thinking_level(model: str, thinking_level: str) -> str`（从已移除的 `pricing.py` 迁入；`pricing.py` 已按用户要求删除，仅记录 Token 与 `search_queries`）
   - `GeminiClient(..., round_timeout_seconds=120.0, tool_timeout_seconds=60.0, max_concurrent_tools=6, max_tool_result_chars=4000, usage_summary_provider=None, search_free_quota_monthly=5000, search_warn_pct=85.0)`；`set_usage_summary_provider(...)`（单轮 `asyncio.wait_for` 超时、同轮 `asyncio.gather` 并发+裁剪及 `"this_month"` Search 免费额度 `OpsNotifier` 预警）
-- **`src/agents/schemas.py`（`IMP-10`）**：
+- **`src/agents/prompts.py` & `src/agents/schemas.py`（`IMP-10`）**：
+  - `build_investor_profile(strategy, *, include_order_audit_rule=True)` & `build_agent_system_instruction(role_instruction, strategy, *, include_order_audit_rule=True)`（`/pick` 传 `False` 隔离存量挂单审计原则）
   - `FlaggedPositionItem(symbol: str, summary: str)`；`MorningReportDecision.flagged_positions: list[FlaggedPositionItem]`（`mode="before"` 校验器兼容旧 `str` / `dict`）
-  - `render_morning_report(decision, max_chars=1800, *, risk_override: RiskOverrideResult | None = None) -> str` & `render_pick_report(decision, max_chars=1000, *, risk_override: RiskOverrideResult | None = None) -> str`（统一高亮 `[🛡️风控护栏修正]` 并保留护栏驳回项，`_fit_max_chars` 尾部防孤立 `【...】` 标题行）；`trim_text_at_line_boundary(text, max_chars) -> str`
+  - `render_morning_report(decision, max_chars=1800, *, risk_override: RiskOverrideResult | None = None) -> str` & `render_pick_report(decision, max_chars=1000, *, risk_override: RiskOverrideResult | None = None) -> str`（统一高亮 `[🛡️风控护栏修正]` 并保留护栏驳回项，`_fit_max_chars` 尾部防孤立 `【...】` 标题行）；`trim_text_at_line_boundary(text, max_chars) -> str`（支持单行句界/分句边界优雅裁剪）
 - **`src/agents/tools.py`（`IMP-11`）**：
   - `run_forced_market_grounding(..., max_concurrent_searches: int = 3) -> str`（`asyncio.Semaphore` 并发限流 + `_GROUNDING_CACHE` 过期条目自动清理）
   - `MarketToolkit(market_data, portfolio, *, llm=None, search_model="gemini-4-hydrogen", ops_notifier=None, db=None)`（`inspect_ticker` 传入持仓 `isin`/`created_at` 与 `bundle`、按需调 `get_us_deep_intel` 与 `db.get_symbol_lessons`，含 CYQ/周线/除息/身份紧凑裁剪 `<4000` 字符；`check_portfolio_correlation` 改调 `get_histories` 并补拉 `SPY`/`ISF.L`/区域基准）
@@ -258,4 +259,4 @@ trading-python/                     # [当前主项目]
 
 ## 六、历史修改日志（已冷热分离）
 
-全部 `IMP-01 ~ IMP-19` 模块详细改动记录、现状评分、测试演进及历史版本修改日志（`v5.0.1 ~ v5.1.1`），统一归档于 [`CHANGELOG.md`](./CHANGELOG.md)，新窗口默认无需通读历史归档。
+全部 `IMP-01 ~ IMP-19` 模块详细改动记录、现状评分、测试演进及历史版本修改日志（`v5.0.1 ~ v5.1.2`），统一归档于 [`CHANGELOG.md`](./CHANGELOG.md)，新窗口默认无需通读历史归档。

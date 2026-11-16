@@ -203,17 +203,49 @@ def _split_t212_ticker(raw_ticker: str) -> tuple[str, str | None]:
     return re.sub(r"_[a-z0-9]+$", "", s, flags=re.IGNORECASE), None
 
 
+_LEGACY_US_TICKER_ALIASES: dict[str, str] = {
+    "FB": "META",
+}
+_NON_US_T212_SUFFIXES = ("_LN_EQ", "_UK_EQ", "_DE_EQ", "_FR_EQ", "_NL_EQ", "_CH_EQ")
+
+
+def _normalize_legacy_us_ticker(
+    raw_ticker: str,
+    clean: str,
+    inline_suffix: str | None = None,
+    inst_currency: str = "",
+) -> str:
+    """Map legacy US ticker symbols (e.g. T212 FB_US_EQ -> META) without altering non-US symbols."""
+    clean_up = (clean or "").strip().upper()
+    alias = _LEGACY_US_TICKER_ALIASES.get(clean_up)
+    if not alias or inline_suffix is not None:
+        return clean
+    raw_up = (raw_ticker or "").strip().upper()
+    if raw_up.endswith(_NON_US_T212_SUFFIXES):
+        return clean
+    curr_up = (inst_currency or "").strip().upper()
+    if raw_up.endswith("_US_EQ") or curr_up in {"", "USD"}:
+        return alias
+    return clean
+
+
 def clean_t212_ticker(raw_ticker: str) -> str:
     """Normalize Trading 212 internal instrument codes like AAPL_US_EQ, VUAGl_EQ, ASMLa_EQ, BRK_B_US_EQ."""
-    clean, _ = _split_t212_ticker(raw_ticker)
-    return clean
+    clean, inline_suffix = _split_t212_ticker(raw_ticker)
+    return _normalize_legacy_us_ticker(raw_ticker, clean, inline_suffix)
 
 
 def to_yahoo_symbol(raw_ticker: str, inst_currency: str = "USD", clean_ticker: str | None = None) -> str:
     """Convert Trading 212 ticker + currency metadata to Yahoo Finance ticker format."""
     parsed_clean, inline_suffix = _split_t212_ticker(raw_ticker)
     raw_upper = (raw_ticker or "").strip().upper()
-    clean = (clean_ticker or parsed_clean).strip().upper()
+    resolved_clean = _normalize_legacy_us_ticker(
+        raw_ticker,
+        clean_ticker or parsed_clean,
+        inline_suffix,
+        inst_currency,
+    )
+    clean = resolved_clean.strip().upper()
     curr = (inst_currency or "").strip()
     curr_upper = curr.upper()
 
@@ -1586,7 +1618,6 @@ def build_trade_context(
         cf_header = f"[资金流水与派息(近 {history_days} 天)] " + (" | ".join(cf_parts) if cf_parts else "（微量变动）")
         cf_lines = [line for _, line in merged_events[:6]]
         cash_flow_summary_text = cf_header + ("\n" + "\n".join(cf_lines) if cf_lines else "")
-        summary_text = f"{summary_text}\n{cash_flow_summary_text}"
 
     return {
         "recent_trades_text": recent_text,

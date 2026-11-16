@@ -35,8 +35,13 @@ class TestT212Client(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clean_t212_ticker("IBTAl_EQ"), "IBTA")
         self.assertEqual(clean_t212_ticker("ASMLa_EQ"), "ASML")
         self.assertEqual(clean_t212_ticker("RR_LN_EQ"), "RR")
+        self.assertEqual(clean_t212_ticker("FB_US_EQ"), "META")
+        self.assertEqual(clean_t212_ticker("FB_LN_EQ"), "FB")
 
         self.assertEqual(to_yahoo_symbol("AAPL_US_EQ", "USD"), "AAPL")
+        self.assertEqual(to_yahoo_symbol("FB_US_EQ", "USD"), "META")
+        self.assertEqual(to_yahoo_symbol("FB_US_EQ", "USD", clean_ticker="FB"), "META")
+        self.assertEqual(to_yahoo_symbol("FB_LN_EQ", "GBX"), "FB.L")
         self.assertEqual(to_yahoo_symbol("BRK_B_US_EQ", "USD"), "BRK-B")
         self.assertEqual(to_yahoo_symbol("VUAGl_EQ", "GBP"), "VUAG.L")
         self.assertEqual(to_yahoo_symbol("VWRPl_EQ", "GBP"), "VWRP.L")
@@ -727,7 +732,8 @@ class TestT212Client(unittest.IsolatedAsyncioTestCase):
         self.assertIn("外部出金 -200.00 GBP", ctx["cash_flow_summary_text"])
         self.assertIn("派息入账 +38.40 GBP(1笔)", ctx["cash_flow_summary_text"])
         self.assertIn("现金利息 +6.50 GBP", ctx["cash_flow_summary_text"])
-        self.assertIn("[资金流水与派息", ctx["trade_summary_30d_text"])
+        self.assertIn("[资金流水与派息", ctx["cash_flow_summary_text"])
+        self.assertNotIn("[资金流水与派息", ctx["trade_summary_30d_text"])
         await client.close()
 
         # Verify zero-bloat when no transactions/dividends and only 503 orders on empty account

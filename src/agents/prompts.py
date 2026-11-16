@@ -5,7 +5,17 @@ from __future__ import annotations
 from src.config import StrategySection
 
 
-def build_investor_profile(strategy: StrategySection) -> str:
+def build_investor_profile(
+    strategy: StrategySection,
+    *,
+    include_order_audit_rule: bool = True,
+) -> str:
+    audit_rule = (
+        "\n• 客观审计原则（反迎合）：对任何已有挂单或前序 AI 结论，只要最新现价、均线结构、目标价空间扣除摩擦后无法显著跑赢"
+        f"{strategy.cash_interest_rate_pct:.1f}%现金利息，必须直白建议撤单（CANCEL）或改价（MODIFY），严禁盲目维持或附和。"
+        if include_order_audit_rule
+        else ""
+    )
     return (
         "【投资者画像与硬性规则】：\n"
         "• 英国个人投资者，持有 Trading 212 Stocks ISA 与 Invest 双账户，不使用杠杆/期权/做空。\n"
@@ -16,12 +26,19 @@ def build_investor_profile(strategy: StrategySection) -> str:
         f"{strategy.cash_interest_rate_pct:.1f}%无风险利息+交易摩擦时才建议出手。\n"
         f"• 交易摩擦门槛：① 非英镑资产买卖各约 {strategy.fx_fee_pct:.2f}% 换汇费（往返约 {strategy.fx_fee_pct * 2:.2f}%），"
         f"英镑资产（英股/LSE英镑ETF）免换汇费；② 买入英国个股另收 {strategy.uk_stamp_duty_pct:.1f}% 印花税（LSE ETF 免税，适合长线）；"
-        "③ Invest 为应税账户，低赔率频繁换仓会侵蚀净收益。\n"
-        "• 客观审计原则（反迎合）：对任何已有挂单或前序 AI 结论，只要最新现价、均线结构、目标价空间扣除摩擦后无法显著跑赢"
-        f"{strategy.cash_interest_rate_pct:.1f}%现金利息，必须直白建议撤单（CANCEL）或改价（MODIFY），严禁盲目维持或附和。"
+        "③ Invest 为应税账户，低赔率频繁换仓会侵蚀净收益。"
+        f"{audit_rule}"
     )
 
 
-def build_agent_system_instruction(role_instruction: str, strategy: StrategySection) -> str:
+def build_agent_system_instruction(
+    role_instruction: str,
+    strategy: StrategySection,
+    *,
+    include_order_audit_rule: bool = True,
+) -> str:
     """Combine stable role instructions and investor profile for Gemini `system_instruction`."""
-    return f"{role_instruction.strip()}\n\n{build_investor_profile(strategy)}"
+    return (
+        f"{role_instruction.strip()}\n\n"
+        f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule)}"
+    )

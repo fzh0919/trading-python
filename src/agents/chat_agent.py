@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction
+from src.agents.schemas import trim_text_at_line_boundary
 from src.agents.tools import MarketToolkit
 from src.config import AppConfig
 
@@ -471,8 +472,8 @@ def _format_previous_cycle_summary(prev_turns: list[tuple[str, str]]) -> str:
         return ""
     lines: list[str] = []
     for u, a in prev_turns[-2:]:
-        u_one = " ".join(str(u).splitlines()).strip()[:70]
-        a_one = " ".join(str(a).splitlines()).strip()[:130]
+        u_one = trim_text_at_line_boundary(" ".join(str(u).splitlines()), 70)
+        a_one = trim_text_at_line_boundary(" ".join(str(a).splitlines()), 130)
         lines.append(f"• [上一周期] 问: {u_one} → 答: {a_one}")
     return "\n".join(lines)
 
@@ -486,10 +487,10 @@ def _format_cycle_baseline_section(
     if isinstance(context_pack, dict):
         exposure = str(context_pack.get("exposure_summary") or "").strip()
         if exposure:
-            parts.append(f"• 组合底层敞口：{exposure[:350]}")
+            parts.append(f"• 组合底层敞口：\n{trim_text_at_line_boundary(exposure, 350)}")
         disagreement_txt = str(context_pack.get("disagreement_text") or "").strip()
         if disagreement_txt and "暂无" not in disagreement_txt:
-            parts.append(f"• 组合多空分歧摘要：\n{disagreement_txt[:550]}")
+            parts.append(f"• 组合多空分歧摘要：\n{trim_text_at_line_boundary(disagreement_txt, 550)}")
         recent_lessons = context_pack.get("recent_lessons") or []
         if isinstance(recent_lessons, list) and recent_lessons:
             lesson_bits: list[str] = []
@@ -497,9 +498,10 @@ def _format_cycle_baseline_section(
                 if isinstance(row, dict) and row.get("reflection_lesson"):
                     alpha = row.get("alpha_pct")
                     a_str = f" Alpha {float(alpha):+.1f}%" if isinstance(alpha, (int, float)) else ""
+                    lesson_str = trim_text_at_line_boundary(str(row["reflection_lesson"]), 100)
                     lesson_bits.append(
                         f"[{row.get('symbol', '')} {row.get('action', '')}{a_str}] "
-                        f"{str(row['reflection_lesson'])[:100]}"
+                        f"{lesson_str}"
                     )
             if lesson_bits:
                 parts.append("• 近期选股 T+N 反思：" + "；".join(lesson_bits))
@@ -548,11 +550,32 @@ def _format_chat_history_compact(history_turns: list[tuple[str, str]], recent_fu
     split_idx = max(0, len(history_turns) - recent_full_turns)
     lines: list[str] = []
     for u, a in history_turns[:split_idx]:
-        a_one_line = " ".join(a.splitlines()).strip()[:100]
-        lines.append(f"• [早期] 问: {u[:60]} → 答: {a_one_line}")
+        u_one_line = trim_text_at_line_boundary(" ".join(u.splitlines()), 60)
+        a_one_line = trim_text_at_line_boundary(" ".join(a.splitlines()), 100)
+        lines.append(f"• [早期] 问: {u_one_line} → 答: {a_one_line}")
     for u, a in history_turns[split_idx:]:
-        lines.append(f"👤 用户: {u}\n🤖 顾问: {a[:380]}")
+        lines.append(f"👤 用户: {u}\n🤖 顾问: {trim_text_at_line_boundary(a, 380)}")
     return "\n\n".join(lines)
+
+
+def _has_complete_embedded_vetoes(morning_block: str, guardrails: list[str]) -> bool:
+    """Check whether morning_block already includes the complete daily redlines without truncation."""
+    if not morning_block:
+        return False
+    lines = morning_block.splitlines()
+    for idx, ln in enumerate(lines):
+        stripped = ln.strip()
+        if "今日风控红线" not in stripped:
+            continue
+        if stripped.endswith(("…", "...")):
+            return False
+        if not stripped.startswith("【") and ("：" in stripped or ":" in stripped):
+            return all(g in morning_block for g in guardrails) if guardrails else True
+        if stripped.startswith("【今日风控红线") and idx + 1 < len(lines):
+            next_ln = lines[idx + 1].strip()
+            if next_ln and not next_ln.endswith(("…", "...")):
+                return all(g in morning_block for g in guardrails) if guardrails else True
+    return False
 
 
 async def answer_user_chat(
@@ -589,7 +612,13 @@ async def answer_user_chat(
     sched = get_us_market_schedule_uk()
     calendar_alerts = get_market_calendar_alerts()
     calendar_inline = ("｜" + "；".join(calendar_alerts)) if calendar_alerts else ""
-    morning_block = morning_full_text[:2050] if morning_full_text else (morning_conclusion or "（暂无）")
+    morning_block = (
+        trim_text_at_line_boundary(morning_full_text, 2050)
+        if morning_full_text
+        else (morning_conclusion or "（暂无）")
+    )
+    veto_section = "" if _has_complete_embedded_vetoes(morning_block, guardrails) else f"【今日风控红线】：\n{veto_block}\n\n"
+    pick_block = trim_text_at_line_boundary(pick_text, 1050) if pick_text else ""
     reset_str = f"{cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK"
 
     # [用户授权调整] /deep 单聊 Prompt 软约束放宽至 1000~1200 字，普通单聊保持 500 字以内（均不做代码截断）
@@ -642,9 +671,9 @@ async def answer_user_chat(
     # Static cycle-invariant prefix FIRST to maximize Gemini Implicit Cache prefix hits across turns
     static_prefix = (
         f"【今日早报及美股哨兵纪要】：\n{morning_block}\n\n"
-        f"【今日风控红线】：\n{veto_block}\n\n"
+        + veto_section
         # [用户授权调整] 放宽 /pick 雷达切片至 1050 字符以完整保留精选行动与驳回原因
-        + (f"【最近一次选股雷达 ({pick_ts} UK)】：\n{pick_text[:1050]}\n\n" if pick_text else "")
+        + (f"【最近一次选股雷达 ({pick_ts} UK)】：\n{pick_block}\n\n" if pick_block else "")
         + _format_cycle_baseline_section(context_pack, prev_cycle_turns)
     )
 

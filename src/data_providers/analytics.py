@@ -1090,6 +1090,7 @@ def format_technical_line(
 
 
 _ISSUER_ALIASES: dict[str, str] = {
+    "FB": "META",
     "GOOGL": "GOOG",
     "BRK.A": "BRK-B",
     "BRK-A": "BRK-B",

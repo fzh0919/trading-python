@@ -159,6 +159,29 @@ class TestAnalyticsAndRules(unittest.TestCase):
                 friction_note="英股(0%换汇, 买入0.5%印花税)",
             ),
             HoldingEvaluation(
+                account="ISA",
+                ticker="INTC",
+                yahoo_symbol="INTC",
+                weight_pct=5.0,
+                return_pct=-4.0,
+                action_bias="HOLD",
+                reasons=[
+                    "长线ISA处于MA200下方弱势区间(未达右侧趋势门槛),暂不触发加仓信号",
+                    "CYQ上方套牢盘较重(仅22%获利),反弹留意抛压",
+                ],
+                friction_note="美股(0.30%往返换汇)",
+            ),
+            HoldingEvaluation(
+                account="ISA",
+                ticker="MSFT",
+                yahoo_symbol="MSFT",
+                weight_pct=12.0,
+                return_pct=8.0,
+                action_bias="HOLD",
+                reasons=["⚠️ 距财报仅3天(2026-11-19),财报前谨慎重仓加码"],
+                friction_note="美股(0.30%往返换汇)",
+            ),
+            HoldingEvaluation(
                 account="Invest",
                 ticker="NVDA",
                 yahoo_symbol="NVDA",
@@ -170,8 +193,10 @@ class TestAnalyticsAndRules(unittest.TestCase):
             ),
         ]
         txt = format_evaluations_text(evals, compact_hold=True)
-        self.assertIn("常规持有 x2 只均无异常", txt)
+        self.assertIn("常规持有 x3 只均无异常", txt)
         self.assertIn("VWRP[ISA 20.0%/+5.0%]", txt)
+        self.assertIn("INTC[ISA 5.0%/-4.0%]", txt)
+        self.assertIn("[ISA] MSFT ⚪ [常规持有]", txt)
         self.assertIn("[Invest] NVDA 🔴 [止损/证伪复核]", txt)
 
     def test_v505_enhanced_risk_rules_and_debeta_correlation(self) -> None:
@@ -874,7 +899,7 @@ class TestAnalyticsAndRules(unittest.TestCase):
             PickDecision,
             ReportActionItem,
         )
-        from src.data_providers.analytics import TechnicalSnapshot
+        from src.data_providers.analytics import TechnicalSnapshot, normalize_issuer_root
         from src.data_providers.market_data import MacroSnapshot
         from src.data_providers.t212_client import AccountSnapshot, PortfolioData
         from src.engine.portfolio_rules import (
@@ -937,6 +962,36 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertIn("⚔️", txt)
         self.assertNotIn("**", txt)
 
+        # Collapsing low-signal SUPPORT_VS_WEAK_TREND rows while keeping high-priority rows expanded
+        from src.engine.portfolio_rules import DisagreementItem
+
+        mixed_txt = format_disagreement_matrix_text(
+            [
+                *disagreements,
+                DisagreementItem(
+                    account="ISA",
+                    ticker="UNH",
+                    yahoo_symbol="UNH",
+                    conflict_type="SUPPORT_VS_WEAK_TREND",
+                    bull_points=["一致目标空间+18%"],
+                    bear_points=["日/周线趋势偏弱"],
+                    decision_hint="估值/超卖有修复空间但右侧尚未转强，等待均线企稳",
+                ),
+                DisagreementItem(
+                    account="Invest",
+                    ticker="UBER",
+                    yahoo_symbol="UBER",
+                    conflict_type="SUPPORT_VS_WEAK_TREND",
+                    bull_points=["RSI14=28.0超卖"],
+                    bear_points=["日/周线趋势偏弱"],
+                    decision_hint="估值/超卖有修复空间但右侧尚未转强，等待均线企稳",
+                ),
+            ]
+        )
+        self.assertIn("NVDA (BULL_VS_OVERWEIGHT)", mixed_txt)
+        self.assertIn("[SUPPORT_VS_WEAK_TREND 合并 x2] UNH[ISA], UBER[Invest]", mixed_txt)
+        self.assertEqual(mixed_txt.count("SUPPORT_VS_WEAK_TREND"), 1)
+
         # MorningReportDecision guardrail: NVDA ADD downgraded by overweight, VWRP.L ADD downgraded by VIX>=28,
         # while TRIM/HOLD remain untouched and caller's original object is not mutated.
         report_dec = MorningReportDecision(
@@ -992,6 +1047,32 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertEqual([a.symbol for a in res_pick.decision.selected_actions], ["INTC"])
         self.assertEqual(len(res_pick.decision.rejected_or_frozen), 2)
         self.assertIn("[🛡️风控护栏修正]", res_pick.decision.rejected_or_frozen[0])
+
+        # Legacy FB -> META issuer alias & same-day /report TRIM/STOP hard reversal blocking
+        self.assertEqual(normalize_issuer_root("FB"), "META")
+        rev_pick = PickDecision(
+            headline="逆势加仓测试",
+            selected_actions=[
+                PickActionItem(account="ISA", symbol="NVDA", action="BUY", thesis="抄底", entry_zone="165", stop_condition="155", target_window="185", entry_price=165.0),
+                PickActionItem(account="Invest", symbol="INTC", action="ADD", thesis="博弈", entry_zone="56", stop_condition="52", target_window="65", entry_price=56.0),
+            ],
+            rejected_or_frozen=[],
+            consistency_and_cash_note="现金充足",
+        )
+        res_rev = apply_risk_override_guardrail(
+            rev_pick,
+            portfolio=portfolio,
+            macro=MacroSnapshot(fetched_at_utc="2026-11-14T07:25:00Z", vix=18.0),
+            strategy=strategy,
+            bundle_map=bundle_map,
+            report_actions=[
+                {"account": "ISA", "symbol": "NVDA", "action": "TRIM", "reason": "财报前减仓"},
+                {"account": "双账户", "symbol": "INTC", "action": "STOP", "reason": "跌破年线止损"},
+            ],
+        )
+        self.assertTrue(res_rev.applied)
+        self.assertEqual(res_rev.decision.selected_actions, [])
+        self.assertEqual([ov.trigger_type for ov in res_rev.overrides], ["REPORT_ACTION_CONFLICT", "REPORT_ACTION_CONFLICT"])
 
     def test_imp08_ref_breakout_patterns_and_volume_enter(self) -> None:
         # 1) Platform breakthrough: 90 bars flat around 100 (so MA60 ~ 100), then volume breakout bar
@@ -1152,7 +1233,10 @@ class TestAnalyticsAndRules(unittest.TestCase):
         c_bad = score_candidate(
             "EXPENSIVE.L", "ISA_LONG_TERM", tech_weak, weak_bundle, 0.30, "NVDA", False, False, strategy
         )
-        self.assertIn("目标价空间+25%", c_good.summary_line)
+        self.assertIn("目标空间 +25%", c_good.summary_line)
+        self.assertNotIn("目标价空间+25%", c_good.summary_line)
+        self.assertNotIn("估值合理(PE=", c_good.summary_line)
+        self.assertNotIn("股息率", c_good.summary_line)
         self.assertIn("CYQ底部单峰密集", c_good.reasons)
         self.assertIn("周/日线多头共振", c_good.reasons)
         self.assertGreater(c_good.score - c_bad.score, 35.0)

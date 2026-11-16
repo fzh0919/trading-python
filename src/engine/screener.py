@@ -798,16 +798,12 @@ def score_candidate(
 
         if tech.drawdown_52w_pct is not None and -18.0 <= tech.drawdown_52w_pct <= -4.0:
             dim1 += 3.0
-            pros.append(f"适度回撤{tech.drawdown_52w_pct:.1f}%")
 
         if tech.rsi14 is not None:
             if 32.0 <= tech.rsi14 <= 55.0:
                 dim1 += 3.0
-                pros.append(f"RSI={tech.rsi14:.0f}不追高")
             elif tech.rsi14 >= 68.0:
                 dim1 -= _linear_scale(tech.rsi14, 68.0, 82.0, 2.0, 6.0)
-                if tech.rsi14 >= 72.0:
-                    cons.append(f"RSI={tech.rsi14:.0f}偏热")
 
         if tech.volatility_60d_pct is not None and tech.volatility_60d_pct > 45.0:
             dim1 -= _linear_scale(tech.volatility_60d_pct, 45.0, 80.0, 2.0, 6.0)
@@ -826,14 +822,11 @@ def score_candidate(
         if tech.rsi14 is not None:
             if tech.rsi14 <= 38.0:
                 dim1 += 4.5
-                pros.append(f"RSI={tech.rsi14:.0f}超卖弹性")
             elif 40.0 <= tech.rsi14 <= 60.0 and (tech.ret_20d_pct or 0.0) > 0.0:
                 dim1 += 3.0
                 pros.append("动量健康")
             elif tech.rsi14 >= 70.0:
                 dim1 -= _linear_scale(tech.rsi14, 70.0, 84.0, 2.0, 7.0)
-                if tech.rsi14 >= 74.0:
-                    cons.append(f"RSI={tech.rsi14:.0f}短期过热")
 
         if bundle and bundle.days_to_earnings is not None and 0 <= bundle.days_to_earnings <= 5:
             dim1 -= 4.0
@@ -866,10 +859,6 @@ def score_candidate(
 
     if rs_20d is not None:
         dim1 += _linear_scale(rs_20d, -8.0, 10.0, -2.5, 3.5)
-        if rs_20d >= 4.0:
-            pros.append(f"RS强于基准({rs_20d:+.1f}%)")
-        elif rs_20d <= -5.0:
-            cons.append(f"RS跑输基准({rs_20d:+.1f}%)")
     if rs_slope is not None and rs_slope > 0.15 and (rs_20d or 0.0) > 0.0:
         dim1 += 1.5
 
@@ -949,10 +938,6 @@ def score_candidate(
     upside_pct = _safe_target_upside_pct(symbol, tech, bundle)
     if upside_pct is not None:
         dim3 += _linear_scale(upside_pct, -15.0, 25.0, -4.0, 5.0)
-        if upside_pct >= 10.0:
-            pros.append(f"目标价空间+{upside_pct:.0f}%")
-        elif upside_pct <= -10.0:
-            cons.append(f"高于一致目标价({upside_pct:+.0f}%)")
 
     if bundle and not is_etf:
         pe_val = (
@@ -964,25 +949,16 @@ def score_candidate(
             if track == "ISA_LONG_TERM":
                 if pe_val <= 22.0:
                     dim3 += _linear_scale(pe_val, 8.0, 22.0, 5.0, 2.5)
-                    pros.append(f"估值合理(PE={pe_val:.1f}x)")
                 else:
                     dim3 += _linear_scale(pe_val, 22.0, 55.0, 2.5, -5.0)
-                    if pe_val >= 50.0:
-                        cons.append(f"远期估值偏高(PE={pe_val:.1f}x)")
             else:
                 if pe_val <= 28.0:
                     dim3 += _linear_scale(pe_val, 10.0, 28.0, 4.0, 1.5)
-                    if pe_val <= 25.0:
-                        pros.append(f"PE健康({pe_val:.1f}x)")
                 else:
                     dim3 += _linear_scale(pe_val, 28.0, 65.0, 1.5, -5.0)
-                    if pe_val >= 65.0:
-                        cons.append(f"高估值(PE={pe_val:.1f}x)")
 
         if bundle.roe_pct is not None:
             dim3 += _linear_scale(bundle.roe_pct, 5.0, 25.0, -1.0, 3.0)
-            if bundle.roe_pct >= 18.0:
-                pros.append(f"高ROE({bundle.roe_pct:.0f}%)")
         if bundle.profit_margin_pct is not None:
             dim3 += _linear_scale(bundle.profit_margin_pct, 2.0, 22.0, -1.0, 2.0)
         if bundle.revenue_growth_pct is not None:
@@ -998,12 +974,8 @@ def score_candidate(
         div = bundle.dividend_yield_pct
         if track == "ISA_LONG_TERM":
             dim3 += _linear_scale(div, 0.0, 3.5, 0.0, 3.5)
-            if div >= 2.5:
-                pros.append(f"股息率{div:.1f}%")
         else:
             dim3 += _linear_scale(div, 0.0, 4.0, 0.0, 2.0)
-            if div >= 3.0:
-                pros.append(f"股息保护{div:.1f}%")
 
     if sym_up.endswith(".L") and is_etf:
         dim3 += 6.0
@@ -1026,8 +998,6 @@ def score_candidate(
             cons.append(f"与持仓{corr_holding}相关性高达{max_corr:.2f}(高度重叠)")
         else:
             dim4 += _linear_scale(max_corr, 0.75, 0.25, 0.0, 6.0)
-            if max_corr <= 0.55:
-                pros.append(f"组合分散度佳(最高相关{max_corr:.2f})")
 
     if weighted_corr is not None and not is_held:
         dim4 += _linear_scale(weighted_corr, 0.75, 0.15, -1.5, 2.0)
@@ -1035,10 +1005,8 @@ def score_candidate(
     if marginal_vol_delta_pct is not None and not is_held:
         if marginal_vol_delta_pct <= -0.02:
             dim4 += _linear_scale(marginal_vol_delta_pct, -0.02, -0.35, 0.5, 2.5)
-            pros.append(f"降低组合波动({marginal_vol_delta_pct:+.2f}%)")
         elif marginal_vol_delta_pct >= 0.35:
             dim4 -= _linear_scale(marginal_vol_delta_pct, 0.35, 0.90, 0.5, 2.5)
-            cons.append(f"推高组合波动({marginal_vol_delta_pct:+.2f}%)")
 
     if is_watchlist:
         dim4 += 3.5
