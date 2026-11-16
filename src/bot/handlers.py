@@ -614,7 +614,7 @@ class AdvisorBot:
             search_badge = f" ⚠️ 接近 {m.google_search_warn_pct:.0f}% 预警线"
 
         lines = [
-            f"📊 Gemini API Token 与搜索用量看板（周期 {summary['cycle_date']}）",
+            f"📊 AI API Token 与搜索用量看板（周期 {summary['cycle_date']}）",
             _fmt_bucket("今日周期", summary["today"]),
             _fmt_bucket("近 7 天", summary["last_7d"]),
             _fmt_bucket("本月 (UK自然月)", month_bucket),
@@ -623,7 +623,7 @@ class AdvisorBot:
                 f"🔍 本月 Google Search 查询: {search_month:,} / {free_quota:,} "
                 f"({quota_pct:.1f}%, 剩余 {remaining_quota:,}){search_badge}"
             ),
-            "ℹ️ 费用以 Google AI Studio 官方账单为准，本看板仅统计纯 Token 与搜索配额。",
+            "ℹ️ 费用以 Google AI Studio 与 DeepSeek 官方账单为准，本看板仅统计纯 Token 与搜索配额。",
         ]
         if summary["by_label_7d"]:
             lines.append("\n【近 7 天分节点消耗】")
@@ -662,12 +662,14 @@ class AdvisorBot:
             f"• 早报分析: {m.report_analyst_model} ({m.report_analyst_thinking_level}) | "
             f"Bear挑刺: {m.report_auditor_model} ({m.report_auditor_thinking_level}) | "
             f"PM拍板: {m.report_model} ({m.report_thinking_level})\n"
-            f"• 美股哨兵: {m.us_sentinel_model} ({m.us_thinking_level}) | "
-            f"单聊: {m.chat_model} ({m.chat_thinking_level}) / deep: {m.chat_deep_model} ({m.chat_deep_thinking_level})\n"
+            f"• 美股哨兵: 平稳 {m.us_sentinel_model} ({m.us_thinking_level}) / 异动 {m.us_anomaly_model} ({m.us_anomaly_thinking_level})\n"
+            f"• 单聊: {m.chat_model} ({m.chat_thinking_level}) / deep: {m.chat_deep_model} ({m.chat_deep_thinking_level})\n"
             f"• 选股初研: {m.pick_researcher_model} ({m.pick_researcher_thinking_level}) | "
             f"终审: {m.pick_model} ({m.pick_thinking_level})\n"
-            f"• 备援模型: {m.fallback_model} ({m.fallback_thinking_level}) | "
-            f"早报搜索: {m.report_search_model} | 单聊/日常搜索: {m.search_model}"
+            f"• 双向备援: Gemini←{m.deepseek_fallback_model} ({m.deepseek_fallback_thinking_level}) | "
+            f"DeepSeek←{m.gemini_fallback_model} ({m.gemini_fallback_thinking_level}) | 同厂 {m.fallback_model}\n"
+            f"• 早报搜索: 宏观与1v1 {m.report_priority_search_model} ({m.report_priority_search_thinking_level}) / "
+            f"批量 {m.report_search_model} | 日常搜索: {m.search_model}"
         )
         return "\n".join(lines)
 

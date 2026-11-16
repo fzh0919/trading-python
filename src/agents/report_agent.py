@@ -680,6 +680,8 @@ async def generate_morning_report(
             symbols=tracked_syms,
             quote_types=quote_types or None,
             priority_symbols=priority_symbols or None,
+            priority_search_model=cfg.models.report_priority_search_model,
+            priority_thinking_level=cfg.models.report_priority_search_thinking_level,
             ttl_seconds=cfg.app.market_data_ttl_seconds,
             ops_notifier=ops_notifier,
             db=db,
@@ -1188,14 +1190,16 @@ async def generate_us_sentinel(
         )
         tools = toolkit.declarations()
         tool_executor = toolkit.as_executor()
-        us_thinking = cfg.models.us_thinking_level
+        us_model = cfg.models.us_anomaly_model
+        us_thinking = cfg.models.us_anomaly_thinking_level
     else:
         tools = None
         tool_executor = None
-        us_thinking = "LOW"
+        us_model = cfg.models.us_sentinel_model
+        us_thinking = cfg.models.us_thinking_level
 
     memo = await llm.generate(
-        model=cfg.models.us_sentinel_model,
+        model=us_model,
         prompt=prompt,
         system_instruction=us_sys,
         thinking_level=us_thinking,

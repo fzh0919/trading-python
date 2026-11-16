@@ -657,12 +657,15 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 pipeline_calls = [c for c in report_calls if c.get("usage_label") != "report_grounding"]
                 self.assertEqual(len(grounding_calls), 3)
                 self.assertTrue(all(c.get("use_google_search") for c in grounding_calls))
-                self.assertTrue(all(c.get("model") == "gemini-3.5-flash-lite" for c in grounding_calls))
+                self.assertEqual(
+                    {c.get("model") for c in grounding_calls},
+                    {"gemini-4-hydrogen", "gemini-3.5-flash-lite"},
+                )
                 self.assertEqual(
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pipeline_calls],
                     [
-                        ("report_analyst", "gemini-4-hydrogen", "HIGH"),
-                        ("report_auditor", "gemini-4-argon", "HIGH"),
+                        ("report_analyst", "gemini-4-hydrogen", "MEDIUM"),
+                        ("report_auditor", "gemini-4-hydrogen", "XHIGH"),
                         ("report_pm", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
@@ -689,7 +692,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("ULVR.L", saved_pack["symbols"])
                 self.assertTrue(saved_pack["symbols"]["NVDA"].get("grounding_news"))
 
-                # 4. /us Delta Sentinel receives full /report, filters out non-US orders (ULVR.L), calm day uses LOW without extra search
+                # 4. /us Delta Sentinel receives full /report, filters out non-US orders (ULVR.L), calm day uses deepseek-flash HIGH without tools
                 calls_before_us = len(llm.calls)
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/us"}}, wait=True)
                 self.assertIn("美股或个股简报", tg.messages[-1])
@@ -698,13 +701,13 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 us_call = us_calls[-1]
                 self.assertEqual(us_call["usage_label"], "us_sentinel")
                 self.assertEqual(us_call["model"], cfg.models.us_sentinel_model)
-                self.assertEqual(us_call["thinking_level"], "LOW")
+                self.assertEqual(us_call["thinking_level"], cfg.models.us_thinking_level)
                 self.assertIsNone(us_call.get("tools"))
                 self.assertTrue(us_call.get("system_instruction"))
                 self.assertIn("【活动挂单裁决】", us_call["prompt"])
                 self.assertIn("【美股活动挂单】：\n（当前无未成交活动挂单）", us_call["prompt"])
 
-                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Hydrogen HIGH), <= 1000 chars
+                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen MEDIUM -> Hydrogen HIGH), <= 1000 chars
                 calls_before = len(llm.calls)
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pick 英国ETF"}}, wait=True)
                 pick_calls = llm.calls[calls_before:]
@@ -715,7 +718,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pick_pipeline],
                     [
-                        ("pick_researcher", "gemini-4-hydrogen", "HIGH"),
+                        ("pick_researcher", "gemini-4-hydrogen", "MEDIUM"),
                         ("pick_critic", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
@@ -752,7 +755,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 )
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/usage"}}, wait=True)
                 usage_msg = tg.messages[-1]
-                self.assertIn("Gemini API Token 与搜索用量看板", usage_msg)
+                self.assertIn("AI API Token 与搜索用量看板", usage_msg)
                 self.assertIn("report_pm", usage_msg)
                 self.assertIn("gemini-4-argon", usage_msg)
                 self.assertNotIn("$", usage_msg)
@@ -763,8 +766,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "现在能加仓NVDA吗"}}, wait=True)
                 chat_call = llm.calls[-1]
                 self.assertEqual(chat_call["usage_label"], "chat")
-                self.assertEqual(chat_call["model"], "gemini-4-hydrogen")
-                self.assertEqual(chat_call["thinking_level"], "LOW")
+                self.assertEqual(chat_call["model"], "deepseek-flash")
+                self.assertEqual(chat_call["thinking_level"], "HIGH")
                 self.assertTrue(chat_call.get("system_instruction"))
                 self.assertIn("必须直白建议撤单（CANCEL）", chat_call["system_instruction"])
                 # morning_report already embeds "• 今日风控红线：..." so chat skips duplicate 【今日风控红线】
@@ -1034,17 +1037,18 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
             t212 = _FakeT212(_sample_portfolio())
 
-            # 1) Calm gate: NVDA 0% move, VIX 0% move -> skips grounding, uses LOW, no tools, trims <= 450
+            # 1) Calm gate: NVDA 0% move, VIX 0% move -> skips grounding, uses deepseek-flash HIGH, no tools, trims <= 450
             clear_grounding_cache()
             calm_llm = _GateLLM("✅ 维持早报计划\n• 观察1：盘前平稳。\n• 观察2：" + ("细节" * 240))
             calm_out = await generate_us_sentinel(cfg, t212, _GateMarketData(), calm_llm, db)
             self.assertLessEqual(len(calm_out), 450)
             self.assertEqual(len(calm_llm.calls), 1)
-            self.assertEqual(calm_llm.calls[0]["thinking_level"], "LOW")
+            self.assertEqual(calm_llm.calls[0]["model"], "deepseek-flash")
+            self.assertEqual(calm_llm.calls[0]["thinking_level"], "HIGH")
             self.assertIsNone(calm_llm.calls[0]["tools"])
             self.assertIn("市场与美股持仓均平稳", calm_llm.calls[0]["prompt"])
 
-            # 2) Stock move anomaly (+4.5% >= 1.8%): triggers us_grounding + MEDIUM + tools + <= 600 ceiling
+            # 2) Stock move anomaly (+4.5% >= 1.8%): triggers us_grounding + gemini-4-hydrogen HIGH + tools + <= 600 ceiling
             clear_grounding_cache()
             anom_text = "🚨 盘前增量修正\n• NVDA 大幅异动，按规则重新核验。\n• " + ("归因分析" * 120)
             anom_llm = _GateLLM(anom_text)
@@ -1055,17 +1059,19 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             sentinel_call = next(c for c in anom_llm.calls if c.get("usage_label") == "us_sentinel")
             self.assertEqual(len(grounding_calls), 1)
             self.assertIn("NVDA", grounding_calls[0]["prompt"])
-            self.assertEqual(sentinel_call["thinking_level"], "MEDIUM")
+            self.assertEqual(sentinel_call["model"], "gemini-4-hydrogen")
+            self.assertEqual(sentinel_call["thinking_level"], "HIGH")
             self.assertIsNotNone(sentinel_call["tools"])
             self.assertIn("本地异动门控：已触发深度复核", sentinel_call["prompt"])
 
-            # 3) VIX spike anomaly (+8.0% >= 4.0%) even with 0% stock move: triggers anomaly gate + MEDIUM
+            # 3) VIX spike anomaly (+8.0% >= 4.0%) even with 0% stock move: triggers anomaly gate + gemini-4-hydrogen HIGH
             clear_grounding_cache()
             vix_llm = _GateLLM("🚨 盘前增量修正\n• VIX 急升，暂停追高。")
             vix_out = await generate_us_sentinel(cfg, t212, _GateMarketData(vix_jump_pct=8.0), vix_llm, db)
             self.assertTrue(vix_out.startswith("🚨"))
             sentinel_vix = next(c for c in vix_llm.calls if c.get("usage_label") == "us_sentinel")
-            self.assertEqual(sentinel_vix["thinking_level"], "MEDIUM")
+            self.assertEqual(sentinel_vix["model"], "gemini-4-hydrogen")
+            self.assertEqual(sentinel_vix["thinking_level"], "HIGH")
             self.assertIn("VIX 日变动 +8.00%", sentinel_vix["prompt"])
 
     async def test_imp13_pick_reuse_lessons_context_and_post_screen_guardrails(self) -> None:
@@ -2269,7 +2275,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(out.startswith("🚨"))
             sentinel_call = next(c for c in llm.calls if c.get("usage_label") == "us_sentinel")
-            self.assertEqual(sentinel_call["thinking_level"], "MEDIUM")
+            self.assertEqual(sentinel_call["model"], "gemini-4-hydrogen")
+            self.assertEqual(sentinel_call["thinking_level"], "HIGH")
             self.assertIn("本地异动门控：已触发深度复核", sentinel_call["prompt"])
             self.assertIn("+4.20%", sentinel_call["prompt"])
 

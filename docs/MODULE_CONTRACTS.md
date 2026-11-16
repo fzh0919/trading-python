@@ -6,9 +6,9 @@
 
 > 💡 下游窗口直接按本字典接线，**不必通读千行上游源码**；后续新增公共函数/字段后，须在对应小节同步补齐 1~2 行契约。
 
-- **`src/config.py`（`IMP-01` & N95 迁移前置）**：
-  - `EnvSettings` 新增：`ops_notify_url: str = ""`（`OPS_NOTIFY_URL`）、`ops_notify_token: str = ""`（`OPS_NOTIFY_TOKEN`）
-  - `ModelsSection` 新增：`chat_deep_model`, `chat_deep_thinking_level`, `google_search_free_quota_monthly` (`5000`), `google_search_warn_pct` (`85.0`)
+- **`src/config.py`（`IMP-01` & N95 迁移前置 & 混合双厂商路由）**：
+  - `EnvSettings` 新增：`ops_notify_url: str = ""`（`OPS_NOTIFY_URL`）、`ops_notify_token: str = ""`（`OPS_NOTIFY_TOKEN`）、`deepseek_api_key: str = ""`（`DEEPSEEK_API_KEY`）、`deepseek_base_url: str = "https://api.deepseek.com"`（`DEEPSEEK_BASE_URL`）
+  - `ModelsSection` 新增：`us_anomaly_model` (`gemini-4-hydrogen`), `us_anomaly_thinking_level` (`HIGH`), `report_priority_search_model` (`gemini-4-hydrogen`), `report_priority_search_thinking_level` (`LOW`), `gemini_fallback_model` (`gemini-4-hydrogen`), `gemini_fallback_thinking_level` (`MEDIUM`), `deepseek_fallback_model` (`deepseek-flash`), `deepseek_fallback_thinking_level` (`HIGH`), `chat_deep_model`, `chat_deep_thinking_level`, `google_search_free_quota_monthly` (`5000`), `google_search_warn_pct` (`85.0`)
   - `StrategySection` 新增：`us_anomaly_move_pct` (`1.8`), `us_anomaly_vix_change_pct` (`4.0`), `settlement_holding_days` (`5`)；`UniverseSection` 新增可选 `etf_symbols: list[str] = []`
   - `AppConfig.reload_pools_if_changed() -> bool`（按 `mtime_ns` 原地热重载 `watchlist` 与 `universe`，YAML 损坏时保留旧配置）
 - **`src/ops_notifier.py` & `src/healthcheck.py`（N95 迁移前置合规 & `IMP-17`）**：
@@ -61,13 +61,13 @@
   - `score_candidate(..., deep_intel=None) -> ScreenerCandidate`（双轨非对称权重：`ISA 25/15/35/25` vs `Invest 35/35/15/15` + ETF 60d VPVR + Stage2 豁免 + 美股深度情报 `value_quality` 加减分）；`await run_quant_screener(..., existing_histories=None, top_n_per_track=8)`（Stage 2 美股批量接入 `get_us_deep_intel_batch`）
 - **`src/agents/llm_client.py`（`IMP-01` & `IMP-09`）**：
   - `normalize_thinking_level(model: str, thinking_level: str) -> str`（从已移除的 `pricing.py` 迁入；`pricing.py` 已按用户要求删除，仅记录 Token 与 `search_queries`）
-  - `GeminiClient(..., round_timeout_seconds=120.0, tool_timeout_seconds=60.0, max_concurrent_tools=6, max_tool_result_chars=4000, usage_summary_provider=None, search_free_quota_monthly=5000, search_warn_pct=85.0)`；`set_usage_summary_provider(...)`（单轮 `asyncio.wait_for` 超时、同轮 `asyncio.gather` 并发+裁剪及 `"this_month"` Search 免费额度 `OpsNotifier` 预警）
+  - `GeminiClient(..., deepseek_api_key="", deepseek_base_url="https://api.deepseek.com", gemini_fallback_model="gemini-4-hydrogen", gemini_fallback_thinking_level="MEDIUM", deepseek_fallback_model="deepseek-flash", deepseek_fallback_thinking_level="HIGH", deepseek_round_timeout_seconds=60.0, deepseek_max_retries=1, round_timeout_seconds=120.0, tool_timeout_seconds=60.0, max_concurrent_tools=6, max_tool_result_chars=4000, usage_summary_provider=None, search_free_quota_monthly=5000, search_warn_pct=85.0)`；`await llm.close()`；`set_usage_summary_provider(...)`（支持 Gemini + DeepSeek OpenAI 兼容协议双厂商路由、`reasoning_content` 工具透传、JSON Schema 动态兜底注入、Google Search 禁切 DeepSeek 隔离及 `"this_month"` Search 免费额度 `OpsNotifier` 预警）
 - **`src/agents/prompts.py` & `src/agents/schemas.py`（`IMP-10`）**：
   - `build_investor_profile(strategy, *, include_order_audit_rule=True)` & `build_agent_system_instruction(role_instruction, strategy, *, include_order_audit_rule=True)`（`/pick` 传 `False` 隔离存量挂单审计原则）
   - `FlaggedPositionItem(symbol: str, summary: str)`；`MorningReportDecision.flagged_positions: list[FlaggedPositionItem]`（`mode="before"` 校验器兼容旧 `str` / `dict`）
   - `render_morning_report(decision, max_chars=1800, *, risk_override: RiskOverrideResult | None = None) -> str` & `render_pick_report(decision, max_chars=1000, *, risk_override: RiskOverrideResult | None = None) -> str`（统一高亮 `[🛡️风控护栏修正]` 并保留护栏驳回项，`_fit_max_chars` 尾部防孤立 `【...】` 标题行）；`trim_text_at_line_boundary(text, max_chars) -> str`（支持单行句界/分句边界优雅裁剪）
 - **`src/agents/tools.py`（`IMP-11` & `IMP-21`）**：
-  - `run_forced_market_grounding(..., max_concurrent_searches: int = 3, priority_symbols: list[str] | None = None) -> str`（`priority_symbols` 脱离 3 股拼团转 1 对 1 独立深搜，`asyncio.Semaphore` 限流 + `_GROUNDING_CACHE` 过期清理；英文检索 Prompt 对齐 RNS/SEC 一手信源，强制输出紧凑中文要点）
+  - `run_forced_market_grounding(..., max_concurrent_searches: int = 3, priority_symbols: list[str] | None = None, priority_search_model: str = "", priority_thinking_level: str = "LOW") -> str`（宏观与 `priority_symbols` 脱离 3 股拼团转 1 对 1 独立深搜并可分层指定 `priority_search_model`，`asyncio.Semaphore` 限流 + `_GROUNDING_CACHE` 过期清理；英文检索 Prompt 对齐 RNS/SEC 一手信源，强制输出紧凑中文要点）
   - `MarketToolkit(market_data, portfolio, *, llm=None, search_model="gemini-4-hydrogen", ops_notifier=None, db=None)`（英文工具声明引导英文 Query；`inspect_ticker` 传入持仓 `isin`/`created_at` 与 `bundle`、按需调 `get_us_deep_intel` 与 `db.get_symbol_lessons`，含 CYQ/周线/除息/身份紧凑裁剪 `<4000` 字符；`check_portfolio_correlation` 改调 `get_histories` 并补拉 `SPY`/`ISF.L`/区域基准）
 - **`src/agents/report_agent.py`（`IMP-12` & `IMP-21`）**：
   - `build_analysis_context_pack(..., us_intel_map=None) -> dict` & `build_portfolio_fact_sheet(..., db=None, context_pack_out=None)`（保持 4 元组兼容；接入 `get_us_deep_intel_batch` 与 `compute_exposure_summary(..., histories=histories)`；Pack 含 `pack_version`, `cycle_date`, `calendar_alerts`, `macro`, `exposure_summary`, `cash_flow_summary`, `portfolio_diff`, `disagreements`, `recent_lessons`, `symbols[sym]` -> `identity_summary`/`technical`/`technical_line`/`bundle_summary`/`evaluations`/`disagreements`/`lessons`/`deep_intel`）

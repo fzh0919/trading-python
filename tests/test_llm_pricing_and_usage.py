@@ -12,10 +12,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from google.genai import types
 from pydantic import ValidationError
 
 from src.agents.chat_agent import _format_chat_history_compact
-from src.agents.llm_client import GeminiClient, _compact_tool_result, normalize_thinking_level
+from src.agents.llm_client import (
+    GeminiClient,
+    _compact_tool_result,
+    _function_declarations_to_openai_tools,
+    normalize_thinking_level,
+)
+from src.agents.schemas import MorningReportDecision, parse_structured_json
 from src.config import ModelsSection, StrategySection, load_config
 from src.ops_notifier import OpsNotifier
 from src.storage.db import AdvisorDatabase
@@ -33,23 +40,31 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
     def test_models_and_strategy_defaults_and_legacy_migration(self) -> None:
         cfg = load_config("config.yaml", env_file=None)
         self.assertEqual(cfg.models.report_analyst_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.report_analyst_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_auditor_model, "gemini-4-argon")
-        self.assertEqual(cfg.models.report_auditor_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.report_analyst_thinking_level, "MEDIUM")
+        self.assertEqual(cfg.models.report_auditor_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.report_auditor_thinking_level, "XHIGH")
         self.assertEqual(cfg.models.report_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.us_sentinel_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.us_thinking_level, "MEDIUM")
+        self.assertEqual(cfg.models.us_sentinel_model, "deepseek-flash")
+        self.assertEqual(cfg.models.us_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.us_anomaly_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.us_anomaly_thinking_level, "HIGH")
         self.assertEqual(cfg.models.pick_researcher_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.pick_researcher_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.pick_researcher_thinking_level, "MEDIUM")
         self.assertEqual(cfg.models.pick_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.pick_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.chat_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.chat_thinking_level, "LOW")
+        self.assertEqual(cfg.models.chat_model, "deepseek-flash")
+        self.assertEqual(cfg.models.chat_thinking_level, "HIGH")
         self.assertEqual(cfg.models.chat_deep_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.chat_deep_thinking_level, "HIGH")
         self.assertEqual(cfg.models.fallback_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.fallback_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.gemini_fallback_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.gemini_fallback_thinking_level, "MEDIUM")
+        self.assertEqual(cfg.models.deepseek_fallback_model, "deepseek-flash")
+        self.assertEqual(cfg.models.deepseek_fallback_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.report_priority_search_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.report_priority_search_thinking_level, "LOW")
         self.assertEqual(cfg.models.report_search_model, "gemini-3.5-flash-lite")
         self.assertEqual(cfg.models.search_model, "gemini-3.5-flash-lite")
         self.assertTrue(cfg.models.enable_forced_search_grounding)
@@ -464,6 +479,262 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             client._candidate_chain("gemini-4-argon", "HIGH"),
             [("gemini-4-argon", "HIGH"), ("gemini-4-hydrogen", "HIGH")],
         )
+
+    def test_cross_vendor_candidate_chain_and_search_isolation(self) -> None:
+        client = GeminiClient(
+            api_key="dummy-gem",
+            deepseek_api_key="dummy-ds",
+            fallback_model="gemini-4-hydrogen",
+            gemini_fallback_model="gemini-4-hydrogen",
+            gemini_fallback_thinking_level="MEDIUM",
+            deepseek_fallback_model="deepseek-flash",
+            deepseek_fallback_thinking_level="HIGH",
+        )
+        self.assertEqual(
+            client._candidate_chain("deepseek-flash", "HIGH"),
+            [
+                ("deepseek-flash", "HIGH"),
+                ("gemini-4-hydrogen", "MEDIUM"),
+                ("gemini-3.5-flash-lite", "LOW"),
+            ],
+        )
+        self.assertEqual(
+            client._candidate_chain("gemini-4-hydrogen", "HIGH"),
+            [
+                ("gemini-4-hydrogen", "HIGH"),
+                ("gemini-3.5-flash-lite", "LOW"),
+                ("deepseek-flash", "HIGH"),
+            ],
+        )
+        # Google Search calls MUST never fall back to DeepSeek
+        self.assertEqual(
+            client._candidate_chain("gemini-4-hydrogen", "LOW", use_google_search=True),
+            [
+                ("gemini-4-hydrogen", "LOW"),
+                ("gemini-3.5-flash-lite", "LOW"),
+            ],
+        )
+        self.assertEqual(
+            client._candidate_chain("gemini-3.5-flash-lite", "LOW", use_google_search=True),
+            [
+                ("gemini-3.5-flash-lite", "LOW"),
+                ("gemini-4-hydrogen", "LOW"),
+            ],
+        )
+
+    async def test_deepseek_tool_calls_telemetry_and_bidirectional_failover(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "hybrid.db")
+            await db.init()
+
+            class _StubTg:
+                bot_token = "dummy-token"
+
+                def __init__(self) -> None:
+                    self.sent: list[tuple[str, str]] = []
+
+                async def send_message(self, chat_id: str, text: str) -> bool:
+                    self.sent.append((chat_id, text))
+                    return True
+
+            tg = _StubTg()
+            ops = OpsNotifier(telegram=tg, chat_id="999", db=db, warn_cooldown_seconds=0, critical_cooldown_seconds=0)
+            client = GeminiClient(
+                api_key="dummy-gem",
+                deepseek_api_key="dummy-ds",
+                usage_recorder=db.log_llm_usage,
+                ops_notifier=ops,
+                fallback_model="gemini-4-hydrogen",
+                gemini_fallback_model="gemini-4-hydrogen",
+                gemini_fallback_thinking_level="MEDIUM",
+                deepseek_fallback_model="deepseek-flash",
+                deepseek_fallback_thinking_level="HIGH",
+                max_transient_retries=0,
+                deepseek_max_retries=0,
+                retry_base_delay_s=0.0,
+            )
+
+            # 1) Schema conversion lowercases Gemini types
+            decls = [
+                types.FunctionDeclaration(
+                    name="inspect_ticker",
+                    description="Fetch ticker info",
+                    parameters={
+                        "type": "OBJECT",
+                        "properties": {"symbol": {"type": "STRING", "description": "Ticker"}},
+                        "required": ["symbol"],
+                    },
+                )
+            ]
+            oai_tools = _function_declarations_to_openai_tools(decls)
+            self.assertEqual(oai_tools[0]["function"]["parameters"]["type"], "object")
+            self.assertEqual(oai_tools[0]["function"]["parameters"]["properties"]["symbol"]["type"], "string")
+
+            # 2) DeepSeek primary multi-round tool call + reasoning_content preservation + telemetry
+            ds_payloads: list[dict] = []
+
+            async def _ds_tool_flow(payload: dict) -> dict:
+                ds_payloads.append(payload)
+                if len(ds_payloads) == 1:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "reasoning_content": "Need live price first",
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {"name": "inspect_ticker", "arguments": '{"symbol": "NVDA"}'},
+                                        }
+                                    ],
+                                }
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 1000,
+                            "prompt_cache_hit_tokens": 400,
+                            "completion_tokens": 180,
+                            "completion_tokens_details": {"reasoning_tokens": 120},
+                            "total_tokens": 1180,
+                        },
+                    }
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "NVDA 维持观察。"}}],
+                    "usage": {
+                        "prompt_tokens": 1300,
+                        "prompt_cache_hit_tokens": 900,
+                        "completion_tokens": 250,
+                        "completion_tokens_details": {"reasoning_tokens": 150},
+                        "total_tokens": 1550,
+                    },
+                }
+
+            client._post_deepseek_completion = _ds_tool_flow  # type: ignore[method-assign]
+
+            async def _exec(name: str, args: dict) -> dict:
+                return {"symbol": args["symbol"], "price": 140.0}
+
+            reply = await client.generate(
+                model="deepseek-flash",
+                prompt="NVDA 怎么看",
+                system_instruction="你是量化顾问",
+                thinking_level="HIGH",
+                tools=decls,
+                tool_executor=_exec,
+                usage_label="chat",
+            )
+            self.assertEqual(reply, "NVDA 维持观察。")
+            self.assertEqual(len(ds_payloads), 2)
+            self.assertEqual(ds_payloads[0]["thinking"], {"type": "enabled"})
+            self.assertEqual(ds_payloads[0]["reasoning_effort"], "high")
+            self.assertNotIn("temperature", ds_payloads[0])
+            # Second round must carry assistant reasoning_content and tool response
+            second_msgs = ds_payloads[1]["messages"]
+            self.assertEqual(second_msgs[2]["reasoning_content"], "Need live price first")
+            self.assertEqual(second_msgs[3]["role"], "tool")
+            self.assertEqual(second_msgs[3]["tool_call_id"], "call_1")
+
+            summary = await db.get_usage_summary(days=30)
+            self.assertEqual(summary["today"]["prompt_tokens"], 2300)
+            self.assertEqual(summary["today"]["cached_tokens"], 1300)
+            self.assertEqual(summary["today"]["thought_tokens"], 270)
+            self.assertEqual(summary["today"]["output_tokens"], 160)
+
+            # 3) DeepSeek 503 outage -> fails over cleanly to Gemini Hydrogen MEDIUM + WARN alert
+            async def _ds_down(payload: dict) -> dict:
+                raise RuntimeError("HTTP 503: upstream overloaded")
+
+            gem_calls: list[tuple[str, str]] = []
+
+            async def _gem_ok(*, model, contents, config):
+                gem_calls.append((model, str(config.thinking_config.thinking_level.value)))
+                return SimpleNamespace(
+                    text="Gemini 备援回答成功",
+                    function_calls=[],
+                    candidates=[],
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=200,
+                        cached_content_token_count=0,
+                        candidates_token_count=40,
+                        thoughts_token_count=30,
+                        total_token_count=270,
+                    ),
+                )
+
+            client._post_deepseek_completion = _ds_down  # type: ignore[method-assign]
+            client._client = SimpleNamespace(  # type: ignore[assignment]
+                aio=SimpleNamespace(models=SimpleNamespace(generate_content=_gem_ok))
+            )
+            fb_reply = await client.generate(
+                model="deepseek-flash",
+                prompt="hello",
+                thinking_level="HIGH",
+                usage_label="us_sentinel",
+            )
+            self.assertEqual(fb_reply, "Gemini 备援回答成功")
+            self.assertEqual(gem_calls, [("gemini-4-hydrogen", "MEDIUM")])
+            self.assertTrue(any("已自动降级到备援模型 gemini-4-hydrogen (MEDIUM)" in m[1] for m in tg.sent))
+
+            # 4) Gemini structured JSON outage -> fails over to DeepSeek with JSON Schema injected
+            async def _gem_down(*, model, contents, config):
+                raise RuntimeError("503 Service Unavailable")
+
+            ds_json_payloads: list[dict] = []
+
+            async def _ds_json_ok(payload: dict) -> dict:
+                ds_json_payloads.append(payload)
+                valid_json = json.dumps(
+                    {
+                        "headline": "跨厂兜底早报成功",
+                        "top_actions": [
+                            {
+                                "account": "ISA",
+                                "symbol": "CASH",
+                                "action": "HOLD",
+                                "price_zone": "N/A",
+                                "reason": "保持观察",
+                            }
+                        ],
+                        "pending_order_audits": [],
+                        "daily_vetoes": ["控制仓位"],
+                        "macro_and_cash": "现金利息4%",
+                        "account_diagnosis": "双账户正常",
+                        "flagged_positions": [],
+                        "hold_summary": "常规持有",
+                        "trade_review": "无频繁交易",
+                        "earnings_watch": [],
+                    },
+                    ensure_ascii=False,
+                )
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": valid_json}}],
+                    "usage": {"prompt_tokens": 500, "completion_tokens": 120, "total_tokens": 620},
+                }
+
+            client._client = SimpleNamespace(  # type: ignore[assignment]
+                aio=SimpleNamespace(models=SimpleNamespace(generate_content=_gem_down))
+            )
+            client._post_deepseek_completion = _ds_json_ok  # type: ignore[method-assign]
+            pm_raw = await client.generate(
+                model="gemini-4-hydrogen",
+                prompt="综合早报",
+                system_instruction="你是 PM",
+                thinking_level="HIGH",
+                response_schema=MorningReportDecision,
+                usage_label="report_pm",
+            )
+            parsed = parse_structured_json(pm_raw, MorningReportDecision)
+            self.assertIsNotNone(parsed)
+            assert parsed is not None
+            self.assertEqual(parsed.headline, "跨厂兜底早报成功")
+            self.assertEqual(ds_json_payloads[0]["response_format"], {"type": "json_object"})
+            self.assertIn("JSON OUTPUT CONTRACT", ds_json_payloads[0]["messages"][0]["content"])
+            self.assertIn("pending_order_audits", ds_json_payloads[0]["messages"][0]["content"])
+            await client.close()
+            await db.close()
 
 
 if __name__ == "__main__":

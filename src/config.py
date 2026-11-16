@@ -40,6 +40,8 @@ class EnvSettings(BaseSettings):
     t212_invest_key: str = ""
     t212_invest_secret: str = ""
     gemini_api_key: str = ""
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     finnhub_api_key: str = ""
@@ -60,28 +62,36 @@ class AppSection(BaseModel):
 
 
 class ModelsSection(BaseModel):
-    # Role-based Gemini 4 routing (Bear auditor anchored on Argon HIGH; PM/Pick/Search optimized for cost)
+    # Hybrid Gemini + DeepSeek routing with cross-vendor failover
     report_analyst_model: str = "gemini-4-hydrogen"
-    report_auditor_model: str = "gemini-4-argon"
+    report_auditor_model: str = "gemini-4-hydrogen"
     report_model: str = "gemini-4-hydrogen"
-    us_sentinel_model: str = "gemini-4-hydrogen"
+    us_sentinel_model: str = "deepseek-flash"
+    us_anomaly_model: str = "gemini-4-hydrogen"
     pick_researcher_model: str = "gemini-4-hydrogen"
     pick_model: str = "gemini-4-hydrogen"
-    chat_model: str = "gemini-4-hydrogen"
+    chat_model: str = "deepseek-flash"
     chat_deep_model: str = "gemini-4-hydrogen"
     fallback_model: str = "gemini-4-hydrogen"
+    gemini_fallback_model: str = "gemini-4-hydrogen"
+    deepseek_fallback_model: str = "deepseek-flash"
+    report_priority_search_model: str = "gemini-4-hydrogen"
     report_search_model: str = "gemini-3.5-flash-lite"
     search_model: str = "gemini-3.5-flash-lite"
 
-    report_analyst_thinking_level: ThinkingLevelLiteral = "HIGH"
-    report_auditor_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_analyst_thinking_level: ThinkingLevelLiteral = "MEDIUM"
+    report_auditor_thinking_level: ThinkingLevelLiteral = "XHIGH"
     report_thinking_level: ThinkingLevelLiteral = "HIGH"
-    us_thinking_level: ThinkingLevelLiteral = "MEDIUM"
-    pick_researcher_thinking_level: ThinkingLevelLiteral = "HIGH"
+    us_thinking_level: ThinkingLevelLiteral = "HIGH"
+    us_anomaly_thinking_level: ThinkingLevelLiteral = "HIGH"
+    pick_researcher_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     pick_thinking_level: ThinkingLevelLiteral = "HIGH"
-    chat_thinking_level: ThinkingLevelLiteral = "LOW"
+    chat_thinking_level: ThinkingLevelLiteral = "HIGH"
     chat_deep_thinking_level: ThinkingLevelLiteral = "HIGH"
     fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
+    gemini_fallback_thinking_level: ThinkingLevelLiteral = "MEDIUM"
+    deepseek_fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_priority_search_thinking_level: ThinkingLevelLiteral = "LOW"
 
     enable_forced_search_grounding: bool = True
     report_max_tool_rounds: int = Field(default=2, ge=1)

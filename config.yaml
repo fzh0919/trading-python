@@ -10,28 +10,36 @@ app:
   ops_warn_cooldown_seconds: 1800
 
 models:
-  # [用户授权调整 v5.2.0] 仅保留 /report Step 2B Bear 挑刺审计官使用 gemini-4-argon + HIGH；其余 PM/选股终审切换至 gemini-4-hydrogen + HIGH，搜索切换至 gemini-3.5-flash-lite
-  report_analyst_model: "gemini-4-hydrogen"
-  report_auditor_model: "gemini-4-argon"  # /report Step 2B 独立风控 Bear 挑刺审计官
-  report_model: "gemini-4-hydrogen"         # /report Step 3 PM 拍板
-  us_sentinel_model: "gemini-4-hydrogen"    # /us 与盘前增量哨兵
-  pick_researcher_model: "gemini-4-hydrogen"  # /pick Stage 1 投研探测
-  pick_model: "gemini-4-hydrogen"           # /pick Stage 2 风控官终审拍板
-  chat_model: "gemini-4-hydrogen"           # Telegram 日常单聊
-  chat_deep_model: "gemini-4-hydrogen"      # /deep 深度单聊升级模型
-  fallback_model: "gemini-4-hydrogen"       # 主模型失败时自动降级备援模型
-  report_search_model: "gemini-3.5-flash-lite"  # /report 强制联网与深挖搜索模型（0 思考高性价比）
-  search_model: "gemini-3.5-flash-lite"         # 单聊 / /pick / /us 联网搜索模型
+  # [混合路由 + 双向灾备] 搜索与核心决策留 Gemini，日常单聊 / 平稳 /us / T+5 反思用 DeepSeek V4.1 Flash (HIGH)
+  report_analyst_model: "gemini-4-hydrogen"         # /report Step 2A 机会分析
+  report_auditor_model: "gemini-4-hydrogen"         # /report Step 2B Bear 挑刺审计官 (XHIGH)
+  report_model: "gemini-4-hydrogen"                 # /report Step 3 PM 拍板
+  us_sentinel_model: "deepseek-flash"               # /us 平稳日哨兵 (HIGH)
+  us_anomaly_model: "gemini-4-hydrogen"             # /us 触发异动门控时自动切入高阶模型
+  pick_researcher_model: "gemini-4-hydrogen"        # /pick Stage 1 投研探测
+  pick_model: "gemini-4-hydrogen"                   # /pick Stage 2 风控官终审拍板
+  chat_model: "deepseek-flash"                      # Telegram 日常单聊 & 盘后 T+5 反思
+  chat_deep_model: "gemini-4-hydrogen"              # /deep 深度单聊升级模型
+  fallback_model: "gemini-4-hydrogen"               # Gemini 节点同厂降级备援模型
+  gemini_fallback_model: "gemini-4-hydrogen"        # DeepSeek 故障时切回 Gemini 备援模型
+  deepseek_fallback_model: "deepseek-flash"         # Gemini 故障时跨厂商兜底模型（非搜索节点）
+  report_priority_search_model: "gemini-4-hydrogen" # 早报宏观与重点异动 1v1 深度联网搜索
+  report_search_model: "gemini-3.5-flash-lite"      # 早报常规 3 股批次联网搜索（0 思考高性价比）
+  search_model: "gemini-3.5-flash-lite"             # 单聊 / /pick / /us 联网搜索模型
 
-  report_analyst_thinking_level: "HIGH"     # 深度分析晨报（不追求速度）
-  report_auditor_thinking_level: "HIGH"     # Bear 挑刺审计深度
-  report_thinking_level: "HIGH"             # LOW | MEDIUM | HIGH
-  us_thinking_level: "MEDIUM"               # LOW | MEDIUM | HIGH
-  pick_researcher_thinking_level: "HIGH"    # LOW | MEDIUM | HIGH | XHIGH
-  pick_thinking_level: "HIGH"               # LOW | MEDIUM | HIGH
-  chat_thinking_level: "LOW"                # LOW | MEDIUM | HIGH | XHIGH
-  chat_deep_thinking_level: "HIGH"          # /deep 单聊升级思考深度
+  report_analyst_thinking_level: "MEDIUM"           # 初研降为 MEDIUM 省思考费，后端有 XHIGH/HIGH 把关
+  report_auditor_thinking_level: "XHIGH"            # Bear 挑刺拉满 XHIGH（比 Argon 省半价且智力更高）
+  report_thinking_level: "HIGH"                     # PM 拍板保持 HIGH
+  us_thinking_level: "HIGH"                         # /us 平稳日 DeepSeek 保持 HIGH（不用 LOW）
+  us_anomaly_thinking_level: "HIGH"                 # /us 异动日 Gemini 保持 HIGH
+  pick_researcher_thinking_level: "MEDIUM"          # 选股初研 MEDIUM，Stage 2 保持 HIGH
+  pick_thinking_level: "HIGH"
+  chat_thinking_level: "HIGH"                       # 日常单聊与 T+5 反思均用 DeepSeek HIGH
+  chat_deep_thinking_level: "HIGH"                  # /deep 单聊深度思考
   fallback_thinking_level: "HIGH"
+  gemini_fallback_thinking_level: "MEDIUM"          # DeepSeek 故障切回 Hydrogen MEDIUM
+  deepseek_fallback_thinking_level: "HIGH"          # Gemini 故障切入 DeepSeek HIGH
+  report_priority_search_thinking_level: "LOW"      # 早报宏观/异动 1v1 搜索用 LOW 兼顾检索深度与成本
 
   enable_forced_search_grounding: true
   report_max_tool_rounds: 2

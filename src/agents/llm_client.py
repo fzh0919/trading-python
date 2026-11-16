@@ -1,4 +1,4 @@
-"""Async Gemini API client with ThinkingConfig, retry/fallback degradation, Ops alerts, and token telemetry."""
+"""Async multi-provider LLM client (Gemini + DeepSeek) with ThinkingConfig, cross-vendor failover, Ops alerts, and telemetry."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import time
 import warnings
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
+import httpx
 from google import genai
 from google.genai import types
 
@@ -49,6 +50,70 @@ def normalize_thinking_level(model: str, thinking_level: str) -> str:
     if lvl == "XHIGH":
         return "HIGH"
     return lvl
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return (model or "").strip().lower().startswith("deepseek-")
+
+
+def _gemini_schema_to_openai(schema: Any) -> dict[str, Any]:
+    """Recursively convert Gemini Schema / dict (uppercase types) into OpenAI JSON Schema (lowercase types)."""
+    if schema is None:
+        return {"type": "object", "properties": {}}
+    if hasattr(schema, "model_dump"):
+        raw = schema.model_dump(exclude_none=True)
+    elif isinstance(schema, dict):
+        raw = dict(schema)
+    else:
+        return {"type": "object", "properties": {}}
+
+    out: dict[str, Any] = {}
+    for key, val in raw.items():
+        if key == "type" and isinstance(val, str):
+            out["type"] = val.lower()
+        elif key == "properties" and isinstance(val, dict):
+            out["properties"] = {pk: _gemini_schema_to_openai(pv) for pk, pv in val.items()}
+        elif key == "items":
+            out["items"] = _gemini_schema_to_openai(val)
+        elif key in {"description", "required", "enum", "default", "title"}:
+            out[key] = val
+    if "type" not in out:
+        out["type"] = "object"
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
+def _function_declarations_to_openai_tools(
+    declarations: list[types.FunctionDeclaration],
+) -> list[dict[str, Any]]:
+    tools_out: list[dict[str, Any]] = []
+    for decl in declarations:
+        params_src = getattr(decl, "parameters_json_schema", None) or getattr(decl, "parameters", None)
+        tools_out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": decl.name or "",
+                    "description": decl.description or "",
+                    "parameters": _gemini_schema_to_openai(params_src),
+                },
+            }
+        )
+    return tools_out
+
+
+def _build_deepseek_thinking_params(thinking_level: str) -> tuple[str, dict[str, Any], bool]:
+    """Map unified ThinkingLevelLiteral into DeepSeek thinking payload and normalized label."""
+    lvl = (thinking_level or "HIGH").strip().upper()
+    if lvl not in {"MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"}:
+        lvl = "HIGH"
+    if lvl == "MINIMAL":
+        return "MINIMAL", {"thinking": {"type": "disabled"}}, False
+    if lvl == "XHIGH":
+        lvl = "HIGH"
+    effort = lvl.lower()
+    return lvl, {"thinking": {"type": "enabled"}, "reasoning_effort": effort}, True
 
 _TRANSIENT_KEYWORDS = (
     "429",
@@ -174,7 +239,7 @@ class LLMBackend(Protocol):
 
 
 class GeminiClient:
-    """Wrapper over google-genai async SDK with transient retry, fallback model switching, and telemetry."""
+    """Multi-provider async LLM client (Gemini primary/search + DeepSeek hybrid & cross-vendor failover)."""
 
     def __init__(
         self,
@@ -186,6 +251,14 @@ class GeminiClient:
         max_transient_retries: int = 2,
         retry_base_delay_s: float = 1.5,
         *,
+        deepseek_api_key: str = "",
+        deepseek_base_url: str = "https://api.deepseek.com",
+        gemini_fallback_model: str = "gemini-4-hydrogen",
+        gemini_fallback_thinking_level: str = "MEDIUM",
+        deepseek_fallback_model: str = "deepseek-flash",
+        deepseek_fallback_thinking_level: str = "HIGH",
+        deepseek_round_timeout_seconds: float = 60.0,
+        deepseek_max_retries: int = 1,
         round_timeout_seconds: float = 120.0,
         tool_timeout_seconds: float = 60.0,
         max_concurrent_tools: int = 6,
@@ -196,19 +269,39 @@ class GeminiClient:
     ) -> None:
         self.api_key = api_key.strip()
         self._client: genai.Client | None = genai.Client(api_key=self.api_key) if self.api_key else None
+        self.deepseek_api_key = (deepseek_api_key or "").strip()
+        self.deepseek_base_url = (deepseek_base_url or "https://api.deepseek.com").strip().rstrip("/")
+        self._http: httpx.AsyncClient | None = None
         self._usage_recorder = usage_recorder
         self._ops = ops_notifier
         self.fallback_model = fallback_model.strip() or "gemini-4-hydrogen"
         self.fallback_thinking_level = fallback_thinking_level.strip() or "HIGH"
+        self.gemini_fallback_model = (gemini_fallback_model or "gemini-4-hydrogen").strip()
+        self.gemini_fallback_thinking_level = (gemini_fallback_thinking_level or "MEDIUM").strip()
+        self.deepseek_fallback_model = (deepseek_fallback_model or "deepseek-flash").strip()
+        self.deepseek_fallback_thinking_level = (deepseek_fallback_thinking_level or "HIGH").strip()
         self.max_transient_retries = max(0, int(max_transient_retries))
+        self.deepseek_max_retries = max(0, int(deepseek_max_retries))
         self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
         self.round_timeout_seconds = max(0.0, float(round_timeout_seconds))
+        self.deepseek_round_timeout_seconds = max(0.0, float(deepseek_round_timeout_seconds))
         self.tool_timeout_seconds = max(0.0, float(tool_timeout_seconds))
         self.max_concurrent_tools = max(1, int(max_concurrent_tools))
         self.max_tool_result_chars = max(0, int(max_tool_result_chars))
         self._usage_summary_provider = usage_summary_provider
         self.search_free_quota_monthly = max(0, int(search_free_quota_monthly))
         self.search_warn_pct = min(100.0, max(1.0, float(search_warn_pct)))
+
+    def _ensure_http_client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            timeout = max(self.deepseek_round_timeout_seconds, 15.0)
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0))
+        return self._http
+
+    async def close(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     def set_usage_recorder(self, recorder: UsageRecorder | None) -> None:
         self._usage_recorder = recorder
@@ -231,16 +324,76 @@ class GeminiClient:
             warnings.simplefilter("ignore", UserWarning)
             return types.ThinkingConfig(thinking_level=lvl_str.lower()), lvl_str  # type: ignore[arg-type]
 
-    def _candidate_chain(self, primary_model: str, primary_thinking: str) -> list[tuple[str, str]]:
-        chain: list[tuple[str, str]] = [(primary_model, primary_thinking)]
-        if self.fallback_model and self.fallback_model != primary_model:
-            chain.append((self.fallback_model, self.fallback_thinking_level))
-        elif "argon" in (primary_model or "").lower():
-            chain.append(("gemini-4-hydrogen", "HIGH"))
-        elif "flash-lite" not in (primary_model or "").lower():
-            # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon
-            chain.append(("gemini-3.5-flash-lite", "LOW"))
-        return chain
+    def _candidate_chain(
+        self,
+        primary_model: str,
+        primary_thinking: str,
+        *,
+        use_google_search: bool = False,
+    ) -> list[tuple[str, str]]:
+        raw_chain: list[tuple[str, str]] = [(primary_model, primary_thinking)]
+        is_ds = _is_deepseek_model(primary_model)
+
+        if is_ds:
+            if self._client is not None:
+                raw_chain.append((self.gemini_fallback_model, self.gemini_fallback_thinking_level))
+                if self.gemini_fallback_model != "gemini-3.5-flash-lite":
+                    raw_chain.append(("gemini-3.5-flash-lite", "LOW"))
+        else:
+            if self.fallback_model and self.fallback_model != primary_model:
+                fb_think = "LOW" if (use_google_search and "flash-lite" not in self.fallback_model.lower()) else self.fallback_thinking_level
+                raw_chain.append((self.fallback_model, fb_think))
+            elif "argon" in (primary_model or "").lower():
+                raw_chain.append(("gemini-4-hydrogen", "HIGH"))
+            elif "flash-lite" not in (primary_model or "").lower():
+                # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon
+                raw_chain.append(("gemini-3.5-flash-lite", "LOW"))
+            elif use_google_search:
+                raw_chain.append(("gemini-4-hydrogen", "LOW"))
+
+            if (
+                not use_google_search
+                and self.deepseek_api_key
+                and self.deepseek_fallback_model
+                and self.deepseek_fallback_model != primary_model
+            ):
+                raw_chain.append((self.deepseek_fallback_model, self.deepseek_fallback_thinking_level))
+
+        deduped: list[tuple[str, str]] = []
+        seen_models: set[str] = set()
+        for cand_m, cand_t in raw_chain:
+            key = (cand_m or "").strip()
+            if not key or key in seen_models:
+                continue
+            seen_models.add(key)
+            deduped.append((key, cand_t))
+        return deduped
+
+    async def _execute_tools_batch(
+        self,
+        calls: list[tuple[str, dict[str, Any]]],
+        tool_executor: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]],
+        model_label: str,
+    ) -> list[dict[str, Any]]:
+        sem = asyncio.Semaphore(self.max_concurrent_tools)
+
+        async def _run_one(call_name: str, call_args: dict[str, Any]) -> dict[str, Any]:
+            logger.info("LLM tool call [%s]: %s(%s)", model_label, call_name, call_args)
+            try:
+                async with sem:
+                    coro = tool_executor(call_name, call_args)
+                    if self.tool_timeout_seconds > 0:
+                        result = await asyncio.wait_for(coro, timeout=self.tool_timeout_seconds)
+                    else:
+                        result = await coro
+            except (TimeoutError, asyncio.TimeoutError):
+                result = {"error": f"tool timeout after {self.tool_timeout_seconds:.1f}s"}
+            except Exception as exc:
+                result = {"error": str(exc)}
+            compact = _compact_tool_result(result, self.max_tool_result_chars)
+            return compact if isinstance(compact, dict) else {"result": compact}
+
+        return list(await asyncio.gather(*(_run_one(n, a) for n, a in calls)))
 
     @staticmethod
     def _extract_search_query_count(response: Any) -> int:
@@ -480,27 +633,12 @@ class GeminiClient:
                 if response.candidates and response.candidates[0].content:
                     contents.append(response.candidates[0].content)
 
-                sem = asyncio.Semaphore(self.max_concurrent_tools)
-
-                async def _execute_single_tool(call: Any) -> types.Part:
-                    call_name = call.name or ""
-                    call_args = dict(call.args or {})
-                    logger.info("Gemini tool call [%s]: %s(%s)", model, call_name, call_args)
-                    try:
-                        async with sem:
-                            coro = tool_executor(call_name, call_args)
-                            if self.tool_timeout_seconds > 0:
-                                result = await asyncio.wait_for(coro, timeout=self.tool_timeout_seconds)
-                            else:
-                                result = await coro
-                    except (TimeoutError, asyncio.TimeoutError):
-                        result = {"error": f"tool timeout after {self.tool_timeout_seconds:.1f}s"}
-                    except Exception as exc:
-                        result = {"error": str(exc)}
-                    compact = _compact_tool_result(result, self.max_tool_result_chars)
-                    return types.Part.from_function_response(name=call_name, response={"result": compact})
-
-                fn_response_parts = list(await asyncio.gather(*(_execute_single_tool(c) for c in fn_calls)))
+                call_specs = [(c.name or "", dict(c.args or {})) for c in fn_calls]
+                compacted_results = await self._execute_tools_batch(call_specs, tool_executor, model)
+                fn_response_parts = [
+                    types.Part.from_function_response(name=name, response={"result": res})
+                    for (name, _), res in zip(call_specs, compacted_results)
+                ]
                 contents.append(types.Content(role="user", parts=fn_response_parts))
 
             failure_reason = "工具调用轮次超限"
@@ -527,6 +665,227 @@ class GeminiClient:
                     search_queries=search_queries,
                 )
 
+    async def _post_deepseek_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        http = self._ensure_http_client()
+        url = f"{self.deepseek_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.deepseek_api_key}",
+            "Content-Type": "application/json",
+        }
+        coro = http.post(url, headers=headers, json=payload)
+        if self.deepseek_round_timeout_seconds > 0:
+            resp = await asyncio.wait_for(coro, timeout=self.deepseek_round_timeout_seconds)
+        else:
+            resp = await coro
+        if resp.status_code >= 400:
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:220]}")
+        return dict(resp.json())
+
+    async def _call_deepseek_single_round(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        openai_tools: list[dict[str, Any]],
+        response_schema: Any,
+        temperature: float,
+        thinking_level: str,
+    ) -> tuple[dict[str, Any], str]:
+        eff_level, thinking_extra, thinking_enabled = _build_deepseek_thinking_params(thinking_level)
+
+        def _build_payload(extra_think: dict[str, Any], include_temp: bool) -> dict[str, Any]:
+            body: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+            }
+            if extra_think:
+                body.update(extra_think)
+            if include_temp:
+                body["temperature"] = temperature
+            if openai_tools:
+                body["tools"] = openai_tools
+                body["tool_choice"] = "auto"
+            if response_schema is not None:
+                body["response_format"] = {"type": "json_object"}
+            return body
+
+        payload = _build_payload(thinking_extra, include_temp=not thinking_enabled)
+        for attempt in range(self.deepseek_max_retries + 1):
+            try:
+                data = await self._post_deepseek_completion(payload)
+                return data, eff_level
+            except Exception as exc:
+                err_msg = str(exc) or type(exc).__name__
+                if thinking_extra and ("400" in err_msg or "thinking" in err_msg.lower() or "reasoning_effort" in err_msg.lower()):
+                    logger.warning("Retrying DeepSeek %s without reasoning_effort due to: %s", model, err_msg[:180])
+                    thinking_extra = {}
+                    eff_level = "DEFAULT"
+                    payload = _build_payload({}, include_temp=True)
+                    data = await self._post_deepseek_completion(payload)
+                    return data, eff_level
+
+                if attempt < self.deepseek_max_retries and _is_transient_llm_error(exc):
+                    delay = self.retry_base_delay_s * (2**attempt)
+                    logger.warning(
+                        "Transient DeepSeek error on %s (attempt %d/%d): %s; retrying in %.1fs",
+                        model,
+                        attempt + 1,
+                        self.deepseek_max_retries + 1,
+                        err_msg[:180],
+                        delay,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError(f"Exhausted DeepSeek retries for {model}")
+
+    async def _run_deepseek_once(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        system_instruction: str,
+        thinking_level: str,
+        tools: list[types.FunctionDeclaration] | None,
+        tool_executor: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None,
+        response_schema: Any,
+        temperature: float,
+        max_tool_rounds: int,
+        usage_label: str,
+    ) -> tuple[str | None, str]:
+        sys_text = system_instruction or ""
+        if response_schema is not None:
+            try:
+                schema_json = json.dumps(response_schema.model_json_schema(), ensure_ascii=False)
+            except Exception:
+                schema_json = "{}"
+            schema_contract = (
+                "\n\n[JSON OUTPUT CONTRACT]\n"
+                "Output strictly a single valid JSON object matching this JSON Schema (no markdown fences, no commentary):\n"
+                f"{schema_json}"
+            )
+            sys_text = (sys_text + schema_contract).strip()
+
+        messages: list[dict[str, Any]] = []
+        if sys_text:
+            messages.append({"role": "system", "content": sys_text})
+        messages.append({"role": "user", "content": prompt})
+
+        openai_tools = _function_declarations_to_openai_tools(tools) if (tools and response_schema is None) else []
+        t0 = time.monotonic()
+        api_rounds = 0
+        prompt_tokens = 0
+        cached_tokens = 0
+        output_tokens = 0
+        thought_tokens = 0
+        total_tokens = 0
+        effective_level = thinking_level or "HIGH"
+        success = False
+        failure_reason = ""
+
+        try:
+            for round_idx in range(max_tool_rounds + 1):
+                data, effective_level = await self._call_deepseek_single_round(
+                    model=model,
+                    messages=messages,
+                    openai_tools=openai_tools,
+                    response_schema=response_schema,
+                    temperature=temperature,
+                    thinking_level=effective_level,
+                )
+                api_rounds += 1
+
+                usage = data.get("usage") or {}
+                p_tok = int(usage.get("prompt_tokens") or 0)
+                c_hit = int(
+                    usage.get("prompt_cache_hit_tokens")
+                    or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                    or 0
+                )
+                comp_tok = int(usage.get("completion_tokens") or 0)
+                reas_tok = int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+                out_tok = max(0, comp_tok - reas_tok)
+                tot_tok = int(usage.get("total_tokens") or (p_tok + comp_tok))
+                prompt_tokens += p_tok
+                cached_tokens += c_hit
+                output_tokens += out_tok
+                thought_tokens += reas_tok
+                total_tokens += tot_tok
+
+                choices = data.get("choices") or []
+                msg = (choices[0].get("message") if choices else None) or {}
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls or tool_executor is None or round_idx == max_tool_rounds:
+                    text = str(msg.get("content") or "").strip()
+                    if text:
+                        success = True
+                        return text, ""
+                    failure_reason = "DeepSeek 返回空文本"
+                    return None, failure_reason
+
+                assistant_entry: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                }
+                if msg.get("reasoning_content"):
+                    assistant_entry["reasoning_content"] = msg["reasoning_content"]
+                messages.append(assistant_entry)
+
+                call_specs: list[tuple[str, dict[str, Any]]] = []
+                call_ids: list[str] = []
+                for idx_tc, tc in enumerate(tool_calls):
+                    fn_obj = tc.get("function") or {}
+                    fn_name = str(fn_obj.get("name") or "")
+                    raw_args = fn_obj.get("arguments")
+                    parsed_args: dict[str, Any] = {}
+                    if isinstance(raw_args, dict):
+                        parsed_args = raw_args
+                    elif isinstance(raw_args, str) and raw_args.strip():
+                        try:
+                            loaded = json.loads(raw_args)
+                            if isinstance(loaded, dict):
+                                parsed_args = loaded
+                        except Exception:
+                            parsed_args = {}
+                    call_specs.append((fn_name, parsed_args))
+                    call_ids.append(str(tc.get("id") or f"call_{round_idx}_{idx_tc}"))
+
+                compacted_results = await self._execute_tools_batch(call_specs, tool_executor, model)
+                for call_id, res in zip(call_ids, compacted_results):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": json.dumps(res, ensure_ascii=False, default=str),
+                        }
+                    )
+
+            failure_reason = "DeepSeek 工具调用轮次超限"
+            return None, failure_reason
+        except Exception as exc:
+            failure_reason = f"{type(exc).__name__}: {str(exc)[:220]}"
+            logger.warning("DeepSeek model %s failed [%s]: %s", model, usage_label or "unknown", failure_reason)
+            return None, failure_reason
+        finally:
+            if api_rounds > 0 or not success:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                await self._record_usage(
+                    usage_label=usage_label,
+                    model=model,
+                    thinking_level=effective_level,
+                    api_rounds=api_rounds,
+                    prompt_tokens=prompt_tokens,
+                    cached_tokens=cached_tokens,
+                    output_tokens=output_tokens,
+                    thought_tokens=thought_tokens,
+                    total_tokens=total_tokens,
+                    latency_ms=latency_ms,
+                    success=success,
+                    search_queries=0,
+                )
+
     async def generate(
         self,
         *,
@@ -542,12 +901,21 @@ class GeminiClient:
         max_tool_rounds: int = 4,
         usage_label: str = "",
     ) -> str:
-        if self._client is None:
+        if use_google_search and self._client is None:
             await self._emit_ops(
                 severity="CRITICAL",
                 source=f"llm:{usage_label or model}",
                 alert_key="gemini_api_key_missing",
-                message="GEMINI_API_KEY 未配置，所有 AI 分析不可用。",
+                message="GEMINI_API_KEY 未配置，Google Search 联网检索不可用。",
+            )
+            return "⚠️ GEMINI_API_KEY 未配置，无法调用大模型分析。"
+
+        if self._client is None and not self.deepseek_api_key:
+            await self._emit_ops(
+                severity="CRITICAL",
+                source=f"llm:{usage_label or model}",
+                alert_key="gemini_api_key_missing",
+                message="GEMINI_API_KEY 与 DEEPSEEK_API_KEY 均未配置，所有 AI 分析不可用。",
             )
             return "⚠️ GEMINI_API_KEY 未配置，无法调用大模型分析。"
 
@@ -559,24 +927,63 @@ class GeminiClient:
             elif use_google_search:
                 configured_tools.append(types.Tool(google_search=types.GoogleSearch()))
 
-        candidates = self._candidate_chain(model, thinking_level)
-        errors: list[str] = []
+        raw_candidates = self._candidate_chain(model, thinking_level, use_google_search=use_google_search)
+        candidates: list[tuple[str, str]] = []
+        skipped_errors: list[str] = []
+        for cand_m, cand_t in raw_candidates:
+            if _is_deepseek_model(cand_m):
+                if use_google_search:
+                    continue
+                if not self.deepseek_api_key:
+                    skipped_errors.append(f"{cand_m}: DEEPSEEK_API_KEY 未配置")
+                    continue
+            else:
+                if self._client is None:
+                    skipped_errors.append(f"{cand_m}: GEMINI_API_KEY 未配置")
+                    continue
+            candidates.append((cand_m, cand_t))
+
+        if not candidates:
+            await self._emit_ops(
+                severity="CRITICAL",
+                source=f"llm:{usage_label or model}",
+                alert_key="gemini_api_key_missing",
+                message=f"无可用模型凭证（{' | '.join(skipped_errors)}）。",
+            )
+            return "⚠️ AI 模型密钥未配置，无法调用大模型分析。"
+
+        errors: list[str] = list(skipped_errors)
+        used_fallback = bool(skipped_errors)
 
         for idx, (cand_model, cand_think) in enumerate(candidates):
-            text, err_reason = await self._run_model_once(
-                model=cand_model,
-                prompt=prompt,
-                system_instruction=system_instruction,
-                thinking_level=cand_think,
-                configured_tools=configured_tools,
-                tool_executor=tool_executor,
-                response_schema=response_schema,
-                temperature=temperature,
-                max_tool_rounds=max_tool_rounds,
-                usage_label=usage_label,
-            )
+            if _is_deepseek_model(cand_model):
+                text, err_reason = await self._run_deepseek_once(
+                    model=cand_model,
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    thinking_level=cand_think,
+                    tools=tools,
+                    tool_executor=tool_executor,
+                    response_schema=response_schema,
+                    temperature=temperature,
+                    max_tool_rounds=max_tool_rounds,
+                    usage_label=usage_label,
+                )
+            else:
+                text, err_reason = await self._run_model_once(
+                    model=cand_model,
+                    prompt=prompt,
+                    system_instruction=system_instruction,
+                    thinking_level=cand_think,
+                    configured_tools=configured_tools,
+                    tool_executor=tool_executor,
+                    response_schema=response_schema,
+                    temperature=temperature,
+                    max_tool_rounds=max_tool_rounds,
+                    usage_label=usage_label,
+                )
             if text is not None:
-                if idx > 0:
+                if idx > 0 or used_fallback:
                     await self._emit_ops(
                         severity="WARN",
                         source=f"llm:{usage_label or model}",
@@ -594,6 +1001,6 @@ class GeminiClient:
             severity="CRITICAL",
             source=f"llm:{usage_label or model}",
             alert_key=f"llm_unavailable:{usage_label or model}",
-            message=f"所有 Gemini 模型均不可用（{joined_errs}）。请立即检查 API 配额、账单状态或 Google 服务异常。",
+            message=f"所有可用 AI 模型均不可用（{joined_errs}）。请立即检查 API 配额、账单状态或服务商异常。",
         )
-        return f"⚠️ Gemini AI 服务当前全部不可用（主模型与备援均失败，已发送运维告警）：{errors[-1]}"
+        return f"⚠️ AI 模型服务当前全部不可用（主模型与备援均失败，已发送运维告警）：{errors[-1]}"

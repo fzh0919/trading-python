@@ -364,7 +364,7 @@ class TradingScheduler:
             model=self.cfg.models.chat_model,
             prompt=prompt,
             system_instruction=system_instruction,
-            thinking_level="LOW",
+            thinking_level=self.cfg.models.chat_thinking_level,
             use_google_search=False,
             temperature=0.2,
             usage_label="settlement_reflection",

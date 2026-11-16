@@ -93,6 +93,7 @@ async def _single_search_query(
     model: str,
     prompt: str,
     usage_label: str,
+    thinking_level: str = "LOW",
 ) -> str:
     return await llm.generate(
         model=model,
@@ -104,7 +105,7 @@ async def _single_search_query(
             "Never fabricate news, pad with known static NAV/closing prices, or write generic commentary. "
             + _GROUNDING_OUTPUT_CONTRACT
         ),
-        thinking_level="LOW",
+        thinking_level=thinking_level,
         use_google_search=True,
         temperature=0.1,
         usage_label=usage_label,
@@ -123,6 +124,8 @@ async def run_forced_market_grounding(
     ops_notifier: OpsNotifier | None = None,
     max_concurrent_searches: int = _DEFAULT_GROUNDING_CONCURRENCY,
     priority_symbols: list[str] | None = None,
+    priority_search_model: str = "",
+    priority_thinking_level: str = "LOW",
     db: AdvisorDatabase | None = None,
     persist_ttl_seconds: int = _DEFAULT_PERSIST_TTL_SECONDS,
     bypass_cache: bool = False,
@@ -267,22 +270,36 @@ async def run_forced_market_grounding(
             logger.debug("Failed loading grounding_news_cache: %s", exc)
             db_cached = {}
 
+    prio_search_model = (priority_search_model or "").strip() or search_model
+    prio_think_lvl = (priority_thinking_level or "LOW").strip() or "LOW"
     sem = asyncio.Semaphore(max(1, max_concurrent_searches))
 
-    async def _bounded_search(prompt: str) -> str:
+    async def _bounded_search(prompt: str, *, use_priority_model: bool) -> str:
+        chosen_model = prio_search_model if use_priority_model else search_model
+        chosen_think = prio_think_lvl if use_priority_model else "LOW"
         async with sem:
             return await _single_search_query(
                 llm=llm,
-                model=search_model,
+                model=chosen_model,
                 prompt=prompt,
                 usage_label=usage_label,
+                thinking_level=chosen_think,
             )
 
     missing_indices = [idx for idx, item in enumerate(tasks_meta) if item[2] not in db_cached]
     raw_by_idx: dict[int, Any] = {}
     if missing_indices:
         fetched_results = await asyncio.gather(
-            *(_bounded_search(tasks_meta[idx][1]) for idx in missing_indices),
+            *(
+                _bounded_search(
+                    tasks_meta[idx][1],
+                    use_priority_model=(
+                        tasks_meta[idx][4]
+                        or tasks_meta[idx][2].endswith(":macro")
+                    ),
+                )
+                for idx in missing_indices
+            ),
             return_exceptions=True,
         )
         for idx, res in zip(missing_indices, fetched_results):

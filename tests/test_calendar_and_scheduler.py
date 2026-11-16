@@ -574,7 +574,7 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(nvda_lessons[0]["raw_return_pct"], 10.0, places=2)
             self.assertAlmostEqual(nvda_lessons[0]["alpha_pct"], 8.0, places=2)
             self.assertEqual(llm.calls[-1]["model"], cfg.models.chat_model)
-            self.assertEqual(llm.calls[-1]["thinking_level"], "LOW")
+            self.assertEqual(llm.calls[-1]["thinking_level"], cfg.models.chat_thinking_level)
             self.assertEqual(llm.calls[-1]["usage_label"], "settlement_reflection")
 
             still_pending = await db.get_pending_settlements()

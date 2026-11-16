@@ -638,7 +638,7 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
 
     async def test_imp21_grounding_priority_symbols_1to1_and_batch_split(self) -> None:
         clear_grounding_cache()
-        prompts_seen: list[str] = []
+        prompts_seen: list[tuple[str, str]] = []
         active = 0
         max_active = 0
 
@@ -647,14 +647,15 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
                 nonlocal active, max_active
                 active += 1
                 max_active = max(max_active, active)
-                prompts_seen.append(str(kwargs.get("prompt") or ""))
+                prompts_seen.append((str(kwargs.get("model") or ""), str(kwargs.get("prompt") or "")))
                 await asyncio.sleep(0.01)
                 active -= 1
                 return "ok"
 
         out = await run_forced_market_grounding(
             llm=_PriorityLLM(),
-            search_model="gemini-4-hydrogen",
+            search_model="gemini-3.5-flash-lite",
+            priority_search_model="gemini-4-hydrogen",
             scope="report",
             symbols=["NVDA", "AAPL", "MSFT", "AMD", "AZN.L"],
             priority_symbols=["NVDA", "AZN.L"],
@@ -664,15 +665,24 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【重点标的1对1深搜 · AZN.L】", out)
         self.assertLessEqual(max_active, 3)
 
+        # Priority 1-to-1 and macro searches route to priority_search_model; batches stay on search_model
+        prio_models = [
+            m for m, p in prompts_seen
+            if "1-to-1 Google Search deep dive" in p or "key macro catalysts" in p
+        ]
+        self.assertEqual(len(prio_models), 3)
+        self.assertTrue(all(m == "gemini-4-hydrogen" for m in prio_models))
+
         # Priority symbols must NOT appear in the grouped 3-symbol prompts
         grouped_prompts = [
-            p for p in prompts_seen
+            (m, p) for m, p in prompts_seen
             if "1-to-1 Google Search deep dive" not in p and "key macro catalysts" not in p
         ]
         self.assertEqual(len(grouped_prompts), 1)  # Only AAPL, MSFT, AMD remain -> 1 US batch
-        self.assertIn("AAPL, MSFT, AMD", grouped_prompts[0])
-        self.assertNotIn("NVDA", grouped_prompts[0])
-        self.assertNotIn("AZN.L", grouped_prompts[0])
+        self.assertEqual(grouped_prompts[0][0], "gemini-3.5-flash-lite")
+        self.assertIn("AAPL, MSFT, AMD", grouped_prompts[0][1])
+        self.assertNotIn("NVDA", grouped_prompts[0][1])
+        self.assertNotIn("AZN.L", grouped_prompts[0][1])
         clear_grounding_cache()
 
     async def test_imp11_inspect_ticker_cyq_weekly_exdiv_intel_lessons_and_budget(self) -> None:

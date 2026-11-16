@@ -25,7 +25,7 @@
 | `data_providers/analytics.py` | 复权自愈、CYQ、周线/ATR/ADX、去 Beta 相关性、CVaR | `test_analytics_and_rules.py` |
 | `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride` | `test_analytics_and_rules.py` |
 | `engine/screener.py`, `engine/universe_seeds.py`, `refresh_pool.py` | 四维双轨量化选股、150 只海选底池、VPVR/Stage2/VCP | `test_analytics_and_rules.py`, `test_universe_audition.py` |
-| `agents/llm_client.py` | `GeminiClient`、Thinking 钳位、工具并发裁剪、Search 额度预警 | `test_llm_pricing_and_usage.py` |
+| `agents/llm_client.py` | `GeminiClient`（Gemini+DeepSeek 混合路由/双向灾备）、Thinking 钳位、工具裁剪、Search 额度预警 | `test_llm_pricing_and_usage.py` |
 | `agents/prompts.py`, `agents/schemas.py` | 投资者画像、JSON 自修复、`[🛡️风控护栏修正]` 倒金字塔渲染 | `test_db_and_end_to_end.py` |
 | `agents/tools.py` | 分域 Google 强搜（英文搜/中文出）与 `MarketToolkit` | `test_v504_ops_and_grounding.py` |
 | `agents/report_agent.py` | `/report` 三步流水线、`AnalysisContextPack`、`/us` 异动门控 | `test_db_and_end_to_end.py` |

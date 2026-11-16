@@ -80,6 +80,12 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
         ops_notifier=ops,
         fallback_model=cfg.models.fallback_model,
         fallback_thinking_level=cfg.models.fallback_thinking_level,
+        deepseek_api_key=cfg.env.deepseek_api_key,
+        deepseek_base_url=cfg.env.deepseek_base_url,
+        gemini_fallback_model=cfg.models.gemini_fallback_model,
+        gemini_fallback_thinking_level=cfg.models.gemini_fallback_thinking_level,
+        deepseek_fallback_model=cfg.models.deepseek_fallback_model,
+        deepseek_fallback_thinking_level=cfg.models.deepseek_fallback_thinking_level,
         usage_summary_provider=db.get_usage_summary,
         search_free_quota_monthly=cfg.models.google_search_free_quota_monthly,
         search_warn_pct=cfg.models.google_search_warn_pct,
@@ -112,9 +118,17 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
             await ops.send_startup_notice(
                 version=APP_VERSION,
                 summary_lines=[
-                    f"核心路由: Bear挑刺 {cfg.models.report_auditor_model} ({cfg.models.report_auditor_thinking_level}) | PM/选股 {cfg.models.report_model} ({cfg.models.report_thinking_level}) | 备援: {cfg.models.fallback_model}",
+                    (
+                        f"核心路由: Bear挑刺 {cfg.models.report_auditor_model} ({cfg.models.report_auditor_thinking_level}) | "
+                        f"PM/选股 {cfg.models.report_model} ({cfg.models.report_thinking_level}) | "
+                        f"单聊/美股平稳 {cfg.models.chat_model} ({cfg.models.chat_thinking_level})"
+                    ),
+                    (
+                        f"双向备援: Gemini←{cfg.models.deepseek_fallback_model} ({cfg.models.deepseek_fallback_thinking_level}) | "
+                        f"DeepSeek←{cfg.models.gemini_fallback_model} ({cfg.models.gemini_fallback_thinking_level})"
+                    ),
                     f"全市场强制联网搜索: {'开启' if cfg.models.enable_forced_search_grounding else '关闭'} "
-                    f"(早报 {cfg.models.report_search_model} | 日常 {cfg.models.search_model})",
+                    f"(早报宏观/1v1 {cfg.models.report_priority_search_model} | 批量 {cfg.models.report_search_model} | 日常 {cfg.models.search_model})",
                     f"晨报日程: 工作日 {cfg.schedule.morning_report_hour:02d}:{cfg.schedule.morning_report_minute:02d} UK",
                 ],
                 reply_markup=REMOVE_KEYBOARD_MARKUP,
@@ -201,7 +215,7 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):
                     await task
-        for resource in (t212, market_data, ops, tg, db):
+        for resource in (llm, t212, market_data, ops, tg, db):
             try:
                 await resource.close()
             except Exception as close_exc:
