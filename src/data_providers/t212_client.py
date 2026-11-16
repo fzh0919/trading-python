@@ -516,11 +516,16 @@ class T212Client:
         isa_count = 0
         invest_count = 0
         if self.isa_key and self.isa_secret:
+            logger.info("T212 metadata sync: fetching ISA instruments list...")
             isa_items = await self.fetch_instruments_metadata(account_scope="ISA")
             isa_count = len(isa_items)
+            logger.info("T212 metadata sync: ISA fetched %d instruments.", isa_count)
         if self.invest_key and self.invest_secret:
+            if isa_count > 0:
+                logger.info("T212 metadata sync: waiting 52s cooldown before Invest instruments list (1 req/50s)...")
             invest_items = await self.fetch_instruments_metadata(account_scope="INVEST")
             invest_count = len(invest_items)
+            logger.info("T212 metadata sync: Invest fetched %d instruments.", invest_count)
         return {"isa_count": isa_count, "invest_count": invest_count}
 
     async def _notify_ops(

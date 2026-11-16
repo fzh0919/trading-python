@@ -356,6 +356,8 @@ class TestUniverseAudition(unittest.TestCase):
         asyncio.run(_run())
 
     def test_telegram_refresh_pool_command(self) -> None:
+        from src.bot.scheduler import TradingScheduler
+
         async def _run() -> None:
             sent: list[str] = []
             edits: list[str] = []
@@ -373,38 +375,54 @@ class TestUniverseAudition(unittest.TestCase):
                 async def send_message(self, chat_id: str, text: str, **kwargs: Any) -> None:
                     sent.append(text)
 
-            class _FakeScheduler:
-                async def run_pool_audition(self, **kwargs: Any) -> dict[str, Any]:
-                    return {
-                        "updated_at_uk": "2026-11-16 15:00",
-                        "base_equities_count": 850,
-                        "t212_tradable_count": 720,
-                        "liquidity_passed_count": 480,
-                        "selected_equities_count": 150,
-                        "selected_etfs_count": 25,
-                        "by_region": {"US": 105, "UK": 30, "EU": 15},
-                        "by_sector": {"Technology": 28, "Healthcare": 22},
-                        "added_symbols": ["NVDA", "AZN.L"],
-                        "removed_symbols": [],
-                        "fundamentals_stats": {"cached": 400, "fetched": 80, "failed": 0, "skipped": 0, "rate_limited": False},
-                        "top_preview": ["NVDA(92, Technology)", "AZN.L(88, Healthcare)"],
-                    }
-
             cfg = AppConfig(env=EnvSettings(telegram_chat_id="12345"))
+            md = MarketDataService()
+            tg = _FakeTG()
+            sched = TradingScheduler(
+                cfg,
+                None,  # type: ignore[arg-type]
+                md,
+                None,  # type: ignore[arg-type]
+                None,  # type: ignore[arg-type]
+                tg,  # type: ignore[arg-type]
+            )
             bot = AdvisorBot(
                 cfg=cfg,
                 t212=None,  # type: ignore[arg-type]
-                market_data=MarketDataService(),
+                market_data=md,
                 llm=None,  # type: ignore[arg-type]
                 db=None,  # type: ignore[arg-type]
-                telegram=_FakeTG(),  # type: ignore[arg-type]
-                scheduler=_FakeScheduler(),  # type: ignore[arg-type]
+                telegram=tg,  # type: ignore[arg-type]
+                scheduler=sched,
             )
-            await bot.handle_update({"message": {"chat": {"id": 12345}, "text": "/refresh_pool"}}, wait=True)
+            self.assertIs(bot.execution_lock, sched.execution_lock)
+
+            fake_res = {
+                "updated_at_uk": "2026-11-16 15:00",
+                "base_equities_count": 850,
+                "t212_tradable_count": 720,
+                "liquidity_passed_count": 480,
+                "selected_equities_count": 150,
+                "selected_etfs_count": 25,
+                "by_region": {"US": 105, "UK": 30, "EU": 15},
+                "by_sector": {"Technology": 28, "Healthcare": 22},
+                "added_symbols": ["NVDA", "AZN.L"],
+                "removed_symbols": [],
+                "fundamentals_stats": {"cached": 400, "fetched": 80, "failed": 0, "skipped": 0, "rate_limited": False},
+                "top_preview": ["NVDA(92, Technology)", "AZN.L(88, Healthcare)"],
+            }
+            with patch("src.bot.scheduler.run_universe_audition", return_value=fake_res):
+                # Run with timeout to fail immediately on any re-entrant execution_lock deadlock
+                await asyncio.wait_for(
+                    bot.handle_update({"message": {"chat": {"id": 12345}, "text": "/refresh_pool"}}, wait=True),
+                    timeout=3.0,
+                )
             self.assertEqual(len(edits), 1)
             self.assertEqual(len(sent), 1)
             self.assertIn("精选个股 150 只", sent[0])
             self.assertIn("美股 105 | 英股 30 | 欧股 15", sent[0])
+            self.assertFalse(sched.execution_lock.locked())
+            self.assertIsNone(sched.current_job_name)
 
         asyncio.run(_run())
 

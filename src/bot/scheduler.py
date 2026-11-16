@@ -477,9 +477,11 @@ class TradingScheduler:
         *,
         sync_online_indices: bool = True,
         sync_t212_metadata: bool = True,
+        acquire_lock: bool = True,
     ) -> dict[str, Any]:
-        """Acquire execution_lock and refresh the curated 150-stock active universe pool."""
-        async with self.execution_lock:
+        """Refresh the curated 150-stock active universe pool (acquiring execution_lock unless already held)."""
+        async def _run() -> dict[str, Any]:
+            prev_job = self.current_job_name
             self.current_job_name = "refresh_pool"
             try:
                 return await run_universe_audition(
@@ -492,7 +494,12 @@ class TradingScheduler:
                 )
             finally:
                 if self.current_job_name == "refresh_pool":
-                    self.current_job_name = None
+                    self.current_job_name = prev_job
+
+        if acquire_lock:
+            async with self.execution_lock:
+                return await _run()
+        return await _run()
 
     async def run_weekly_quant_audit(self, now_utc: datetime | None = None) -> dict[str, Any]:
         """Acquire execution_lock and silently execute weekly offline universe & threshold audit."""

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from src.config import StrategySection, UniverseSection
 from src.data_providers.analytics import (
@@ -2005,6 +2008,7 @@ async def run_universe_audition(
     prev_equities = {str(r["symbol"]).upper() for r in previous_rows if not r.get("is_etf")}
 
     # Step 1: Resolve multi-market base pool & T212 account-level eligibility
+    logger.info("Audition Step 1/4: resolving multi-market base universe & T212 eligibility...")
     base_data = await resolve_base_universe_symbols(cfg, db=db, sync_online=sync_online_indices)
     equities_map: dict[str, list[str]] = dict(base_data.get("equities") or {})
     etf_syms: list[str] = list(base_data.get("etfs") or [])
@@ -2063,6 +2067,11 @@ async def run_universe_audition(
     # Step 2: Batched 1y OHLCV incremental update & local liquidity/structure pre-filter (0 .info calls)
     benchmarks = ["SPY", "ISF.L", "EXS1.DE"]
     eq_syms = list(tradable_equities.keys())
+    logger.info(
+        "Audition Step 2/4: fetching/updating 1y OHLCV for %d tradable equities (+%d ETFs)...",
+        len(eq_syms),
+        len(tradable_etfs),
+    )
     histories = await market_data.get_histories([*eq_syms, *benchmarks], period="1y") if eq_syms else {}
 
     liquid_candidates: list[tuple[str, TechnicalSnapshot, pd.DataFrame, float]] = []
@@ -2096,6 +2105,12 @@ async def run_universe_audition(
 
     # Step 3: Load cached fundamentals from SQLite & gently fetch missing/stale with 429 circuit breaker
     liquid_syms = [item[0] for item in liquid_candidates]
+    logger.info(
+        "Audition Step 3/4: %d/%d equities passed liquidity/structure pre-filter; loading fundamentals (cache TTL %dd)...",
+        len(liquid_syms),
+        len(eq_syms),
+        ttl_days,
+    )
     fund_map, fund_stats = await market_data.get_fundamentals_cached(
         liquid_syms,
         max_age_days=ttl_days,
@@ -2214,6 +2229,16 @@ async def run_universe_audition(
             by_region["EU"] += 1
         else:
             by_region["US"] += 1
+
+    logger.info(
+        "Audition Step 4/4 complete: selected %d equities (US=%d, UK=%d, EU=%d) + %d LSE ETFs | fundamentals=%s",
+        len(selected),
+        by_region["US"],
+        by_region["UK"],
+        by_region["EU"],
+        len(etf_rows),
+        fund_stats,
+    )
 
     return {
         "updated_at_uk": uk_now,

@@ -541,6 +541,7 @@ class AdvisorBot:
                         res = await self.scheduler.run_pool_audition(
                             sync_online_indices=sync_online,
                             sync_t212_metadata=True,
+                            acquire_lock=False,
                         )
                     else:
                         res = await run_universe_audition(
