@@ -19,7 +19,7 @@ from src.agents.schemas import (
     render_morning_report,
     trim_text_at_line_boundary,
 )
-from src.agents.tools import MarketToolkit, run_forced_market_grounding
+from src.agents.tools import MarketToolkit, _format_us_deep_intel, run_forced_market_grounding
 from src.config import AppConfig
 
 if TYPE_CHECKING:
@@ -238,6 +238,7 @@ def build_analysis_context_pack(
     isin_map: dict[str, str] | None = None,
     lessons_by_sym: dict[str, list[dict[str, Any]]] | None = None,
     recent_lessons: list[dict[str, Any]] | None = None,
+    us_intel_map: dict[str, dict[str, Any]] | None = None,
     cash_flow_summary: str = "",
     portfolio_diff: str = "",
     cycle_date: str | None = None,
@@ -247,6 +248,7 @@ def build_analysis_context_pack(
     resolved_cycle = cycle_date or get_trading_cycle_id(now_utc)
     isin_lookup = isin_map or {}
     lessons_lookup = lessons_by_sym or {}
+    intel_lookup = us_intel_map or {}
 
     pos_by_sym: dict[str, list[dict[str, Any]]] = {}
     for pos in portfolio.all_positions():
@@ -329,6 +331,7 @@ def build_analysis_context_pack(
             "evaluations": eval_by_sym.get(sym, []),
             "disagreements": dis_by_sym.get(sym, []),
             "lessons": lessons_lookup.get(sym, []),
+            "deep_intel": intel_lookup.get(sym.upper()) or intel_lookup.get(sym) or {},
         }
 
     return {
@@ -382,7 +385,18 @@ async def _assemble_fact_sheet_bundle(
     isin_map, created_at_map = _extract_holding_context(portfolio)
     fetch_isin_map = {sym: isin_map[sym] for sym in fetch_syms if sym in isin_map} or None
 
-    (histories, bundles), macro, (lessons_by_sym, recent_lessons) = await asyncio.gather(
+    us_tracked = [s for s in tracked_syms if _is_us_symbol(s)]
+
+    async def _empty_intel() -> dict[str, dict[str, Any]]:
+        return {}
+
+    intel_coro = (
+        market_data.get_us_deep_intel_batch(us_tracked)
+        if (us_tracked and hasattr(market_data, "get_us_deep_intel_batch"))
+        else _empty_intel()
+    )
+
+    (histories, bundles), macro, (lessons_by_sym, recent_lessons), us_intel_map = await asyncio.gather(
         market_data.get_bundles(
             fetch_syms,
             include_news=True,
@@ -391,6 +405,7 @@ async def _assemble_fact_sheet_bundle(
         ),
         market_data.get_macro_snapshot(),
         _fetch_symbol_lessons(db, tracked_syms),
+        intel_coro,
     )
 
     tech_map: dict[str, TechnicalSnapshot] = {}
@@ -408,7 +423,7 @@ async def _assemble_fact_sheet_bundle(
     if us_only:
         evals = [e for e in evals if _is_us_symbol(e.yahoo_symbol)]
     eval_text = format_evaluations_text(evals)
-    exposure_text = compute_exposure_summary(portfolio, bundles)
+    exposure_text = compute_exposure_summary(portfolio, bundles, histories=histories)
 
     disagreements = build_disagreement_matrix(portfolio, tech_map, bundles, cfg.strategy, evals=evals)
     if us_only:
@@ -448,6 +463,18 @@ async def _assemble_fact_sheet_bundle(
                 f"• {sym} [{item['created_at_uk']} {item['action']} | {alpha_str}]: {item['reflection_lesson']}"
             )
 
+    deep_intel_lines: list[str] = []
+    for sym in tracked_syms:
+        if not _is_us_symbol(sym):
+            continue
+        b = bundles.get(sym)
+        if b is not None and b.quote_type.upper() == "ETF":
+            continue
+        intel_raw = us_intel_map.get(sym.upper()) or us_intel_map.get(sym) or {}
+        intel_fmt = _format_us_deep_intel(intel_raw)
+        if intel_fmt:
+            deep_intel_lines.append(f"• {sym}: {intel_fmt}")
+
     news_lines = []
     for sym in tracked_syms:
         b = bundles.get(sym)
@@ -470,6 +497,11 @@ async def _assemble_fact_sheet_bundle(
         if lesson_lines
         else ""
     )
+    deep_intel_section = (
+        "\n\n【美股机构评级、EPS惊喜与内部人动向（Finnhub）】\n" + "\n".join(deep_intel_lines)
+        if deep_intel_lines
+        else ""
+    )
 
     fact_sheet = (
         f"【实时宏观与汇率（确定性数据源）】\n{macro.to_text()}"
@@ -487,6 +519,7 @@ async def _assemble_fact_sheet_bundle(
         + eval_text
         + "\n\n【本地多空证据冲突表（Disagreement Matrix）】\n"
         + disagreement_text
+        + deep_intel_section
         + lesson_section
         + "\n\n【近期公司新闻摘要】\n"
         + ("\n".join(news_lines) if news_lines else "（近7天无重要突发新闻或暂无抓取）")
@@ -514,6 +547,7 @@ async def _assemble_fact_sheet_bundle(
         isin_map=isin_map,
         lessons_by_sym=lessons_by_sym,
         recent_lessons=recent_lessons,
+        us_intel_map=us_intel_map,
         cycle_date=cycle_id,
     )
     return (
@@ -581,31 +615,19 @@ async def generate_morning_report(
         return f"⚠️ Trading 212 双账户数据均读取失败：\nISA: {portfolio.isa.error}\nInvest: {portfolio.invest.error}"
 
     tracked_syms = portfolio.unique_yahoo_symbols(include_pending=True)
-    grounding_coro = (
-        run_forced_market_grounding(
-            llm=llm,
-            search_model=cfg.models.report_search_model,
-            scope="report",
-            symbols=tracked_syms,
-            ttl_seconds=cfg.app.market_data_ttl_seconds,
-            ops_notifier=ops_notifier,
-        )
-        if cfg.models.enable_forced_search_grounding
-        else asyncio.sleep(0, result="")
-    )
+    held_syms = portfolio.unique_yahoo_symbols(include_pending=False)
 
-    prev_snap, past_lessons, fact_bundle, grounding_brief = await asyncio.gather(
+    prev_snap, past_lessons, fact_bundle = await asyncio.gather(
         db.get_previous_snapshot(min_age_hours=4.0),
         db.get_past_decision_context(limit=5),
         _assemble_fact_sheet_bundle(portfolio, market_data, cfg, us_only=False, db=db),
-        grounding_coro,
     )
     (
         fact_sheet,
-        _tech_map,
+        tech_map,
         bundles,
         macro,
-        _histories,
+        histories,
         evals,
         _disagreements,
         disagreement_text,
@@ -613,12 +635,58 @@ async def generate_morning_report(
         context_pack,
     ) = fact_bundle
 
+    priority_symbols: list[str] = []
+    for sym in held_syms:
+        b = bundles.get(sym)
+        t = tech_map.get(sym)
+        near_earnings = (
+            b is not None
+            and b.days_to_earnings is not None
+            and 0 <= int(b.days_to_earnings) <= 7
+        )
+        ex_days = (
+            b.days_to_ex_dividend
+            if (b is not None and b.days_to_ex_dividend is not None)
+            else (t.days_to_ex_dividend if t is not None else None)
+        )
+        near_ex_div = ex_days is not None and -3 <= int(ex_days) <= 3
+        move_1d = (
+            t.ret_1d_pct
+            if (t is not None and t.ret_1d_pct is not None)
+            else _daily_move_pct_from_hist(histories.get(sym))
+        )
+        big_move = move_1d is not None and abs(float(move_1d)) >= 3.0
+        if near_earnings or near_ex_div or big_move:
+            priority_symbols.append(sym)
+
+    quote_types = {
+        sym: bundles[sym].quote_type
+        for sym in tracked_syms
+        if sym in bundles and bundles[sym].quote_type
+    }
+    grounding_brief = (
+        await run_forced_market_grounding(
+            llm=llm,
+            search_model=cfg.models.report_search_model,
+            scope="report",
+            symbols=tracked_syms,
+            quote_types=quote_types or None,
+            priority_symbols=priority_symbols or None,
+            ttl_seconds=cfg.app.market_data_ttl_seconds,
+            ops_notifier=ops_notifier,
+        )
+        if cfg.models.enable_forced_search_grounding
+        else ""
+    )
+
     trade_ctx = build_trade_context(
         portfolio,
         history_days=cfg.strategy.order_history_days,
         max_recent_lines=10,
         max_summary_lines=10,
         bundles=bundles,
+        tech_map=tech_map,
+        histories=histories,
     )
     cash_flow_text = trade_ctx.get("cash_flow_summary_text") or "（近30天无外部出入金或派息流水）"
     diff_text = _compute_portfolio_diff_text(
@@ -950,16 +1018,37 @@ async def generate_us_sentinel(
             return {}
 
     async def _fetch_us_quotes() -> dict[str, dict[str, Any]]:
-        if not getattr(getattr(market_data, "finnhub", None), "enabled", False) or not us_tracked_syms:
+        if not us_tracked_syms:
             return {}
-        pairs = await asyncio.gather(
-            *(market_data.get_us_realtime_quote(sym) for sym in us_tracked_syms),
-            return_exceptions=True,
-        )
         out: dict[str, dict[str, Any]] = {}
-        for sym, res in zip(us_tracked_syms, pairs):
-            if isinstance(res, dict) and res:
-                out[sym] = res
+        if getattr(getattr(market_data, "finnhub", None), "enabled", False):
+            pairs = await asyncio.gather(
+                *(market_data.get_us_realtime_quote(sym) for sym in us_tracked_syms),
+                return_exceptions=True,
+            )
+            for sym, res in zip(us_tracked_syms, pairs):
+                if isinstance(res, dict) and res:
+                    out[sym] = res
+
+        if sched.phase == "PRE":
+            need_prepost = list(us_tracked_syms)
+        else:
+            need_prepost = [
+                sym
+                for sym in us_tracked_syms
+                if sym not in out
+                or out[sym].get("change_pct") is None
+                or abs(float(out[sym].get("change_pct") or 0.0)) < 1e-9
+            ]
+
+        if need_prepost and hasattr(market_data, "get_us_prepost_quotes"):
+            try:
+                prepost_map = await market_data.get_us_prepost_quotes(need_prepost)
+                for sym, pp in (prepost_map or {}).items():
+                    if isinstance(pp, dict) and pp.get("current_price"):
+                        out[sym] = {**(out.get(sym) or {}), **pp}
+            except Exception as exc:
+                logger.debug("US prepost quotes fallback failed in /us sentinel: %s", exc)
         return out
 
     (
@@ -979,7 +1068,7 @@ async def generate_us_sentinel(
     )
     (
         fact_sheet,
-        _tech_map,
+        tech_map,
         bundles,
         macro,
         histories,
@@ -1020,6 +1109,8 @@ async def generate_us_sentinel(
         max_summary_lines=5,
         bundles=bundles,
         pending_us_only=True,
+        tech_map=tech_map,
+        histories=histories,
     )
     phase_desc = {
         "PRE": f"美股盘前（{sched.open_time_uk} UK 开盘，距开盘 {max(sched.minutes_to_open, 0)} 分钟）",

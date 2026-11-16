@@ -27,6 +27,7 @@ from src.engine.screener import (
     detect_minervini_stage2,
     detect_vcp_contraction,
     detect_volume_ma_breakout,
+    run_offline_universe_and_threshold_audit,
     run_quant_screener,
     score_candidate,
 )
@@ -2042,6 +2043,300 @@ class TestAnalyticsAndRules(unittest.TestCase):
         rs = compute_relative_strength(histories["NVDA"], histories["SPY"])
         self.assertIsNotNone(rs["rs_20d_pct"])
         self.assertIsNotNone(rs["rs_slope_20d"])
+
+    def test_imp21_portfolio_cvar_risk_attribution_and_screener_deep_intel(self) -> None:
+        import asyncio
+        from src.data_providers.analytics import (
+            compute_exposure_summary,
+            compute_portfolio_cvar_and_risk_attribution,
+        )
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        dates = pd.date_range("2026-04-01", periods=130, freq="B")
+        rng = np.random.default_rng(21)
+        # NVDA high vol (~3.5% daily), AZN.L medium vol (~1.5%), VWRL.L low vol (~0.8%)
+        r_nvda = rng.normal(0.0005, 0.035, 130)
+        r_nvda[15] = -0.11  # realistic left-tail shock
+        r_nvda[42] = -0.09
+        r_azn = rng.normal(0.0003, 0.015, 130)
+        r_vwrl = rng.normal(0.0002, 0.008, 130)
+
+        def _mk(rets: np.ndarray, start: float) -> pd.DataFrame:
+            c = start * np.cumprod(1.0 + rets)
+            return pd.DataFrame(
+                {
+                    "Open": c * 0.998,
+                    "High": c * 1.01,
+                    "Low": c * 0.99,
+                    "Close": c,
+                    "Volume": np.full(len(c), 1_200_000.0),
+                },
+                index=dates,
+            )
+
+        histories = {
+            "NVDA": _mk(r_nvda, 120.0),
+            "AZN.L": _mk(r_azn, 10000.0),
+            "VWRL.L": _mk(r_vwrl, 95.0),
+            "MSFT": _mk(rng.normal(0.0006, 0.018, 130), 400.0),
+            "SPY": _mk(rng.normal(0.0004, 0.010, 130), 520.0),
+            "ISF.L": _mk(rng.normal(0.0002, 0.009, 130), 800.0),
+        }
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-16 10:00",
+            fetched_at_ms=1794823200000,
+            total_combined_value=10000.0,
+            isa=AccountSnapshot(
+                ok=True,
+                total_account_value=6000.0,
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        inst_currency="USD",
+                        quantity=20,
+                        avg_price=100,
+                        cur_price=120,
+                        current_value=3500.0,
+                        total_cost=3000.0,
+                        pnl=500.0,
+                        fx_impact=0.0,
+                        return_pct=16.7,
+                        weight_pct=58.3,
+                    ),
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="AZNl_EQ",
+                        ticker="AZN",
+                        yahoo_symbol="AZN.L",
+                        name="AstraZeneca",
+                        inst_currency="GBp",
+                        quantity=25,
+                        avg_price=9800,
+                        cur_price=10200,
+                        current_value=2500.0,
+                        total_cost=2400.0,
+                        pnl=100.0,
+                        fx_impact=0.0,
+                        return_pct=4.2,
+                        weight_pct=41.7,
+                    ),
+                ],
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                total_account_value=4000.0,
+                positions=[
+                    PositionItem(
+                        account="Invest",
+                        raw_ticker="VWRLl_EQ",
+                        ticker="VWRL",
+                        yahoo_symbol="VWRL.L",
+                        name="Vanguard All-World",
+                        inst_currency="GBP",
+                        quantity=30,
+                        avg_price=90,
+                        cur_price=95,
+                        current_value=3000.0,
+                        total_cost=2850.0,
+                        pnl=150.0,
+                        fx_impact=0.0,
+                        return_pct=5.3,
+                        weight_pct=75.0,
+                    ),
+                ],
+            ),
+        )
+        bundles = {
+            "NVDA": TickerMarketBundle(symbol="NVDA", quote_type="EQUITY", currency="USD", sector="Technology"),
+            "AZN.L": TickerMarketBundle(symbol="AZN.L", quote_type="EQUITY", currency="GBp", sector="Healthcare"),
+            "VWRL.L": TickerMarketBundle(symbol="VWRL.L", quote_type="ETF", currency="GBP"),
+        }
+
+        risk_info = compute_portfolio_cvar_and_risk_attribution(portfolio, histories, lookback_days=120)
+        self.assertGreater(risk_info["portfolio_vol_pct"], 0.0)
+        self.assertLess(risk_info["cvar_95_pct"], 0.0)
+        self.assertGreater(risk_info["cvar_95_gbp"], 0.0)
+        rc_sum = sum(r["risk_pct"] for r in risk_info["risk_contributions"])
+        self.assertAlmostEqual(rc_sum, 100.0, delta=0.5)
+        self.assertEqual(risk_info["top_risk_sources"][0]["symbol"], "NVDA")
+        self.assertGreater(risk_info["top_risk_sources"][0]["risk_pct"], risk_info["top_risk_sources"][0]["weight_pct"])
+
+        exp_compat = compute_exposure_summary(portfolio, bundles)
+        self.assertNotIn("95%单日CVaR", exp_compat)
+        exp_full = compute_exposure_summary(portfolio, bundles, histories=histories)
+        self.assertIn("组合真实风险归因(前3波动源)", exp_full)
+        self.assertIn("尾部压力测试(95%单日CVaR)", exp_full)
+
+        # Verify score_candidate and run_quant_screener Stage 2 US deep intel integration
+        tech = compute_technical_snapshot("MSFT", histories["MSFT"])
+        assert tech is not None
+        strategy = StrategySection()
+        msft_bundle = TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD", forward_pe=24.0)
+        intel_bull = {
+            "recommendations": [{"period": "2026-11-01", "strong_buy": 20, "buy": 8, "hold": 2, "sell": 0, "strong_sell": 0}],
+            "earnings_surprises": [{"surprise_pct": 5.0}, {"surprise_pct": 4.2}, {"surprise_pct": 6.1}, {"surprise_pct": 3.0}],
+            "insider_sentiment": {"mspr": 18.5, "change": 900},
+        }
+        intel_bear = {
+            "recommendations": [{"period": "2026-11-01", "strong_buy": 1, "buy": 2, "hold": 10, "sell": 5, "strong_sell": 2}],
+            "earnings_surprises": [{"surprise_pct": -2.0}],
+            "insider_sentiment": {"mspr": -14.0, "change": -800},
+        }
+        c_bull = score_candidate("MSFT", "ISA_LONG_TERM", tech, msft_bundle, 0.3, "AZN.L", False, False, strategy, hist=histories["MSFT"], deep_intel=intel_bull)
+        c_bear = score_candidate("MSFT", "ISA_LONG_TERM", tech, msft_bundle, 0.3, "AZN.L", False, False, strategy, hist=histories["MSFT"], deep_intel=intel_bear)
+        self.assertGreater(c_bull.dimension_scores["value_quality"], c_bear.dimension_scores["value_quality"])
+        self.assertIn("连续财报Beat", c_bull.pros)
+        self.assertTrue(any("内部人净增持" in p for p in c_bull.pros))
+        self.assertTrue(any("内部人减持" in c for c in c_bear.cons))
+
+        batch_calls: list[list[str]] = []
+
+        class _ScreenerStubMD(MarketDataService):
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                return {s: histories[s] for s in symbols if s in histories}
+
+            async def get_bundles(self, symbols: list[str], **kwargs):
+                return {s: histories[s] for s in symbols if s in histories}, {
+                    s: TickerMarketBundle(symbol=s, quote_type="EQUITY", currency="USD", current_price=400.0)
+                    for s in symbols
+                }
+
+            async def get_us_deep_intel_batch(self, symbols: list[str], max_concurrency: int = 4) -> dict[str, dict]:
+                batch_calls.append(list(symbols))
+                return {s: intel_bull for s in symbols}
+
+        universe = UniverseSection(
+            isa_long_term=["MSFT"],
+            invest_tactical=["MSFT"],
+            uk_lse_etfs=[],
+        )
+        isa_res, _ = asyncio.run(
+            run_quant_screener(
+                portfolio=portfolio,
+                market_data=_ScreenerStubMD(),
+                universe=universe,
+                watchlist=[],
+                strategy=strategy,
+                existing_histories=histories,
+            )
+        )
+        self.assertTrue(batch_calls)
+        self.assertIn("MSFT", batch_calls[0])
+        self.assertTrue(any("连续财报Beat" in c.pros for c in isa_res))
+
+    def test_imp22_offline_universe_and_threshold_audit(self) -> None:
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        dates = pd.date_range("2025-01-01", periods=360, freq="B")
+        rng = np.random.default_rng(42)
+
+        def _ohlcv_from_close(closes: np.ndarray) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "Open": closes * 0.996,
+                    "High": closes * 1.012,
+                    "Low": closes * 0.988,
+                    "Close": closes,
+                    "Volume": np.full(len(closes), 1_200_000.0),
+                },
+                index=dates,
+            )
+
+        # Held position: HELD1 with realistic noisy upward drift
+        held_rets = 0.0007 + rng.normal(0.0, 0.015, size=len(dates))
+        held_closes = 100.0 * np.cumprod(1.0 + held_rets)
+
+        # High-overlap candidate: tracks HELD1 closely over >=120d (corr ~ 0.97)
+        dup_rets = held_rets + rng.normal(0.0, 0.002, size=len(dates))
+        dup_closes = 80.0 * np.cumprod(1.0 + dup_rets)
+
+        # Zombie candidate: rises early, then persistent downtrend for last 140 bars (Close < MA200 & MA50 < MA200 >= 60d)
+        zombie_closes = np.concatenate(
+            [
+                np.linspace(100.0, 140.0, 120),
+                np.linspace(140.0, 60.0, 240),
+            ]
+        )
+
+        # Breakout winner + loser candidate: steady uptrend with periodic breakout spikes triggering trailing TP & ATR stop
+        brk_closes = np.linspace(50.0, 80.0, 220)
+        seg_up = np.linspace(80.0, 108.0, 35)  # +35% surge -> hits +20% activation
+        seg_pb = np.linspace(108.0, 92.0, 15)  # -14.8% pullback from peak -> triggers -12% trailing TP
+        seg_base2 = np.linspace(92.0, 96.0, 30)
+        seg_drop = np.linspace(96.0, 78.0, 30)  # triggers ATR stop
+        seg_tail = np.linspace(78.0, 85.0, 30)
+        brk_full = np.concatenate([brk_closes, seg_up, seg_pb, seg_base2, seg_drop, seg_tail])
+        brk_df = _ohlcv_from_close(brk_full)
+        # Ensure breakout day cleanly clears prior 20d high and drop triggers Low <= stop
+        brk_df.iloc[220, brk_df.columns.get_loc("Close")] = 84.0
+        brk_df.iloc[220, brk_df.columns.get_loc("High")] = 84.5
+
+        histories = {
+            "HELD1": _ohlcv_from_close(held_closes),
+            "DUP1": _ohlcv_from_close(dup_closes),
+            "ZOMB1": _ohlcv_from_close(zombie_closes),
+            "BRK1": brk_df,
+        }
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-14 10:00",
+            fetched_at_ms=1794650400000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                positions=[
+                    PositionItem(
+                        account="ISA",
+                        raw_ticker="HELD1_US_EQ",
+                        ticker="HELD1",
+                        yahoo_symbol="HELD1",
+                        name="Held One",
+                        inst_currency="USD",
+                        quantity=10.0,
+                        avg_price=100.0,
+                        cur_price=float(held_closes[-1]),
+                        current_value=5000.0,
+                        total_cost=4000.0,
+                        pnl=1000.0,
+                        fx_impact=0.0,
+                        return_pct=25.0,
+                        weight_pct=100.0,
+                    )
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        universe = UniverseSection(
+            isa_long_term=["DUP1", "ZOMB1"],
+            invest_tactical=["BRK1"],
+        )
+        strategy = StrategySection()
+
+        audit = run_offline_universe_and_threshold_audit(histories, portfolio, universe, strategy)
+        self.assertEqual(audit["universe_count"], 3)
+        self.assertEqual(audit["held_count"], 1)
+
+        overlap_syms = [x["symbol"] for x in audit["overlap_candidates"]]
+        self.assertIn("DUP1", overlap_syms)
+        self.assertNotIn("ZOMB1", overlap_syms)
+
+        zombie_syms = [x["symbol"] for x in audit["zombie_candidates"]]
+        self.assertIn("ZOMB1", zombie_syms)
+        self.assertNotIn("DUP1", zombie_syms)
+
+        bt = audit["threshold_backtest"]
+        self.assertGreaterEqual(bt["sample_count"], 1)
+        self.assertGreaterEqual(bt["trailing_tp_triggers"] + bt["atr_stop_triggers"] + bt["horizon_exits"], 1)
+
+        summary = audit["summary_text"]
+        self.assertNotIn("#", summary)
+        self.assertNotIn("**", summary)
+        self.assertIn("DUP1", summary)
+        self.assertIn("ZOMB1", summary)
+        self.assertIn("阈值回测", summary)
 
 
 if __name__ == "__main__":

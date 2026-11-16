@@ -126,6 +126,9 @@ class _MockMarketData(MarketDataService):
     async def get_us_realtime_quote(self, symbol: str) -> dict | None:
         return None
 
+    async def get_us_prepost_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        return {}
+
     async def get_macro_snapshot(self) -> MacroSnapshot:
         return MacroSnapshot(fetched_at_utc="2026-11-13 09:00 UTC", gbp_usd=1.27, vix=15.0)
 
@@ -622,6 +625,260 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(observed_job_inside, "daily_settlement")
             self.assertIsNone(sched.current_job_name)
             self.assertFalse(shared_lock.locked())
+
+    async def test_imp20_prewarm_windows_daily_metadata_sync_and_silence(self) -> None:
+        from src.data_providers.t212_client import HistoricalDividendItem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "prewarm.db")
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
+                watchlist=["AAPL"],
+                universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["AMD"]),
+            )
+            tg = _StubTg()
+
+            class _PrewarmT212(_MockT212):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.inst_sync_calls = 0
+
+                async def fetch_instruments_metadata(self) -> list[dict]:
+                    self.inst_sync_calls += 1
+                    return [
+                        {
+                            "ticker": "NVDA_US_EQ",
+                            "yahoo_symbol": "NVDA",
+                            "isin": "US67066G1040",
+                            "currency_code": "USD",
+                            "short_name": "NVDA",
+                            "inst_type": "STOCK",
+                            "extended_hours": True,
+                            "working_schedule_id": 55,
+                            "updated_at_ms": 1794560400000,
+                        }
+                    ]
+
+                async def get_portfolio(self, use_cache: bool = True) -> PortfolioData:
+                    p = await super().get_portfolio(use_cache=use_cache)
+                    p.isa.recent_dividends = [
+                        HistoricalDividendItem(
+                            id="div-prewarm-1",
+                            account="ISA",
+                            raw_ticker="VWRPl_EQ",
+                            ticker="VWRP",
+                            yahoo_symbol="VWRP.L",
+                            name="Vanguard FTSE All-World",
+                            amount=18.5,
+                            paid_on="2026-11-12T10:00:00Z",
+                            paid_on_ms=1794477600000,
+                            uk_time_str="11-12 10:00",
+                        )
+                    ]
+                    return p
+
+            class _PrewarmMarketData(_MockMarketData):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.warmed_batches: list[tuple[list[str], str]] = []
+                    self.macro_calls = 0
+
+                async def get_histories(self, symbols: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
+                    self.warmed_batches.append((list(symbols), period))
+                    return await super().get_histories(symbols, period=period)
+
+                async def get_macro_snapshot(self) -> MacroSnapshot:
+                    self.macro_calls += 1
+                    return await super().get_macro_snapshot()
+
+            t212 = _PrewarmT212()
+            md = _PrewarmMarketData()
+            sched = TradingScheduler(cfg, t212, md, _StubLLM(), db, tg)
+
+            # 1) 07:20 UK Friday -> triggers silent prewarm_morning & daily 1x metadata sync
+            t_morning_prewarm = datetime(2026, 11, 13, 7, 20, tzinfo=timezone.utc)
+            self.assertEqual(await sched.check_and_run_due_jobs(t_morning_prewarm), ["prewarm_morning"])
+            self.assertEqual(len(tg.sent), 0)
+            self.assertEqual(t212.inst_sync_calls, 1)
+            self.assertEqual(md.macro_calls, 1)
+            self.assertEqual(md.warmed_batches[0][1], "2y")
+            for sym in ("NVDA", "AAPL", "VWRP.L", "AMD", "SPY"):
+                self.assertIn(sym, md.warmed_batches[0][0])
+            self.assertTrue(await db.has_scheduler_job_fired("prewarm_morning", "2026-11-13"))
+            self.assertTrue(await db.has_scheduler_job_fired("t212_metadata_sync", "2026-11-13"))
+            self.assertEqual(len(await db.get_t212_instrument_map()), 1)
+            self.assertAlmostEqual((await db.get_cumulative_dividends_by_symbol())[("ISA", "VWRP.L")], 18.5)
+
+            # Duplicate check in same window does NOT re-fire
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 7, 25, tzinfo=timezone.utc)),
+                [],
+            )
+
+            # 2) 14:05 UK Friday (-10m before 14:15 premarket sentinel) -> fires prewarm_premarket without duplicating metadata sync
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 14, 5, tzinfo=timezone.utc)),
+                ["prewarm_premarket"],
+            )
+            self.assertEqual(t212.inst_sync_calls, 1)
+            self.assertEqual(len(tg.sent), 0)
+
+            # 3) 21:20 UK Friday (-10m before 21:30 weekly_radar) -> fires prewarm_weekly_radar silently
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 21, 20, tzinfo=timezone.utc)),
+                ["prewarm_weekly_radar"],
+            )
+            self.assertEqual(len(tg.sent), 0)
+
+            # Direct run_prewarm execution works cleanly
+            manual_res = await sched.run_prewarm("manual", now_utc=datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc))
+            self.assertGreaterEqual(manual_res["symbols_warmed"], 5)
+            self.assertTrue(manual_res["macro_ok"])
+
+    async def test_imp22_t10_t20_mfe_mae_followup_and_saturday_quant_audit(self) -> None:
+        import numpy as np
+
+        class _FollowupMarketData(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[list[str], str]] = []
+
+            @staticmethod
+            def _make_range_df(
+                dates: pd.DatetimeIndex,
+                closes: list[float],
+                highs: list[float] | None = None,
+                lows: list[float] | None = None,
+            ) -> pd.DataFrame:
+                h = highs if highs is not None else [c * 1.01 for c in closes]
+                l = lows if lows is not None else [c * 0.99 for c in closes]
+                return pd.DataFrame(
+                    {
+                        "Open": [c * 0.998 for c in closes],
+                        "High": h,
+                        "Low": l,
+                        "Close": closes,
+                        "Volume": [1_000_000.0 for _ in closes],
+                    },
+                    index=dates,
+                )
+
+            async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                self.calls.append((list(symbols), period))
+                # 25 business days starting 2026-10-05: enough for T+5, T+10, T+20
+                dates = pd.date_range("2026-10-05", periods=25, freq="B")
+                long_dates = pd.date_range("2025-07-01", periods=320, freq="B")
+                out: dict[str, pd.DataFrame] = {}
+                for sym in symbols:
+                    if sym == "NVDA":
+                        # Entry on 2026-10-05 (idx 0, close=100)
+                        # T+5 (idx 5, 2026-10-12): close=105 (+5%), high peak=108 (+8%), low=98 (-2%)
+                        # T+10 (idx 10, 2026-10-19): close=110 (+10%), high peak=115 (+15%)
+                        # T+20 (idx 20, 2026-11-02): close=120 (+20%), high peak=125 (+25%), low=95 (-5%)
+                        closes = [100.0 + i * 1.0 for i in range(25)]
+                        highs = [c * 1.01 for c in closes]
+                        lows = [c * 0.995 for c in closes]
+                        highs[3] = 108.0
+                        lows[2] = 98.0
+                        highs[8] = 115.0
+                        highs[18] = 125.0
+                        lows[15] = 95.0
+                        out[sym] = self._make_range_df(dates, closes, highs=highs, lows=lows)
+                    elif sym == "SPY":
+                        closes = [500.0 + i * 2.5 for i in range(25)]
+                        out[sym] = self._make_range_df(dates, closes)
+                    elif sym == "ZOMB.L":
+                        z_closes = np.concatenate([np.linspace(120.0, 150.0, 120), np.linspace(150.0, 70.0, 200)])
+                        out[sym] = self._make_range_df(
+                            long_dates,
+                            list(z_closes),
+                            highs=list(z_closes * 1.01),
+                            lows=list(z_closes * 0.99),
+                        )
+                    elif sym in ("VWRP.L", "ISF.L"):
+                        b_closes = [100.0 + i * 0.1 for i in range(len(long_dates))]
+                        out[sym] = self._make_range_df(long_dates, b_closes)
+                return out
+
+        class _SimpleReflectLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def generate(self, **kwargs) -> str:
+                self.calls += 1
+                return "T+5 正超额收益，严格跟踪止损纪律。"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp22_sched.db")
+            await db.init()
+
+            rec_ms = int(datetime(2026, 10, 5, 21, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-10-05 21:30",
+                        "created_at_ms": rec_ms,
+                        "account": "Invest",
+                        "symbol": "NVDA",
+                        "action": "BUY",
+                        "entry_price": 100.0,
+                        "thesis": "AI breakout",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "SPY",
+                    }
+                ]
+            )
+
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
+                universe=UniverseSection(isa_long_term=["VWRP.L", "ZOMB.L"]),
+            )
+            md = _FollowupMarketData()
+            llm = _SimpleReflectLLM()
+            tg = _StubTg()
+            sched = TradingScheduler(cfg, _MockT212(), md, llm, db, tg)
+
+            # 1) Settle at T+5 close (2026-10-12 22:00 UTC) -> settles T+5 with initial MFE (+8%) & MAE (-2%)
+            res_t5 = await sched.run_daily_settlement(now_utc=datetime(2026, 10, 12, 22, 0, tzinfo=timezone.utc))
+            self.assertEqual(res_t5["settled"], 1)
+            self.assertEqual(llm.calls, 1)
+
+            recs = await db.get_recent_recommendations(limit=5)
+            self.assertAlmostEqual(recs[0]["raw_return_pct"], 5.0, places=2)
+            self.assertAlmostEqual(recs[0]["mfe_pct"], 8.0, places=2)
+            self.assertAlmostEqual(recs[0]["mae_pct"], -2.0, places=2)
+            self.assertIsNone(recs[0]["t10_alpha_pct"])
+            self.assertIsNone(recs[0]["t20_alpha_pct"])
+
+            # 2) Run settlement after T+20 close (2026-11-03 22:00 UTC) -> 0 LLM calls! Updates T+10, T+20, and MFE/MAE
+            res_t20 = await sched.run_daily_settlement(now_utc=datetime(2026, 11, 3, 22, 0, tzinfo=timezone.utc))
+            self.assertEqual(res_t20["settled"], 0)
+            self.assertEqual(res_t20["followup_updated"], 1)
+            self.assertEqual(llm.calls, 1)  # 0 extra LLM calls for T+10 / T+20 follow-up
+
+            recs_after = await db.get_recent_recommendations(limit=5)
+            self.assertAlmostEqual(recs_after[0]["t10_return_pct"], 10.0, places=2)
+            self.assertAlmostEqual(recs_after[0]["t10_alpha_pct"], 5.0, places=2)  # NVDA +10% vs SPY +5%
+            self.assertAlmostEqual(recs_after[0]["t20_return_pct"], 20.0, places=2)
+            self.assertAlmostEqual(recs_after[0]["t20_alpha_pct"], 10.0, places=2)  # NVDA +20% vs SPY +10%
+            self.assertAlmostEqual(recs_after[0]["mfe_pct"], 25.0, places=2)
+            self.assertAlmostEqual(recs_after[0]["mae_pct"], -5.0, places=2)
+
+            # 3) Saturday idle window (2026-11-14 11:00 UTC) fires weekly_quant_audit silently once per week
+            sat_early = datetime(2026, 11, 14, 7, 31, tzinfo=timezone.utc)
+            self.assertEqual(await sched.check_and_run_due_jobs(sat_early), [])
+
+            sat_idle = datetime(2026, 11, 14, 11, 0, tzinfo=timezone.utc)
+            fired_sat = await sched.check_and_run_due_jobs(sat_idle)
+            self.assertEqual(fired_sat, ["weekly_quant_audit"])
+            self.assertEqual(len(tg.sent), 0)  # must not spam Telegram
+            self.assertEqual(await sched.check_and_run_due_jobs(datetime(2026, 11, 14, 14, 0, tzinfo=timezone.utc)), [])
+
+            latest_audit = await db.get_latest_quant_audit()
+            assert latest_audit is not None
+            self.assertEqual(latest_audit["audit_date"], "2026-11-14")
+            self.assertIn("ZOMB.L", latest_audit["summary_text"])
 
 
 if __name__ == "__main__":

@@ -200,12 +200,21 @@ class AdvisorBot:
         return (ratio - 1.0) * 100.0, False
 
     async def _build_stats_message(self) -> str:
-        stats, lessons, rows = await asyncio.gather(
+        async def _empty_audit() -> dict[str, Any] | None:
+            return None
+
+        audit_coro = (
+            self.db.get_latest_quant_audit()
+            if hasattr(self.db, "get_latest_quant_audit")
+            else _empty_audit()
+        )
+        stats, lessons, rows, latest_audit = await asyncio.gather(
             self.db.get_recommendation_stats(),
             self.db.get_recent_lessons(limit=3),
             self.db.get_recent_recommendations(limit=10),
+            audit_coro,
         )
-        if not rows and stats.get("total_count", 0) == 0:
+        if not rows and stats.get("total_count", 0) == 0 and not latest_audit:
             return "📭 暂无历史选股或调仓记录（运行一次 /pick 后会自动建档）。"
 
         symbols = list(
@@ -238,11 +247,29 @@ class AdvisorBot:
         if stats["settled_count"] > 0:
             avg_raw = f"{stats['avg_raw_return_pct']:+.2f}%" if stats["avg_raw_return_pct"] is not None else "N/A"
             avg_alpha = f"{stats['avg_alpha_pct']:+.2f}%" if stats["avg_alpha_pct"] is not None else "N/A"
+            t10_alpha = (
+                f"{stats['avg_t10_alpha_pct']:+.2f}%"
+                if stats.get("avg_t10_alpha_pct") is not None
+                else "N/A"
+            )
+            t20_alpha = (
+                f"{stats['avg_t20_alpha_pct']:+.2f}%"
+                if stats.get("avg_t20_alpha_pct") is not None
+                else "N/A"
+            )
+            mfe_s = f"{stats['avg_mfe_pct']:+.1f}%" if stats.get("avg_mfe_pct") is not None else "N/A"
+            mae_s = f"{stats['avg_mae_pct']:+.1f}%" if stats.get("avg_mae_pct") is not None else "N/A"
             lines.append(
                 f"• 原始胜率: {stats['win_rate_pct']:.1f}% ({stats['win_count']}/{stats['settled_count']}) | 平均收益: {avg_raw}"
             )
             lines.append(
                 f"• 超额 Alpha 胜率: {stats['alpha_win_rate_pct']:.1f}% ({stats['alpha_win_count']}/{stats['settled_count']}) | 平均 Alpha: {avg_alpha}"
+            )
+            lines.append(
+                f"• 多窗口 Alpha 轨迹: T+5 平均 {avg_alpha} | T+10 平均 {t10_alpha} | T+20 平均 {t20_alpha}"
+            )
+            lines.append(
+                f"• 持仓期极值分布: 平均最大浮盈(MFE) {mfe_s} | 平均最大回撤(MAE) {mae_s}"
             )
         else:
             lines.append("• 胜率与 Alpha: 暂无已结算 (T+N) 样本，待盘后结算后自动生成。")
@@ -289,6 +316,14 @@ class AdvisorBot:
                 lines.append(
                     f"• [{r['created_at_uk']}] [{r['account']}] {r['action']} {sym}{price_s}{perf_s}：{r['thesis']}"
                 )
+
+        if latest_audit:
+            audit_ts = str(latest_audit.get("created_at_uk") or latest_audit.get("audit_date") or "").strip()
+            audit_header = f"\n【周末候选池与阈值体检】({audit_ts})" if audit_ts else "\n【周末候选池与阈值体检】"
+            lines.append(audit_header)
+            summary_txt = str(latest_audit.get("summary_text") or "").strip()
+            if summary_txt:
+                lines.append(summary_txt)
 
         return "\n".join(lines)
 

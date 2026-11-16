@@ -37,6 +37,8 @@ class PositionItem(BaseModel):
     weight_pct: float = 0.0
     created_at: str | None = None
     isin: str | None = None
+    cumulative_dividends_gbp: float = 0.0
+    total_return_with_div_pct: float | None = None
 
 
 class PendingOrderItem(BaseModel):
@@ -342,6 +344,7 @@ class T212Client:
         ops_notifier: Any = None,
         snapshot_loader: Callable[[], Awaitable[PortfolioData | None]] | None = None,
         transient_backoff_s: float = 0.5,
+        db: Any = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.isa_key = isa_key.strip()
@@ -356,12 +359,14 @@ class T212Client:
         self._ops = ops_notifier
         self._snapshot_loader = snapshot_loader
         self._transient_backoff_s = max(0.0, float(transient_backoff_s))
+        self._db = db
         self._client: httpx.AsyncClient | None = None
         self._portfolio_lock = asyncio.Lock()
         self._cache: tuple[float, PortfolioData] | None = None
         self._last_good_portfolio: PortfolioData | None = None
         self._last_good_accounts: dict[str, tuple[str, int, AccountSnapshot]] = {}
         self._rate_limit_resets: dict[tuple[str, str], float] = {}
+        self._instrument_map: dict[str, dict[str, Any]] = {}
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -378,6 +383,113 @@ class T212Client:
 
     def set_snapshot_loader(self, snapshot_loader: Callable[[], Awaitable[PortfolioData | None]] | None) -> None:
         self._snapshot_loader = snapshot_loader
+
+    def set_db(self, db: Any) -> None:
+        self._db = db
+
+    def _resolve_ticker_metadata(
+        self,
+        raw_ticker: str,
+        inst: dict[str, Any],
+        default_currency: str,
+        extra_currency: str = "",
+    ) -> tuple[str, str, str, str | None]:
+        """Resolve (clean_ticker, inst_currency, yahoo_symbol, isin) using cached T212 instrument metadata."""
+        clean = clean_t212_ticker(raw_ticker)
+        meta = self._instrument_map.get(raw_ticker) or {}
+        inst_curr = str(
+            inst.get("currency")
+            or meta.get("currency_code")
+            or ("USD" if raw_ticker.upper().endswith("_US_EQ") else "")
+            or extra_currency
+            or default_currency
+        )
+        yahoo_sym = str(meta.get("yahoo_symbol") or "").strip() or to_yahoo_symbol(raw_ticker, inst_curr, clean)
+        raw_isin = inst.get("isin") or meta.get("isin") or ""
+        isin = str(raw_isin).strip().upper() or None
+        return clean, inst_curr, yahoo_sym, isin
+
+    async def fetch_instruments_metadata(self) -> list[dict[str, Any]]:
+        """Fetch /equity/metadata/instruments (1 req / 50s bucket) and sync to SQLite archive if available."""
+        if self.isa_key and self.isa_secret:
+            api_key, api_secret = self.isa_key, self.isa_secret
+        elif self.invest_key and self.invest_secret:
+            api_key, api_secret = self.invest_key, self.invest_secret
+        else:
+            return []
+
+        client = self._get_client()
+        headers = self._auth_headers(api_key, api_secret)
+        url = f"{self.base_url}/equity/metadata/instruments"
+        try:
+            resp = await self._request_with_retry(
+                client,
+                url,
+                headers,
+                default_retry_sleep_s=50.5,
+                max_retries=2,
+                rate_bucket="metadata_instruments",
+                max_rate_wait_s=55.0,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("T212 /equity/metadata/instruments failed: %s", exc)
+            return []
+
+        remaining = _parse_ratelimit_remaining(resp.headers)
+        reset_ts = _parse_ratelimit_reset_ts(resp.headers)
+        if remaining is not None and remaining <= 0 and reset_ts is None:
+            self._rate_limit_resets[("metadata_instruments", urlparse(url).path)] = time.time() + 50.0
+
+        if resp.status_code != 200:
+            logger.warning("T212 /equity/metadata/instruments returned HTTP %d", resp.status_code)
+            return []
+
+        raw_items = resp.json()
+        if not isinstance(raw_items, list):
+            return []
+
+        now_ms = int(time.time() * 1000)
+        parsed_items: list[dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            ticker = str(raw.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            currency_code = str(raw.get("currencyCode") or raw.get("currency") or "").strip()
+            short_name = str(raw.get("shortName") or raw.get("name") or "").strip()
+            isin = str(raw.get("isin") or "").strip().upper()
+            inst_type = str(raw.get("type") or "").strip().upper()
+            extended_hours = bool(raw.get("extendedHours", False))
+            raw_sched = raw.get("workingScheduleId")
+            working_schedule_id: int | None = None
+            if raw_sched is not None and str(raw_sched).strip() != "":
+                try:
+                    working_schedule_id = int(raw_sched)
+                except (TypeError, ValueError):
+                    working_schedule_id = None
+            clean_hint = short_name if re.fullmatch(r"[A-Za-z0-9._-]{1,10}", short_name) else None
+            yahoo_sym = to_yahoo_symbol(ticker, currency_code or "USD", clean_ticker=clean_hint)
+            item = {
+                "ticker": ticker,
+                "yahoo_symbol": yahoo_sym,
+                "isin": isin,
+                "currency_code": currency_code,
+                "short_name": short_name,
+                "inst_type": inst_type,
+                "extended_hours": extended_hours,
+                "working_schedule_id": working_schedule_id,
+                "updated_at_ms": now_ms,
+            }
+            self._instrument_map[ticker] = item
+            parsed_items.append(item)
+
+        if parsed_items and self._db is not None and hasattr(self._db, "upsert_t212_instruments"):
+            try:
+                await self._db.upsert_t212_instruments(parsed_items)
+            except Exception as exc:
+                logger.warning("Failed persisting T212 instrument metadata: %s", exc)
+        return parsed_items
 
     async def _notify_ops(
         self,
@@ -519,14 +631,13 @@ class T212Client:
                     for o in raw_pending:
                         inst = o.get("instrument") or {}
                         raw_ticker = str(o.get("ticker") or inst.get("ticker") or "UNKNOWN")
-                        clean = clean_t212_ticker(raw_ticker)
                         # Note: T212 Order.currency is often the account settlement currency (e.g. GBP)
                         # whereas limitPrice/stopPrice are quoted in the instrument's trading currency.
-                        inst_curr = str(
-                            inst.get("currency")
-                            or ("USD" if raw_ticker.upper().endswith("_US_EQ") else "")
-                            or o.get("currency")
-                            or account_currency
+                        clean, inst_curr, yahoo_sym, _ = self._resolve_ticker_metadata(
+                            raw_ticker,
+                            inst,
+                            account_currency,
+                            extra_currency=str(o.get("currency") or ""),
                         )
                         signed_qty = float(o.get("quantity") or 0)
                         raw_qty = abs(signed_qty)
@@ -543,7 +654,7 @@ class T212Client:
                                 account=account_label,
                                 raw_ticker=raw_ticker,
                                 ticker=clean,
-                                yahoo_symbol=to_yahoo_symbol(raw_ticker, inst_curr, clean),
+                                yahoo_symbol=yahoo_sym,
                                 name=str(inst.get("name") or clean),
                                 side=side,
                                 order_type=str(o.get("type") or "LIMIT"),
@@ -649,13 +760,12 @@ class T212Client:
                     inst = order.get("instrument") or {}
                     wallet = fill.get("walletImpact") or {}
                     raw_ticker = str(order.get("ticker") or inst.get("ticker") or "UNKNOWN")
-                    clean = clean_t212_ticker(raw_ticker)
                     wallet_currency = str(wallet.get("currency") or account_currency)
-                    inst_curr = str(
-                        inst.get("currency")
-                        or ("USD" if raw_ticker.upper().endswith("_US_EQ") else "")
-                        or order.get("currency")
-                        or wallet_currency
+                    clean, inst_curr, yahoo_sym, _ = self._resolve_ticker_metadata(
+                        raw_ticker,
+                        inst,
+                        wallet_currency,
+                        extra_currency=str(order.get("currency") or ""),
                     )
                     signed_qty = fill.get("quantity") if fill.get("quantity") is not None else order.get("quantity", 0)
                     side = str(order.get("side") or ("SELL" if float(signed_qty or 0) < 0 else "BUY"))
@@ -672,7 +782,7 @@ class T212Client:
                             account=account_label,
                             raw_ticker=raw_ticker,
                             ticker=clean,
-                            yahoo_symbol=to_yahoo_symbol(raw_ticker, inst_curr, clean),
+                            yahoo_symbol=yahoo_sym,
                             name=str(inst.get("name") or clean),
                             inst_currency=inst_curr,
                             side=side,
@@ -858,9 +968,13 @@ class T212Client:
                         continue
                     inst = d.get("instrument") or {}
                     raw_ticker = str(d.get("ticker") or inst.get("ticker") or "UNKNOWN")
-                    clean = clean_t212_ticker(raw_ticker)
                     div_curr = str(d.get("currency") or account_currency)
-                    inst_curr = str(d.get("tickerCurrency") or inst.get("currency") or "")
+                    meta = self._instrument_map.get(raw_ticker) or {}
+                    inst_curr = str(d.get("tickerCurrency") or inst.get("currency") or meta.get("currency_code") or "")
+                    clean = clean_t212_ticker(raw_ticker)
+                    yahoo_sym = str(meta.get("yahoo_symbol") or "").strip() or to_yahoo_symbol(
+                        raw_ticker, inst_curr or div_curr, clean
+                    )
                     dedup_id = str(d.get("reference") or f"{raw_ticker}_{paid_on}")
                     if dedup_id in seen_div_ids:
                         continue
@@ -871,7 +985,7 @@ class T212Client:
                             account=account_label,
                             raw_ticker=raw_ticker,
                             ticker=clean,
-                            yahoo_symbol=to_yahoo_symbol(raw_ticker, inst_curr or div_curr, clean),
+                            yahoo_symbol=yahoo_sym,
                             name=str(inst.get("name") or clean),
                             inst_currency=inst_curr,
                             dividend_type=str(d.get("type") or "DIVIDEND"),
@@ -1028,12 +1142,12 @@ class T212Client:
                 inst = p.get("instrument") or {}
                 wallet = p.get("walletImpact") or {}
                 raw_ticker = str(inst.get("ticker") or p.get("ticker") or "UNKNOWN")
-                clean = clean_t212_ticker(raw_ticker)
                 if wallet.get("currency"):
                     account_currency = str(wallet["currency"])
-                inst_curr = str(
-                    inst.get("currency")
-                    or ("USD" if raw_ticker.upper().endswith("_US_EQ") else account_currency)
+                clean, inst_curr, yahoo_sym, isin = self._resolve_ticker_metadata(
+                    raw_ticker,
+                    inst,
+                    account_currency,
                 )
 
                 qty = float(p.get("quantity") or 0)
@@ -1064,11 +1178,6 @@ class T212Client:
                 if created_at == "":
                     created_at = None
 
-                raw_isin = inst.get("isin")
-                isin = str(raw_isin).strip() if raw_isin else None
-                if isin == "":
-                    isin = None
-
                 calc_val += current_value
                 calc_cost += total_cost
                 calc_pnl += pnl
@@ -1079,7 +1188,7 @@ class T212Client:
                         account=account_label,
                         raw_ticker=raw_ticker,
                         ticker=clean,
-                        yahoo_symbol=to_yahoo_symbol(raw_ticker, inst_curr, clean),
+                        yahoo_symbol=yahoo_sym,
                         name=str(inst.get("name") or clean),
                         inst_currency=inst_curr,
                         quantity=qty,
@@ -1127,36 +1236,35 @@ class T212Client:
             for pos in parsed_positions:
                 pos.weight_pct = ((pos.current_value / total_account_value) * 100.0) if total_account_value > 0 else 0.0
 
-            return (
-                AccountSnapshot(
-                    ok=True,
-                    account_label=account_label,
-                    account_currency=account_currency,
-                    total_account_value=total_account_value,
-                    investments_value=investments_value,
-                    investments_cost=investments_cost,
-                    unrealized_pnl=unrealized_pnl,
-                    realized_pnl=summary_realized,
-                    total_cash=total_cash,
-                    available_to_trade=available_to_trade,
-                    reserved_cash=reserved,
-                    in_pies_cash=in_pies,
-                    cash_ratio_pct=cash_ratio,
-                    total_fx_impact=total_fx_impact,
-                    positions=parsed_positions,
-                    pending_orders=pending_orders,
-                    recent_orders=recent_orders,
-                    recent_transactions=recent_transactions,
-                    recent_dividends=recent_dividends,
-                    pending_orders_supported=pending_supported,
-                    pending_orders_error=pending_error,
-                    order_history_supported=history_supported,
-                    transactions_supported=tx_supported,
-                    dividends_supported=div_supported,
-                    cash_status_note=cash_note,
-                ),
-                False,
+            snap = AccountSnapshot(
+                ok=True,
+                account_label=account_label,
+                account_currency=account_currency,
+                total_account_value=total_account_value,
+                investments_value=investments_value,
+                investments_cost=investments_cost,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=summary_realized,
+                total_cash=total_cash,
+                available_to_trade=available_to_trade,
+                reserved_cash=reserved,
+                in_pies_cash=in_pies,
+                cash_ratio_pct=cash_ratio,
+                total_fx_impact=total_fx_impact,
+                positions=parsed_positions,
+                pending_orders=pending_orders,
+                recent_orders=recent_orders,
+                recent_transactions=recent_transactions,
+                recent_dividends=recent_dividends,
+                pending_orders_supported=pending_supported,
+                pending_orders_error=pending_error,
+                order_history_supported=history_supported,
+                transactions_supported=tx_supported,
+                dividends_supported=div_supported,
+                cash_status_note=cash_note,
             )
+            self._enrich_account_dividends(snap, None)
+            return snap, False
         except httpx.HTTPError as exc:
             logger.warning("Transient HTTP error fetching %s account: %s", account_label, exc)
             return AccountSnapshot(ok=False, account_label=account_label, error=f"{type(exc).__name__}: {exc}"), True
@@ -1232,6 +1340,31 @@ class T212Client:
                     )
         return None
 
+    @staticmethod
+    def _enrich_account_dividends(
+        acc: AccountSnapshot,
+        cum_map: dict[tuple[str, str], float] | None = None,
+    ) -> None:
+        """Populate cumulative_dividends_gbp & total_return_with_div_pct from DB archive and recent dividends."""
+        if not acc.ok or not acc.positions:
+            return
+        recent_by_sym: dict[str, float] = {}
+        for d in acc.recent_dividends:
+            if d.yahoo_symbol and d.amount > 0:
+                recent_by_sym[d.yahoo_symbol] = recent_by_sym.get(d.yahoo_symbol, 0.0) + float(d.amount)
+
+        for pos in acc.positions:
+            db_div = (cum_map or {}).get((acc.account_label, pos.yahoo_symbol), 0.0)
+            rec_div = recent_by_sym.get(pos.yahoo_symbol, 0.0)
+            cum_div = db_div if db_div > 0 else rec_div
+            if cum_div > 0:
+                pos.cumulative_dividends_gbp = round(float(cum_div), 4)
+                if pos.total_cost > 0:
+                    pos.total_return_with_div_pct = round(
+                        ((pos.pnl + pos.cumulative_dividends_gbp) / pos.total_cost) * 100.0,
+                        2,
+                    )
+
     async def get_portfolio(self, use_cache: bool = True) -> PortfolioData:
         now = time.monotonic()
         if use_cache and self._cache is not None:
@@ -1245,6 +1378,12 @@ class T212Client:
                 cached_at, cached_data = self._cache
                 if (now - cached_at) < self.cache_ttl_seconds:
                     return cached_data
+
+            if not self._instrument_map and self._db is not None and hasattr(self._db, "get_t212_instrument_map"):
+                try:
+                    self._instrument_map = await self._db.get_t212_instrument_map()
+                except Exception as exc:
+                    logger.debug("Failed loading cached T212 instrument map: %s", exc)
 
             client = self._get_client()
             (isa_snap, isa_transient), (invest_snap, invest_transient) = await asyncio.gather(
@@ -1302,6 +1441,33 @@ class T212Client:
                     fallback_source = "mixed"
                     parts = [f"{lbl}@{m[0]} UK" for lbl, m in fallback_meta.items()]
                     fallback_note = f"⚠️ 部分账户实时拉取异常，已回退缓存快照: {', '.join(parts)}"
+
+            cum_map: dict[tuple[str, str], float] = {}
+            if self._db is not None:
+                if not is_fallback:
+                    live_divs = [
+                        d.model_dump()
+                        for acc in (isa_snap, invest_snap)
+                        if acc.ok and not acc.is_fallback
+                        for d in acc.recent_dividends
+                    ]
+                    if live_divs and hasattr(self._db, "upsert_dividends"):
+                        try:
+                            await self._db.upsert_dividends(live_divs)
+                        except Exception as exc:
+                            logger.warning("Failed archiving live T212 dividends: %s", exc)
+                if hasattr(self._db, "get_cumulative_dividends_by_symbol"):
+                    try:
+                        cum_map = await self._db.get_cumulative_dividends_by_symbol()
+                    except Exception as exc:
+                        logger.debug("Failed loading cumulative dividends from DB: %s", exc)
+
+            self._enrich_account_dividends(isa_snap, cum_map)
+            self._enrich_account_dividends(invest_snap, cum_map)
+            if isa_snap.ok and not isa_snap.is_fallback:
+                self._last_good_accounts["ISA"] = (now_uk, now_ms, isa_snap.model_copy(deep=True))
+            if invest_snap.ok and not invest_snap.is_fallback:
+                self._last_good_accounts["Invest"] = (now_uk, now_ms, invest_snap.model_copy(deep=True))
 
             data = PortfolioData(
                 fetched_at_uk=portfolio_uk,
@@ -1388,13 +1554,145 @@ def format_positions_text(acc: AccountSnapshot) -> str:
     lines = []
     for p in acc.positions:
         stock_net = p.pnl - p.fx_impact
+        div_str = ""
+        if p.cumulative_dividends_gbp > 0:
+            tot_ret = (
+                p.total_return_with_div_pct
+                if p.total_return_with_div_pct is not None
+                else (
+                    ((p.pnl + p.cumulative_dividends_gbp) / p.total_cost) * 100.0
+                    if p.total_cost > 0
+                    else p.return_pct
+                )
+            )
+            div_str = f" | 累计派息 +{p.cumulative_dividends_gbp:.2f} {curr} (含息总回报 {tot_ret:+.2f}%)"
         lines.append(
             f"• {p.ticker} ({p.name}) [{p.yahoo_symbol}]: 市值 {curr} {p.current_value:,.2f} (占 {p.weight_pct:.1f}%) | "
             f"均价 {p.avg_price:.2f}→现价 {p.cur_price:.2f} {p.inst_currency} | "
             f"浮盈 {p.pnl:+,.2f} {curr} ({p.return_pct:+.2f}%) "
-            f"(本币 {stock_net:+,.2f} | 汇率 {p.fx_impact:+,.2f}) | {p.quantity:.4f}股"
+            f"(本币 {stock_net:+,.2f} | 汇率 {p.fx_impact:+,.2f}) | {p.quantity:.4f}股{div_str}"
         )
     return "\n".join(lines)
+
+
+def _compute_pending_order_quant_note(
+    o: PendingOrderItem,
+    *,
+    display_curr: str,
+    is_gbp_pence: bool,
+    bundle: Any | None,
+    tech: Any | None,
+    hist: Any | None,
+) -> str:
+    """Compute quote-currency-aligned distance %, ATR multiple, 20d empirical touch rate, and chip/noise tags."""
+    raw_trig = (
+        o.stop_price
+        if (o.stop_price is not None and "STOP" in (o.order_type or "").upper())
+        else (o.limit_price if o.limit_price is not None else o.stop_price)
+    )
+    if raw_trig is None or raw_trig <= 0:
+        return ""
+
+    b_curr = getattr(bundle, "currency", None) if bundle is not None else None
+    b_price = getattr(bundle, "current_price", None) if bundle is not None else None
+    t_close = getattr(tech, "last_close", None) if tech is not None else None
+    cur_price = float(b_price) if (b_price is not None and b_price > 0) else (
+        float(t_close) if (t_close is not None and t_close > 0) else None
+    )
+    if cur_price is None or cur_price <= 0:
+        return ""
+
+    trig_aligned = float(raw_trig)
+    cur_aligned = float(cur_price)
+
+    # Guard against 100x GBp vs GBP mismatch on LSE (.L) symbols
+    if o.yahoo_symbol.endswith(".L"):
+        ratio_raw = trig_aligned / cur_aligned
+        if is_gbp_pence and (o.currency or "").upper() == "GBP" and ratio_raw < 0.05:
+            trig_aligned *= 100.0
+        elif b_curr == "GBP" and display_curr == "GBp" and ratio_raw > 20.0:
+            cur_aligned *= 100.0
+        elif not is_gbp_pence and b_curr == "GBp" and ratio_raw < 0.05:
+            trig_aligned *= 100.0
+
+    scale_tech = 1.0
+    if t_close is not None and t_close > 0:
+        tech_ratio = cur_aligned / float(t_close)
+        if 80.0 <= tech_ratio <= 125.0:
+            scale_tech = 100.0
+        elif 0.008 <= tech_ratio <= 0.0125:
+            scale_tech = 0.01
+
+    dist_pct = ((trig_aligned / cur_aligned) - 1.0) * 100.0
+    atr_mult: float | None = None
+    atr_raw = getattr(tech, "atr14", None) if tech is not None else None
+    if atr_raw is not None and float(atr_raw) > 0:
+        atr_aligned = float(atr_raw) * scale_tech
+        atr_mult = abs(trig_aligned - cur_aligned) / atr_aligned
+
+    touch_prob_20d_pct: float | None = None
+    if hist is not None and getattr(hist, "empty", True) is False:
+        try:
+            import numpy as np
+            import pandas as pd
+            from src.data_providers.analytics import _normalize_adjusted_ohlcv, _resolve_col
+
+            norm_df = _normalize_adjusted_ohlcv(hist)
+            c_col = _resolve_col(norm_df, "Close")
+            h_col = _resolve_col(norm_df, "High")
+            l_col = _resolve_col(norm_df, "Low")
+            if c_col and h_col and l_col:
+                sub = norm_df[[c_col, h_col, l_col]].apply(pd.to_numeric, errors="coerce").dropna().tail(252)
+                if len(sub) >= 25:
+                    closes = sub[c_col].to_numpy(dtype=np.float64)
+                    highs = sub[h_col].to_numpy(dtype=np.float64)
+                    lows = sub[l_col].to_numpy(dtype=np.float64)
+                    target_ratio = trig_aligned / cur_aligned
+                    window = 20
+                    n_bars = len(closes)
+                    hits = 0
+                    total_windows = 0
+                    for i in range(0, n_bars - window):
+                        base_c = closes[i]
+                        if base_c <= 0:
+                            continue
+                        total_windows += 1
+                        thresh = base_c * target_ratio
+                        if target_ratio <= 1.0:
+                            if float(np.min(lows[i + 1 : i + 1 + window])) <= thresh:
+                                hits += 1
+                        else:
+                            if float(np.max(highs[i + 1 : i + 1 + window])) >= thresh:
+                                hits += 1
+                    if total_windows > 0:
+                        touch_prob_20d_pct = (hits / total_windows) * 100.0
+        except Exception as exc:
+            logger.debug("Touch prob calc skipped for %s: %s", o.yahoo_symbol, exc)
+
+    metrics_parts = [f"距现价 {dist_pct:+.1f}%"]
+    if atr_mult is not None:
+        metrics_parts.append(f"{atr_mult:.1f}倍ATR")
+    if touch_prob_20d_pct is not None:
+        metrics_parts.append(f"20日触价率 {touch_prob_20d_pct:.0f}%")
+
+    tags: list[str] = []
+    is_buy = (o.side or "").upper() == "BUY"
+    is_stop = (o.stop_price is not None) or ("STOP" in (o.order_type or "").upper())
+    if is_buy and atr_mult is not None and atr_mult > 4.0 and touch_prob_20d_pct is not None and touch_prob_20d_pct < 5.0:
+        tags.append("[远端低概率单]")
+    if is_stop and atr_mult is not None and atr_mult < 0.8:
+        tags.append("[止损过窄易被日常波动扫出]")
+    if is_buy and tech is not None:
+        c_low_raw = getattr(tech, "cyq_cost_90_low", None)
+        c_high_raw = getattr(tech, "cyq_cost_90_high", None)
+        if c_low_raw is not None and c_high_raw is not None:
+            c_low = float(c_low_raw) * scale_tech
+            c_high = float(c_high_raw) * scale_tech
+            if 0.0 < c_low <= trig_aligned <= c_high:
+                tags.append("[位于90%筹码支撑带]")
+
+    tag_str = f" {' '.join(tags)}" if tags else ""
+    return f" | {' / '.join(metrics_parts)}{tag_str}"
 
 
 def build_trade_context(
@@ -1405,6 +1703,8 @@ def build_trade_context(
     max_summary_lines: int = 12,
     bundles: dict[str, Any] | None = None,
     pending_us_only: bool = False,
+    tech_map: dict[str, Any] | None = None,
+    histories: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Build pending orders, 7-day fills, and 30-day ticker behavior stats for AI prompts."""
     all_orders = sorted(
@@ -1536,13 +1836,22 @@ def build_trade_context(
             tgt = f", 目标均价 {b.target_mean_price:.2f}" if b.target_mean_price else ""
             market_ctx = f" | 市场现价 {b.current_price:.2f} {b.currency or display_curr}{tgt}"
 
+        quant_note = _compute_pending_order_quant_note(
+            o,
+            display_curr=display_curr,
+            is_gbp_pence=is_gbp_pence,
+            bundle=b,
+            tech=tech_map.get(o.yahoo_symbol) if tech_map else None,
+            hist=histories.get(o.yahoo_symbol) if histories else None,
+        )
+
         qty_str = f"{o.quantity:.4f}股" if o.quantity > 0 else f"金额 {o.currency} {o.value:.2f}"
         if o.filled_quantity > 0 or o.status == "PARTIALLY_FILLED":
             qty_str += f"[部分成交,已成{o.filled_quantity:.4f}股]"
         side_lbl = "卖出" if o.side == "SELL" else "买入"
         pending_lines.append(
             f"• [{o.account}·挂单] {o.ticker} ({o.name}) [{o.yahoo_symbol}] {side_lbl} {qty_str} | "
-            f"{o.order_type} {'/'.join(trig)} {display_curr} ({o.time_in_force}){market_ctx}"
+            f"{o.order_type} {'/'.join(trig)} {display_curr} ({o.time_in_force}){market_ctx}{quant_note}"
         )
 
     pending_err_parts = [

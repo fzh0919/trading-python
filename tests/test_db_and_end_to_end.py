@@ -109,6 +109,9 @@ class _FakeMarketData(MarketDataService):
     async def get_us_realtime_quote(self, symbol: str) -> dict | None:
         return None
 
+    async def get_us_prepost_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        return {}
+
     async def get_macro_snapshot(self) -> MacroSnapshot:
         return MacroSnapshot(
             fetched_at_utc="2026-11-14 09:00 UTC",
@@ -2184,6 +2187,212 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     await db.close()
 
         await asyncio.wait_for(_run(), timeout=20.0)
+
+    async def test_imp20_us_sentinel_premarket_15m_gap_triggers_anomaly_gate(self) -> None:
+        from unittest.mock import patch
+        from src.agents.report_agent import generate_us_sentinel
+        from src.engine.calendar_utils import UsMarketSchedule
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp20_us_prepost.db")
+            await db.init()
+
+            class _PreMarketGateMD(_FakeMarketData):
+                def __init__(self) -> None:
+                    super().__init__(finnhub_key="fh-test")
+
+                async def get_us_realtime_quote(self, symbol: str) -> dict | None:
+                    # Finnhub free /quote returns 0.0% during premarket before regular open
+                    return {"symbol": symbol, "current_price": 100.0, "prev_close": 100.0, "change": 0.0, "change_pct": 0.0}
+
+                async def get_us_prepost_quotes(self, symbols: list[str]) -> dict[str, dict]:
+                    return {
+                        "NVDA": {
+                            "symbol": "NVDA",
+                            "current_price": 104.2,
+                            "prev_close": 100.0,
+                            "change": 4.2,
+                            "change_pct": 4.2,
+                            "source": "yfinance_prepost_15m",
+                        }
+                    }
+
+            class _PreLLM:
+                def __init__(self) -> None:
+                    self.calls: list[dict] = []
+
+                async def generate(self, **kwargs) -> str:
+                    self.calls.append(kwargs)
+                    if kwargs.get("use_google_search"):
+                        return "盘前异动检索：NVDA 盘前跳空 +4.2%。"
+                    return "🚨 盘前增量修正\n• NVDA 盘前跳空 +4.2%，上调风控关注。"
+
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
+            t212 = _FakeT212(_sample_portfolio())
+            llm = _PreLLM()
+            pre_sched = UsMarketSchedule(
+                ny_date="2026-11-13",
+                uk_date="2026-11-13",
+                uk_weekday_label="周五",
+                open_time_uk="14:30",
+                macro_time_uk="13:30",
+                mid_morning_time_uk="15:00",
+                fomc_time_uk="19:00",
+                close_time_uk="21:00",
+                is_dst_mismatch=False,
+                is_us_trading_day=True,
+                is_us_holiday=False,
+                is_us_early_close=False,
+                close_time_et="16:00",
+                phase="PRE",
+                minutes_to_open=15,
+                minutes_since_open=-15,
+                minutes_to_close=405,
+            )
+
+            clear_grounding_cache()
+            with patch("src.agents.report_agent.get_us_market_schedule_uk", return_value=pre_sched):
+                out = await generate_us_sentinel(cfg, t212, _PreMarketGateMD(), llm, db, is_scheduled_premarket=True)
+
+            self.assertTrue(out.startswith("🚨"))
+            sentinel_call = next(c for c in llm.calls if c.get("usage_label") == "us_sentinel")
+            self.assertEqual(sentinel_call["thinking_level"], "MEDIUM")
+            self.assertIn("本地异动门控：已触发深度复核", sentinel_call["prompt"])
+            self.assertIn("+4.20%", sentinel_call["prompt"])
+
+    async def test_imp21_morning_report_wires_deep_intel_cvar_touch_prob_and_priority_search(self) -> None:
+        from unittest.mock import patch
+        from src.agents.report_agent import generate_morning_report
+        from src.agents.tools import clear_grounding_cache
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp21_report.db")
+            await db.init()
+
+            class _Imp21MarketData(_FakeMarketData):
+                async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+                    hists = await super().get_histories(symbols, period=period)
+                    # Give NVDA a +4.5% last-day move to trigger priority 1-to-1 Google Search
+                    if "NVDA" in hists and not hists["NVDA"].empty:
+                        df = hists["NVDA"].copy()
+                        prev_c = float(df["Close"].iloc[-2])
+                        spike = round(prev_c * 1.045, 2)
+                        df.iloc[-1, df.columns.get_loc("Close")] = spike
+                        df.iloc[-1, df.columns.get_loc("High")] = spike * 1.01
+                        hists["NVDA"] = df
+                    return hists
+
+                async def get_bundles(self, symbols: list[str], **kwargs):
+                    hists, bundles = await super().get_bundles(symbols, **kwargs)
+                    if "NVDA" in bundles:
+                        bundles["NVDA"].days_to_earnings = 4
+                    return hists, bundles
+
+                async def get_us_deep_intel_batch(self, symbols: list[str], max_concurrency: int = 4) -> dict[str, dict]:
+                    return {
+                        "NVDA": {
+                            "recommendations": [{"period": "2026-11-01", "strong_buy": 25, "buy": 10, "hold": 2, "sell": 0, "strong_sell": 0}],
+                            "earnings_surprises": [{"period": "2026-09-30", "surprise_pct": 9.5}],
+                            "insider_sentiment": {"mspr": 14.2, "change": 600},
+                        }
+                    }
+
+            portfolio = _sample_portfolio()
+            t212 = _FakeT212(portfolio)
+            md = _Imp21MarketData()
+            llm = _RecordingLLM()
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
+            captured_grounding: dict[str, object] = {}
+
+            async def _fake_grounding(**kwargs):
+                captured_grounding.update(kwargs)
+                return "【重点标的1对1深搜 · NVDA】\nNVDA 盘中上涨 +4.5% 临近财报。"
+
+            clear_grounding_cache()
+            try:
+                with patch("src.agents.report_agent.run_forced_market_grounding", side_effect=_fake_grounding):
+                    out = await generate_morning_report(cfg, t212, md, llm, db)
+            finally:
+                await md.close()
+                await db.close()
+
+            self.assertIn("保留4%现金缓冲", out)
+            self.assertIn("NVDA", captured_grounding.get("priority_symbols") or [])
+            analyst_call = next(c for c in llm.calls if c.get("usage_label") == "report_analyst")
+            prompt_txt = analyst_call["prompt"]
+            self.assertIn("组合真实风险归因(前3波动源)", prompt_txt)
+            self.assertIn("尾部压力测试(95%单日CVaR)", prompt_txt)
+            self.assertIn("美股机构评级、EPS惊喜与内部人动向", prompt_txt)
+            self.assertIn("20日触价率", prompt_txt)
+
+    async def test_imp22_stats_dashboard_renders_multiwindow_alpha_mfe_mae_and_weekly_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp22_stats.db")
+            await db.init()
+
+            rec_ms = int(datetime(2026, 10, 5, 21, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-10-05 21:30",
+                        "created_at_ms": rec_ms,
+                        "account": "Invest",
+                        "symbol": "NVDA",
+                        "action": "BUY",
+                        "entry_price": 100.0,
+                        "thesis": "AI breakout",
+                        "horizon_days": 5,
+                        "benchmark_symbol": "SPY",
+                    }
+                ]
+            )
+            pending = await db.get_pending_settlements()
+            rec_id = pending[0]["id"]
+            await db.settle_recommendation(
+                rec_id,
+                benchmark_symbol="SPY",
+                settled_at_uk="2026-10-12 22:00",
+                raw_return_pct=5.2,
+                alpha_pct=3.1,
+                outcome_status="SETTLED",
+                reflection_lesson="控制回撤继续跟踪。",
+                mfe_pct=8.4,
+                mae_pct=-2.1,
+            )
+            await db.update_recommendation_followup(
+                rec_id,
+                t10_return_pct=9.8,
+                t10_alpha_pct=6.4,
+                t20_return_pct=15.0,
+                t20_alpha_pct=10.2,
+                mfe_pct=17.5,
+                mae_pct=-3.2,
+            )
+            await db.save_quant_audit(
+                "2026-11-14",
+                "• 扫描池 51 只候选 vs 10 只持仓\n• 长期弱势僵尸股(>=60d Phase4): 1只(TEST)",
+                {"universe_count": 51},
+                created_at_uk="2026-11-14 10:30",
+            )
+
+            cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
+            bot = AdvisorBot(
+                cfg=cfg,
+                t212=_FakeT212(_sample_portfolio()),
+                market_data=_FakeMarketData(),
+                llm=_RecordingLLM(),
+                db=db,
+                telegram=_RecordingTg(),
+            )
+            try:
+                stats_msg = await bot._build_stats_message()
+            finally:
+                await db.close()
+
+            self.assertIn("多窗口 Alpha 轨迹: T+5 平均 +3.10% | T+10 平均 +6.40% | T+20 平均 +10.20%", stats_msg)
+            self.assertIn("持仓期极值分布: 平均最大浮盈(MFE) +17.5% | 平均最大回撤(MAE) -3.2%", stats_msg)
+            self.assertIn("【周末候选池与阈值体检】", stats_msg)
+            self.assertIn("扫描池 51 只候选", stats_msg)
 
 
 if __name__ == "__main__":

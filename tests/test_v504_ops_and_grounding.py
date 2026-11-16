@@ -632,6 +632,42 @@ class TestImp11ToolsAndGrounding(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(k.startswith("pick:") for k in tools_mod._GROUNDING_CACHE))
         clear_grounding_cache()
 
+    async def test_imp21_grounding_priority_symbols_1to1_and_batch_split(self) -> None:
+        clear_grounding_cache()
+        prompts_seen: list[str] = []
+        active = 0
+        max_active = 0
+
+        class _PriorityLLM:
+            async def generate(self, **kwargs) -> str:
+                nonlocal active, max_active
+                active += 1
+                max_active = max(max_active, active)
+                prompts_seen.append(str(kwargs.get("prompt") or ""))
+                await asyncio.sleep(0.01)
+                active -= 1
+                return "ok"
+
+        out = await run_forced_market_grounding(
+            llm=_PriorityLLM(),
+            search_model="gemini-4-hydrogen",
+            scope="report",
+            symbols=["NVDA", "AAPL", "MSFT", "AMD", "AZN.L"],
+            priority_symbols=["NVDA", "AZN.L"],
+            ttl_seconds=60,
+        )
+        self.assertIn("【重点标的1对1深搜 · NVDA】", out)
+        self.assertIn("【重点标的1对1深搜 · AZN.L】", out)
+        self.assertLessEqual(max_active, 3)
+
+        # Priority symbols must NOT appear in the grouped 3-symbol prompts
+        grouped_prompts = [p for p in prompts_seen if "1 对 1 深度检索" not in p and "过去 48 小时内影响英国" not in p]
+        self.assertEqual(len(grouped_prompts), 1)  # Only AAPL, MSFT, AMD remain -> 1 US batch
+        self.assertIn("AAPL, MSFT, AMD", grouped_prompts[0])
+        self.assertNotIn("NVDA", grouped_prompts[0])
+        self.assertNotIn("AZN.L", grouped_prompts[0])
+        clear_grounding_cache()
+
     async def test_imp11_inspect_ticker_cyq_weekly_exdiv_intel_lessons_and_budget(self) -> None:
         import json
         import numpy as np

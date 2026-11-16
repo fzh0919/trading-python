@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -1059,7 +1060,9 @@ def format_technical_line(
             parts.append(f"股息率 {bundle.dividend_yield_pct:.2f}%")
         if bundle.earnings_date:
             days_s = f"({bundle.days_to_earnings}天后)" if bundle.days_to_earnings is not None else ""
-            parts.append(f"财报 {bundle.earnings_date}{days_s}")
+            eps_val = getattr(bundle, "eps_estimate", None)
+            eps_s = f" EPS预期 {eps_val:.2f}" if eps_val is not None else ""
+            parts.append(f"财报 {bundle.earnings_date}{days_s}{eps_s}")
         ex_div_date = getattr(bundle, "ex_dividend_date", None)
         ex_days = getattr(bundle, "days_to_ex_dividend", None)
         if ex_days is None:
@@ -1207,9 +1210,140 @@ def infer_etf_index_family(
     return None
 
 
+def compute_portfolio_cvar_and_risk_attribution(
+    portfolio: PortfolioData,
+    histories: dict[str, pd.DataFrame],
+    lookback_days: int = 120,
+) -> dict[str, Any]:
+    """Compute PSD-shrunk portfolio annualized volatility, component risk contributions, and 95% historical 1d CVaR."""
+    held_values: dict[str, float] = {}
+    for pos in portfolio.all_positions():
+        sym = (pos.yahoo_symbol or "").strip()
+        if sym and pos.current_value > 0.0:
+            held_values[sym] = held_values.get(sym, 0.0) + float(pos.current_value)
+
+    if not held_values or not histories:
+        return {}
+
+    close_series: dict[str, pd.Series] = {}
+    vol_1d: dict[str, float] = {}
+    extract_days = max(int(lookback_days), 60) + 10
+    for sym in held_values:
+        cs = _extract_close_series(histories.get(sym), extract_days)
+        if cs is None:
+            continue
+        # Clean 1-day log-return volatility WITHOUT cross-holiday ffill distortion
+        r1 = np.log(cs / cs.shift(1)).tail(lookback_days).dropna()
+        if len(r1) < 15:
+            continue
+        std_1d = float(np.std(r1.to_numpy(dtype=np.float64), ddof=1))
+        if std_1d > 0.0:
+            close_series[sym] = cs
+            vol_1d[sym] = std_1d
+
+    valid_syms = [s for s in held_values if s in close_series]
+    if not valid_syms:
+        return {}
+
+    raw_w = np.array([held_values[s] for s in valid_syms], dtype=np.float64)
+    w_sum = float(np.sum(raw_w))
+    if w_sum <= 0.0:
+        return {}
+    w = raw_w / w_sum
+
+    raw_total = portfolio.total_combined_value or (
+        portfolio.isa.total_account_value + portfolio.invest.total_account_value
+    )
+    total_all = max(float(raw_total or 0.0), w_sum)
+
+    px_df = pd.DataFrame({s: close_series[s] for s in valid_syms}).sort_index().ffill(limit=1)
+
+    if len(valid_syms) == 1:
+        sym0 = valid_syms[0]
+        port_vol_pct = float(vol_1d[sym0] * np.sqrt(252.0) * 100.0)
+        contributions = [
+            {
+                "symbol": sym0,
+                "risk_pct": 100.0,
+                "weight_pct": round((held_values[sym0] / total_all) * 100.0, 1),
+                "invested_weight_pct": 100.0,
+            }
+        ]
+    else:
+        log3 = np.log(px_df / px_df.shift(3)).tail(lookback_days).dropna()
+        n_dim = len(valid_syms)
+        if len(log3) >= 20:
+            arr3 = log3.to_numpy(dtype=np.float64)
+            stds3 = np.std(arr3, axis=0, ddof=1)
+            if np.any(stds3 <= 0.0):
+                corr3 = np.eye(n_dim, dtype=np.float64)
+            else:
+                corr3 = np.corrcoef(arr3, rowvar=False)
+                if corr3.ndim == 0:
+                    corr3 = np.eye(n_dim, dtype=np.float64)
+                else:
+                    corr3 = np.nan_to_num(corr3, nan=0.0)
+                    np.fill_diagonal(corr3, 1.0)
+        else:
+            corr3 = np.eye(n_dim, dtype=np.float64)
+
+        shrinkage = 0.20
+        corr_shrunk = (1.0 - shrinkage) * corr3 + shrinkage * np.eye(n_dim, dtype=np.float64)
+        d_vec = np.array([vol_1d[s] for s in valid_syms], dtype=np.float64)
+        cov_1d = np.outer(d_vec, d_vec) * corr_shrunk
+
+        port_var = float(w @ cov_1d @ w)
+        if port_var <= 0.0:
+            return {}
+        port_vol_pct = float(np.sqrt(port_var * 252.0) * 100.0)
+        mrc_var = cov_1d @ w
+        rc_pct_arr = (w * mrc_var) / port_var * 100.0
+
+        contributions = []
+        for idx, sym in enumerate(valid_syms):
+            contributions.append(
+                {
+                    "symbol": sym,
+                    "risk_pct": round(float(rc_pct_arr[idx]), 1),
+                    "weight_pct": round((held_values[sym] / total_all) * 100.0, 1),
+                    "invested_weight_pct": round(float(w[idx] * 100.0), 1),
+                }
+            )
+        contributions.sort(key=lambda item: item["risk_pct"], reverse=True)
+
+    # Historical 95% 1-day CVaR using aligned daily simple returns (excluding common no-move days)
+    ret1_raw = px_df.pct_change(fill_method=None).tail(lookback_days).dropna(how="all")
+    ret1_clean = ret1_raw.fillna(0.0)
+    active_mask = (ret1_clean.abs().sum(axis=1) > 1e-12)
+    ret1_clean = ret1_clean.loc[active_mask]
+
+    cvar_95_pct: float | None = None
+    cvar_95_gbp: float | None = None
+    if len(ret1_clean) >= 20:
+        port_rets = ret1_clean[valid_syms].to_numpy(dtype=np.float64) @ w
+        q05 = float(np.quantile(port_rets, 0.05))
+        tail = port_rets[port_rets <= q05]
+        if len(tail) == 0:
+            k = max(1, int(np.ceil(len(port_rets) * 0.05)))
+            tail = np.sort(port_rets)[:k]
+        cvar_val = float(np.mean(tail))
+        cvar_95_pct = round(cvar_val * 100.0, 2)
+        cvar_95_gbp = round(max(0.0, -cvar_val) * w_sum, 2)
+
+    return {
+        "portfolio_vol_pct": round(port_vol_pct, 2),
+        "cvar_95_pct": cvar_95_pct,
+        "cvar_95_gbp": cvar_95_gbp,
+        "modeled_value_gbp": round(w_sum, 2),
+        "risk_contributions": contributions,
+        "top_risk_sources": contributions[:3],
+    }
+
+
 def compute_exposure_summary(
     portfolio: PortfolioData,
     bundles: dict[str, TickerMarketBundle],
+    histories: dict[str, pd.DataFrame] | None = None,
 ) -> str:
     """Deterministically compute cross-account duplicate issuers, clone ETF underlying index overlap, and sector weights."""
     by_issuer: dict[str, dict[str, float]] = {}
@@ -1285,4 +1419,17 @@ def compute_exposure_summary(
         lines.append("• 跨账户同名重叠: 无")
     if clone_etf_lines:
         lines.extend(clone_etf_lines)
+    if histories:
+        risk_info = compute_portfolio_cvar_and_risk_attribution(portfolio, histories)
+        top_sources = risk_info.get("top_risk_sources") or []
+        if top_sources:
+            top_str = " | ".join(
+                f"{item['symbol']} 占总风险 {item['risk_pct']:.0f}% (市值占 {item['weight_pct']:.0f}%)"
+                for item in top_sources
+            )
+            lines.append(f"• 组合真实风险归因(前3波动源): {top_str}")
+        cvar_pct = risk_info.get("cvar_95_pct")
+        cvar_gbp = risk_info.get("cvar_95_gbp")
+        if cvar_pct is not None and cvar_gbp is not None:
+            lines.append(f"• 尾部压力测试(95%单日CVaR): 极端日均潜在回撤 {cvar_pct:+.2f}% (约 £{cvar_gbp:,.0f})")
     return "\n".join(lines)

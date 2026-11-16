@@ -1,4 +1,4 @@
-# Trading 212 × Gemini AI 私人量化投顾 (v5.1.2)
+# Trading 212 × Gemini AI 私人量化投顾 (v5.2.0)
 
 面向英国个人投资者（Trading 212 **Stocks ISA** 免税长线账户 + **Invest** 应税短线账户，每账户约 10 只持仓，双账户均**仅保留 `GBP` 英镑现金**、不使用 Pie、不开启分红自动再投资）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling 常驻、零公网端口暴露、Docker 容器化部署）。
 
@@ -8,8 +8,8 @@
 
 ### 解决的核心痛点
 1. **英镑现金结算 + 标的本地货币报价的摩擦核算**：人在英国（基准时区 `Europe/London`），双账户现金与钱包结算（`walletImpact`）统一为 `GBP` 英镑，而横跨英股（`GBp` 便士 / `GBP` 英镑）、美股（`USD`）与欧股（`EUR`）的个股/ETF 行情、均价与挂单触发价均按**标的所属市场的本地货币**报价；闲置英镑现金享 ~4.0% 年化无风险利息，英国个股买入收 `0.50%` 印花税（LSE ETF 免税），非英镑标的每次买卖固定发生 `0.15%` 即时换汇磨损（往返 `0.30%`）。所有操作建议必须扣费后跑赢 4% 现金锚。
-2. **N95 本地 0-Token 量化重算与后置确定性护栏**：仓位权重、本币/汇率盈亏拆解、近 30 日出入金/派息流水归因、MA/Wilder RSI14/ATR14/ADX14/周线多空共振、CYQ 筹码分布（ETF 采用 60d VPVR）、基于建仓日（`Position.createdAt`）的波段高点移动止盈、除息窗口防假破位守卫、分市场去大盘 Beta 残差相关性、四维双轨非对称选股漏斗（Minervini Stage 2 / VCP / 3 日跨时区对数收益收缩协方差）、本地 0-Token 多空冲突矩阵（`Disagreement Matrix`）及后置风控护栏（`RiskOverride` 强制降级高亮 `[🛡️风控护栏修正]`）全部由本地 Python 确定性实算后再喂给 Gemini；对用户已有活动挂单执行零情面独立审计（`KEEP` / `MODIFY` / `CANCEL`）。
-3. **以 `/report` 为绝对基石的全天风控对齐与跨指令快照复用**：每日 `07:30 UK` 的 `/report` 全景晨报是全系统的唯一事实底座，其生成的今日风控红线（`daily_guardrails`）、全文基线与预计算 `AnalysisContextPack` 快照落库 SQLite，供同周期 `/us` 盘前异动门控哨兵、`/pick` 选股雷达与日常单聊（0-Token 提问标的局部切片 + Gemini Implicit Cache 静态前缀对齐）零重复计算复用；盘后自动执行 `T+5` 真实 Alpha 结算与微反思记忆闭环。
+2. **N95 本地 0-Token 量化重算与后置确定性护栏**：仓位权重、本币/汇率盈亏拆解、近 30 日出入金/派息流水与 T212 长期分红归档（含息总回报）、`2y` SQLite 日线增量缓存（含拆股重拉保护）、MA/Wilder RSI14/ATR14/ADX14/周线多空共振、CYQ 筹码分布（ETF 采用 60d VPVR）、基于建仓日（`Position.createdAt`）的波段高点移动止盈、除息窗口防假破位守卫、分市场去大盘 Beta 残差相关性、PSD 收缩协方差前 3 波动风险贡献源与 95% 单日历史 CVaR 尾部压力测试、活动挂单币种对齐偏离/ATR 倍数/20 日经验触价率精算、Finnhub 美股深度情报（评级/EPS 惊喜/高管 MSPR）与 FRED 20d 利率动量/高收益债利差、四维双轨非对称选股漏斗（Minervini Stage 2 / VCP / 3 日跨时区对数收益收缩协方差）、本地 0-Token 多空冲突矩阵（`Disagreement Matrix`）及后置风控护栏（`RiskOverride` 强制降级高亮 `[🛡️风控护栏修正]`）全部由本地 Python 确定性实算后再喂给 Gemini；对用户已有活动挂单执行零情面独立审计（`KEEP` / `MODIFY` / `CANCEL`）。
+3. **以 `/report` 为绝对基石的全天风控对齐与跨指令快照复用**：每日 `07:30 UK` 的 `/report` 全景晨报（含重点异动/临近财报持仓 1 对 1 独立 Google Search）是全系统的唯一事实底座，其生成的今日风控红线（`daily_guardrails`）、全文基线与预计算 `AnalysisContextPack` 快照落库 SQLite，供同周期 `/us` 盘前异动门控哨兵（含 `yfinance 15m prepost` 真实盘前跳空检测）、`/pick` 选股雷达与日常单聊（0-Token 提问标的局部切片 + Gemini Implicit Cache 静态前缀对齐）零重复计算复用；定时任务前 `-10m` 自动静默预热缓存并每日同步 1 次 T212 元数据与分红归档，盘后自动执行 `T+5`/`T+10`/`T+20` 真实 Alpha 结算、`MFE/MAE` 极值追踪与微反思记忆闭环，周六闲时自动执行 0-Token 选股池与阈值离线体检。
 
 ### 算力与硬件部署环境
 - **大模型与预算定位**：基于 Google AI Pro 订阅的 **Gemini API Paid Tier**（享有高并发配额、每月 5,000 次免费 Google Search Grounding 及 API 数据不用于模型训练的隐私保护）。理想月度消耗控制在 **\$10 USD 赠金以内（完美状态）**，月度上限 **\$20 USD**——在**绝对不缩减 `/report` 规模与深度**的前提下，通过优化日常单聊与消除重复工具调用控制成本。
@@ -24,7 +24,7 @@
 - **`docs/finnhub_API_manual.json`**：Finnhub API 官方 OpenAPI 规范文档（美股实时报价、财报日历、公司新闻与深度评级）。
 - **`_ref/`（本地隔离参考区，不进 Git / Docker）**：早期 GAS 脚本与 7 套参考开源项目（`REF_stock-master`、`REF_stock-screener-main`、`REF_PyPortfolioOpt-main`、`REF_Riskfolio-Lib-master`、`REF_skfolio-main`、`REF_TradingAgents-main`、`REF_daily_stock_analysis-main`）。
 
-> **开发者与 AI 交接手册**：模块拆解、数据库/模型契约、`IMP-01 ~ IMP-19` 拓扑验收记录见 [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)，详细版本与模块修改流水见 [CHANGELOG.md](CHANGELOG.md)。
+> **开发者与 AI 交接手册**：模块拆解、数据库/模型契约、`IMP-01 ~ IMP-22` 拓扑验收记录见 [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)，详细版本与模块修改流水见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -51,7 +51,7 @@ uv python install 3.12.13
 uv venv --python 3.12.13
 uv pip install -r requirements.txt
 
-# 日常编译、全套纯离线单测（87 tests）与 Git 同步
+# 日常编译、全套纯离线单测（103 tests）与 Git 同步
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m tests.run_tests tests
 git add -A && git commit -m "<msg>" && git push
@@ -97,17 +97,19 @@ docker compose exec advisor python -c "from src.config import load_config; from 
 ## 3. Telegram 指令与自动日程
 
 **自动推送日程（锁死伦敦时间 `Europe/London`，自动适配英美冬夏令时错位周、半日市与法定假日）：**
+- **任务前 `-10m` 静默预热（早报 / 美股盘前 / 周五雷达前，不发消息）**：错峰预热持仓与候选池 `2y` 日线增量缓存及宏观快照，并每日同步 1 次 T212 `instruments` 元数据与累计分红归档。
 - **工作日 `07:30 UK`（支持 `07:30~09:30 UK` 断网/重启自动补发）**：自动推送 `/report` 全景晨报，并切换新一天的交易周期与风控红线。
-- **美股开盘前 15 分钟（常规 `14:15 UK` / 错位周 `13:15 UK`）**：自动推送 `/us` 盘前增量哨兵（美股法定休市日静音提醒；本地异动门控平稳日仅发极简平安报）。
+- **美股开盘前 15 分钟（常规 `14:15 UK` / 错位周 `13:15 UK`）**：自动推送 `/us` 盘前增量哨兵（美股法定休市日静音提醒；结合 `yfinance 15m prepost` 捕捉真实盘前跳空，平稳日仅发极简平安报）。
 - **周五美股收盘后 30 分钟（常规 `21:30 UK` / 美股半日市自动提前至 `18:30 UK`）**：自动推送 `/pick` 周末选股雷达。
-- **工作日 `22:00~23:30 UK`（盘后静默任务）**：自动执行 `T+5`（按英/欧/美各市场交易日历与收盘判定）历史推荐真实收益/Alpha 结算、微反思记忆写回及 90 天旧库记录清理。
+- **工作日 `22:00~23:30 UK`（盘后静默任务）**：自动执行 `T+5`（按英/欧/美各市场交易日历与收盘判定）历史推荐真实收益/Alpha 结算、微反思记忆写回、0-Token `T+10`/`T+20` 延伸 Alpha 与 `MFE/MAE` 极值追评，及 90 天旧库记录清理。
+- **周六 `10:00~22:00 UK`（周末静默体检，不发消息）**：自动执行 0-Token 离线候选池与阈值体检（120d 滚动高相关重叠、`>=60d` Phase 4 僵尸股及突破样本止盈止损回测），结果汇总进 `/stats` 看板。
 
 **手动指令（左侧 `/` 菜单 + `/help`，自由单聊支持 `/deep` 开头升级深度推理）：**
 - `/pos` — 瞬时拉取双账户实时仓位、净值、挂单与近 7 天成交（0 Token 秒出）
 - `/report` — **核心全景晨报**（宏观 + 双账户 + 30日复盘 + 全市场分域 Google 联网扫描 + 逐仓/挂单审计 + 风控护栏，`<=1800` 字）
 - `/pick [方向]` — 四维量化初筛 + 联网催化扫描 + 投研员/风控官双审 + 后置硬拦截（`<=1000` 字）
 - `/us` — 美股盘前/盘中/收盘/休市自适应增量简报（平稳日 `<=450` 字 / 异动日 `<=600` 字）
-- `/stats` — 查看历史选股真实 `T+5` 胜率、超额 Alpha、近期复盘教训与待结算浮盈
+- `/stats` — 查看历史选股真实 `T+5`/`T+10`/`T+20` 胜率与超额 Alpha 轨迹、持仓期 `MFE`/`MAE` 极值分布、近期复盘教训、待结算浮盈与周末选股池离线体检
 - `/health` — 全链路实时体检（T212 降级/行情/Finnhub/FRED/Gemini/DB/未送达告警与 `ops-notify` 网关状态）
 - `/usage` — 查看 Token 消耗、缓存命中率、思考占比与本月 Google Search 免费额度进度
 - `/clear` / `/cancel` — 清空今日单聊记忆 / 立即中止正在运行的耗时分析

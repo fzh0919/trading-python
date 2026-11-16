@@ -441,6 +441,241 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertIn("this_month", usage)
             self.assertEqual(usage["this_month"]["search_queries"], 4)
 
+    async def test_imp20_ohlcv_cache_t212_instruments_and_dividend_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "imp20.db")
+            await db.init()
+            # Idempotent re-init preserves schema & data
+            await db.init()
+
+            now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+            fresh_ms = int(now.timestamp() * 1000)
+            stale_ms = int((now - timedelta(days=120)).timestamp() * 1000)
+
+            saved = await db.save_cached_ohlcv(
+                [
+                    {
+                        "symbol": "NVDA",
+                        "period": "2y",
+                        "last_bar_date": "2026-11-15",
+                        "last_close": 135.5,
+                        "updated_at_ms": fresh_ms,
+                        "payload_json": '{"index":["2026-11-15"],"columns":["Close"],"data":[[135.5]]}',
+                    },
+                    {
+                        "symbol": "OLD_SYM",
+                        "period": "2y",
+                        "last_bar_date": "2026-07-01",
+                        "last_close": 50.0,
+                        "updated_at_ms": stale_ms,
+                        "payload_json": '{"index":["2026-07-01"],"columns":["Close"],"data":[[50.0]]}',
+                    },
+                    # Invalid/empty entries must be rejected
+                    {
+                        "symbol": "EMPTY_JSON",
+                        "period": "2y",
+                        "last_bar_date": "2026-11-15",
+                        "last_close": 10.0,
+                        "payload_json": "{}",
+                    },
+                    {
+                        "symbol": "ZERO_CLOSE",
+                        "period": "2y",
+                        "last_bar_date": "2026-11-15",
+                        "last_close": 0.0,
+                        "payload_json": '{"index":["2026-11-15"],"columns":["Close"],"data":[[0.0]]}',
+                    },
+                ]
+            )
+            self.assertEqual(saved, 2)
+
+            cached = await db.get_cached_ohlcv(["NVDA", "MISSING"], period="2y")
+            self.assertEqual(list(cached.keys()), ["NVDA"])
+            self.assertAlmostEqual(cached["NVDA"]["last_close"], 135.5)
+
+            upserted_inst = await db.upsert_t212_instruments(
+                [
+                    {
+                        "ticker": "NVDA_US_EQ",
+                        "yahoo_symbol": "NVDA",
+                        "isin": "US67066G1040",
+                        "currencyCode": "USD",
+                        "shortName": "NVDA",
+                        "type": "STOCK",
+                        "extendedHours": True,
+                        "workingScheduleId": 77,
+                        "updated_at_ms": stale_ms,
+                    },
+                    {
+                        "ticker": "VUAGl_EQ",
+                        "yahoo_symbol": "VUAG.L",
+                        "isin": "IE00BFMXXD54",
+                        "currencyCode": "GBP",
+                        "shortName": "VUAG",
+                        "type": "ETF",
+                        "extendedHours": False,
+                        "workingScheduleId": 12,
+                        "updated_at_ms": stale_ms,
+                    },
+                ]
+            )
+            self.assertEqual(upserted_inst, 2)
+            inst_map = await db.get_t212_instrument_map()
+            self.assertTrue(inst_map["NVDA_US_EQ"]["extended_hours"])
+            self.assertEqual(inst_map["NVDA_US_EQ"]["working_schedule_id"], 77)
+            self.assertEqual(inst_map["VUAGl_EQ"]["yahoo_symbol"], "VUAG.L")
+
+            upserted_divs = await db.upsert_dividends(
+                [
+                    {
+                        "id": "div-1",
+                        "account": "ISA",
+                        "ticker": "VUSA",
+                        "yahoo_symbol": "VUSA.L",
+                        "amount_gbp": 12.5,
+                        "gross_per_share": 0.25,
+                        "paid_on": "2026-06-01T10:00:00Z",
+                        "paid_on_ms": stale_ms,
+                    },
+                    {
+                        "id": "div-2",
+                        "account": "ISA",
+                        "ticker": "VUSA",
+                        "yahoo_symbol": "VUSA.L",
+                        "amount": 17.5,
+                        "gross_per_share": 0.35,
+                        "paid_on": "2026-09-01T10:00:00Z",
+                        "paid_on_ms": fresh_ms,
+                    },
+                    {
+                        "id": "div-2",  # duplicate primary key updates cleanly without double counting
+                        "account": "ISA",
+                        "ticker": "VUSA",
+                        "yahoo_symbol": "VUSA.L",
+                        "amount": 17.5,
+                        "gross_per_share": 0.35,
+                        "paid_on": "2026-09-01T10:00:00Z",
+                        "paid_on_ms": fresh_ms,
+                    },
+                    {
+                        "id": "div-3",
+                        "account": "Invest",
+                        "ticker": "AAPL",
+                        "yahoo_symbol": "AAPL",
+                        "amount_gbp": 5.25,
+                        "paid_on": "2026-10-01T10:00:00Z",
+                        "paid_on_ms": fresh_ms,
+                    },
+                ]
+            )
+            self.assertEqual(upserted_divs, 4)
+            cum_divs = await db.get_cumulative_dividends_by_symbol()
+            self.assertAlmostEqual(cum_divs[("ISA", "VUSA.L")], 30.0)
+            self.assertAlmostEqual(cum_divs[("Invest", "AAPL")], 5.25)
+
+            # prune_old_records removes expired ohlcv_cache ONLY, keeping long-term T212 archive tables
+            pruned = await db.prune_old_records(retention_days=90, now_utc=now)
+            self.assertEqual(pruned["ohlcv_cache"], 1)
+            self.assertEqual(list((await db.get_cached_ohlcv(["NVDA", "OLD_SYM"], period="2y")).keys()), ["NVDA"])
+            self.assertEqual(len(await db.get_t212_instrument_map()), 2)
+            self.assertAlmostEqual((await db.get_cumulative_dividends_by_symbol())[("ISA", "VUSA.L")], 30.0)
+
+    async def test_imp22_followup_columns_quant_audits_and_stats(self) -> None:
+        import aiosqlite
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "legacy_imp22.db"
+            # Seed a pre-IMP-22 pick_recommendations table lacking the 6 follow-up columns
+            async with aiosqlite.connect(db_path) as raw:
+                await raw.execute(
+                    """
+                    CREATE TABLE pick_recommendations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at_uk TEXT NOT NULL,
+                        created_at_ms INTEGER NOT NULL,
+                        account TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        entry_price REAL,
+                        thesis TEXT DEFAULT '',
+                        horizon_days INTEGER DEFAULT 5,
+                        benchmark_symbol TEXT DEFAULT '',
+                        settled_at_uk TEXT DEFAULT '',
+                        raw_return_pct REAL,
+                        alpha_pct REAL,
+                        outcome_status TEXT DEFAULT 'PENDING',
+                        reflection_lesson TEXT DEFAULT ''
+                    )
+                    """
+                )
+                await raw.execute(
+                    """
+                    INSERT INTO pick_recommendations (
+                        created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis,
+                        horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, outcome_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("2026-10-01 21:30", 1790886600000, "Invest", "NVDA", "BUY", 100.0, "Legacy settled", 5, "SPY", "2026-10-08 22:00", 5.0, 3.0, "SETTLED"),
+                )
+                await raw.commit()
+
+            db = AdvisorDatabase(db_path)
+            await db.init()
+
+            # Verify _ensure_columns added the 6 new columns idempotently and followup query finds it
+            followups = await db.get_settled_recommendations_for_followup(limit=10)
+            self.assertEqual(len(followups), 1)
+            rec_id = followups[0]["id"]
+            self.assertIsNone(followups[0]["t10_alpha_pct"])
+            self.assertIsNone(followups[0]["t20_alpha_pct"])
+
+            # Partial update T+10 + MFE/MAE must NOT overwrite T+20 or drop existing fields
+            ok1 = await db.update_recommendation_followup(
+                rec_id,
+                t10_return_pct=8.5,
+                t10_alpha_pct=6.0,
+                mfe_pct=11.2,
+                mae_pct=-2.4,
+            )
+            self.assertTrue(ok1)
+            still_need_t20 = await db.get_settled_recommendations_for_followup(limit=10)
+            self.assertEqual(len(still_need_t20), 1)
+            self.assertAlmostEqual(still_need_t20[0]["t10_alpha_pct"], 6.0)
+            self.assertIsNone(still_need_t20[0]["t20_alpha_pct"])
+
+            # Partial update T+20 + expanded MFE/MAE keeps T+10 intact and removes from follow-up queue
+            ok2 = await db.update_recommendation_followup(
+                rec_id,
+                t20_return_pct=14.0,
+                t20_alpha_pct=10.5,
+                mfe_pct=16.8,
+                mae_pct=-2.4,
+            )
+            self.assertTrue(ok2)
+            self.assertEqual(await db.get_settled_recommendations_for_followup(limit=10), [])
+
+            stats = await db.get_recommendation_stats()
+            self.assertAlmostEqual(stats["avg_alpha_pct"], 3.0)
+            self.assertAlmostEqual(stats["avg_t10_alpha_pct"], 6.0)
+            self.assertAlmostEqual(stats["avg_t20_alpha_pct"], 10.5)
+            self.assertAlmostEqual(stats["avg_mfe_pct"], 16.8)
+            self.assertAlmostEqual(stats["avg_mae_pct"], -2.4)
+
+            # Verify quant_health_audits persistence & latest lookup
+            self.assertIsNone(await db.get_latest_quant_audit())
+            await db.save_quant_audit(
+                "2026-11-14",
+                "• 扫描池 51 只候选\n• 僵尸股: 无",
+                {"universe_count": 51, "overlap_candidates": [{"symbol": "AMD"}]},
+                created_at_uk="2026-11-14 10:30",
+            )
+            latest = await db.get_latest_quant_audit()
+            assert latest is not None
+            self.assertEqual(latest["audit_date"], "2026-11-14")
+            self.assertEqual(latest["created_at_uk"], "2026-11-14 10:30")
+            self.assertIn("51 只候选", latest["summary_text"])
+            self.assertEqual(latest["payload"]["overlap_candidates"][0]["symbol"], "AMD")
+
 
 if __name__ == "__main__":
     unittest.main()

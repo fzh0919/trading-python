@@ -11,16 +11,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+import numpy as np
+import pandas as pd
 
 from src.data_providers.market_data import TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    PendingOrderItem,
     PortfolioData,
     PositionItem,
     T212Client,
     build_trade_context,
     clean_t212_ticker,
     format_account_overview,
+    format_positions_text,
     to_yahoo_symbol,
 )
 from src.storage.db import AdvisorDatabase
@@ -758,6 +762,283 @@ class TestT212Client(unittest.IsolatedAsyncioTestCase):
         self.assertIn("挂单占用(未成交前仍计息): 500.00", reserved_overview)
         self.assertNotIn("资金流水与派息", empty_ctx["trade_summary_30d_text"])
         self.assertIn("活动挂单接口临时异常", empty_ctx["pending_orders_text"])
+
+    async def test_imp20_instruments_metadata_and_dividend_archive_total_return(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "t212_imp20.db")
+            await db.init()
+
+            # Pre-seed an older archived dividend payout (>30d ago, outside recent_dividends API window)
+            await db.upsert_dividends(
+                [
+                    {
+                        "id": "div-hist-1",
+                        "account": "ISA",
+                        "ticker": "VUAG",
+                        "yahoo_symbol": "VUAG.L",
+                        "amount_gbp": 20.0,
+                        "gross_per_share": 0.4,
+                        "paid_on": "2026-06-01T10:00:00Z",
+                        "paid_on_ms": 1780308000000,
+                    }
+                ]
+            )
+
+            recent_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat().replace("+00:00", "Z")
+            state = {"inst_calls": 0, "fail_positions": False}
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                path = request.url.path
+                auth = request.headers.get("Authorization", "")
+                is_invest = "aW52ZXN0" in auth
+
+                if path.endswith("/equity/metadata/instruments"):
+                    state["inst_calls"] += 1
+                    if state["inst_calls"] == 1:
+                        return httpx.Response(429, headers={"Retry-After": "0.01"}, json={"error": "rate limit"})
+                    return httpx.Response(
+                        200,
+                        headers={"x-ratelimit-remaining": "0"},
+                        json=[
+                            {
+                                "ticker": "NVDA_US_EQ",
+                                "isin": "US67066G1040",
+                                "currencyCode": "USD",
+                                "shortName": "NVDA",
+                                "type": "STOCK",
+                                "extendedHours": True,
+                                "workingScheduleId": 55,
+                            },
+                            {
+                                "ticker": "VUAGl_EQ",
+                                "isin": "IE00BFMXXD54",
+                                "currencyCode": "GBP",
+                                "shortName": "VUAG",
+                                "type": "ETF",
+                                "extendedHours": False,
+                                "workingScheduleId": 12,
+                            },
+                        ],
+                    )
+
+                if state["fail_positions"]:
+                    return httpx.Response(503, json={"error": "upstream unavailable"})
+
+                if is_invest:
+                    return httpx.Response(404)
+
+                if path.endswith("/equity/account/summary"):
+                    return httpx.Response(
+                        200,
+                        json={
+                            "currency": "GBP",
+                            "totalValue": 5500.0,
+                            "cash": {"availableToTrade": 1000.0, "reservedForOrders": 0.0, "inPies": 0.0},
+                            "investments": {
+                                "currentValue": 4500.0,
+                                "totalCost": 4000.0,
+                                "unrealizedProfitLoss": 500.0,
+                            },
+                        },
+                    )
+                if path.endswith("/equity/positions"):
+                    return httpx.Response(
+                        200,
+                        json=[
+                            {
+                                "instrument": {"ticker": "VUAGl_EQ", "name": "Vanguard S&P 500"},
+                                "quantity": 50,
+                                "averagePricePaid": 80.0,
+                                "currentPrice": 90.0,
+                                "walletImpact": {
+                                    "currency": "GBP",
+                                    "currentValue": 4500.0,
+                                    "totalCost": 4000.0,
+                                    "unrealizedProfitLoss": 500.0,
+                                    "fxImpact": 0.0,
+                                },
+                            }
+                        ],
+                    )
+                if path.endswith("/equity/history/dividends"):
+                    return httpx.Response(
+                        200,
+                        json={
+                            "items": [
+                                {
+                                    "ticker": "VUAGl_EQ",
+                                    "amount": 30.0,
+                                    "currency": "GBP",
+                                    "grossAmountPerShare": 0.6,
+                                    "quantity": 50,
+                                    "paidOn": recent_ts,
+                                    "reference": "div-recent-2",
+                                    "type": "ORDINARY",
+                                }
+                            ]
+                        },
+                    )
+                if path.endswith("/equity/orders") or path.endswith("/equity/history/orders") or path.endswith("/equity/history/transactions"):
+                    return httpx.Response(200, json=[] if path.endswith("/equity/orders") else {"items": []})
+                return httpx.Response(404)
+
+            client = T212Client(
+                isa_key="isa",
+                isa_secret="sec",
+                transport=httpx.MockTransport(handler),
+                transient_backoff_s=0.01,
+                db=db,
+            )
+            try:
+                items = await client.fetch_instruments_metadata()
+                self.assertEqual(len(items), 2)
+                self.assertEqual(state["inst_calls"], 2)
+                self.assertIn(("metadata_instruments", "/api/v0/equity/metadata/instruments"), client._rate_limit_resets)
+
+                inst_map = await db.get_t212_instrument_map()
+                self.assertEqual(inst_map["VUAGl_EQ"]["yahoo_symbol"], "VUAG.L")
+                self.assertTrue(inst_map["NVDA_US_EQ"]["extended_hours"])
+
+                portfolio = await client.get_portfolio(use_cache=False)
+                self.assertFalse(portfolio.is_fallback)
+                pos = portfolio.isa.positions[0]
+                self.assertEqual(pos.yahoo_symbol, "VUAG.L")
+                self.assertEqual(pos.isin, "IE00BFMXXD54")
+                self.assertAlmostEqual(pos.cumulative_dividends_gbp, 50.0)
+                self.assertAlmostEqual(pos.total_return_with_div_pct or 0.0, 13.75, places=2)
+
+                pos_text = format_positions_text(portfolio.isa)
+                self.assertIn("累计派息 +50.00 GBP (含息总回报 +13.75%)", pos_text)
+
+                # On 503 fallback, dividend archive must NOT be written
+                state["fail_positions"] = True
+                upsert_calls = {"count": 0}
+                orig_upsert = db.upsert_dividends
+
+                async def _spy_upsert(div_items):
+                    upsert_calls["count"] += 1
+                    return await orig_upsert(div_items)
+
+                db.upsert_dividends = _spy_upsert  # type: ignore[method-assign]
+                fb_portfolio = await client.get_portfolio(use_cache=False)
+                self.assertTrue(fb_portfolio.is_fallback)
+                self.assertEqual(upsert_calls["count"], 0)
+            finally:
+                await client.close()
+
+    def test_imp21_pending_order_atr_touch_prob_and_tags(self) -> None:
+        from src.data_providers.analytics import compute_technical_snapshot
+        from src.data_providers.market_data import TickerMarketBundle
+
+        dates = pd.date_range("2025-11-01", periods=252, freq="B")
+        # Controlled ~1% daily range oscillation around 100 -> ATR14 ~ 1.5
+        base = 100.0 + np.sin(np.arange(252) / 6.0) * 1.5
+        hist_us = pd.DataFrame(
+            {
+                "Open": base,
+                "High": base + 0.8,
+                "Low": base - 0.8,
+                "Close": base,
+                "Volume": np.full(252, 1_000_000.0),
+            },
+            index=dates,
+        )
+        # UK stock quoted in GBp (~500p), oscillating around 500p
+        base_uk = 500.0 + np.sin(np.arange(252) / 6.0) * 8.0
+        hist_uk = pd.DataFrame(
+            {
+                "Open": base_uk,
+                "High": base_uk + 4.0,
+                "Low": base_uk - 4.0,
+                "Close": base_uk,
+                "Volume": np.full(252, 500_000.0),
+            },
+            index=dates,
+        )
+        cur_us = float(hist_us["Close"].iloc[-1])
+        cur_uk = float(hist_uk["Close"].iloc[-1])
+        tech_us = compute_technical_snapshot("NVDA", hist_us)
+        tech_uk = compute_technical_snapshot("AZN.L", hist_uk)
+        assert tech_us is not None and tech_uk is not None
+
+        # Place UK buy limit right inside CYQ 90% cost band
+        uk_cyq_mid = round((float(tech_uk.cyq_cost_90_low or 495.0) + float(tech_uk.cyq_cost_90_high or 505.0)) / 2.0, 2)
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-16 10:00",
+            fetched_at_ms=1794823200000,
+            isa=AccountSnapshot(
+                ok=True,
+                pending_orders=[
+                    PendingOrderItem(
+                        id="ord-far",
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        side="BUY",
+                        order_type="LIMIT",
+                        quantity=2.0,
+                        value=160.0,
+                        limit_price=round(cur_us * 0.80, 2),  # -20% (>10 ATR, 0% touch prob)
+                        currency="USD",
+                        time_in_force="GTC",
+                    ),
+                    PendingOrderItem(
+                        id="ord-stop",
+                        account="ISA",
+                        raw_ticker="NVDA_US_EQ",
+                        ticker="NVDA",
+                        yahoo_symbol="NVDA",
+                        name="NVIDIA",
+                        side="SELL",
+                        order_type="STOP",
+                        quantity=2.0,
+                        value=200.0,
+                        stop_price=round(cur_us - 0.3, 2),  # < 0.8 * ATR
+                        currency="USD",
+                        time_in_force="GTC",
+                    ),
+                ],
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                pending_orders=[
+                    PendingOrderItem(
+                        id="ord-cyq",
+                        account="Invest",
+                        raw_ticker="AZNl_EQ",
+                        ticker="AZN",
+                        yahoo_symbol="AZN.L",
+                        name="AstraZeneca",
+                        side="BUY",
+                        order_type="LIMIT",
+                        quantity=10.0,
+                        value=50.0,
+                        limit_price=uk_cyq_mid,
+                        currency="GBP",  # T212 sometimes labels .L limit order currency as GBP while price is GBp
+                        time_in_force="GTC",
+                    ),
+                ],
+            ),
+        )
+        bundles = {
+            "NVDA": TickerMarketBundle(symbol="NVDA", currency="USD", current_price=cur_us),
+            "AZN.L": TickerMarketBundle(symbol="AZN.L", currency="GBp", current_price=cur_uk),
+        }
+        ctx = build_trade_context(
+            portfolio,
+            bundles=bundles,
+            tech_map={"NVDA": tech_us, "AZN.L": tech_uk},
+            histories={"NVDA": hist_us, "AZN.L": hist_uk},
+        )
+        p_txt = ctx["pending_orders_text"]
+        self.assertIn("距现价 -20.0%", p_txt)
+        self.assertIn("倍ATR", p_txt)
+        self.assertIn("20日触价率 0%", p_txt)
+        self.assertIn("[远端低概率单]", p_txt)
+        self.assertIn("[止损过窄易被日常波动扫出]", p_txt)
+        self.assertIn("[位于90%筹码支撑带]", p_txt)
 
 
 if __name__ == "__main__":

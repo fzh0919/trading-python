@@ -65,12 +65,14 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
         cache_ttl_seconds=cfg.app.cache_ttl_seconds,
         ops_notifier=ops,
         snapshot_loader=db.get_latest_snapshot,
+        db=db,
     )
     market_data = MarketDataService(
         finnhub_key=cfg.env.finnhub_api_key,
         fred_key=cfg.env.fred_api_key,
         ttl_seconds=cfg.app.market_data_ttl_seconds,
         ops_notifier=ops,
+        db=db,
     )
     llm = GeminiClient(
         cfg.env.gemini_api_key,

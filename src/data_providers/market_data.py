@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import math
 from pathlib import Path
+import re
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
@@ -182,6 +185,81 @@ def _sanitize_history_df(df: pd.DataFrame | None) -> pd.DataFrame:
     return clean
 
 
+def _sanitize_intraday_df(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize intraday (e.g. 15m prepost) OHLCV DataFrame while preserving exact timestamps."""
+    if df is None or df.empty or "Close" not in df.columns:
+        return pd.DataFrame()
+    clean = df.copy()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in clean.columns:
+            clean[col] = pd.to_numeric(clean[col], errors="coerce")
+    clean = clean.dropna(subset=["Close"])
+    clean = clean[clean["Close"] > 0]
+    if clean.empty:
+        return pd.DataFrame()
+    dt_idx = pd.to_datetime(clean.index, errors="coerce")
+    clean.index = dt_idx
+    clean = clean[clean.index.notna()]
+    if clean.empty:
+        return pd.DataFrame()
+    return clean[~clean.index.duplicated(keep="last")].sort_index()
+
+
+def _parse_eps_estimate(value: Any) -> float | None:
+    """Extract numeric EPS estimate from float/int or strings like 'EPS预期 1.25'."""
+    if value is None:
+        return None
+    direct = _safe_float(value)
+    if direct is not None:
+        return direct
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", str(value))
+    return _safe_float(m.group(0)) if m else None
+
+
+def _serialize_ohlcv_df(symbol: str, period: str, df: pd.DataFrame) -> dict[str, Any] | None:
+    """Serialize sanitized daily OHLCV DataFrame into SQLite ohlcv_cache payload."""
+    clean = _sanitize_history_df(df)
+    if clean.empty or "Close" not in clean.columns:
+        return None
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in clean.columns]
+    if "Close" not in cols:
+        return None
+    dates = [ts.strftime("%Y-%m-%d") for ts in pd.to_datetime(clean.index)]
+    last_close = float(clean["Close"].iloc[-1])
+    if not dates or not math.isfinite(last_close) or last_close <= 0:
+        return None
+    records = clean[cols].round(6).values.tolist()
+    return {
+        "symbol": symbol,
+        "period": period,
+        "last_bar_date": dates[-1],
+        "last_close": last_close,
+        "updated_at_ms": int(time.time() * 1000),
+        "payload_json": json.dumps({"index": dates, "columns": cols, "data": records}),
+    }
+
+
+def _deserialize_ohlcv_json(payload_json: str) -> pd.DataFrame:
+    """Deserialize persisted ohlcv_cache JSON string back to a sanitized DataFrame."""
+    if not payload_json:
+        return pd.DataFrame()
+    try:
+        obj = json.loads(payload_json)
+        if not isinstance(obj, dict):
+            return pd.DataFrame()
+        index = obj.get("index")
+        columns = obj.get("columns")
+        data = obj.get("data")
+        if not isinstance(index, list) or not isinstance(columns, list) or not isinstance(data, list):
+            return pd.DataFrame()
+        if not index or not data:
+            return pd.DataFrame()
+        df = pd.DataFrame(data=data, index=pd.to_datetime(index, errors="coerce"), columns=columns)
+        return _sanitize_history_df(df)
+    except Exception:
+        return pd.DataFrame()
+
+
 class TickerMarketBundle(BaseModel):
     symbol: str
     quote_type: str = ""
@@ -208,6 +286,7 @@ class TickerMarketBundle(BaseModel):
     recommendation_key: str = ""
     earnings_date: str | None = None
     days_to_earnings: int | None = None
+    eps_estimate: float | None = None
     ex_dividend_date: str | None = None
     days_to_ex_dividend: int | None = None
     news: list[dict[str, str]] = Field(default_factory=list)
@@ -248,9 +327,12 @@ class MacroSnapshot(BaseModel):
     gbp_usd: float | None = None
     eur_gbp: float | None = None
     us_10y_yield: float | None = None
+    us_10y_change_20d_bps: float | None = None
     us_2y_yield: float | None = None
     yield_spread_10y_2y: float | None = None
     breakeven_10y_pct: float | None = None
+    hy_oas_spread_pct: float | None = None
+    hy_oas_change_20d_bps: float | None = None
     fed_funds_rate: float | None = None
     ecb_deposit_rate: float | None = None
     vix: float | None = None
@@ -267,13 +349,25 @@ class MacroSnapshot(BaseModel):
         if self.eur_gbp is not None:
             parts.append(f"EUR/GBP: {self.eur_gbp:.4f}")
         if self.us_10y_yield is not None:
-            parts.append(f"美10Y国债: {self.us_10y_yield:.2f}%")
+            chg_s = (
+                f"(20d {self.us_10y_change_20d_bps:+.0f}bp)"
+                if self.us_10y_change_20d_bps is not None
+                else ""
+            )
+            parts.append(f"10Y美债 {self.us_10y_yield:.2f}%{chg_s}")
         if self.us_2y_yield is not None:
             parts.append(f"美2Y国债: {self.us_2y_yield:.2f}%")
         if self.yield_spread_10y_2y is not None:
             parts.append(f"10Y-2Y利差: {self.yield_spread_10y_2y:+.2f}%")
         if self.breakeven_10y_pct is not None:
             parts.append(f"美10Y通胀预期: {self.breakeven_10y_pct:.2f}%")
+        if self.hy_oas_spread_pct is not None:
+            oas_chg = (
+                f"(20d {self.hy_oas_change_20d_bps:+.0f}bp)"
+                if self.hy_oas_change_20d_bps is not None
+                else ""
+            )
+            parts.append(f"高收益债利差 {self.hy_oas_spread_pct:.2f}%{oas_chg}")
         if self.fed_funds_rate is not None:
             parts.append(f"Fed利率: {self.fed_funds_rate:.2f}%")
         if self.ecb_deposit_rate is not None:
@@ -586,11 +680,12 @@ class FredClient:
     def enabled(self) -> bool:
         return bool(self.api_key)
 
-    async def _fetch_latest_value(
-        self, client: httpx.AsyncClient, series_id: str
-    ) -> tuple[float | None, str | None]:
+    async def _fetch_series_stats(
+        self, client: httpx.AsyncClient, series_id: str, limit: int = 25
+    ) -> tuple[dict[str, float | None], str | None]:
+        """Fetch recent FRED observations and compute latest value plus 5d/20d changes."""
         if not self.enabled:
-            return None, None
+            return {}, None
         try:
             res = await client.get(
                 self.BASE_URL,
@@ -599,22 +694,39 @@ class FredClient:
                     "api_key": self.api_key,
                     "file_type": "json",
                     "sort_order": "desc",
-                    "limit": 5,
+                    "limit": max(5, int(limit)),
                 },
                 timeout=10.0,
             )
             if res.status_code != 200:
-                return None, f"FRED {series_id} HTTP {res.status_code}"
+                return {}, f"FRED {series_id} HTTP {res.status_code}"
             obs = (res.json() or {}).get("observations") or []
+            vals: list[float] = []
             for row in obs:
-                val = str(row.get("value") or ".")
-                if val != ".":
-                    return _safe_float(val), None
-            return None, None
+                raw_val = str(row.get("value") or ".")
+                if raw_val == ".":
+                    continue
+                parsed = _safe_float(raw_val)
+                if parsed is not None:
+                    vals.append(parsed)
+            if not vals:
+                return {}, None
+            latest = vals[0]
+            return {
+                "latest": latest,
+                "change_5d": (latest - vals[5]) if len(vals) >= 6 else None,
+                "change_20d": (latest - vals[20]) if len(vals) >= 21 else None,
+            }, None
         except Exception as exc:
             err = f"FRED {series_id} {type(exc).__name__}: {exc}"
             logger.debug("FRED error for %s: %s", series_id, exc)
-            return None, err
+            return {}, err
+
+    async def _fetch_latest_value(
+        self, client: httpx.AsyncClient, series_id: str
+    ) -> tuple[float | None, str | None]:
+        stats, err = await self._fetch_series_stats(client, series_id, limit=25)
+        return stats.get("latest"), err
 
     async def get_latest_value(self, client: httpx.AsyncClient, series_id: str) -> float | None:
         val, err = await self._fetch_latest_value(client, series_id)
@@ -634,6 +746,7 @@ class MarketDataService:
         ops_notifier: Any = None,
         max_cache_entries: int = 256,
         deep_intel_ttl_seconds: int = 21600,
+        db: Any = None,
     ) -> None:
         self.finnhub = FinnhubClient(finnhub_key)
         self.fred = FredClient(fred_key)
@@ -642,6 +755,7 @@ class MarketDataService:
         self.deep_intel_ttl_seconds = max(60, int(deep_intel_ttl_seconds))
         self._sem = asyncio.Semaphore(max_concurrency)
         self._ops = ops_notifier
+        self._db = db
 
         self._hist_cache: OrderedDict[tuple[str, str], tuple[float, pd.DataFrame]] = OrderedDict()
         self._bundle_cache: OrderedDict[str, tuple[float, TickerMarketBundle]] = OrderedDict()
@@ -658,6 +772,9 @@ class MarketDataService:
 
     def set_ops_notifier(self, ops_notifier: Any) -> None:
         self._ops = ops_notifier
+
+    def set_db(self, db: Any) -> None:
+        self._db = db
 
     async def _notify_ops(self, severity: str, alert_key: str, message: str) -> None:
         if self._ops is not None:
@@ -714,16 +831,21 @@ class MarketDataService:
             cache.popitem(last=False)
 
     def _get_cached_hist(self, symbol: str, period: str, now: float, *, allow_stale: bool = False) -> pd.DataFrame | None:
-        key = (symbol, period)
-        entry = self._hist_cache.get(key)
-        if entry is None:
-            return None
-        ts, df = entry
-        if df.empty:
-            return None
-        if allow_stale or (self.ttl_seconds > 0 and (now - ts) < self.ttl_seconds):
-            self._hist_cache.move_to_end(key)
-            return df
+        candidate_keys = [(symbol, period)]
+        if period == "1y":
+            candidate_keys.append((symbol, "2y"))
+        elif allow_stale and period == "2y":
+            candidate_keys.append((symbol, "1y"))
+        for key in candidate_keys:
+            entry = self._hist_cache.get(key)
+            if entry is None:
+                continue
+            ts, df = entry
+            if df.empty:
+                continue
+            if allow_stale or (self.ttl_seconds > 0 and (now - ts) < self.ttl_seconds):
+                self._hist_cache.move_to_end(key)
+                return df
         return None
 
     def _set_cached_hist(self, symbol: str, period: str, now: float, df: pd.DataFrame) -> None:
@@ -896,15 +1018,21 @@ class MarketDataService:
         return hist, bundle
 
     @staticmethod
-    def _extract_batch_frames(raw: pd.DataFrame | None, batch_syms: list[str]) -> dict[str, pd.DataFrame]:
+    def _extract_batch_frames(
+        raw: pd.DataFrame | None,
+        batch_syms: list[str],
+        *,
+        intraday: bool = False,
+    ) -> dict[str, pd.DataFrame]:
         """Split yf.download output (MultiIndex or single-symbol flat DataFrame) per ticker."""
         out: dict[str, pd.DataFrame] = {}
         if raw is None or raw.empty:
             return out
+        sanitizer = _sanitize_intraday_df if intraday else _sanitize_history_df
 
         if not isinstance(raw.columns, pd.MultiIndex):
             if len(batch_syms) == 1:
-                cleaned = _sanitize_history_df(raw)
+                cleaned = sanitizer(raw)
                 if not cleaned.empty:
                     out[batch_syms[0]] = cleaned
             return out
@@ -918,7 +1046,7 @@ class MarketDataService:
             elif sym in lvl1:
                 sub = raw.xs(sym, axis=1, level=1)
             if sub is not None and not sub.empty:
-                cleaned = _sanitize_history_df(sub)
+                cleaned = sanitizer(sub)
                 if not cleaned.empty:
                     out[sym] = cleaned
         return out
@@ -944,8 +1072,42 @@ class MarketDataService:
             logger.debug("yfinance batch download failed (%d syms): %s", len(batch_syms), exc)
             return {}
 
-    async def get_histories(self, symbols: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
-        """Batch-fetch daily OHLCV DataFrames without triggering .info calls, with caching & singleflight."""
+    async def _download_histories_raw(self, symbols: list[str], period: str) -> dict[str, pd.DataFrame]:
+        """Download daily OHLCV for symbols in chunks of 30 with single-ticker fallback."""
+        batch_map: dict[str, pd.DataFrame] = {}
+        chunk_size = 30
+        for idx in range(0, len(symbols), chunk_size):
+            chunk = symbols[idx : idx + chunk_size]
+            async with self._sem:
+                chunk_res = await asyncio.to_thread(self._download_batch_sync, chunk, period)
+            batch_map.update(chunk_res)
+
+        missing = [s for s in symbols if s not in batch_map or batch_map[s].empty]
+        if missing:
+            async def _fallback_one(sym: str) -> tuple[str, pd.DataFrame]:
+                try:
+                    async with self._sem:
+                        df, _ = await asyncio.to_thread(
+                            self._fetch_yf_sync,
+                            sym,
+                            period,
+                            False,
+                            False,
+                            False,
+                        )
+                    return sym, df
+                except Exception as exc:
+                    logger.debug("Fallback history fetch failed for %s: %s", sym, exc)
+                    return sym, pd.DataFrame()
+
+            fb_pairs = await asyncio.gather(*(_fallback_one(s) for s in missing))
+            for sym, df in fb_pairs:
+                if not df.empty:
+                    batch_map[sym] = df
+        return batch_map
+
+    async def get_histories(self, symbols: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
+        """Batch-fetch daily OHLCV DataFrames with SQLite incremental merge, split detection & singleflight."""
         now = time.monotonic()
         unique_syms = list(dict.fromkeys(s.strip() for s in symbols if s and s.strip()))
         results: dict[str, pd.DataFrame] = {}
@@ -971,41 +1133,105 @@ class MarketDataService:
         if to_fetch:
             try:
                 batch_map: dict[str, pd.DataFrame] = {}
-                chunk_size = 30
-                for idx in range(0, len(to_fetch), chunk_size):
-                    chunk = to_fetch[idx : idx + chunk_size]
-                    async with self._sem:
-                        chunk_res = await asyncio.to_thread(self._download_batch_sync, chunk, period)
-                    batch_map.update(chunk_res)
+                local_df_map: dict[str, pd.DataFrame] = {}
+                db_period_map: dict[str, str] = {}
+                inc_fetch_syms: list[str] = []
+                full_fetch_syms: list[str] = []
+                to_persist: dict[str, tuple[str, pd.DataFrame]] = {}
 
-                missing = [s for s in to_fetch if s not in batch_map or batch_map[s].empty]
-                if missing:
-                    async def _fallback_one(sym: str) -> tuple[str, pd.DataFrame]:
-                        try:
-                            async with self._sem:
-                                df, _ = await asyncio.to_thread(
-                                    self._fetch_yf_sync,
-                                    sym,
-                                    period,
-                                    False,
-                                    False,
-                                    False,
-                                )
-                            return sym, df
-                        except Exception as exc:
-                            logger.debug("Fallback history fetch failed for %s: %s", sym, exc)
-                            return sym, pd.DataFrame()
+                if self._db is not None and hasattr(self._db, "get_cached_ohlcv") and period in ("1y", "2y"):
+                    db_cache: dict[str, dict[str, Any]] = {}
+                    try:
+                        db_cache = await self._db.get_cached_ohlcv(to_fetch, period=period)
+                        if period == "1y":
+                            miss_db = [s for s in to_fetch if s not in db_cache]
+                            if miss_db:
+                                db_cache.update(await self._db.get_cached_ohlcv(miss_db, period="2y"))
+                    except Exception as exc:
+                        logger.debug("SQLite ohlcv_cache lookup failed: %s", exc)
+                        db_cache = {}
 
-                    fb_pairs = await asyncio.gather(*(_fallback_one(s) for s in missing))
-                    for sym, df in fb_pairs:
+                    today_utc = datetime.now(timezone.utc).date()
+                    for sym in to_fetch:
+                        row = db_cache.get(sym)
+                        if row:
+                            local_df = _deserialize_ohlcv_json(str(row.get("payload_json") or ""))
+                            if not local_df.empty:
+                                local_df_map[sym] = local_df
+                                db_period_map[sym] = str(row.get("period") or period)
+                                last_bar_date = pd.Timestamp(local_df.index[-1]).date()
+                                if (today_utc - last_bar_date).days <= 5:
+                                    inc_fetch_syms.append(sym)
+                                    continue
+                        full_fetch_syms.append(sym)
+                else:
+                    full_fetch_syms = list(to_fetch)
+
+                if inc_fetch_syms:
+                    inc_map = await self._download_histories_raw(inc_fetch_syms, "1mo")
+                    for sym in inc_fetch_syms:
+                        local_df = local_df_map[sym]
+                        inc_df = inc_map.get(sym, pd.DataFrame())
+                        if inc_df.empty:
+                            batch_map[sym] = local_df
+                            continue
+                        overlap_idx = local_df.index.intersection(inc_df.index)
+                        if len(overlap_idx) == 0:
+                            full_fetch_syms.append(sym)
+                            continue
+                        max_rel_diff = 0.0
+                        for ts in overlap_idx:
+                            c_old = float(local_df.loc[ts, "Close"])
+                            c_new = float(inc_df.loc[ts, "Close"])
+                            if c_old > 0:
+                                rel_diff = abs(c_new - c_old) / c_old
+                                if rel_diff > max_rel_diff:
+                                    max_rel_diff = rel_diff
+                        if max_rel_diff <= 0.005:
+                            merged_df = _sanitize_history_df(pd.concat([local_df, inc_df]))
+                            if not merged_df.empty:
+                                batch_map[sym] = merged_df
+                                to_persist[sym] = (db_period_map.get(sym, period), merged_df)
+                            else:
+                                full_fetch_syms.append(sym)
+                        else:
+                            logger.info(
+                                "Split/corporate adjustment detected for %s (overlap diff=%.2f%% > 0.5%%); refetching full %s.",
+                                sym,
+                                max_rel_diff * 100.0,
+                                period,
+                            )
+                            full_fetch_syms.append(sym)
+
+                full_fetch_syms = list(dict.fromkeys(full_fetch_syms))
+                if full_fetch_syms:
+                    full_map = await self._download_histories_raw(full_fetch_syms, period)
+                    for sym in full_fetch_syms:
+                        df = full_map.get(sym, pd.DataFrame())
                         if not df.empty:
                             batch_map[sym] = df
+                            to_persist[sym] = (period, df)
+                        elif sym in local_df_map and not local_df_map[sym].empty:
+                            batch_map[sym] = local_df_map[sym]
+
+                if to_persist and self._db is not None and hasattr(self._db, "save_cached_ohlcv") and period in ("1y", "2y"):
+                    entries = [
+                        ent
+                        for sym, (save_p, df) in to_persist.items()
+                        if (ent := _serialize_ohlcv_df(sym, save_p, df)) is not None
+                    ]
+                    if entries:
+                        try:
+                            await self._db.save_cached_ohlcv(entries)
+                        except Exception as exc:
+                            logger.warning("Failed persisting ohlcv_cache entries: %s", exc)
 
                 fetch_now = time.monotonic()
                 for sym in to_fetch:
                     df = batch_map.get(sym, pd.DataFrame())
                     if not df.empty:
-                        self._set_cached_hist(sym, period, fetch_now, df)
+                        if sym in to_persist or self._db is None:
+                            self._set_cached_hist(sym, period, fetch_now, df)
                         results[sym] = df
                     else:
                         stale = self._get_cached_hist(sym, period, fetch_now, allow_stale=True)
@@ -1033,7 +1259,7 @@ class MarketDataService:
 
         return results
 
-    async def get_history(self, symbol: str, period: str = "1y") -> pd.DataFrame:
+    async def get_history(self, symbol: str, period: str = "2y") -> pd.DataFrame:
         clean_sym = symbol.strip()
         if not clean_sym:
             return pd.DataFrame()
@@ -1055,7 +1281,7 @@ class MarketDataService:
         failed_syms: list[str] = []
 
         if not include_info and not include_news and not include_earnings:
-            histories = await self.get_histories(unique_syms, period="1y")
+            histories = await self.get_histories(unique_syms, period="2y")
             for sym in unique_syms:
                 df = histories.get(sym, pd.DataFrame())
                 b = TickerMarketBundle(
@@ -1071,10 +1297,20 @@ class MarketDataService:
             await self._emit_batch_failure_ops(unique_syms, failed_syms)
             return histories, bundles
 
+        if self._db is not None and unique_syms:
+            missing_h_syms = [
+                s
+                for s in unique_syms
+                if self._get_cached_hist(s, "2y", now) is None and self._get_cached_hist(s, "1y", now) is None
+            ]
+            if missing_h_syms:
+                await self.get_histories(missing_h_syms, period="2y")
+                now = time.monotonic()
+
         loop = asyncio.get_running_loop()
 
         async def _load_one(sym: str) -> None:
-            h_cached = self._get_cached_hist(sym, "1y", now)
+            h_cached = self._get_cached_hist(sym, "2y", now) or self._get_cached_hist(sym, "1y", now)
             b_cached = self._get_cached_bundle(sym, now, require_info=include_info)
             if h_cached is not None and b_cached is not None:
                 histories[sym] = h_cached
@@ -1101,7 +1337,7 @@ class MarketDataService:
                     hist, bundle = await asyncio.to_thread(
                         self._fetch_yf_sync,
                         sym,
-                        "1y",
+                        "2y",
                         include_info,
                         include_news,
                         include_earnings,
@@ -1109,9 +1345,9 @@ class MarketDataService:
                     )
                 fetch_now = time.monotonic()
                 if not hist.empty:
-                    self._set_cached_hist(sym, "1y", fetch_now, hist)
+                    self._set_cached_hist(sym, "2y", fetch_now, hist)
                 else:
-                    stale_h = self._get_cached_hist(sym, "1y", fetch_now, allow_stale=True)
+                    stale_h = self._get_cached_hist(sym, "2y", fetch_now, allow_stale=True)
                     if stale_h is not None:
                         hist = stale_h
                         bundle.has_history = True
@@ -1133,7 +1369,7 @@ class MarketDataService:
             except Exception as exc:
                 failed_syms.append(f"{sym}({type(exc).__name__})")
                 logger.warning("Yahoo Finance fetch failed for %s: %s", sym, exc)
-                stale_h = self._get_cached_hist(sym, "1y", time.monotonic(), allow_stale=True)
+                stale_h = self._get_cached_hist(sym, "2y", time.monotonic(), allow_stale=True)
                 stale_b = self._get_cached_bundle(sym, time.monotonic(), require_info=False, allow_stale=True)
                 if stale_h is not None:
                     histories[sym] = stale_h
@@ -1150,8 +1386,8 @@ class MarketDataService:
         await asyncio.gather(*(_load_one(s) for s in unique_syms))
         await self._emit_batch_failure_ops(unique_syms, failed_syms)
 
-        # Enrich US stocks with Finnhub earnings calendar + Finnhub news concurrently
-        if self.finnhub.enabled and (include_news or include_earnings):
+        # Enrich stocks with Finnhub earnings calendar, news, and ISIN profile fallback
+        if self.finnhub.enabled and (include_news or include_earnings or include_info):
             client = await self._get_http_client("finnhub")
             batch_errors: list[str] = []
             if include_earnings:
@@ -1162,11 +1398,14 @@ class MarketDataService:
                     if b.quote_type.upper() == "ETF":
                         continue
                     if sym in cal:
-                        ed_str, _ = cal[sym]
+                        ed_str, eps_raw = cal[sym]
                         ed_iso, delta = _parse_date_days_ahead(ed_str)
                         if ed_iso:
                             b.earnings_date = ed_iso
                             b.days_to_earnings = delta
+                        eps_val = _parse_eps_estimate(eps_raw)
+                        if eps_val is not None:
+                            b.eps_estimate = eps_val
 
             if include_news:
                 us_syms = [s for s in unique_syms if _is_us_symbol(s) and s in bundles]
@@ -1179,6 +1418,52 @@ class MarketDataService:
                             batch_errors.append(err)
                         if items:
                             bundles[sym].news = items
+
+            if include_info:
+                need_profile = [
+                    (sym, b)
+                    for sym, b in bundles.items()
+                    if b.isin
+                    and (
+                        (not b.short_name or b.short_name.upper() == sym.upper())
+                        or (b.quote_type.upper() != "ETF" and not b.sector)
+                    )
+                ]
+                if need_profile:
+                    prof_results = await asyncio.gather(
+                        *(self.finnhub.get_profile_by_isin(client, b.isin) for _, b in need_profile),
+                        return_exceptions=True,
+                    )
+                    prof_now = time.monotonic()
+                    for (sym, b), prof in zip(need_profile, prof_results):
+                        if not isinstance(prof, dict) or not prof:
+                            continue
+                        changed = False
+                        prof_name = _clean_text(prof.get("name"))
+                        if prof_name and (not b.short_name or b.short_name.upper() == sym.upper()):
+                            b.short_name = prof_name
+                            changed = True
+                        if prof_name and (not b.long_name or b.long_name.upper() == sym.upper()):
+                            b.long_name = prof_name
+                            changed = True
+                        prof_ind = _clean_text(prof.get("industry"))
+                        if prof_ind and not b.sector:
+                            b.sector = prof_ind
+                            changed = True
+                        if prof_ind and not b.industry:
+                            b.industry = prof_ind
+                            changed = True
+                        prof_exch = _clean_text(prof.get("exchange"))
+                        if prof_exch and not b.exchange:
+                            b.exchange = prof_exch
+                            changed = True
+                        prof_curr = _clean_text(prof.get("currency"))
+                        if prof_curr and not b.currency:
+                            b.currency = prof_curr
+                            changed = True
+                        if changed:
+                            b.identity_summary = b.build_identity_anchor()
+                            self._set_cached_bundle(sym, prof_now, b)
 
             self.finnhub.last_error = batch_errors[0] if batch_errors else None
             if batch_errors:
@@ -1230,6 +1515,139 @@ class MarketDataService:
         client = await self._get_http_client("finnhub")
         return await self.finnhub.get_quote(client, symbol)
 
+    def _download_prepost_15m_sync(self, batch_syms: list[str]) -> dict[str, pd.DataFrame]:
+        if not batch_syms:
+            return {}
+        try:
+            def _do_download() -> pd.DataFrame:
+                return yf.download(
+                    tickers=batch_syms if len(batch_syms) > 1 else batch_syms[0],
+                    period="5d",
+                    interval="15m",
+                    prepost=True,
+                    auto_adjust=True,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                )
+
+            raw = self._run_yf_call_with_retry(_do_download, max_retries=1)
+            return self._extract_batch_frames(raw, batch_syms, intraday=True)
+        except Exception as exc:
+            logger.debug("yfinance prepost 15m batch download failed (%d syms): %s", len(batch_syms), exc)
+            return {}
+
+    def _fetch_prepost_15m_single_sync(self, symbol: str) -> pd.DataFrame:
+        try:
+            def _load() -> pd.DataFrame | None:
+                return yf.Ticker(symbol).history(
+                    period="5d",
+                    interval="15m",
+                    prepost=True,
+                    auto_adjust=True,
+                )
+
+            raw = self._run_yf_call_with_retry(_load, max_retries=1)
+            return _sanitize_intraday_df(raw)
+        except Exception as exc:
+            logger.debug("yfinance prepost 15m single fetch failed for %s: %s", symbol, exc)
+            return pd.DataFrame()
+
+    def _extract_intraday_15m_quote(self, sym: str, df: pd.DataFrame | None) -> dict[str, Any] | None:
+        clean = _sanitize_intraday_df(df)
+        if clean.empty or "Close" not in clean.columns:
+            return None
+        closes = clean["Close"].astype(float)
+        idx = pd.DatetimeIndex(closes.index)
+        et_idx = idx.tz_convert(ZoneInfo("America/New_York")) if idx.tz is not None else idx
+        current_price = float(closes.iloc[-1])
+        if not math.isfinite(current_price) or current_price <= 0:
+            return None
+
+        dates = [ts.date() for ts in et_idx]
+        unique_dates = sorted(set(dates))
+        prev_close: float | None = None
+        if len(unique_dates) >= 2:
+            prev_date = unique_dates[-2]
+            prev_mask = [d == prev_date for d in dates]
+            prev_bars = closes[prev_mask]
+            prev_et = [ts for ts, m in zip(et_idx, prev_mask) if m]
+            reg_bars = [
+                float(val)
+                for val, ts in zip(prev_bars, prev_et)
+                if 570 <= (ts.hour * 60 + ts.minute) <= 960
+            ]
+            if reg_bars:
+                prev_close = reg_bars[-1]
+            elif not prev_bars.empty:
+                prev_close = float(prev_bars.iloc[-1])
+        else:
+            daily_df = (
+                self._get_cached_hist(sym, "2y", time.monotonic(), allow_stale=True)
+                or self._get_cached_hist(sym, "1y", time.monotonic(), allow_stale=True)
+            )
+            if daily_df is not None and not daily_df.empty and "Close" in daily_df.columns:
+                d_closes = pd.to_numeric(daily_df["Close"], errors="coerce").dropna()
+                if not d_closes.empty:
+                    d_dates = [pd.Timestamp(ts).date() for ts in d_closes.index]
+                    prior = [float(v) for v, d in zip(d_closes, d_dates) if d < unique_dates[0]]
+                    if prior:
+                        prev_close = prior[-1]
+                    elif len(d_closes) >= 2:
+                        prev_close = float(d_closes.iloc[-2])
+            if prev_close is None:
+                prev_close = float(closes.iloc[0])
+
+        if prev_close is None or not math.isfinite(prev_close) or prev_close <= 0:
+            return None
+        change = current_price - prev_close
+        change_pct = ((current_price / prev_close) - 1.0) * 100.0
+        return {
+            "symbol": sym,
+            "current_price": current_price,
+            "prev_close": prev_close,
+            "change": round(change, 4),
+            "change_pct": round(change_pct, 4),
+            "source": "yfinance_prepost_15m",
+        }
+
+    async def get_us_prepost_quotes(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch latest 15m pre/post-market quotes for US symbols and compute gap vs previous regular close."""
+        us_syms = list(
+            dict.fromkeys(
+                s.strip().upper()
+                for s in symbols
+                if s and s.strip() and _is_us_symbol(s.strip())
+            )
+        )
+        if not us_syms:
+            return {}
+
+        frame_map: dict[str, pd.DataFrame] = {}
+        for idx in range(0, len(us_syms), 30):
+            chunk = us_syms[idx : idx + 30]
+            async with self._sem:
+                chunk_res = await asyncio.to_thread(self._download_prepost_15m_sync, chunk)
+            frame_map.update(chunk_res)
+
+        missing = [s for s in us_syms if s not in frame_map or frame_map[s].empty]
+        if missing:
+            async def _fb(sym: str) -> tuple[str, pd.DataFrame]:
+                async with self._sem:
+                    df = await asyncio.to_thread(self._fetch_prepost_15m_single_sync, sym)
+                return sym, df
+
+            for sym, df in await asyncio.gather(*(_fb(s) for s in missing)):
+                if not df.empty:
+                    frame_map[sym] = df
+
+        out: dict[str, dict[str, Any]] = {}
+        for sym in us_syms:
+            quote = self._extract_intraday_15m_quote(sym, frame_map.get(sym))
+            if quote is not None:
+                out[sym] = quote
+        return out
+
     async def get_us_deep_intel(self, symbol: str) -> dict[str, Any]:
         """On-demand cached US analyst recommendation, EPS surprise & insider sentiment (rate-limit safe)."""
         clean_sym = symbol.strip().upper()
@@ -1258,6 +1676,51 @@ class MarketDataService:
             self._deep_intel_cache.move_to_end(clean_sym)
             self._prune_ordered_cache(self._deep_intel_cache, now, self.deep_intel_ttl_seconds)
         return intel
+
+    async def get_us_deep_intel_batch(
+        self, symbols: list[str], max_concurrency: int = 4
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-fetch Finnhub US deep intel reusing the 6h cache with bounded concurrency."""
+        if not self.finnhub.enabled:
+            return {}
+        clean_syms = list(
+            dict.fromkeys(
+                s.strip().upper()
+                for s in symbols
+                if s and s.strip() and _is_us_symbol(s)
+            )
+        )
+        if not clean_syms:
+            return {}
+
+        now = time.monotonic()
+        out: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for sym in clean_syms:
+            cached = self._deep_intel_cache.get(sym)
+            if cached and (now - cached[0]) < self.deep_intel_ttl_seconds:
+                self._deep_intel_cache.move_to_end(sym)
+                if cached[1]:
+                    out[sym] = cached[1]
+            else:
+                missing.append(sym)
+
+        if missing:
+            sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+
+            async def _fetch_one(sym: str) -> tuple[str, dict[str, Any]]:
+                async with sem:
+                    try:
+                        return sym, await self.get_us_deep_intel(sym)
+                    except Exception as exc:
+                        logger.debug("get_us_deep_intel(%s) failed: %s", sym, exc)
+                        return sym, {}
+
+            results = await asyncio.gather(*(_fetch_one(sym) for sym in missing))
+            for sym, intel in results:
+                if intel:
+                    out[sym] = intel
+        return out
 
     async def get_macro_snapshot(self) -> MacroSnapshot:
         now = time.monotonic()
@@ -1302,22 +1765,37 @@ class MarketDataService:
                 except Exception as exc:
                     logger.warning("Macro history fetch failed for %s: %s", sym, exc)
 
-            async def _pull_fred() -> dict[str, float | None]:
+            async def _pull_fred() -> dict[str, dict[str, float | None]]:
                 if not self.fred.enabled:
                     return {}
                 client = await self._get_http_client("fred")
-                series_ids = ["DGS10", "DFF", "UNRATE", "VIXCLS", "DGS2", "T10Y2Y", "T10YIE", "ECBDFR"]
+                series_ids = [
+                    "DGS10",
+                    "DFF",
+                    "UNRATE",
+                    "VIXCLS",
+                    "DGS2",
+                    "T10Y2Y",
+                    "T10YIE",
+                    "ECBDFR",
+                    "BAMLH0A0HYM2",
+                ]
                 pairs = await asyncio.gather(
-                    *(self.fred._fetch_latest_value(client, sid) for sid in series_ids)
+                    *(self.fred._fetch_series_stats(client, sid, limit=25) for sid in series_ids)
                 )
-                out: dict[str, float | None] = {}
+                out: dict[str, dict[str, float | None]] = {}
                 errs: list[str] = []
-                for sid, (val, err) in zip(series_ids, pairs):
-                    out[sid] = val
+                for sid, (stats, err) in zip(series_ids, pairs):
+                    out[sid] = stats
                     if err:
                         errs.append(err)
                 self.fred.last_error = errs[0] if errs else None
-                if errs and out.get("DGS10") is None and out.get("DFF") is None and out.get("UNRATE") is None:
+                if (
+                    errs
+                    and out.get("DGS10", {}).get("latest") is None
+                    and out.get("DFF", {}).get("latest") is None
+                    and out.get("UNRATE", {}).get("latest") is None
+                ):
                     await self._notify_ops(
                         "WARN",
                         "fred_error",
@@ -1325,29 +1803,36 @@ class MarketDataService:
                     )
                 return out
 
-            _, fred_vals = await asyncio.gather(
+            _, fred_stats = await asyncio.gather(
                 asyncio.gather(*(_pull_hist(s) for s in fx_syms)),
                 _pull_fred(),
             )
 
-            us10y = fred_vals.get("DGS10")
-            us2y = fred_vals.get("DGS2")
-            spread_10_2 = fred_vals.get("T10Y2Y")
+            dgs10_stats = fred_stats.get("DGS10", {})
+            us10y = dgs10_stats.get("latest")
+            dgs10_chg20 = dgs10_stats.get("change_20d")
+            us2y = fred_stats.get("DGS2", {}).get("latest")
+            spread_10_2 = fred_stats.get("T10Y2Y", {}).get("latest")
             if spread_10_2 is None and us10y is not None and us2y is not None:
                 spread_10_2 = round(us10y - us2y, 4)
+            hy_oas_stats = fred_stats.get("BAMLH0A0HYM2", {})
+            hy_oas_chg20 = hy_oas_stats.get("change_20d")
 
             snap = MacroSnapshot(
                 fetched_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 gbp_usd=_last_close(h_map.get("GBPUSD=X", pd.DataFrame())),
                 eur_gbp=_last_close(h_map.get("EURGBP=X", pd.DataFrame())),
                 us_10y_yield=us10y,
+                us_10y_change_20d_bps=round(dgs10_chg20 * 100.0, 1) if dgs10_chg20 is not None else None,
                 us_2y_yield=us2y,
                 yield_spread_10y_2y=spread_10_2,
-                breakeven_10y_pct=fred_vals.get("T10YIE"),
-                fed_funds_rate=fred_vals.get("DFF"),
-                ecb_deposit_rate=fred_vals.get("ECBDFR"),
-                vix=_last_close(h_map.get("^VIX", pd.DataFrame())) or fred_vals.get("VIXCLS"),
-                us_unemployment_pct=fred_vals.get("UNRATE"),
+                breakeven_10y_pct=fred_stats.get("T10YIE", {}).get("latest"),
+                hy_oas_spread_pct=hy_oas_stats.get("latest"),
+                hy_oas_change_20d_bps=round(hy_oas_chg20 * 100.0, 1) if hy_oas_chg20 is not None else None,
+                fed_funds_rate=fred_stats.get("DFF", {}).get("latest"),
+                ecb_deposit_rate=fred_stats.get("ECBDFR", {}).get("latest"),
+                vix=_last_close(h_map.get("^VIX", pd.DataFrame())) or fred_stats.get("VIXCLS", {}).get("latest"),
+                us_unemployment_pct=fred_stats.get("UNRATE", {}).get("latest"),
                 spy_5d_pct=_ret_5d(h_map.get("SPY", pd.DataFrame())),
                 qqq_5d_pct=_ret_5d(h_map.get("QQQ", pd.DataFrame())),
                 ftse_5d_pct=_ret_5d(h_map.get("ISF.L", pd.DataFrame())),

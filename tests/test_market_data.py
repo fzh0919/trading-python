@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import tempfile
 import time
 from typing import Any
 import unittest
@@ -13,11 +15,13 @@ import httpx
 import numpy as np
 import pandas as pd
 
+from src.data_providers.analytics import compute_technical_snapshot, format_technical_line
 from src.data_providers.market_data import (
     MarketDataService,
     TickerMarketBundle,
     YFRateLimitError,
 )
+from src.storage.db import AdvisorDatabase
 
 
 def _sample_ohlcv(periods: int = 230, start_price: float = 100.0) -> pd.DataFrame:
@@ -321,15 +325,15 @@ class TestMarketDataService(unittest.IsolatedAsyncioTestCase):
             await svc.get_histories(["AAA"])
             await svc.get_histories(["BBB"])
             await svc.get_histories(["CCC"])
-            self.assertEqual(list(svc._hist_cache.keys()), [("BBB", "1y"), ("CCC", "1y")])
+            self.assertEqual(list(svc._hist_cache.keys()), [("BBB", "2y"), ("CCC", "2y")])
 
             # Empty fetch must NOT poison cache for DDD
             res_empty = await svc.get_histories(["DDD"])
             self.assertTrue(res_empty["DDD"].empty)
-            self.assertNotIn(("DDD", "1y"), svc._hist_cache)
+            self.assertNotIn(("DDD", "2y"), svc._hist_cache)
 
         # Stale-while-error fallback when TTL expired and live Yahoo fails
-        svc._hist_cache[("BBB", "1y")] = (time.monotonic() - 5000.0, df_b)
+        svc._hist_cache[("BBB", "2y")] = (time.monotonic() - 5000.0, df_b)
         with (
             patch("src.data_providers.market_data.yf.download", return_value=pd.DataFrame()),
             patch("src.data_providers.market_data.yf.Ticker.history", return_value=pd.DataFrame()),
@@ -513,6 +517,287 @@ class TestMarketDataService(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(df_us.index.tz)
         self.assertEqual(df_uk.index[0], pd.Timestamp("2026-10-20"))
         self.assertEqual(list(df_uk.index), list(df_us.index))
+
+    async def test_imp20_sqlite_ohlcv_incremental_merge_and_split_full_refetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "mkt_cache.db")
+            await db.init()
+
+            today = datetime.now(timezone.utc).date()
+            base_dates = pd.bdate_range(end=today - timedelta(days=2), periods=15)
+            inc_dates = pd.bdate_range(end=today, periods=5)
+
+            def _make_df(idx: pd.DatetimeIndex, close_vals: list[float]) -> pd.DataFrame:
+                c = np.array(close_vals, dtype=float)
+                return pd.DataFrame(
+                    {
+                        "Open": c * 0.99,
+                        "High": c * 1.01,
+                        "Low": c * 0.98,
+                        "Close": c,
+                        "Volume": np.full(len(c), 1_000_000.0),
+                    },
+                    index=idx,
+                )
+
+            nvda_old = _make_df(base_dates, [100.0 + i for i in range(len(base_dates))])
+            aapl_old = _make_df(base_dates, [200.0] * len(base_dates))
+
+            from src.data_providers.market_data import _serialize_ohlcv_df
+
+            await db.save_cached_ohlcv(
+                [
+                    _serialize_ohlcv_df("NVDA", "2y", nvda_old),
+                    _serialize_ohlcv_df("AAPL", "2y", aapl_old),
+                ]
+            )
+
+            # NVDA 1mo overlap matches within <=0.5%; AAPL 1mo has 2-for-1 split (-50% diff > 0.5%)
+            nvda_inc_closes = [float(nvda_old.loc[ts, "Close"]) if ts in nvda_old.index else 125.0 for ts in inc_dates]
+            aapl_inc = _make_df(inc_dates, [100.0] * len(inc_dates))
+            nvda_inc = _make_df(inc_dates, nvda_inc_closes)
+            aapl_full_2y = _make_df(pd.bdate_range(end=today, periods=30), [100.0 + i * 0.1 for i in range(30)])
+
+            dl_calls: list[tuple[list[str], str]] = []
+
+            def _fake_download(tickers, period="2y", **kwargs):
+                syms = [tickers] if isinstance(tickers, str) else list(tickers)
+                dl_calls.append((syms, period))
+                if period == "1mo":
+                    frames = {}
+                    if "NVDA" in syms:
+                        frames["NVDA"] = nvda_inc
+                    if "AAPL" in syms:
+                        frames["AAPL"] = aapl_inc
+                    return pd.concat(frames, axis=1) if len(frames) > 1 else next(iter(frames.values()))
+                if period == "2y":
+                    return aapl_full_2y
+                return pd.DataFrame()
+
+            svc = MarketDataService(ttl_seconds=900, db=db)
+            with patch("src.data_providers.market_data.yf.download", side_effect=_fake_download):
+                res = await svc.get_histories(["NVDA", "AAPL"], period="2y")
+
+            self.assertEqual(dl_calls[0], (["NVDA", "AAPL"], "1mo"))
+            # Only AAPL triggered full 2y refetch after split detection; NVDA merged incrementally
+            self.assertEqual(dl_calls[1], (["AAPL"], "2y"))
+            self.assertAlmostEqual(float(res["NVDA"]["Close"].iloc[-1]), 125.0)
+            self.assertGreater(len(res["NVDA"]), len(nvda_old))
+            self.assertEqual(len(res["AAPL"]), 30)
+
+            persisted = await db.get_cached_ohlcv(["NVDA", "AAPL"], period="2y")
+            self.assertAlmostEqual(persisted["NVDA"]["last_close"], 125.0)
+            self.assertAlmostEqual(persisted["AAPL"]["last_close"], float(aapl_full_2y["Close"].iloc[-1]), places=2)
+
+    async def test_imp20_us_prepost_15m_quotes_and_fallback(self) -> None:
+        idx_day1 = pd.date_range("2026-11-12 09:30", "2026-11-12 16:00", freq="15min", tz="America/New_York")
+        idx_ah = pd.date_range("2026-11-12 16:15", "2026-11-12 18:00", freq="15min", tz="America/New_York")
+        idx_day2_pre = pd.date_range("2026-11-13 08:00", "2026-11-13 09:00", freq="15min", tz="America/New_York")
+        full_idx = idx_day1.append(idx_ah).append(idx_day2_pre)
+
+        nvda_15m = pd.DataFrame(
+            {
+                "Open": [100.0] * len(idx_day1) + [100.2] * len(idx_ah) + [105.0] * len(idx_day2_pre),
+                "High": [100.5] * len(full_idx),
+                "Low": [99.5] * len(full_idx),
+                "Close": [100.0] * len(idx_day1) + [100.2] * len(idx_ah) + [105.0] * len(idx_day2_pre),
+                "Volume": [10_000.0] * len(full_idx),
+            },
+            index=full_idx,
+        )
+        amd_15m = pd.DataFrame(
+            {
+                "Open": [200.0] * len(idx_day1) + [200.0] * len(idx_ah) + [194.0] * len(idx_day2_pre),
+                "High": [201.0] * len(full_idx),
+                "Low": [193.0] * len(full_idx),
+                "Close": [200.0] * len(idx_day1) + [200.0] * len(idx_ah) + [194.0] * len(idx_day2_pre),
+                "Volume": [10_000.0] * len(full_idx),
+            },
+            index=full_idx,
+        )
+
+        # Batch returns only NVDA; AMD falls back to single-symbol yf.Ticker().history()
+        batch_df = pd.concat({"NVDA": nvda_15m}, axis=1)
+
+        class _TickerStub:
+            def __init__(self, sym: str) -> None:
+                self.sym = sym
+
+            def history(self, **kwargs: Any) -> pd.DataFrame:
+                self.last_kwargs = kwargs
+                return amd_15m if self.sym == "AMD" else pd.DataFrame()
+
+        svc = MarketDataService()
+        with (
+            patch("src.data_providers.market_data.yf.download", return_value=batch_df) as dl_mock,
+            patch("src.data_providers.market_data.yf.Ticker", side_effect=_TickerStub),
+        ):
+            quotes = await svc.get_us_prepost_quotes(["NVDA", "AMD", "VWRP.L"])
+
+        self.assertNotIn("VWRP.L", quotes)
+        self.assertAlmostEqual(quotes["NVDA"]["current_price"], 105.0)
+        self.assertAlmostEqual(quotes["NVDA"]["prev_close"], 100.0)
+        self.assertAlmostEqual(quotes["NVDA"]["change_pct"], 5.0)
+        self.assertAlmostEqual(quotes["AMD"]["current_price"], 194.0)
+        self.assertAlmostEqual(quotes["AMD"]["prev_close"], 200.0)
+        self.assertAlmostEqual(quotes["AMD"]["change_pct"], -3.0)
+        self.assertTrue(dl_mock.call_args.kwargs.get("prepost"))
+        self.assertEqual(dl_mock.call_args.kwargs.get("interval"), "15m")
+
+    async def test_imp20_eps_estimate_and_finnhub_profile_by_isin_fallback(self) -> None:
+        profile_calls: list[str] = []
+
+        def _finnhub_handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/calendar/earnings"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "earningsCalendar": [
+                            {"symbol": "NVDA", "date": "2026-11-25", "epsEstimate": 0.85}
+                        ]
+                    },
+                )
+            if path.endswith("/stock/profile2"):
+                isin_q = request.url.params.get("isin", "")
+                profile_calls.append(isin_q)
+                return httpx.Response(
+                    200,
+                    json={
+                        "ticker": "VWRA",
+                        "name": "Vanguard FTSE All-World",
+                        "exchange": "LSE",
+                        "currency": "USD",
+                        "finnhubIndustry": "Broad Equity ETF",
+                        "country": "IE",
+                    },
+                )
+            return httpx.Response(200, json=[])
+
+        svc = MarketDataService(finnhub_key="fh-test")
+        svc.finnhub._transport = httpx.MockTransport(_finnhub_handler)
+        hist = _sample_ohlcv(230, 120.0)
+
+        class _TickerStub:
+            def __init__(self, sym: str) -> None:
+                self.sym = sym
+
+            def history(self, **kwargs: Any) -> pd.DataFrame:
+                return hist
+
+            @property
+            def info(self) -> dict[str, Any]:
+                if self.sym == "VWRA.L":
+                    return {}  # Missing sector & shortName -> triggers ISIN profile2 fallback
+                return {"quoteType": "EQUITY", "currency": "USD", "shortName": "NVIDIA Corp", "sector": "Technology"}
+
+            @property
+            def calendar(self) -> dict[str, Any]:
+                return {}
+
+            @property
+            def news(self) -> list[dict[str, Any]]:
+                return []
+
+        try:
+            with patch("src.data_providers.market_data.yf.Ticker", side_effect=_TickerStub):
+                histories, bundles = await svc.get_bundles(
+                    ["NVDA", "VWRA.L"],
+                    include_news=False,
+                    include_earnings=True,
+                    include_info=True,
+                    isin_map={"VWRA.L": "IE00BK5BQT80"},
+                )
+
+            self.assertAlmostEqual(bundles["NVDA"].eps_estimate or 0.0, 0.85, places=2)
+            tech = compute_technical_snapshot("NVDA", histories["NVDA"], bundle=bundles["NVDA"])
+            line = format_technical_line("NVDA", tech, bundles["NVDA"])
+            self.assertIn("EPS预期 0.85", line)
+
+            self.assertEqual(profile_calls, ["IE00BK5BQT80"])
+            self.assertEqual(bundles["VWRA.L"].short_name, "Vanguard FTSE All-World")
+            self.assertEqual(bundles["VWRA.L"].sector, "Broad Equity ETF")
+            self.assertIn("Vanguard FTSE All-World", bundles["VWRA.L"].identity_summary)
+        finally:
+            await svc.close()
+
+    async def test_imp21_fred_momentum_high_yield_oas_and_batch_us_deep_intel(self) -> None:
+        fred_limits: list[str] = []
+        fh_calls: list[str] = []
+        active_fh = 0
+        max_active_fh = 0
+
+        def _fred_handler(request: httpx.Request) -> httpx.Response:
+            sid = request.url.params.get("series_id", "")
+            fred_limits.append(request.url.params.get("limit", ""))
+            if sid == "DGS10":
+                # latest=4.25, 20d_ago=4.07 -> +18bp; include a "." missing point
+                obs = [{"value": "4.25"}, {"value": "."}] + [{"value": "4.15"}] * 19 + [{"value": "4.07"}]
+                return httpx.Response(200, json={"observations": obs})
+            if sid == "BAMLH0A0HYM2":
+                # latest=3.15, 20d_ago=3.20 -> -5bp
+                obs = [{"value": "3.15"}] + [{"value": "3.18"}] * 19 + [{"value": "3.20"}]
+                return httpx.Response(200, json={"observations": obs})
+            return httpx.Response(200, json={"observations": [{"value": "4.00"}]})
+
+        async def _finnhub_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal active_fh, max_active_fh
+            active_fh += 1
+            max_active_fh = max(max_active_fh, active_fh)
+            await asyncio.sleep(0.01)
+            active_fh -= 1
+            path = request.url.path
+            sym = request.url.params.get("symbol", "")
+            fh_calls.append(f"{path}:{sym}")
+            if path.endswith("/stock/recommendation"):
+                return httpx.Response(200, json=[{"period": "2026-11-01", "strongBuy": 18, "buy": 10, "hold": 2, "sell": 0, "strongSell": 0}])
+            if path.endswith("/stock/earnings"):
+                return httpx.Response(
+                    200,
+                    json=[
+                        {"period": f"2026-0{i}-30", "actual": 1.1, "estimate": 1.0, "surprisePercent": 10.0}
+                        for i in (9, 6, 3, 1)
+                    ],
+                )
+            if path.endswith("/stock/insider-sentiment"):
+                return httpx.Response(200, json={"data": [{"year": 2026, "month": 10, "change": 500, "mspr": 12.5}]})
+            return httpx.Response(404)
+
+        svc = MarketDataService(finnhub_key="fh-test", fred_key="fred-test")
+        svc.fred._transport = httpx.MockTransport(_fred_handler)
+        svc.finnhub._transport = httpx.MockTransport(_finnhub_handler)
+        hist = _sample_ohlcv(20, 100.0)
+
+        class _TickerStub:
+            def __init__(self, sym: str) -> None:
+                self.sym = sym
+
+            def history(self, **kwargs: Any) -> pd.DataFrame:
+                return hist
+
+        try:
+            with patch("src.data_providers.market_data.yf.Ticker", side_effect=_TickerStub):
+                macro = await svc.get_macro_snapshot()
+
+            self.assertTrue(all(lim == "25" for lim in fred_limits))
+            self.assertAlmostEqual(macro.us_10y_yield or 0.0, 4.25, places=2)
+            self.assertAlmostEqual(macro.us_10y_change_20d_bps or 0.0, 18.0, places=1)
+            self.assertAlmostEqual(macro.hy_oas_spread_pct or 0.0, 3.15, places=2)
+            self.assertAlmostEqual(macro.hy_oas_change_20d_bps or 0.0, -5.0, places=1)
+            txt = macro.to_text()
+            self.assertIn("10Y美债 4.25%(20d +18bp)", txt)
+            self.assertIn("高收益债利差 3.15%(20d -5bp)", txt)
+
+            intel_map = await svc.get_us_deep_intel_batch(["NVDA", "MSFT", "AZN.L", "NVDA"], max_concurrency=2)
+            self.assertEqual(set(intel_map.keys()), {"NVDA", "MSFT"})
+            self.assertNotIn("AZN.L", intel_map)
+            self.assertEqual(len(fh_calls), 6)  # 2 unique US symbols * 3 endpoints
+            # Repeat call must reuse 6h _deep_intel_cache with 0 new HTTP requests
+            intel_map2 = await svc.get_us_deep_intel_batch(["NVDA", "MSFT"], max_concurrency=2)
+            self.assertEqual(len(fh_calls), 6)
+            self.assertEqual(intel_map2["NVDA"], intel_map["NVDA"])
+        finally:
+            await svc.close()
 
 
 if __name__ == "__main__":

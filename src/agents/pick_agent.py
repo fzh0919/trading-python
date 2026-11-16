@@ -513,8 +513,15 @@ async def generate_pick_radar(
 
     evals = evaluate_portfolio(portfolio, tech_map, held_bundles, cfg.strategy, histories=held_histories)
     evals_text = format_evaluations_text(evals)
-    exposure_text = compute_exposure_summary(portfolio, held_bundles)
-    trade_ctx = build_trade_context(portfolio, max_recent_lines=6, max_summary_lines=6, bundles=held_bundles)
+    exposure_text = compute_exposure_summary(portfolio, held_bundles, histories=held_histories)
+    trade_ctx = build_trade_context(
+        portfolio,
+        max_recent_lines=6,
+        max_summary_lines=6,
+        bundles=held_bundles,
+        tech_map=tech_map,
+        histories=held_histories,
+    )
 
     morning_audits_text, morning_symbol_tags, report_top_actions = _extract_morning_audit_context(
         context_pack,

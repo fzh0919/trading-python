@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,7 +24,8 @@ LONDON_TZ = ZoneInfo("Europe/London")
 _RECOMMENDATION_SELECT_COLS = (
     "id, created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis, "
     "horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, "
-    "outcome_status, reflection_lesson"
+    "outcome_status, reflection_lesson, "
+    "t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct"
 )
 
 
@@ -62,6 +64,12 @@ def _row_to_recommendation(row: tuple[Any, ...]) -> dict[str, Any]:
         "alpha_pct": row[12],
         "outcome_status": str(row[13] or "PENDING"),
         "reflection_lesson": str(row[14] or ""),
+        "t10_return_pct": row[15],
+        "t10_alpha_pct": row[16],
+        "t20_return_pct": row[17],
+        "t20_alpha_pct": row[18],
+        "mfe_pct": row[19],
+        "mae_pct": row[20],
     }
 
 
@@ -171,7 +179,13 @@ class AdvisorDatabase:
                     raw_return_pct REAL,
                     alpha_pct REAL,
                     outcome_status TEXT DEFAULT 'PENDING',
-                    reflection_lesson TEXT DEFAULT ''
+                    reflection_lesson TEXT DEFAULT '',
+                    t10_return_pct REAL,
+                    t10_alpha_pct REAL,
+                    t20_return_pct REAL,
+                    t20_alpha_pct REAL,
+                    mfe_pct REAL,
+                    mae_pct REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -223,6 +237,49 @@ class AdvisorDatabase:
                     fired_at_uk TEXT NOT NULL,
                     PRIMARY KEY (job_name, uk_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS ohlcv_cache (
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    last_bar_date TEXT NOT NULL,
+                    last_close REAL NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (symbol, period)
+                );
+                CREATE INDEX IF NOT EXISTS idx_ohlcv_cache_updated_ms ON ohlcv_cache(updated_at_ms);
+
+                CREATE TABLE IF NOT EXISTS t212_instruments_metadata (
+                    ticker TEXT PRIMARY KEY,
+                    yahoo_symbol TEXT NOT NULL DEFAULT '',
+                    isin TEXT NOT NULL DEFAULT '',
+                    currency_code TEXT NOT NULL DEFAULT '',
+                    short_name TEXT NOT NULL DEFAULT '',
+                    inst_type TEXT NOT NULL DEFAULT '',
+                    extended_hours INTEGER NOT NULL DEFAULT 0,
+                    working_schedule_id INTEGER,
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_t212_inst_yahoo ON t212_instruments_metadata(yahoo_symbol);
+
+                CREATE TABLE IF NOT EXISTS t212_dividend_archive (
+                    id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    yahoo_symbol TEXT NOT NULL,
+                    amount_gbp REAL NOT NULL,
+                    gross_per_share REAL NOT NULL DEFAULT 0.0,
+                    paid_on TEXT NOT NULL DEFAULT '',
+                    paid_on_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_t212_div_acc_sym ON t212_dividend_archive(account, yahoo_symbol);
+
+                CREATE TABLE IF NOT EXISTS quant_health_audits (
+                    audit_date TEXT PRIMARY KEY,
+                    created_at_uk TEXT NOT NULL,
+                    summary_text TEXT NOT NULL,
+                    payload_json TEXT DEFAULT '{}'
+                );
                 """
             )
             await _ensure_columns(
@@ -244,6 +301,12 @@ class AdvisorDatabase:
                     "alpha_pct": "REAL",
                     "outcome_status": "TEXT DEFAULT 'PENDING'",
                     "reflection_lesson": "TEXT DEFAULT ''",
+                    "t10_return_pct": "REAL",
+                    "t10_alpha_pct": "REAL",
+                    "t20_return_pct": "REAL",
+                    "t20_alpha_pct": "REAL",
+                    "mfe_pct": "REAL",
+                    "mae_pct": "REAL",
                 },
             )
             await _ensure_columns(
@@ -595,6 +658,8 @@ class AdvisorDatabase:
         alpha_pct: float | None,
         outcome_status: str = "SETTLED",
         reflection_lesson: str = "",
+        mfe_pct: float | None = None,
+        mae_pct: float | None = None,
     ) -> bool:
         """Idempotently settle a PENDING recommendation; returns False if already settled."""
         status = str(outcome_status or "SETTLED").strip().upper()
@@ -609,7 +674,9 @@ class AdvisorDatabase:
                     raw_return_pct = ?,
                     alpha_pct = ?,
                     outcome_status = ?,
-                    reflection_lesson = ?
+                    reflection_lesson = ?,
+                    mfe_pct = COALESCE(?, mfe_pct),
+                    mae_pct = COALESCE(?, mae_pct)
                 WHERE id = ? AND (outcome_status IS NULL OR outcome_status = 'PENDING')
                 """,
                 (
@@ -619,8 +686,63 @@ class AdvisorDatabase:
                     alpha_pct,
                     status,
                     lesson,
+                    mfe_pct,
+                    mae_pct,
                     int(rec_id),
                 ),
+            )
+            await db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def get_settled_recommendations_for_followup(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return SETTLED recommendations that still lack T+10 or T+20 follow-up metrics."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                f"SELECT {_RECOMMENDATION_SELECT_COLS} FROM pick_recommendations "
+                "WHERE outcome_status = 'SETTLED' "
+                "AND entry_price IS NOT NULL AND entry_price > 0 "
+                "AND (t10_alpha_pct IS NULL OR t20_alpha_pct IS NULL) "
+                "ORDER BY created_at_ms ASC, id ASC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+        return [_row_to_recommendation(r) for r in rows]
+
+    async def update_recommendation_followup(
+        self,
+        rec_id: int,
+        *,
+        t10_return_pct: float | None = None,
+        t10_alpha_pct: float | None = None,
+        t20_return_pct: float | None = None,
+        t20_alpha_pct: float | None = None,
+        mfe_pct: float | None = None,
+        mae_pct: float | None = None,
+    ) -> bool:
+        """Update non-null T+10/T+20 follow-up returns and MFE/MAE metrics on a SETTLED recommendation."""
+        updates: list[str] = []
+        params: list[Any] = []
+        field_values = (
+            ("t10_return_pct", t10_return_pct),
+            ("t10_alpha_pct", t10_alpha_pct),
+            ("t20_return_pct", t20_return_pct),
+            ("t20_alpha_pct", t20_alpha_pct),
+            ("mfe_pct", mfe_pct),
+            ("mae_pct", mae_pct),
+        )
+        for col, val in field_values:
+            if val is not None:
+                updates.append(f"{col} = ?")
+                params.append(float(val))
+        if not updates:
+            return False
+
+        params.append(int(rec_id))
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                f"UPDATE pick_recommendations SET {', '.join(updates)} "
+                "WHERE id = ? AND outcome_status = 'SETTLED'",
+                params,
             )
             await db.commit()
             return (cur.rowcount or 0) > 0
@@ -655,7 +777,7 @@ class AdvisorDatabase:
         return [_row_to_recommendation(r) for r in rows]
 
     async def get_recommendation_stats(self) -> dict[str, Any]:
-        """Aggregate settled recommendation win rates and average raw/alpha returns for /stats."""
+        """Aggregate settled recommendation win rates, multi-window Alpha, MFE/MAE, and average returns for /stats."""
         async with self._connect() as db:
             cur = await db.execute(
                 """
@@ -667,7 +789,11 @@ class AdvisorDatabase:
                     COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' AND raw_return_pct > 0 THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' AND alpha_pct > 0 THEN 1 ELSE 0 END), 0),
                     AVG(CASE WHEN outcome_status = 'SETTLED' THEN raw_return_pct END),
-                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN alpha_pct END)
+                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN alpha_pct END),
+                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN t10_alpha_pct END),
+                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN t20_alpha_pct END),
+                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN mfe_pct END),
+                    AVG(CASE WHEN outcome_status = 'SETTLED' THEN mae_pct END)
                 FROM pick_recommendations
                 """
             )
@@ -684,6 +810,10 @@ class AdvisorDatabase:
                 "alpha_win_rate_pct": 0.0,
                 "avg_raw_return_pct": None,
                 "avg_alpha_pct": None,
+                "avg_t10_alpha_pct": None,
+                "avg_t20_alpha_pct": None,
+                "avg_mfe_pct": None,
+                "avg_mae_pct": None,
             }
         settled = int(row[3] or 0)
         win_cnt = int(row[4] or 0)
@@ -699,6 +829,10 @@ class AdvisorDatabase:
             "alpha_win_rate_pct": round((alpha_win_cnt / settled) * 100.0, 1) if settled > 0 else 0.0,
             "avg_raw_return_pct": round(float(row[6]), 2) if row[6] is not None else None,
             "avg_alpha_pct": round(float(row[7]), 2) if row[7] is not None else None,
+            "avg_t10_alpha_pct": round(float(row[8]), 2) if row[8] is not None else None,
+            "avg_t20_alpha_pct": round(float(row[9]), 2) if row[9] is not None else None,
+            "avg_mfe_pct": round(float(row[10]), 2) if row[10] is not None else None,
+            "avg_mae_pct": round(float(row[11]), 2) if row[11] is not None else None,
         }
 
     async def append_chat_turn(
@@ -1018,7 +1152,7 @@ class AdvisorDatabase:
         *,
         now_utc: datetime | None = None,
     ) -> dict[str, int]:
-        """Delete expired rows from portfolio_snapshots, llm_usage_logs, and ops_events while keeping latest snapshot."""
+        """Delete expired rows from portfolio_snapshots, llm_usage_logs, ops_events, and ohlcv_cache while preserving archives and latest snapshot."""
         ref_sec = (now_utc or datetime.now(timezone.utc)).timestamp()
         cutoff_ms = int((ref_sec - max(retention_days, 1) * 86400) * 1000)
         async with self._connect(write=True) as db:
@@ -1041,11 +1175,16 @@ class AdvisorDatabase:
                 "DELETE FROM ops_events WHERE created_at_ms < ?",
                 (cutoff_ms,),
             )
+            cur_ohlcv = await db.execute(
+                "DELETE FROM ohlcv_cache WHERE updated_at_ms < ?",
+                (cutoff_ms,),
+            )
             await db.commit()
             return {
                 "portfolio_snapshots": int(cur_snap.rowcount or 0),
                 "llm_usage_logs": int(cur_usage.rowcount or 0),
                 "ops_events": int(cur_ops.rowcount or 0),
+                "ohlcv_cache": int(cur_ohlcv.rowcount or 0),
             }
 
     async def has_scheduler_job_fired(self, job_name: str, uk_date: str) -> bool:
@@ -1066,3 +1205,302 @@ class AdvisorDatabase:
                 (job_name, uk_date, fired_at_uk),
             )
             await db.commit()
+
+    async def get_cached_ohlcv(self, symbols: list[str], period: str = "2y") -> dict[str, dict[str, Any]]:
+        """Load persisted OHLCV JSON cache rows for the given symbols and period."""
+        clean_syms = list(dict.fromkeys(str(s or "").strip() for s in symbols if str(s or "").strip()))
+        clean_period = str(period or "2y").strip()
+        if not clean_syms or not clean_period:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        async with self._connect() as db:
+            for idx in range(0, len(clean_syms), 500):
+                chunk = clean_syms[idx : idx + 500]
+                placeholders = ", ".join("?" for _ in chunk)
+                cur = await db.execute(
+                    f"""
+                    SELECT symbol, period, last_bar_date, last_close, updated_at_ms, payload_json
+                    FROM ohlcv_cache
+                    WHERE period = ? AND symbol IN ({placeholders})
+                    """,
+                    (clean_period, *chunk),
+                )
+                for row in await cur.fetchall():
+                    payload_json = str(row[5] or "").strip()
+                    last_close = float(row[3] or 0.0)
+                    if not payload_json or payload_json in ("{}", "[]") or not math.isfinite(last_close) or last_close <= 0:
+                        continue
+                    sym_key = str(row[0])
+                    out[sym_key] = {
+                        "symbol": sym_key,
+                        "period": str(row[1]),
+                        "last_bar_date": str(row[2]),
+                        "last_close": last_close,
+                        "updated_at_ms": int(row[4] or 0),
+                        "payload_json": payload_json,
+                    }
+        return out
+
+    async def save_cached_ohlcv(self, entries: list[dict[str, Any]]) -> int:
+        """Persist non-empty OHLCV history cache rows under the single write lock."""
+        if not entries:
+            return 0
+        now_ms = int(time.time() * 1000)
+        rows_to_write: list[tuple[str, str, str, float, int, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            sym = str(entry.get("symbol") or "").strip()
+            period = str(entry.get("period") or "").strip()
+            last_bar_date = str(entry.get("last_bar_date") or "").strip()
+            try:
+                last_close = float(entry.get("last_close") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            raw_payload = entry.get("payload_json")
+            if isinstance(raw_payload, (dict, list)):
+                if not raw_payload:
+                    continue
+                payload_json = json.dumps(raw_payload)
+            else:
+                payload_json = str(raw_payload or "").strip()
+            if (
+                not sym
+                or not period
+                or not last_bar_date
+                or not math.isfinite(last_close)
+                or last_close <= 0
+                or not payload_json
+                or payload_json in ("{}", "[]")
+            ):
+                continue
+            raw_ts = entry.get("updated_at_ms")
+            try:
+                updated_at_ms = int(raw_ts) if raw_ts is not None and int(raw_ts) > 0 else now_ms
+            except (TypeError, ValueError):
+                updated_at_ms = now_ms
+            rows_to_write.append((sym, period, last_bar_date, last_close, updated_at_ms, payload_json))
+
+        if not rows_to_write:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO ohlcv_cache (
+                    symbol, period, last_bar_date, last_close, updated_at_ms, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                rows_to_write,
+            )
+            await db.commit()
+        return len(rows_to_write)
+
+    async def upsert_t212_instruments(self, items: list[dict[str, Any]]) -> int:
+        """Upsert Trading 212 instrument metadata into the long-term archive table."""
+        if not items:
+            return 0
+        now_ms = int(time.time() * 1000)
+        rows_to_write: list[tuple[str, str, str, str, str, str, int, int | None, int]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            yahoo_symbol = str(item.get("yahoo_symbol") or "").strip()
+            isin = str(item.get("isin") or "").strip().upper()
+            currency_code = str(item.get("currency_code") or item.get("currencyCode") or "").strip()
+            short_name = str(item.get("short_name") or item.get("shortName") or item.get("name") or "").strip()
+            inst_type = str(item.get("inst_type") or item.get("type") or "").strip().upper()
+            raw_ext = item.get("extended_hours") if "extended_hours" in item else item.get("extendedHours", False)
+            extended_hours = 1 if bool(raw_ext) else 0
+            raw_sched = item.get("working_schedule_id") if "working_schedule_id" in item else item.get("workingScheduleId")
+            working_schedule_id: int | None = None
+            if raw_sched is not None and str(raw_sched).strip() != "":
+                try:
+                    working_schedule_id = int(raw_sched)
+                except (TypeError, ValueError):
+                    working_schedule_id = None
+            raw_ts = item.get("updated_at_ms")
+            try:
+                updated_at_ms = int(raw_ts) if raw_ts is not None and int(raw_ts) > 0 else now_ms
+            except (TypeError, ValueError):
+                updated_at_ms = now_ms
+            rows_to_write.append(
+                (
+                    ticker,
+                    yahoo_symbol,
+                    isin,
+                    currency_code,
+                    short_name,
+                    inst_type,
+                    extended_hours,
+                    working_schedule_id,
+                    updated_at_ms,
+                )
+            )
+
+        if not rows_to_write:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO t212_instruments_metadata (
+                    ticker, yahoo_symbol, isin, currency_code, short_name,
+                    inst_type, extended_hours, working_schedule_id, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows_to_write,
+            )
+            await db.commit()
+        return len(rows_to_write)
+
+    async def get_t212_instrument_map(self) -> dict[str, dict[str, Any]]:
+        """Return {raw_t212_ticker: metadata_dict} from t212_instruments_metadata."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT ticker, yahoo_symbol, isin, currency_code, short_name,
+                       inst_type, extended_hours, working_schedule_id, updated_at_ms
+                FROM t212_instruments_metadata
+                """
+            )
+            rows = await cur.fetchall()
+        return {
+            str(r[0]): {
+                "ticker": str(r[0]),
+                "yahoo_symbol": str(r[1] or ""),
+                "isin": str(r[2] or ""),
+                "currency_code": str(r[3] or ""),
+                "short_name": str(r[4] or ""),
+                "inst_type": str(r[5] or ""),
+                "extended_hours": bool(r[6]),
+                "working_schedule_id": int(r[7]) if r[7] is not None else None,
+                "updated_at_ms": int(r[8] or 0),
+            }
+            for r in rows
+            if r[0]
+        }
+
+    async def upsert_dividends(self, items: list[dict[str, Any]]) -> int:
+        """Archive historical GBP dividend payouts without duplicates."""
+        if not items:
+            return 0
+        rows_to_write: list[tuple[str, str, str, str, float, float, str, int]] = []
+        for raw in items:
+            d = raw.model_dump() if hasattr(raw, "model_dump") else raw
+            if not isinstance(d, dict):
+                continue
+            div_id = str(d.get("id") or "").strip()
+            account = str(d.get("account") or "").strip()
+            ticker = str(d.get("ticker") or d.get("raw_ticker") or "").strip()
+            yahoo_symbol = str(d.get("yahoo_symbol") or "").strip()
+            raw_amt = d.get("amount_gbp") if d.get("amount_gbp") is not None else d.get("amount")
+            try:
+                amount_gbp = float(raw_amt or 0.0)
+                gross_per_share = float(d.get("gross_per_share") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not div_id or not account or not yahoo_symbol or not math.isfinite(amount_gbp) or amount_gbp <= 0:
+                continue
+            paid_on = str(d.get("paid_on") or "").strip()
+            try:
+                paid_on_ms = int(d.get("paid_on_ms") or 0)
+            except (TypeError, ValueError):
+                paid_on_ms = 0
+            rows_to_write.append(
+                (
+                    div_id,
+                    account,
+                    ticker,
+                    yahoo_symbol,
+                    amount_gbp,
+                    gross_per_share if math.isfinite(gross_per_share) else 0.0,
+                    paid_on,
+                    paid_on_ms,
+                )
+            )
+
+        if not rows_to_write:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO t212_dividend_archive (
+                    id, account, ticker, yahoo_symbol, amount_gbp,
+                    gross_per_share, paid_on, paid_on_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows_to_write,
+            )
+            await db.commit()
+        return len(rows_to_write)
+
+    async def get_cumulative_dividends_by_symbol(self) -> dict[tuple[str, str], float]:
+        """Aggregate archived GBP dividends grouped by (account, yahoo_symbol)."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT account, yahoo_symbol, COALESCE(SUM(amount_gbp), 0.0)
+                FROM t212_dividend_archive
+                WHERE account != '' AND yahoo_symbol != ''
+                GROUP BY account, yahoo_symbol
+                """
+            )
+            rows = await cur.fetchall()
+        return {
+            (str(r[0]), str(r[1])): round(float(r[2] or 0.0), 4)
+            for r in rows
+            if r[0] and r[1] and float(r[2] or 0.0) > 0
+        }
+
+    async def save_quant_audit(
+        self,
+        audit_date: str,
+        summary_text: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        created_at_uk: str | None = None,
+    ) -> None:
+        """Persist weekly offline universe and strategy threshold health audit idempotently by audit_date."""
+        uk_ts = created_at_uk or datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
+        payload_str = json.dumps(payload or {}, ensure_ascii=False)
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO quant_health_audits (
+                    audit_date, created_at_uk, summary_text, payload_json
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (str(audit_date), uk_ts, str(summary_text or ""), payload_str),
+            )
+            await db.commit()
+
+    async def get_latest_quant_audit(self) -> dict[str, Any] | None:
+        """Return the most recent offline universe & threshold health audit row, if any."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT audit_date, created_at_uk, summary_text, payload_json
+                FROM quant_health_audits
+                ORDER BY audit_date DESC, created_at_uk DESC
+                LIMIT 1
+                """
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        raw_payload = str(row[3] or "{}")
+        try:
+            parsed = json.loads(raw_payload)
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except json.JSONDecodeError:
+            parsed = {}
+        return {
+            "audit_date": str(row[0]),
+            "created_at_uk": str(row[1]),
+            "summary_text": str(row[2]),
+            "payload_json": raw_payload,
+            "payload": parsed,
+        }

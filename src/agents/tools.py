@@ -105,13 +105,20 @@ async def run_forced_market_grounding(
     ttl_seconds: int = 900,
     ops_notifier: OpsNotifier | None = None,
     max_concurrent_searches: int = _DEFAULT_GROUNDING_CONCURRENCY,
+    priority_symbols: list[str] | None = None,
 ) -> str:
     """Run grouped concurrent Google Search Grounding across UK/EU/US equities, ETFs, and macro news."""
     if llm is None:
         return ""
 
     clean_syms = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
-    cache_key = f"{scope}:{','.join(sorted(clean_syms))}:{focus_query.strip().lower()}"
+    prio_ordered = list(dict.fromkeys(s.strip().upper() for s in (priority_symbols or ()) if s and s.strip()))
+    prio_set = set(prio_ordered)
+    grouped_syms = [s for s in clean_syms if s not in prio_set]
+
+    cache_key = (
+        f"{scope}:{','.join(sorted(clean_syms))}:{','.join(sorted(prio_set))}:{focus_query.strip().lower()}"
+    )
     now = _monotonic()
     _prune_grounding_cache(now)
     cached = _GROUNDING_CACHE.get(cache_key)
@@ -122,7 +129,7 @@ async def run_forced_market_grounding(
     uk_syms: list[str] = []
     eu_syms: list[str] = []
     us_syms: list[str] = []
-    for sym in clean_syms:
+    for sym in grouped_syms:
         region = _classify_symbol_region(sym, qtypes.get(sym, ""))
         if region in {"UK", "UK_ETF"}:
             uk_syms.append(sym)
@@ -148,6 +155,25 @@ async def run_forced_market_grounding(
                 f"请通过 Google Search 检索围绕主题「{focus_query.strip()}」在美股、英股/LSE ETF 与欧股中的最新突发催化、行业景气数据与潜在监管风险，控制在 260 字以内。",
             )
         )
+
+    for sym in prio_ordered:
+        region = _classify_symbol_region(sym, qtypes.get(sym, ""))
+        if region in {"UK", "UK_ETF"}:
+            p_prompt = (
+                f"请通过 Google Search 针对伦敦交易所标的 {sym} 进行 1 对 1 深度检索：核查近 7 天 RNS 监管公告、"
+                "财报/派息动态、突发异动原因及机构最新评级变化，给出日期与核心数字，控制在 180 字以内。"
+            )
+        elif region == "EU":
+            p_prompt = (
+                f"请通过 Google Search 针对欧洲标的 {sym} 进行 1 对 1 深度检索：核查近 7 天监管公告、"
+                "财报指引、订单/监管消息、突发异动原因及机构评级变化，给出日期与核心数字，控制在 180 字以内。"
+            )
+        else:
+            p_prompt = (
+                f"请通过 Google Search 针对美股/ETF {sym} 进行 1 对 1 深度检索：核查近 72 小时隔夜突发新闻、"
+                "盘前盘后异动原因、最新财报预期/指引、分红及机构评级调整，给出日期与核心数字，控制在 180 字以内。"
+            )
+        tasks_meta.append((f"【重点标的1对1深搜 · {sym}】", p_prompt))
 
     batch_size = 3
     region_specs = [
