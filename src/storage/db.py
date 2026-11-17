@@ -356,6 +356,26 @@ class AdvisorDatabase:
                     note TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (account_label, currency)
                 );
+
+                CREATE TABLE IF NOT EXISTS pending_order_snapshots (
+                    account_label TEXT NOT NULL,
+                    order_id TEXT NOT NULL,
+                    yahoo_symbol TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    quantity REAL NOT NULL DEFAULT 0.0,
+                    filled_quantity REAL NOT NULL DEFAULT 0.0,
+                    limit_price REAL,
+                    stop_price REAL,
+                    order_status TEXT NOT NULL DEFAULT '',
+                    currency TEXT NOT NULL DEFAULT '',
+                    first_seen_uk TEXT NOT NULL DEFAULT '',
+                    first_seen_ms INTEGER NOT NULL DEFAULT 0,
+                    last_seen_uk TEXT NOT NULL DEFAULT '',
+                    last_seen_ms INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (account_label, order_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_order_snapshots_seen
+                    ON pending_order_snapshots(last_seen_ms);
                 """
             )
             await _ensure_columns(
@@ -1289,6 +1309,11 @@ class AdvisorDatabase:
                 "DELETE FROM grounding_news_cache WHERE fetched_at_ms < ?",
                 (cutoff_ms,),
             )
+            # Pending-order snapshots are a short-lived diff anchor: keep 3 days only.
+            cur_pending = await db.execute(
+                "DELETE FROM pending_order_snapshots WHERE last_seen_ms < ?",
+                (int((ref_sec - 3 * 86400) * 1000),),
+            )
             await db.commit()
             return {
                 "portfolio_snapshots": int(cur_snap.rowcount or 0),
@@ -1296,6 +1321,7 @@ class AdvisorDatabase:
                 "ops_events": int(cur_ops.rowcount or 0),
                 "ohlcv_cache": int(cur_ohlcv.rowcount or 0),
                 "grounding_news_cache": int(cur_grounding.rowcount or 0),
+                "pending_order_snapshots": int(cur_pending.rowcount or 0),
             }
 
     async def has_scheduler_job_fired(self, job_name: str, uk_date: str) -> bool:
@@ -1316,6 +1342,129 @@ class AdvisorDatabase:
                 (job_name, uk_date, fired_at_uk),
             )
             await db.commit()
+
+    async def upsert_pending_order_snapshots(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        seen_at_ms: int = 0,
+        seen_at_uk: str = "",
+    ) -> int:
+        """Insert-or-refresh live pending-order rows, preserving each row's original first_seen anchor."""
+        now_ms = int(seen_at_ms or time.time() * 1000)
+        uk_str = str(seen_at_uk or "").strip() or datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+        payload: list[tuple[Any, ...]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            account = str(row.get("account_label") or "").strip()
+            order_id = str(row.get("order_id") or "").strip()
+            if not account or not order_id:
+                continue
+
+            def _num(value: Any) -> float | None:
+                try:
+                    num = float(value)
+                except (TypeError, ValueError):
+                    return None
+                return num if math.isfinite(num) else None
+
+            payload.append(
+                (
+                    account,
+                    order_id,
+                    str(row.get("yahoo_symbol") or "").strip().upper(),
+                    str(row.get("side") or "").strip().upper(),
+                    _num(row.get("quantity")) or 0.0,
+                    _num(row.get("filled_quantity")) or 0.0,
+                    _num(row.get("limit_price")),
+                    _num(row.get("stop_price")),
+                    str(row.get("order_status") or ""),
+                    str(row.get("currency") or ""),
+                    uk_str,
+                    now_ms,
+                    uk_str,
+                    now_ms,
+                )
+            )
+        if not payload:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                """
+                INSERT INTO pending_order_snapshots (
+                    account_label, order_id, yahoo_symbol, side, quantity,
+                    filled_quantity, limit_price, stop_price, order_status, currency,
+                    first_seen_uk, first_seen_ms, last_seen_uk, last_seen_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_label, order_id) DO UPDATE SET
+                    yahoo_symbol = excluded.yahoo_symbol,
+                    side = excluded.side,
+                    quantity = excluded.quantity,
+                    filled_quantity = excluded.filled_quantity,
+                    limit_price = excluded.limit_price,
+                    stop_price = excluded.stop_price,
+                    order_status = excluded.order_status,
+                    currency = excluded.currency,
+                    last_seen_uk = excluded.last_seen_uk,
+                    last_seen_ms = excluded.last_seen_ms
+                """,
+                payload,
+            )
+            await db.commit()
+        return len(payload)
+
+    async def get_pending_order_snapshots(self) -> list[dict[str, Any]]:
+        """Return the last-seen live pending-order snapshot rows."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT account_label, order_id, yahoo_symbol, side, quantity,
+                       filled_quantity, limit_price, stop_price, order_status, currency,
+                       first_seen_uk, first_seen_ms, last_seen_uk, last_seen_ms
+                FROM pending_order_snapshots
+                ORDER BY account_label ASC, order_id ASC
+                """
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "account_label": str(r[0] or ""),
+                "order_id": str(r[1] or ""),
+                "yahoo_symbol": str(r[2] or ""),
+                "side": str(r[3] or ""),
+                "quantity": float(r[4] or 0.0),
+                "filled_quantity": float(r[5] or 0.0),
+                "limit_price": None if r[6] is None else float(r[6]),
+                "stop_price": None if r[7] is None else float(r[7]),
+                "order_status": str(r[8] or ""),
+                "currency": str(r[9] or ""),
+                "first_seen_uk": str(r[10] or ""),
+                "first_seen_ms": int(r[11] or 0),
+                "last_seen_uk": str(r[12] or ""),
+                "last_seen_ms": int(r[13] or 0),
+            }
+            for r in rows
+        ]
+
+    async def delete_pending_order_snapshots(self, keys: list[tuple[str, str]]) -> int:
+        """Delete snapshot rows for orders that already vanished (filled or cancelled)."""
+        clean = [
+            (str(account or "").strip(), str(order_id or "").strip())
+            for account, order_id in (keys or [])
+            if str(account or "").strip() and str(order_id or "").strip()
+        ]
+        if not clean:
+            return 0
+        async with self._connect(write=True) as db:
+            await db.executemany(
+                "DELETE FROM pending_order_snapshots WHERE account_label = ? AND order_id = ?",
+                clean,
+            )
+            await db.commit()
+        return len(clean)
 
     async def get_cached_ohlcv(self, symbols: list[str], period: str = "2y") -> dict[str, dict[str, Any]]:
         """Load persisted OHLCV JSON cache rows for the given symbols and period."""

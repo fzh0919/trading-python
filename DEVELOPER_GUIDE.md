@@ -35,6 +35,8 @@
 | **DeepSeek 侧车（筛选/质检/周报/记忆）** | `ds_helper_model` / `ds_helper_thinking_level` | `deepseek-flash` (`HIGH`)，单次 `ds_helper_timeout_seconds=20s` | `ds_pick_prefilter_enabled`（ID 名单）/ `ds_semantic_audit_enabled`（只读质检）/ 周六诊断 / 偏好抽取；缺 `DEEPSEEK_API_KEY` 时 **0 调用**，绝不回落 Gemini | 名单 JSON / `violations` / `<=450` 字诊断 / 带原话锚点笔记 |
 | **盘中异动哨兵** | 复用 `chat_model` 与 `search_model` | 扫描 0-Token（实时价：Finnhub → T212 持仓 → 日线末根）；仅触发标的做 1v1 联网 + DS (`HIGH`) 判推送 | `intraday_sentinel_enabled`，工作日 `08:00~21:00 UK` 每 `30` 分钟、`execution_lock` 被占则跳过；限价/止损挂单均纳入逼近判定 | Telegram `<=250` 字纯文本（仅 `should_push=true` 且发送成功） |
 
+> **调用级韧性（`v5.3.3`）**：`gemini_round_timeout_seconds=120s` 为单轮硬超时；硬超时按 `gemini_timeout_max_retries=0` **直接切备援**（不再空转重试），5xx/429 仍按 `gemini_max_transient_retries=2` 重试；`/report` Step 2 另有 `report_step2_timeout_seconds=240s` 总护栏，到点取消未完成方并用中性占位继续 PM 拍板（`report_step2_degraded` WARN）。
+
 ---
 
 ## 三、SQLite 数据库核心表速查（`data/advisor.db`，周期切换点 `07:30 UK`）

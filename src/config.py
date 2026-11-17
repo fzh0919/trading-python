@@ -101,6 +101,13 @@ class ModelsSection(BaseModel):
 
     enable_forced_search_grounding: bool = True
     report_max_tool_rounds: int = Field(default=2, ge=1)
+    # v5.3.3: Gemini call-level resilience. Hard timeouts (our own wait_for ceiling) fail over
+    # immediately by default; transport/5xx errors keep the full retry budget.
+    gemini_round_timeout_seconds: float = Field(default=120.0, ge=15.0, le=600.0)
+    gemini_max_transient_retries: int = Field(default=2, ge=0, le=5)
+    gemini_timeout_max_retries: int = Field(default=0, ge=0, le=2)
+    # /report Step 2 (Bull + Bear concurrent) wall-clock budget before neutral degradation.
+    report_step2_timeout_seconds: float = Field(default=240.0, ge=60.0, le=900.0)
     google_search_free_quota_monthly: int = Field(default=5000, ge=0)
     google_search_warn_pct: float = Field(default=85.0, gt=0.0, le=100.0)
 
@@ -177,6 +184,8 @@ class StrategySection(BaseModel):
     intraday_poll_minutes: int = Field(default=30, ge=10, le=120)
     intraday_move_alert_pct: float = Field(default=3.5, gt=0.0)
     intraday_order_near_pct: float = Field(default=1.5, gt=0.0)
+    # Pending-order fill receipt: 0-token snapshot diff, cross-verified with order history
+    intraday_fill_receipt_enabled: bool = True
 
     # Benchmark-relative mandate (v5.3.2): long-term alpha vs global broad index,
     # symmetric attack/defence discipline, risk-based sizing and hard trade-cadence caps.

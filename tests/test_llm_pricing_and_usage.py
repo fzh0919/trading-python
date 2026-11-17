@@ -225,7 +225,7 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.wait_for(_run(), timeout=10.0)
 
-    async def test_round_timeout_triggers_transient_retry_and_fallback(self) -> None:
+    async def test_hard_timeout_fails_over_without_retrying_primary(self) -> None:
         class _RecordingOps:
             def __init__(self) -> None:
                 self.events: list[dict] = []
@@ -275,11 +275,60 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
         )
         reply = await client.generate(model="gemini-4-argon", prompt="hi", usage_label="report_pm")
         self.assertEqual(reply, "超时后备援成功")
-        self.assertEqual(attempts, ["gemini-4-argon", "gemini-4-argon", "gemini-4-hydrogen"])
+        # Hard timeout no longer burns the transport retry budget: one attempt, then failover.
+        self.assertEqual(attempts, ["gemini-4-argon", "gemini-4-hydrogen"])
         self.assertEqual(len(usage_records), 2)
         self.assertFalse(usage_records[0]["success"])
         self.assertTrue(usage_records[1]["success"])
         self.assertTrue(any(e["severity"] == "WARN" and "已自动降级" in e["message"] for e in ops.events))
+
+    async def test_hard_timeout_respects_explicit_retry_budget(self) -> None:
+        ops_events: list[dict] = []
+
+        class _RecordingOps:
+            async def notify(self, *, severity: str, source: str, alert_key: str, message: str) -> None:
+                ops_events.append({"severity": severity, "alert_key": alert_key, "message": message})
+
+        async def _record(rec: dict) -> None:
+            return None
+
+        client = GeminiClient(
+            api_key="dummy-key",
+            usage_recorder=_record,
+            ops_notifier=_RecordingOps(),  # type: ignore[arg-type]
+            fallback_model="gemini-4-hydrogen",
+            fallback_thinking_level="HIGH",
+            max_transient_retries=2,
+            timeout_max_retries=1,
+            retry_base_delay_s=0.0,
+            round_timeout_seconds=0.05,
+        )
+        attempts: list[str] = []
+
+        async def _slow_primary_fast_fallback(*, model, contents, config):
+            attempts.append(model)
+            if model == "gemini-4-carbon":
+                await asyncio.sleep(0.25)
+            return SimpleNamespace(
+                text="备援成功",
+                function_calls=[],
+                candidates=[],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=10,
+                    cached_content_token_count=0,
+                    candidates_token_count=5,
+                    thoughts_token_count=0,
+                    total_token_count=15,
+                ),
+            )
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_slow_primary_fast_fallback))
+        )
+        reply = await client.generate(model="gemini-4-carbon", prompt="hi", usage_label="report_auditor")
+        self.assertEqual(reply, "备援成功")
+        self.assertEqual(attempts, ["gemini-4-carbon", "gemini-4-carbon", "gemini-4-hydrogen"])
+        self.assertTrue(any(e["alert_key"].startswith("llm_fallback:") for e in ops_events))
 
     async def test_concurrent_tool_calls_isolation_timeout_and_compaction(self) -> None:
         client = GeminiClient(

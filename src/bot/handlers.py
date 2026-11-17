@@ -39,7 +39,8 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "report", "description": "全景深度晨报（含全市场联网检索）"},
     {"command": "pick", "description": "全市场选股雷达（可附方向，如 /pick 英股ETF）"},
     {"command": "us", "description": "美股盘前/盘中/收盘增量哨兵"},
-    {"command": "stats", "description": "历史选股与调仓记录档案"},
+    {"command": "deep", "description": "深度单聊（/deep 问题，4 轮多维推演）"},
+    {"command": "stats", "description": "历史选股 T+N 胜率、Alpha 与 MFE/MAE 看板"},
     {"command": "help", "description": "查看核心与运维全部指令说明"},
 ]
 
@@ -159,17 +160,19 @@ class AdvisorBot:
         return (
             f"🤖 Trading 212 × Gemini 量化投顾（v{APP_VERSION}）已就绪！\n\n"
             "【核心投研指令（见左侧 / 菜单栏）】\n"
-            "• /pos — 瞬时拉取双账户实时净值、仓位与近7日成交（免等待 AI）\n"
-            "• /report — 深度全景晨报（含全市场分域联网检索、30日复盘、逐仓与挂单审计）\n"
-            "• /pick [方向] — 全市场选股雷达（美/英/欧股 + LSE ETF 联网催化 + 风控终审）\n"
-            "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报\n"
-            "• /stats — 查看近期历史选股与加减仓记录档案\n"
+            "• /pos — 瞬时拉取双账户实时净值、仓位、挂单与近7日成交（免等待 AI）\n"
+            "• /report — 深度全景晨报（全市场分域联网检索、30日复盘、逐仓与挂单审计，≤1800字）\n"
+            "• /pick [方向] — 全市场选股雷达（美/英/欧股 + LSE ETF 联网催化 + 风控终审，≤1000字）\n"
+            "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报（平稳≤450字，异动≤600字）\n"
+            "• /deep <问题> — 深度单聊升级版（1000~1200字、最多4轮工具的多维推演，Token 消耗更高）\n"
+            "• /stats — 历史推荐 T+5/10/20 胜率与 Alpha、MFE/MAE 极值、近期教训与量化体检\n"
             "• /wallet — Invest GBP+USD 双钱包对账（实时总现金、实时汇率、推算/实报 GBP 与校准差额）\n"
             "• /usd <金额> [挂单占用] — 上报 Invest USD 余额；/wallet gbp 1500 [usd 600] 单报或双报\n"
-            "• 直接打字 — 全天单聊（自带今日晨报基线、实时查价与谷歌搜新闻工具）\n\n"
-            "【运维与系统控制指令】\n"
-            "• /refresh_pool — 手动触发多市场底池海选（0-Token 筛选 150 只优质个股 + LSE ETF）\n"
-            "• /health — 全链路实时自检（T212/行情/FRED/Finnhub/Gemini/DB 与近期告警）\n"
+            "• /help — 显示本指令说明（/start 同义）；指令支持 /cmd@机器人名 形式，参数大小写不敏感\n"
+            "• 直接打字 — 全天单聊（自带今日晨报基线、实时查价与谷歌搜新闻工具；/deep 前缀升级深度模式）\n\n"
+            "【运维与系统控制指令（不在左侧菜单，直接输入即可）】\n"
+            "• /refresh_pool — 手动触发多市场底池海选（0-Token 筛 150 只个股 + LSE ETF；附 offline 跳过联网指数同步）\n"
+            "• /health — 全链路实时自检（T212/行情/FRED/Finnhub/Gemini/DB 与近期告警；/heath 为兼容别名）\n"
             "• /usage — 查看 Gemini Token 消耗、缓存命中率与本月 Google Search 免费额度进度\n"
             "• /clear — 清空今日对话记忆重新开始\n"
             "• /cancel — 立即中止正在运行的耗时分析"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -12,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.agents.ds_sidecar import call_ds_json, ds_helper_available, sanitize_plain_text
-from src.agents.llm_client import LLMBackend
+from src.agents.llm_client import LLMBackend, is_degraded_llm_output
 from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
 from src.agents.schemas import (
@@ -677,6 +678,67 @@ async def build_portfolio_fact_sheet(
     return fact_sheet, tech_map, bundles, macro
 
 
+STEP2_ANALYST_FALLBACK = (
+    "（本轮 Bull 机会分析未返回有效结果：模型调用超时或不可用。PM 请仅依据本地 FactSheet、"
+    "多空证据对照与量化指标，按保守口径裁决，不得编造新的价位依据；无证据支撑则维持 HOLD。）"
+)
+STEP2_AUDITOR_FALLBACK = (
+    "（本轮 Bear 独立审计未返回有效结果：模型调用超时或不可用。PM 请按保守口径自行裁决："
+    "今日不放行超出既有计划的新增加仓，既有挂单维持原状不撤。）"
+)
+
+
+async def _gather_step2_notes(
+    analyst_coro: Awaitable[str],
+    auditor_coro: Awaitable[str],
+    *,
+    timeout_s: float,
+) -> tuple[str, str, list[str]]:
+    """Run Bull/Bear concurrently under one wall-clock budget.
+
+    Timed-out tasks are cancelled and their notes replaced with neutral placeholders, and the
+    `generate()` model-unavailable sentinel is swapped out too: OpsNotifier wording must never
+    reach the PM prompt where it would read like a Bear audit opinion.
+    """
+    tasks: dict[str, asyncio.Task[str]] = {
+        "analyst": asyncio.ensure_future(analyst_coro),
+        "auditor": asyncio.ensure_future(auditor_coro),
+    }
+    degraded: list[str] = []
+    if timeout_s > 0:
+        _, pending = await asyncio.wait(set(tasks.values()), timeout=timeout_s)
+        if pending:
+            for role, task in tasks.items():
+                if task in pending:
+                    degraded.append(role)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.warning(
+                "Report Step 2 wall-clock budget %.0fs exceeded; degraded roles: %s",
+                timeout_s,
+                ", ".join(degraded),
+            )
+    else:
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    fallbacks = {"analyst": STEP2_ANALYST_FALLBACK, "auditor": STEP2_AUDITOR_FALLBACK}
+    notes: dict[str, str] = {}
+    for role, task in tasks.items():
+        text = ""
+        if not task.cancelled():
+            try:
+                text = (task.result() or "").strip()
+            except Exception as exc:  # defensive: generate() already converts its own failures
+                logger.warning("Report Step 2 %s task raised: %s", role, exc)
+        if not text or is_degraded_llm_output(text):
+            if role not in degraded:
+                degraded.append(role)
+            text = fallbacks[role]
+        notes[role] = text
+    return notes["analyst"], notes["auditor"], degraded
+
+
 async def generate_morning_report(
     cfg: AppConfig,
     t212: T212Client,
@@ -880,7 +942,8 @@ async def generate_morning_report(
     auditor_prompt = f"【任务：独立风控与挂单审计官（Bear 视角，深度审计并保留完整依据，1200 字内）】\n{shared_context}"
 
     report_rounds = max(1, int(cfg.models.report_max_tool_rounds))
-    analyst_notes, auditor_notes = await asyncio.gather(
+    step2_timeout_s = float(cfg.models.report_step2_timeout_seconds)
+    analyst_notes, auditor_notes, degraded_roles = await _gather_step2_notes(
         llm.generate(
             model=cfg.models.report_analyst_model,
             prompt=analyst_prompt,
@@ -903,7 +966,18 @@ async def generate_morning_report(
             max_tool_rounds=report_rounds,
             usage_label="report_auditor",
         ),
+        timeout_s=step2_timeout_s,
     )
+    if degraded_roles and ops_notifier is not None:
+        await ops_notifier.notify(
+            severity="WARN",
+            source="report:step2",
+            alert_key="report_step2_degraded",
+            message=(
+                f"/report Step 2 降级运行：{'/'.join(degraded_roles)} 未返回有效结论"
+                f"（预算 {step2_timeout_s:.0f}s），已用中性占位继续 PM 拍板。"
+            ),
+        )
 
     # ---------- Step 3: Portfolio Manager Structured Synthesis ----------
     pm_sys = build_agent_system_instruction(

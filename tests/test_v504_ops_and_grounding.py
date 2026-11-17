@@ -335,19 +335,36 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
 
             bot = AdvisorBot(cfg, t212, md, _BoomLLM(), db, tg, ops_notifier=ops, scheduler=sched)
 
-            # Left "/" menu keeps the 8 core commands; ops commands live in /help
+            # Left "/" menu keeps the core commands (ops-only commands live in /help)
             self.assertEqual(
                 [c["command"] for c in BOT_COMMANDS],
-                ["pos", "wallet", "usd", "report", "pick", "us", "stats", "help"],
+                ["pos", "wallet", "usd", "report", "pick", "us", "deep", "stats", "help"],
             )
+            # Telegram API constraints: every menu entry must be a real routed command with a short label
+            for item in BOT_COMMANDS:
+                self.assertLessEqual(len(item["description"]), 256)
+                self.assertRegex(item["command"], r"^[a-z0-9_]{1,32}$")
 
             # /help splits core vs ops commands and removes persistent bottom keyboard
             await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/help"}}, wait=True)
             help_msg, help_markup = tg.sent[-1][1], tg.sent[-1][2]
             self.assertIn("【核心投研指令", help_msg)
-            self.assertIn("【运维与系统控制指令】", help_msg)
+            self.assertIn("【运维与系统控制指令", help_msg)
             self.assertIn("/health", help_msg)
             self.assertEqual(help_markup, REMOVE_KEYBOARD_MARKUP)
+
+            # Completeness guard: every left-menu command AND every routed ops command must be documented
+            documented = {
+                line.split()[1].split("@")[0]
+                for line in help_msg.splitlines()
+                if line.startswith("• /")
+            }
+            self.assertTrue({"/" + c["command"] for c in BOT_COMMANDS} <= documented)
+            self.assertTrue(
+                {"/deep", "/refresh_pool", "/health", "/usage", "/clear", "/cancel"} <= documented
+            )
+            self.assertIn("/start", help_msg)
+            self.assertLessEqual(len(help_msg), 3500)
 
             # Trading cycle resets at 07:30 UK aligned with morning_report_hour/minute
             self.assertEqual(

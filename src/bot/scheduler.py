@@ -337,6 +337,194 @@ def _format_pending_orders(orders: list[Any]) -> str:
     return "; ".join(lines)
 
 
+FILL_QTY_TOLERANCE = 0.001
+FILL_MATCH_GRACE_MS = 60_000
+FILL_RECEIPT_MAX_CHARS = 450
+
+
+def _pending_order_snapshot_row(order: Any) -> dict[str, Any]:
+    """Flatten a live PendingOrderItem into a pending_order_snapshots row."""
+    return {
+        "account_label": str(getattr(order, "account", "") or "").strip(),
+        "order_id": str(getattr(order, "id", "") or "").strip(),
+        "yahoo_symbol": str(getattr(order, "yahoo_symbol", "") or "").strip().upper(),
+        "side": str(getattr(order, "side", "") or "").strip().upper(),
+        "quantity": float(getattr(order, "quantity", 0.0) or 0.0),
+        "filled_quantity": float(getattr(order, "filled_quantity", 0.0) or 0.0),
+        "limit_price": _to_float(getattr(order, "limit_price", None)),
+        "stop_price": _to_float(getattr(order, "stop_price", None)),
+        "order_status": str(getattr(order, "status", "") or ""),
+        "currency": str(getattr(order, "currency", "") or ""),
+    }
+
+
+def _snapshot_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(row.get("account_label") or "").strip(),
+        str(row.get("order_id") or "").strip(),
+    )
+
+
+def diff_pending_order_snapshots(
+    previous: list[dict[str, Any]],
+    live_rows: list[dict[str, Any]],
+    *,
+    supported_accounts: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Compare stored pending-order snapshots against this round's live orders.
+
+    Accounts whose pending-order API is unavailable this round are excluded from the
+    vanish/partial inference, so an HTTP 403 can never be mistaken for "all filled".
+    """
+    prev_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in previous or []:
+        if not isinstance(row, dict):
+            continue
+        key = _snapshot_key(row)
+        if key[0] and key[1]:
+            prev_by_key[key] = row
+    live_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in live_rows or []:
+        if not isinstance(row, dict):
+            continue
+        key = _snapshot_key(row)
+        if key[0] and key[1]:
+            live_by_key[key] = row
+
+    partial: list[dict[str, Any]] = []
+    for key, live in live_by_key.items():
+        prev = prev_by_key.get(key)
+        if prev is None:
+            continue
+        prev_filled = float(prev.get("filled_quantity") or 0.0)
+        live_filled = float(live.get("filled_quantity") or 0.0)
+        if live_filled > prev_filled + FILL_QTY_TOLERANCE:
+            partial.append(
+                {
+                    **live,
+                    "first_seen_ms": int(prev.get("first_seen_ms") or 0),
+                    "first_seen_uk": str(prev.get("first_seen_uk") or ""),
+                    "previous_filled_quantity": prev_filled,
+                }
+            )
+
+    supported = {str(a or "").strip() for a in (supported_accounts or set())}
+    vanished = [
+        prev
+        for key, prev in prev_by_key.items()
+        if key not in live_by_key and str(prev.get("account_label") or "").strip() in supported
+    ]
+    return {"partial": partial, "vanished": vanished, "live": list(live_by_key.values())}
+
+
+def match_fill_history(
+    order_row: dict[str, Any],
+    recent_orders: list[Any],
+    *,
+    grace_ms: int = FILL_MATCH_GRACE_MS,
+) -> dict[str, Any] | None:
+    """Cross-verify a vanished pending order against T212 historical fills.
+
+    T212's history `id` is the fill id, NOT the order id, so the only reliable match is
+    account + symbol + side + a fill timestamp window anchored on first_seen_ms.
+    """
+    account = str(order_row.get("account_label") or "").strip()
+    symbol = str(order_row.get("yahoo_symbol") or "").strip().upper()
+    side = str(order_row.get("side") or "").strip().upper()
+    target_qty = float(order_row.get("quantity") or 0.0)
+    first_seen_ms = int(order_row.get("first_seen_ms") or 0)
+    if not account or not symbol or target_qty <= 0:
+        return None
+    window_start_ms = max(0, first_seen_ms - max(0, int(grace_ms))) if first_seen_ms > 0 else 0
+
+    matched: list[Any] = []
+    for fill in recent_orders or []:
+        if str(getattr(fill, "account", "") or "").strip() != account:
+            continue
+        if str(getattr(fill, "yahoo_symbol", "") or "").strip().upper() != symbol:
+            continue
+        if str(getattr(fill, "side", "") or "").strip().upper() != side:
+            continue
+        filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
+        if filled_at_ms <= 0 or filled_at_ms < window_start_ms:
+            continue
+        matched.append(fill)
+    if not matched:
+        return None
+
+    qty = sum(abs(float(getattr(fill, "quantity", 0.0) or 0.0)) for fill in matched)
+    if qty <= 0:
+        return None
+    notional = sum(
+        abs(float(getattr(fill, "quantity", 0.0) or 0.0)) * abs(float(getattr(fill, "price", 0.0) or 0.0))
+        for fill in matched
+    )
+    last_filled_ms = max(int(getattr(fill, "filled_at_ms", 0) or 0) for fill in matched)
+    currency = (
+        str(getattr(matched[-1], "inst_currency", "") or "")
+        or str(getattr(matched[-1], "wallet_currency", "") or "")
+        or str(order_row.get("currency") or "")
+    )
+    return {
+        "matched_quantity": qty,
+        "avg_price": (notional / qty) if qty > 0 else 0.0,
+        "last_filled_at_ms": last_filled_ms,
+        "currency": currency,
+        "is_complete": qty >= target_qty * (1.0 - FILL_QTY_TOLERANCE),
+    }
+
+
+def _format_uk_from_ms(ms: int) -> str:
+    if int(ms or 0) <= 0:
+        return ""
+    return (
+        datetime.fromtimestamp(int(ms) / 1000.0, tz=timezone.utc)
+        .astimezone(LONDON_TZ)
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
+def format_fill_receipt(
+    order_row: dict[str, Any],
+    match: dict[str, Any],
+    *,
+    partial: bool = False,
+    cross_day: bool = False,
+    max_chars: int = FILL_RECEIPT_MAX_CHARS,
+) -> str:
+    """Render a plain-text fill receipt with an explicit wallet re-calibration nudge."""
+    account = str(order_row.get("account_label") or "").strip()
+    side = str(order_row.get("side") or "").strip().upper()
+    symbol = str(order_row.get("yahoo_symbol") or "").strip().upper()
+    order_qty = float(order_row.get("quantity") or 0.0)
+    filled_qty = float(match.get("matched_quantity") or 0.0)
+    avg_price = float(match.get("avg_price") or 0.0)
+    currency = str(match.get("currency") or order_row.get("currency") or "").strip()
+    filled_uk = _format_uk_from_ms(int(match.get("last_filled_at_ms") or 0))
+
+    header = "⚠️ 挂单部分成交" if partial else "✅ 挂单成交回执"
+    lines = [f"{header}（{account} {side} {symbol}）"]
+    price_str = f"{avg_price:,.2f}" if avg_price > 0 else "成交价未回传"
+    lines.append(f"• 成交: {filled_qty:g}/{order_qty:g} 股 @ {price_str} {currency}".strip())
+    limit_price = order_row.get("limit_price")
+    if limit_price is not None:
+        try:
+            lines.append(f"• 原挂单限价: {float(limit_price):,.2f} {currency}".strip())
+        except (TypeError, ValueError):
+            pass
+    if partial:
+        lines.append("• 状态: 部分成交，余量仍在挂单中，可继续等待或 /pos 复核。")
+    elif not bool(match.get("is_complete", True)):
+        lines.append("• 状态: 未足额成交，余量可能已撤单，请 /pos 复核。")
+    else:
+        lines.append("• 状态: 已全部成交。")
+    if filled_uk:
+        moment = f"跨日补发，成交时间 {filled_uk} UK" if cross_day else f"成交时间 {filled_uk} UK"
+        lines.append(f"• {moment}")
+    lines.append("• 现金与持仓已变：请 /usd 金额 或 /wallet gbp x usd y 校准钱包，再用 /pos 复核实时仓位。")
+    return "\n".join(lines)[: max(0, int(max_chars))]
+
+
 class TradingScheduler:
     """Deterministic minute-tick scheduler with per-job isolation and Telegram ops alerting."""
 
@@ -1372,6 +1560,116 @@ class TradingScheduler:
         except TypeError:
             return True
 
+    async def _collect_order_fill_receipts(self, now_utc: datetime, *, uk_date: str) -> list[tuple[str, str]]:
+        """Diff the 0-token pending-order snapshot and return [(dedupe_key, receipt_text)].
+
+        Reuses the portfolio already fetched by the intraday sentinel (cache-backed) and stays
+        silent whenever either the pending-order or the order-history API is unavailable.
+        """
+        if not bool(getattr(self.cfg.strategy, "intraday_fill_receipt_enabled", True)):
+            return []
+        get_snapshots = getattr(self.db, "get_pending_order_snapshots", None)
+        upsert_snapshots = getattr(self.db, "upsert_pending_order_snapshots", None)
+        delete_snapshots = getattr(self.db, "delete_pending_order_snapshots", None)
+        if not (callable(get_snapshots) and callable(upsert_snapshots) and callable(delete_snapshots)):
+            return []
+        try:
+            portfolio = await self.t212.get_portfolio(use_cache=True)
+        except Exception as exc:
+            logger.warning("Fill receipt portfolio fetch failed: %s", exc)
+            return []
+
+        accounts = [acc for acc in (portfolio.isa, portfolio.invest) if getattr(acc, "ok", False)]
+        supported = {
+            str(acc.account_label or "").strip()
+            for acc in accounts
+            if getattr(acc, "pending_orders_supported", False)
+        }
+        history_ok = any(getattr(acc, "order_history_supported", False) for acc in accounts)
+        if not supported or not history_ok:
+            # Cannot cross-verify a fill -> stay silent instead of risking a false receipt.
+            return []
+        history_accounts = {
+            str(acc.account_label or "").strip()
+            for acc in accounts
+            if getattr(acc, "order_history_supported", False)
+        }
+
+        live_rows = [
+            _pending_order_snapshot_row(order)
+            for acc in accounts
+            if str(acc.account_label or "").strip() in supported
+            for order in (getattr(acc, "pending_orders", None) or [])
+        ]
+        try:
+            previous = await get_snapshots()
+        except Exception as exc:
+            logger.warning("Fill receipt snapshot load failed: %s", exc)
+            return []
+
+        diff = diff_pending_order_snapshots(previous, live_rows, supported_accounts=supported)
+        history = [*portfolio.isa.recent_orders, *portfolio.invest.recent_orders]
+        now_ms = int(now_utc.timestamp() * 1000)
+        receipts: list[tuple[str, str]] = []
+        stale_keys: list[tuple[str, str]] = []
+
+        for row in diff["partial"]:
+            key = _snapshot_key(row)
+            dedupe = f"{key[0]}:{key[1]}:p{float(row.get('filled_quantity') or 0.0):g}"
+            if await self._is_job_locked(f"fill_receipt:{dedupe}", uk_date):
+                continue
+            match = match_fill_history(row, history) or {
+                "matched_quantity": float(row.get("filled_quantity") or 0.0),
+                "avg_price": 0.0,
+                "last_filled_at_ms": now_ms,
+                "currency": str(row.get("currency") or ""),
+                "is_complete": False,
+            }
+            receipts.append((dedupe, format_fill_receipt(row, match, partial=True)))
+
+        for row in diff["vanished"]:
+            key = _snapshot_key(row)
+            dedupe = f"{key[0]}:{key[1]}"
+            if key[0] not in history_accounts:
+                # No order history for this account this round -> cannot verify, keep the row.
+                continue
+            stale_keys.append(key)
+            if await self._is_job_locked(f"fill_receipt:{dedupe}", uk_date):
+                continue
+            match = match_fill_history(row, history)
+            if match is None:
+                logger.info(
+                    "Pending order %s %s vanished without a matching fill (likely cancelled)",
+                    key[0],
+                    key[1],
+                )
+                continue
+            cross_day = _format_uk_from_ms(int(match.get("last_filled_at_ms") or 0))[:10] != uk_date
+            receipts.append(
+                (
+                    dedupe,
+                    format_fill_receipt(
+                        row,
+                        match,
+                        partial=not bool(match.get("is_complete", True)),
+                        cross_day=cross_day,
+                    ),
+                )
+            )
+
+        try:
+            if live_rows:
+                await upsert_snapshots(
+                    live_rows,
+                    seen_at_ms=now_ms,
+                    seen_at_uk=now_utc.astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M"),
+                )
+            if stale_keys:
+                await delete_snapshots(stale_keys)
+        except Exception as exc:
+            logger.warning("Fill receipt snapshot persist failed: %s", exc)
+        return receipts
+
     async def _run_intraday_sentinel_job(
         self,
         now_utc: datetime,
@@ -1385,6 +1683,11 @@ class TradingScheduler:
             self.current_job_name = "intraday_sentinel"
             self._last_intraday_scan_utc = now_utc
             try:
+                receipts = await self._collect_order_fill_receipts(now_utc, uk_date=uk_date)
+            except Exception:
+                logger.exception("Fill receipt check crashed; skipping receipts this round")
+                receipts = []
+            try:
                 alerts = await self._run_intraday_sentinel_impl(now_utc, uk_date=uk_date)
             except Exception:
                 logger.exception("Intraday sentinel scan crashed; skipping this round")
@@ -1393,7 +1696,21 @@ class TradingScheduler:
                 if self.current_job_name == "intraday_sentinel":
                     self.current_job_name = prev_job
 
+        uk_now_str = now_utc.astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
         pushed: list[str] = []
+        for dedupe_key, text in receipts:
+            try:
+                delivered = await self.tg.send_message(chat_id, text)
+            except Exception as exc:  # noqa: BLE001 - delivery failure must not break the loop
+                logger.warning("Fill receipt delivery failed for %s: %s", dedupe_key, exc)
+                continue
+            if delivered is False:
+                logger.warning("Fill receipt for %s was not delivered; keeping the dedupe slot free.", dedupe_key)
+                continue
+            # Mark only after a successful push so a failed delivery never mutes the receipt.
+            await self._mark_job_locked(f"fill_receipt:{dedupe_key}", uk_date, uk_now_str)
+            pushed.append(f"FILL:{dedupe_key}")
+
         for sym, text in alerts:
             try:
                 delivered = await self.tg.send_message(chat_id, text)

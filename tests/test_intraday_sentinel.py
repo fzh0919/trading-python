@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
-from src.bot.scheduler import TradingScheduler, _intraday_move_pct, _order_distance_pct
+from src.bot.scheduler import (
+    TradingScheduler,
+    _intraday_move_pct,
+    _order_distance_pct,
+    diff_pending_order_snapshots,
+    format_fill_receipt,
+    match_fill_history,
+)
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig, EnvSettings, UniverseSection
 from src.data_providers.market_data import MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    HistoricalOrderItem,
     PendingOrderItem,
     PortfolioData,
     PositionItem,
@@ -132,7 +140,13 @@ def _position(symbol: str, currency: str, cur_price: float) -> PositionItem:
     )
 
 
-def _order(symbol: str, limit_price: float, currency: str) -> PendingOrderItem:
+def _order(
+    symbol: str,
+    limit_price: float,
+    currency: str,
+    *,
+    filled_quantity: float = 0.0,
+) -> PendingOrderItem:
     return PendingOrderItem(
         id=f"ord-{symbol}",
         account="ISA",
@@ -143,13 +157,52 @@ def _order(symbol: str, limit_price: float, currency: str) -> PendingOrderItem:
         side="BUY",
         order_type="LIMIT",
         quantity=5.0,
+        filled_quantity=filled_quantity,
         value=limit_price * 5.0,
         limit_price=limit_price,
         currency=currency,
     )
 
 
-def _portfolio(positions: list[PositionItem], orders: list[PendingOrderItem] | None = None) -> PortfolioData:
+def _fill(
+    symbol: str,
+    quantity: float,
+    price: float,
+    filled_at_ms: int,
+    *,
+    account: str = "ISA",
+    currency: str = "GBP",
+) -> HistoricalOrderItem:
+    return HistoricalOrderItem(
+        id=f"fill-{symbol}-{filled_at_ms}",
+        account=account,
+        raw_ticker=f"{symbol}_EQ",
+        ticker=symbol,
+        yahoo_symbol=symbol,
+        name=f"{symbol} Inc",
+        inst_currency=currency,
+        side="BUY",
+        order_type="LIMIT",
+        filled_at="2026-11-17T15:01:00Z",
+        filled_at_ms=filled_at_ms,
+        uk_time_str="2026-11-17 15:01",
+        quantity=quantity,
+        price=price,
+        net_value=quantity * price,
+        wallet_currency=currency,
+        realised_pnl=0.0,
+        tax_total=0.0,
+    )
+
+
+def _portfolio(
+    positions: list[PositionItem],
+    orders: list[PendingOrderItem] | None = None,
+    *,
+    recent_orders: list[HistoricalOrderItem] | None = None,
+    pending_supported: bool = False,
+    history_supported: bool = False,
+) -> PortfolioData:
     return PortfolioData(
         fetched_at_uk="2026-11-17 15:00",
         fetched_at_ms=1794927600000,
@@ -162,6 +215,9 @@ def _portfolio(positions: list[PositionItem], orders: list[PendingOrderItem] | N
             total_cash=2000.0,
             positions=positions,
             pending_orders=orders or [],
+            recent_orders=recent_orders or [],
+            pending_orders_supported=pending_supported,
+            order_history_supported=history_supported,
         ),
         invest=AccountSnapshot(ok=True, account_label="Invest"),
     )
@@ -191,11 +247,21 @@ class _SentinelTestCase(unittest.IsolatedAsyncioTestCase):
         histories: dict | None = None,
         quotes: dict | None = None,
         llm=None,
+        recent_orders: list[HistoricalOrderItem] | None = None,
+        pending_supported: bool = False,
+        history_supported: bool = False,
     ) -> tuple[TradingScheduler, _StubMarketData, _StubTg, object]:
         md = _StubMarketData(histories or {}, bundles or {}, quotes)
         tg = _StubTg()
         llm = llm or _DsStubLLM()
-        sched = TradingScheduler(self.cfg, _StubT212(_portfolio(positions, orders)), md, llm, self.db, tg)
+        portfolio = _portfolio(
+            positions,
+            orders,
+            recent_orders=recent_orders,
+            pending_supported=pending_supported,
+            history_supported=history_supported,
+        )
+        sched = TradingScheduler(self.cfg, _StubT212(portfolio), md, llm, self.db, tg)
         return sched, md, tg, llm
 
 
@@ -465,6 +531,140 @@ class TestSentinelMath(unittest.TestCase):
         self.assertIsNotNone(dist)
         assert dist is not None
         self.assertAlmostEqual(dist, 0.8, places=4)
+
+
+class TestFillReceipts(_SentinelTestCase):
+    """Pending-order fill receipts: 0-token snapshot diff cross-verified against order history."""
+
+    async def _seed(self):
+        sched, _, tg, _ = self._build(
+            positions=[],
+            orders=[_order("VWRP.L", 95.0, "GBP")],
+            bundles={"VWRP.L": _bundle("VWRP.L", 100.0, "GBP")},
+            histories={"VWRP.L": _history(100.0, 100.0)},
+            pending_supported=True,
+            history_supported=True,
+        )
+        await sched.check_and_run_due_jobs(NOW)
+        return sched, tg
+
+    def _build_empty(self, **kwargs):
+        return self._build(
+            positions=[],
+            bundles={},
+            histories={},
+            pending_supported=True,
+            history_supported=True,
+            **kwargs,
+        )
+
+    async def test_first_scan_seeds_snapshot_silently(self) -> None:
+        _, tg = await self._seed()
+        self.assertEqual(tg.sent, [])
+        rows = await self.db.get_pending_order_snapshots()
+        self.assertEqual([r["order_id"] for r in rows], ["ord-VWRP.L"])
+        self.assertGreater(rows[0]["first_seen_ms"], 0)
+
+    async def test_full_fill_pushes_once_and_not_again(self) -> None:
+        await self._seed()
+        fill = _fill("VWRP.L", 5.0, 100.0, int(NOW.timestamp() * 1000) + 60_000)
+        sched, _, tg, _ = self._build_empty(recent_orders=[fill])
+        later = NOW + timedelta(minutes=30)
+        await sched.check_and_run_due_jobs(later)
+        self.assertEqual(len(tg.sent), 1)
+        text = tg.sent[0][1]
+        self.assertIn("挂单成交回执", text)
+        self.assertIn("5/5", text)
+        self.assertIn("/usd", text)
+        self.assertNotIn("#", text)
+        self.assertNotIn("**", text)
+        self.assertLessEqual(len(text), 450)
+        self.assertTrue(await self.db.has_scheduler_job_fired("fill_receipt:ISA:ord-VWRP.L", UK_DATE))
+        self.assertEqual(await self.db.get_pending_order_snapshots(), [])
+
+        sched2, _, tg2, _ = self._build_empty(recent_orders=[fill])
+        await sched2.check_and_run_due_jobs(later + timedelta(minutes=30))
+        self.assertEqual(tg2.sent, [])
+
+    async def test_cancelled_order_is_silent_and_row_removed(self) -> None:
+        await self._seed()
+        sched, _, tg, _ = self._build_empty()
+        await sched.check_and_run_due_jobs(NOW + timedelta(minutes=30))
+        self.assertEqual(tg.sent, [])
+        self.assertEqual(await self.db.get_pending_order_snapshots(), [])
+        self.assertFalse(await self.db.has_scheduler_job_fired("fill_receipt:ISA:ord-VWRP.L", UK_DATE))
+
+    async def test_partial_fill_pushes_once(self) -> None:
+        await self._seed()
+        seed_ms = int(NOW.timestamp() * 1000)
+        partial = _order("VWRP.L", 100.0, "GBP", filled_quantity=2.0)
+        fill = _fill("VWRP.L", 2.0, 100.0, seed_ms + 60_000)
+        sched, _, tg, _ = self._build_empty(orders=[partial], recent_orders=[fill])
+        await sched.check_and_run_due_jobs(NOW + timedelta(minutes=30))
+        self.assertEqual(len(tg.sent), 1)
+        self.assertIn("部分成交", tg.sent[0][1])
+        self.assertIn("2/5", tg.sent[0][1])
+
+        sched2, _, tg2, _ = self._build_empty(orders=[partial], recent_orders=[fill])
+        await sched2.check_and_run_due_jobs(NOW + timedelta(minutes=60))
+        self.assertEqual(tg2.sent, [])
+
+    async def test_pending_api_unsupported_skips_account(self) -> None:
+        await self._seed()
+        sched, _, tg, _ = self._build(
+            positions=[],
+            bundles={},
+            histories={},
+            pending_supported=False,  # simulate HTTP 403 on /equity/orders
+            history_supported=True,
+        )
+        await sched.check_and_run_due_jobs(NOW + timedelta(minutes=30))
+        self.assertEqual(tg.sent, [])
+        rows = await self.db.get_pending_order_snapshots()
+        self.assertEqual([r["order_id"] for r in rows], ["ord-VWRP.L"])
+
+    def test_pure_helpers_guard_and_format(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        row = {
+            "account_label": "ISA",
+            "order_id": "ord-1",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 5.0,
+            "filled_quantity": 0.0,
+            "limit_price": 100.0,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        self.assertIsNone(match_fill_history(row, []))
+        self.assertIsNone(match_fill_history(row, [_fill("VWRP.L", 5.0, 100.0, first_seen - 86_400_000)]))
+        self.assertIsNone(match_fill_history(row, [_fill("MSFT", 5.0, 300.0, first_seen + 1000, currency="USD")]))
+
+        match = match_fill_history(row, [_fill("VWRP.L", 5.0, 99.5, first_seen + 1000)])
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertTrue(match["is_complete"])
+        self.assertAlmostEqual(match["avg_price"], 99.5, places=6)
+
+        text = format_fill_receipt(row, match, cross_day=True)
+        self.assertIn("跨日补发", text)
+        self.assertIn("/usd", text)
+        self.assertLessEqual(len(text), 450)
+
+        # A 403 account must never be treated as "all orders vanished".
+        self.assertEqual(
+            diff_pending_order_snapshots(
+                [{**row, "account_label": "Invest", "order_id": "x"}],
+                [],
+                supported_accounts={"ISA"},
+            )["vanished"],
+            [],
+        )
+        self.assertEqual(
+            len(diff_pending_order_snapshots([row], [], supported_accounts={"ISA"})["vanished"]),
+            1,
+        )
 
 
 if __name__ == "__main__":

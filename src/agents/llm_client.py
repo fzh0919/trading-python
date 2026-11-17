@@ -134,6 +134,25 @@ _TRANSIENT_KEYWORDS = (
 )
 
 
+# Our own `asyncio.wait_for` ceiling (not a transport error): a hard timeout usually means the
+# model is saturated, so retrying it costs minutes before failover can even start.
+_HARD_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, asyncio.TimeoutError)
+
+# Sentinel strings returned by `generate()` when every candidate model failed. They are meant for
+# end-user surfaces (Telegram), never as analyst/auditor content inside an internal prompt.
+DEGRADED_LLM_MARKERS: tuple[str, ...] = (
+    "⚠️ AI 模型服务当前全部不可用",
+    "⚠️ AI 模型密钥未配置",
+    "⚠️ GEMINI_API_KEY 未配置",
+)
+
+
+def is_degraded_llm_output(text: str | None) -> bool:
+    """True when `generate()` returned its model-unavailable sentinel instead of real content."""
+    stripped = (text or "").strip()
+    return any(stripped.startswith(marker) for marker in DEGRADED_LLM_MARKERS)
+
+
 def _is_transient_llm_error(exc: Exception) -> bool:
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
         return True
@@ -260,6 +279,7 @@ class GeminiClient:
         deepseek_round_timeout_seconds: float = 60.0,
         deepseek_max_retries: int = 1,
         round_timeout_seconds: float = 120.0,
+        timeout_max_retries: int = 0,
         tool_timeout_seconds: float = 60.0,
         max_concurrent_tools: int = 6,
         max_tool_result_chars: int = 4000,
@@ -281,6 +301,7 @@ class GeminiClient:
         self.deepseek_fallback_model = (deepseek_fallback_model or "deepseek-flash").strip()
         self.deepseek_fallback_thinking_level = (deepseek_fallback_thinking_level or "HIGH").strip()
         self.max_transient_retries = max(0, int(max_transient_retries))
+        self.timeout_max_retries = max(0, min(int(timeout_max_retries), self.max_transient_retries))
         self.deepseek_max_retries = max(0, int(deepseek_max_retries))
         self.retry_base_delay_s = max(0.0, float(retry_base_delay_s))
         self.round_timeout_seconds = max(0.0, float(round_timeout_seconds))
@@ -543,19 +564,29 @@ class GeminiClient:
                     resp = await _invoke_sdk(cfg)
                     return resp, thinking_cfg, effective_level
 
-                if attempt < self.max_transient_retries and _is_transient_llm_error(exc):
-                    delay = self.retry_base_delay_s * (2**attempt)
-                    logger.warning(
-                        "Transient Gemini error on %s (attempt %d/%d): %s; retrying in %.1fs",
-                        model,
-                        attempt + 1,
-                        self.max_transient_retries + 1,
-                        err_msg[:180],
-                        delay,
-                    )
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    continue
+                if _is_transient_llm_error(exc):
+                    is_timeout = isinstance(exc, _HARD_TIMEOUT_ERRORS)
+                    retry_budget = self.timeout_max_retries if is_timeout else self.max_transient_retries
+                    if attempt < retry_budget:
+                        delay = self.retry_base_delay_s * (2**attempt)
+                        logger.warning(
+                            "Transient Gemini error on %s (attempt %d/%d): %s; retrying in %.1fs",
+                            model,
+                            attempt + 1,
+                            retry_budget + 1,
+                            err_msg[:180],
+                            delay,
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+                    if is_timeout:
+                        logger.warning(
+                            "Hard timeout on %s after %.0fs (%s); skipping further retries to fail over sooner",
+                            model,
+                            self.round_timeout_seconds,
+                            usage_label or "unknown",
+                        )
                 raise
         raise RuntimeError(f"Exhausted retries for {model}")
 

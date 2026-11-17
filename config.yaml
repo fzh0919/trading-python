@@ -43,6 +43,12 @@ models:
 
   enable_forced_search_grounding: true
   report_max_tool_rounds: 2
+  # [v5.3.3 调用级韧性] 单轮硬超时 / 5xx 重试预算 / 硬超时重试预算（0 = 超时立即切备援，不再空等）
+  gemini_round_timeout_seconds: 120.0
+  gemini_max_transient_retries: 2
+  gemini_timeout_max_retries: 0
+  # /report Step 2（Bull+Bear 并发）总时长护栏：到点取消未完成方，用中性占位继续 PM 拍板
+  report_step2_timeout_seconds: 240.0
   google_search_free_quota_monthly: 5000    # Google Search Grounding 月免费额度参考线
   google_search_warn_pct: 85.0              # 达到月免费额度该百分比时预警提醒
 
@@ -125,6 +131,7 @@ strategy:
   intraday_poll_minutes: 30
   intraday_move_alert_pct: 3.5
   intraday_order_near_pct: 1.5
+  intraday_fill_receipt_enabled: true   # 挂单成交回执（快照比对 + 历史成交交叉验证，0 额外 API）
 
 # Optional priority symbols (Yahoo Finance symbols, e.g. ["TSM", "AZN.L", "ASML.AS"])
 watchlist: []
