@@ -52,6 +52,99 @@ from src.storage.db import AdvisorDatabase
 logger = logging.getLogger(__name__)
 LONDON_TZ = ZoneInfo("Europe/London")
 
+_GUARDRAIL_TAG = "[🛡️风控护栏修正]"
+
+
+def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
+    """Render the deterministic deployment-gate constraints for Researcher/Critic prompts."""
+    isa_g = gate_ctx.get("isa") if isinstance(gate_ctx.get("isa"), dict) else {}
+    inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
+    lines = ["【今日组合门控约束（确定性底线，严禁违反）】"]
+    if isa_g.get("isa_satellite_saturated"):
+        lines.append(
+            f"• ISA 个股卫星层已饱和（持仓+挂单 {isa_g.get('committed_satellite_count')}只/"
+            f"{float(isa_g.get('committed_satellite_pct') or 0.0):.1f}%）：ISA 赛道只允许宽基 ETF"
+            "（VWRP.L 等），严禁推荐新开 ISA 个股，闲钱归拢核心宽基。"
+        )
+    lines.append(
+        f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
+        f"{inv_g.get('reason') or ''}"
+    )
+    if inv_g.get("status") == "ROTATE":
+        lines.append(
+            f"• ROTATE 等风险置换：Invest 新开仓必须先在 thesis 写明以平掉/撤掉 "
+            f"{inv_g.get('funding_from') or '现有未脱险弱仓'} 为置换资金源，严禁动用闲置现金净增槽位。"
+        )
+    scale = float(inv_g.get("risk_budget_scale") or 1.0)
+    if 0.0 < scale < 1.0:
+        lines.append(f"• 连损恢复首单：Invest 单笔风险预算按 {scale:.1f}R 半仓试探执行。")
+    lines.append(f"• 市场状态 {gate_ctx.get('regime')}，全局门控 {gate_ctx.get('global_status')}。")
+    return "\n".join(lines) + "\n"
+
+
+def _apply_gate_channel_constraints(
+    decision: PickDecision,
+    portfolio: PortfolioData,
+    gate_ctx: dict[str, Any],
+) -> tuple[PickDecision, list[str]]:
+    """v5.4.0 post-guardrail hard interception: cross-account same-ticket dedupe + ROTATE funding.
+
+    Never mutates the caller's decision object; returns the hardened copy and human-readable
+    rejection notes (tagged so render_pick_report surfaces them).
+    """
+    inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
+    funding_from = str(inv_g.get("funding_from") or "").strip().upper()
+
+    held_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
+    pending_buy_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
+    for pos in portfolio.all_positions():
+        sym = pos.yahoo_symbol.upper()
+        held_by_acct.setdefault(pos.account.strip().upper(), set()).update({sym, sym.split(".")[0]})
+    for order in portfolio.all_pending_orders():
+        if str(order.side or "").strip().upper() != "BUY":
+            continue
+        sym = order.yahoo_symbol.upper()
+        pending_buy_by_acct.setdefault(order.account.strip().upper(), set()).update({sym, sym.split(".")[0]})
+
+    other_acct = {"ISA": "INVEST", "INVEST": "ISA"}
+    kept: list[Any] = []
+    notes: list[str] = []
+    for item in decision.selected_actions:
+        act_up = str(item.action or "").strip().upper()
+        sym = item.symbol.strip().upper()
+        base = sym.split(".")[0]
+        acct = item.account.strip().upper()
+        if act_up in {"BUY", "ADD"}:
+            other = other_acct.get(acct, "")
+            if other and (sym in held_by_acct.get(other, set()) or base in held_by_acct.get(other, set())
+                          or sym in pending_buy_by_acct.get(other, set()) or base in pending_buy_by_acct.get(other, set())):
+                note = (
+                    f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                    f"跨账户同票去重：{item.symbol} 已在 {other} 持仓/挂单，请归口原持仓账户管理"
+                )
+                notes.append(note)
+                continue
+            if funding_from and acct == "INVEST" and inv_g.get("status") == "ROTATE":
+                combined = f"{item.thesis} {item.risk_note}".upper()
+                if funding_from and funding_from not in combined and funding_from.split(".")[0] not in combined:
+                    note = (
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        f"ROTATE 等风险置换：Invest 新开仓须在 thesis 中写明先平/撤 {funding_from} 的置换资金源"
+                    )
+                    notes.append(note)
+                    continue
+        kept.append(item)
+
+    if not notes:
+        return decision, []
+    hardened = decision.model_copy(
+        update={
+            "selected_actions": kept,
+            "rejected_or_frozen": [*(decision.rejected_or_frozen or []), *notes],
+        }
+    )
+    return hardened, notes
+
 
 def _extract_holding_context(portfolio: PortfolioData) -> tuple[dict[str, str], dict[str, str]]:
     """Extract per-symbol ISIN and earliest open timestamp from live portfolio positions."""
@@ -443,6 +536,7 @@ async def _post_screen_validate_decision(
     llm: LLMBackend | None = None,
     ops_notifier: OpsNotifier | None = None,
     trade_ctx: dict[str, str] | None = None,
+    deployment_gate: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Backfill native entry_price, apply deterministic risk override guardrail, and render."""
     all_bundles = dict(held_bundles)
@@ -504,25 +598,43 @@ async def _post_screen_validate_decision(
         history_days=cfg.strategy.order_history_days,
         cooldown_days=cfg.strategy.rebuy_cooldown_days,
     )
+    # v5.4.0: gate-linked sizing — after a loss-streak cooldown the recovery pilot runs at
+    # half risk (0.5R ≈ £42.5) so the suggested share count scales automatically.
+    gate_mode = str(getattr(cfg.strategy, "deployment_gate_mode", "advise") or "advise").strip().lower()
+    gate_ctx = deployment_gate if (isinstance(deployment_gate, dict) and gate_mode == "advise") else None
+    sizing_strategy = cfg.strategy
+    if gate_ctx is not None:
+        inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
+        scale = float(inv_g.get("risk_budget_scale") or 1.0)
+        if 0.0 < scale < 1.0:
+            base_budget = float(getattr(cfg.strategy, "invest_risk_budget_gbp", 85.0) or 85.0)
+            sizing_strategy = cfg.strategy.model_copy(
+                update={"invest_risk_budget_gbp": base_budget * scale}
+            )
     override_res = apply_risk_override_guardrail(
         hydrated_decision,
         portfolio=portfolio,
         macro=macro,
-        strategy=cfg.strategy,
+        strategy=sizing_strategy,
         bundle_map=all_bundles,
         evals=evals,
         high_correlation_symbols=high_corr_syms,
         daily_vetoes=guardrails,
         report_actions=report_actions,
         trade_behavior=trade_behavior,
+        deployment_gate=gate_ctx,
     )
     resolved_decision = (
         override_res.decision
         if isinstance(override_res.decision, PickDecision)
         else hydrated_decision
     )
+    # v5.4.0: deterministic gate channel constraints (cross-account dedupe + ROTATE funding).
+    final_decision = resolved_decision
+    if gate_ctx is not None:
+        final_decision, _gate_notes = _apply_gate_channel_constraints(resolved_decision, portfolio, gate_ctx)
     final_text = render_pick_report(
-        resolved_decision,
+        final_decision,
         max_chars=1000,
         risk_override=override_res,
     )
@@ -536,12 +648,12 @@ async def _post_screen_validate_decision(
             "horizon_days": cfg.strategy.settlement_holding_days,
             "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
         }
-        for item in resolved_decision.selected_actions
+        for item in final_decision.selected_actions
     ]
     if llm is not None and not final_text.startswith("⚠️"):
         selected_syms = {
             item.symbol.strip().upper()
-            for item in resolved_decision.selected_actions
+            for item in final_decision.selected_actions
             if item.symbol.strip() and item.symbol.strip().upper() != "CASH"
         }
         held_syms = {s.strip().upper() for s in portfolio.unique_yahoo_symbols()}
@@ -562,7 +674,7 @@ async def _post_screen_validate_decision(
             rendered_text=final_text,
             strategy=cfg.strategy,
             ops_notifier=ops_notifier,
-            headline=resolved_decision.headline,
+            headline=final_decision.headline,
             selected_symbols=selected_syms,
             known_symbols=rejected_syms,
         )
@@ -648,6 +760,13 @@ async def generate_pick_radar(
         if isinstance(context_pack, dict) and isinstance(context_pack.get("symbols"), dict)
         else {}
     )
+    # v5.4.0: read today's deterministic deployment gate from the /report context pack.
+    # Legacy packs without the key keep the pre-v5.4.0 behaviour 100% intact.
+    gate_ctx = context_pack.get("deployment_gate") if isinstance(context_pack, dict) else None
+    gate_ctx = gate_ctx if isinstance(gate_ctx, dict) else None
+    gate_block = ""
+    if gate_ctx is not None and str(getattr(cfg.strategy, "deployment_gate_mode", "off") or "off").strip().lower() == "advise":
+        gate_block = _format_gate_constraint_block(gate_ctx)
     if not recent_lessons and isinstance(context_pack, dict):
         pack_recent = context_pack.get("recent_lessons")
         if isinstance(pack_recent, list):
@@ -837,6 +956,7 @@ async def generate_pick_radar(
     )
     researcher_prompt = (
         f"【任务：增量选股投研员】\n"
+        f"{gate_block}"
         f"时段状态：{market_phase_note}\n"
         f"方向：{focus_line}\n\n"
         f"=== 今日 /report 审计基线与风控红线（必须严格继承，除非有盘中新数据证明必须修正）===\n"
@@ -912,6 +1032,7 @@ async def generate_pick_radar(
         include_order_audit_rule=False,
     )
     critic_prompt = (
+        f"{gate_block}"
         f"【时段状态】：{market_phase_note}\n"
         f"【今日 /report 基线】：{morning_conclusion or '（暂无）'}\n"
         + (f"【今日 /report 持仓与挂单裁决（默认遵循）】：\n{morning_audits_text}\n" if morning_audits_text else "")
@@ -965,6 +1086,7 @@ async def generate_pick_radar(
             llm=llm,
             ops_notifier=ops_notifier,
             trade_ctx=trade_ctx,
+            deployment_gate=gate_ctx,
         )
     else:
         logger.warning("Pick Critic structured parse fell back to plain text.")

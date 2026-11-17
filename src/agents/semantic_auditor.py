@@ -67,11 +67,25 @@ def build_fact_baseline(
         acct = getattr(portfolio, label, None)
         if acct is None:
             continue
-        lines.append(
-            f"{label.upper()}：可用 {_fmt_num(getattr(acct, 'available_to_trade', None))}"
-            f" | 挂单占用 {_fmt_num(getattr(acct, 'reserved_cash', None))}"
-            f" | 总现金 {_fmt_num(getattr(acct, 'total_cash', None))}"
-        )
+        acct_val = float(getattr(acct, "total_account_value", 0.0) or 0.0)
+        available = float(getattr(acct, "available_to_trade", 0.0) or 0.0)
+        total_cash = float(getattr(acct, "total_cash", 0.0) or 0.0)
+        reserved = float(getattr(acct, "reserved_cash", 0.0) or 0.0)
+        if acct_val > 0:
+            avail_pct = (available / acct_val) * 100.0
+            cash_pct = (total_cash / acct_val) * 100.0
+            line = (
+                f"{label.upper()}：可用 {_fmt_num(available)} (可用占比 {avail_pct:.1f}%)"
+                f" | 挂单占用 {_fmt_num(reserved)}"
+                f" | 总现金 {_fmt_num(total_cash)} (总现金占比 {cash_pct:.1f}%)"
+            )
+        else:
+            line = (
+                f"{label.upper()}：可用 {_fmt_num(available)}"
+                f" | 挂单占用 {_fmt_num(reserved)}"
+                f" | 总现金 {_fmt_num(total_cash)}"
+            )
+        lines.append(line)
     pending_text = str((trade_ctx or {}).get("pending_orders_text") or "").strip()
     if pending_text:
         lines.append("活动挂单（未成交仍计息）：\n" + pending_text[:1200])

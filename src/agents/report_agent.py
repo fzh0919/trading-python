@@ -49,6 +49,11 @@ from src.engine.calendar_utils import (
     get_us_market_schedule_uk,
     is_uk_bank_holiday,
 )
+from src.engine.deployment_gate import (
+    evaluate_deployment_gate,
+    format_deployment_gate_banner,
+    reconcile_pm_pick_gate,
+)
 from src.engine.portfolio_rules import (
     DisagreementItem,
     HoldingEvaluation,
@@ -740,6 +745,36 @@ async def _gather_step2_notes(
     return notes["analyst"], notes["auditor"], degraded
 
 
+def _evaluate_deployment_gate_safely(
+    cfg: AppConfig,
+    portfolio: PortfolioData,
+    bundles: dict[str, TickerMarketBundle],
+    histories: dict[str, pd.DataFrame],
+    macro: MacroSnapshot,
+    tech_map: dict[str, TechnicalSnapshot],
+    gate_histories: dict[str, pd.DataFrame],
+    gate_candidates: list[dict[str, Any]],
+    prev_gate_states: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Deterministic gate evaluation that must never break the /report pipeline."""
+    try:
+        return evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=cfg.strategy,
+            bundles=bundles,
+            histories={**gate_histories, **histories},
+            macro=macro,
+            tech_map=tech_map,
+            candidates=gate_candidates,
+            universe_etf_symbols=cfg.universe.etf_symbols,
+            prev_gate_states=prev_gate_states,
+            gbp_usd=getattr(macro, "gbp_usd", None),
+        )
+    except Exception as exc:  # noqa: BLE001 - gate failure must never block the report
+        logger.warning("Deployment gate evaluation failed, banner omitted: %s", exc)
+        return None
+
+
 async def generate_morning_report(
     cfg: AppConfig,
     t212: T212Client,
@@ -777,6 +812,70 @@ async def generate_morning_report(
         calendar_alerts,
         context_pack,
     ) = fact_bundle
+
+    # ---------- v5.4.0 deployment gate data pre-fetch (0 LLM calls, offline-tolerant) ----------
+    gate_mode = str(getattr(cfg.strategy, "deployment_gate_mode", "off") or "off").strip().lower()
+    gate_histories: dict[str, pd.DataFrame] = {}
+    gate_candidates: list[dict[str, Any]] = []
+    prev_gate_states: list[dict[str, Any]] = []
+    if gate_mode != "off":
+        regime_bench = str(getattr(cfg.strategy, "regime_benchmark_symbol", "SPY") or "SPY").strip().upper()
+        core_bench = str(getattr(cfg.strategy, "benchmark_symbol", "VWRP.L") or "VWRP.L").strip().upper()
+        etf_upper = {s.strip().upper() for s in (cfg.universe.etf_symbols or []) if s} | {core_bench}
+        active_pool_syms: list[str] = []
+        if callable(getattr(db, "get_active_universe_pool", None)):
+            try:
+                active_rows = await db.get_active_universe_pool()
+                for row in active_rows or []:
+                    if isinstance(row, dict) and not row.get("is_etf"):
+                        sym_r = str(row.get("symbol") or "").strip()
+                        if sym_r and sym_r.upper() not in etf_upper:
+                            active_pool_syms.append(sym_r)
+                            if len(active_pool_syms) >= 30:
+                                break
+            except Exception as exc:
+                logger.debug("Deployment-gate active universe lookup skipped: %s", exc)
+        pool_syms = list(
+            dict.fromkeys(
+                [
+                    s
+                    for s in (
+                        *cfg.universe.invest_tactical,
+                        *active_pool_syms,
+                        *cfg.universe.isa_long_term,
+                        *cfg.watchlist,
+                    )
+                    if s and s.strip().upper() not in etf_upper
+                ]
+            )
+        )
+        gate_syms = list(dict.fromkeys([regime_bench, core_bench, "^VIX", *pool_syms]))
+        if callable(getattr(market_data, "get_histories", None)):
+            try:
+                fetched = await market_data.get_histories(gate_syms, period="2y")
+                if isinstance(fetched, dict):
+                    gate_histories = {k: v for k, v in fetched.items() if v is not None and not v.empty}
+            except Exception as exc:
+                logger.debug("Deployment-gate history pre-fetch failed; continuing without A-trigger scan: %s", exc)
+        for sym in pool_syms:
+            hist = gate_histories.get(sym)
+            if hist is None or hist.empty:
+                continue
+            try:
+                snap = compute_technical_snapshot(sym, hist, bundle=bundles.get(sym))
+            except Exception as exc:
+                logger.debug("Deployment-gate tech snapshot failed for %s: %s", sym, exc)
+                continue
+            if snap is not None:
+                gate_candidates.append({"symbol": sym, "tech": snap, "bundle": bundles.get(sym), "account": "Invest"})
+        if hasattr(db, "get_recent_context_packs"):
+            try:
+                for pack in await db.get_recent_context_packs(limit=5):
+                    gate_prev = pack.get("deployment_gate") if isinstance(pack, dict) else None
+                    if isinstance(gate_prev, dict) and gate_prev.get("regime"):
+                        prev_gate_states.append(gate_prev)
+            except Exception as exc:
+                logger.debug("Deployment-gate previous-state lookup skipped: %s", exc)
 
     # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
     if getattr(macro, "gbp_usd", None):
@@ -1013,6 +1112,31 @@ async def generate_morning_report(
         f"=== 独立风控审计官挑刺与挂单审计 (Bear) ===\n{auditor_notes}"
     )
 
+    # v5.4.0: inject the deterministic gate bottom line into the PM prompt (advise mode only).
+    gate_preview: dict[str, Any] | None = None
+    if gate_mode == "advise":
+        gate_preview = _evaluate_deployment_gate_safely(
+            cfg,
+            portfolio,
+            bundles,
+            histories,
+            macro,
+            tech_map,
+            gate_histories,
+            gate_candidates,
+            prev_gate_states,
+        )
+    if gate_preview is not None:
+        isa_g = gate_preview.get("isa") or {}
+        inv_g = gate_preview.get("invest") or {}
+        pm_prompt += (
+            "\n\n=== 今日组合门控（Python 确定性底线；PM 仅可单向收紧） ===\n"
+            f"市场状态 {gate_preview.get('regime')}｜ISA {isa_g.get('status')}（{isa_g.get('reason')}）"
+            f"｜Invest {inv_g.get('status')}（{inv_g.get('reason')}）\n"
+            "• 仅在发现重大宏观/事件风险时把 pick_gate.allow 置 false 收紧；"
+            "严禁把 WAIT/DEFEND 升为 RUN；ROTATE 必须给出合法 funding_from 置换源。"
+        )
+
     raw_pm = await llm.generate(
         model=cfg.models.report_model,
         prompt=pm_prompt,
@@ -1047,6 +1171,48 @@ async def generate_morning_report(
             trade_behavior=trade_ctx.get("trade_behavior"),
         )
         resolved_decision = override_res.decision if isinstance(override_res.decision, MorningReportDecision) else decision
+
+        # v5.4.0: evaluate the deterministic gate AFTER the guardrail, reconcile the PM pick_gate
+        # one-way, persist to the context pack and (in advise mode) render the banner.
+        # Zero extra LLM calls.
+        gate_dict: dict[str, Any] | None = None
+        gate_banner = ""
+        if gate_mode != "off":
+            gate_dict = _evaluate_deployment_gate_safely(
+                cfg,
+                portfolio,
+                bundles,
+                histories,
+                macro,
+                tech_map,
+                gate_histories,
+                gate_candidates,
+                prev_gate_states,
+            )
+            if gate_dict is not None:
+                pm_proposal = getattr(resolved_decision, "pick_gate", None)
+                funding_whitelist = set(gate_dict.get("invest", {}).get("unfinanced_positions") or []) | set(
+                    gate_dict.get("invest", {}).get("pending_new_equity_buys") or []
+                )
+                gate_dict["pm"] = reconcile_pm_pick_gate(
+                    gate_dict,
+                    pm_proposal.model_dump() if pm_proposal is not None else None,
+                    whitelist_symbols=funding_whitelist,
+                )
+                gate_dict["banner"] = format_deployment_gate_banner(gate_dict)
+        if gate_dict is not None:
+            context_pack["deployment_gate"] = gate_dict
+            logger.info(
+                "Deployment gate [%s]: regime=%s global=%s isa=%s invest=%s",
+                gate_mode,
+                gate_dict.get("regime"),
+                gate_dict.get("global_status"),
+                gate_dict.get("isa", {}).get("status"),
+                gate_dict.get("invest", {}).get("status"),
+            )
+            if gate_mode == "advise":
+                gate_banner = str(gate_dict.get("banner") or "")
+
         context_pack["report_decision"] = {
             "headline": resolved_decision.headline,
             "top_actions": [a.model_dump() for a in resolved_decision.top_actions],
@@ -1057,6 +1223,7 @@ async def generate_morning_report(
             resolved_decision,
             max_chars=max_body_chars,
             risk_override=override_res,
+            gate_banner=gate_banner,
         )
         guardrails = list(resolved_decision.daily_vetoes)
         actions_summary = "; ".join(

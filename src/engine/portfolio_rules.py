@@ -10,12 +10,17 @@ from pydantic import BaseModel, Field
 
 from src.config import StrategySection
 from src.data_providers.analytics import (
+    _ETF_TECH_PENETRATION_PCT,
     TechnicalSnapshot,
     compute_drawdown_since_date,
     normalize_issuer_root,
 )
 from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
 from src.data_providers.t212_client import AccountSnapshot, PendingOrderItem, PortfolioData, PositionItem
+
+# v5.4.0: single-source VIX danger threshold shared by apply_risk_override_guardrail
+# and the deterministic deployment gate (src/engine/deployment_gate.py).
+DEFAULT_VIX_DANGER_THRESHOLD: float = 28.0
 
 
 class HoldingEvaluation(BaseModel):
@@ -36,6 +41,8 @@ class HoldingEvaluation(BaseModel):
     rr_ratio: float | None = None
     suggested_size_gbp: float | None = None
     min_order_gbp: float | None = None
+    # v5.4.0: ISA legacy <min_isa_equity_order_gbp crumb currently inside a rebound/pruning window
+    is_crumb_prune_candidate: bool = False
 
 
 class DisagreementItem(BaseModel):
@@ -57,7 +64,7 @@ class RiskOverrideRecord(BaseModel):
     symbol: str
     from_action: str
     to_action: str
-    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT | EX_DIV_WINDOW | RR_BELOW_FLOOR | RR_UNVERIFIED
+    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT | EX_DIV_WINDOW | RR_BELOW_FLOOR | RR_UNVERIFIED | FREQUENCY_CAP | REBUY_COOLDOWN | ISA_SATELLITE_SATURATED
     reason: str
 
 
@@ -829,6 +836,30 @@ def evaluate_holding(
             ):
                 reasons.append("CYQ筹码支撑结构良好")
 
+    # v5.4.0 ISA legacy crumb (grandfathered, < min_isa_equity_order_gbp) — only a *gentle*
+    # rebound-window prune hint. Never force-liquidate in panic days or silent pullbacks.
+    crumb_prune_candidate = False
+    is_isa_legacy_crumb = (
+        (not is_invest)
+        and (not is_etf)
+        and (0 < pos.current_value < strategy.min_isa_equity_order_gbp)
+    )
+    if is_isa_legacy_crumb and not stop_flag and not earnings_soon and tech is not None:
+        rebound_window = bool(
+            pos.return_pct >= strategy.isa_crumb_near_breakeven_floor_pct
+            and (
+                (tech.rsi14 is not None and tech.rsi14 >= 60.0)
+                or (tech.drawdown_20d_pct is not None and tech.drawdown_20d_pct >= -2.0)
+            )
+        )
+        if rebound_window:
+            crumb_prune_candidate = True
+            trim_score += 2
+            reasons.append(
+                f"历史小额散仓(£{pos.current_value:.0f}<£{strategy.min_isa_equity_order_gbp:.0f})"
+                "反弹接近回本/阻力窗，可顺势归拢至核心宽基(零Quota损耗)"
+            )
+
     # Hurdle gate v5.3.2: ISA judged on opportunity cost vs long-term trend, Invest on R:R.
     # Cash interest (4.0%/3.4%) is a parking-yield floor only — never a veto on long-term ISA holdings.
     upside_pct = _compute_analyst_upside_pct(bundle)
@@ -902,6 +933,7 @@ def evaluate_holding(
         rr_ratio=round(rr_ratio, 2) if rr_ratio is not None else None,
         suggested_size_gbp=sizing["suggested_gbp"],
         min_order_gbp=sizing["min_order_gbp"],
+        is_crumb_prune_candidate=crumb_prune_candidate,
     )
 
 
@@ -936,7 +968,7 @@ def evaluate_portfolio(
         "INVEST": data.invest.total_account_value or sum(p.current_value for p in data.invest.positions),
     }
 
-    return [
+    evals = [
         evaluate_holding(
             pos,
             tech_map.get(pos.yahoo_symbol),
@@ -951,6 +983,39 @@ def evaluate_portfolio(
         )
         for pos in data.all_positions()
     ]
+
+    # v5.4.0: at most `isa_crumb_pruning_max_per_report` crumb prune hints per report.
+    # Extras are downgraded to HOLD — legacy crumbs are never force-liquidated en masse.
+    pos_value_by_sym = {p.yahoo_symbol.upper(): p.current_value for p in data.all_positions()}
+    crumb_alerts = [
+        ev
+        for ev in evals
+        if ev.is_crumb_prune_candidate and ev.action_bias == "TRIM_ALERT"
+    ]
+    if len(crumb_alerts) > strategy.isa_crumb_pruning_max_per_report:
+        crumb_alerts.sort(
+            key=lambda ev: (
+                -ev.return_pct,
+                -(pos_value_by_sym.get(ev.yahoo_symbol.upper(), 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        keep_ysyms = {ev.yahoo_symbol.upper() for ev in crumb_alerts[: strategy.isa_crumb_pruning_max_per_report]}
+        evals = [
+            (
+                ev.model_copy(
+                    update={
+                        "action_bias": "HOLD",
+                        "reasons": ["存量小额散仓静待反弹窗口分批归核，不低位急割"],
+                        "is_crumb_prune_candidate": False,
+                    }
+                )
+                if (ev.is_crumb_prune_candidate and ev.yahoo_symbol.upper() not in keep_ysyms)
+                else ev
+            )
+            for ev in evals
+        ]
+    return evals
 
 
 _CONFLICT_HINTS: dict[str, str] = {
@@ -1212,6 +1277,7 @@ def _cadence_violation(
     sym_up: str,
     base: str,
     strategy: StrategySection,
+    is_etf: bool = False,
 ) -> tuple[str, str] | None:
     """Detect a cadence/cooldown breach: weekly/monthly BUY caps or the re-buy cooldown.
 
@@ -1219,7 +1285,12 @@ def _cadence_violation(
     short history window can never silently freeze all new deployment. This function only
     *detects* the breach — whether it blocks or merely advises is decided by
     ``trade_cadence_guard_mode``.
+
+    v5.4.0: core wide-base ETF buys (VWRP.L etc.) are 100% quota-exempt — buying the
+    benchmark or clearing legacy crumbs never consumes any individual-equity quota.
     """
+    if is_etf:
+        return None
     if not behavior or behavior.get("partial"):
         return None
     weekly_cap = int(getattr(strategy, "max_weekly_new_buys", 0) or 0)
@@ -1262,7 +1333,8 @@ def apply_risk_override_guardrail(
     daily_vetoes: list[str] | None = None,
     report_actions: list[Any] | None = None,
     trade_behavior: dict[str, Any] | None = None,
-    vix_danger_threshold: float = 28.0,
+    vix_danger_threshold: float = DEFAULT_VIX_DANGER_THRESHOLD,
+    deployment_gate: dict[str, Any] | None = None,
 ) -> RiskOverrideResult:
     """Apply deterministic post-LLM risk override guardrails to MorningReportDecision or PickDecision."""
     if decision is None:
@@ -1320,13 +1392,58 @@ def apply_risk_override_guardrail(
                         )
         issuer_weights = {r: (v / total_all) * 100.0 for r, v in issuer_vals.items()}
 
-    # Index bundles case-insensitively and by base symbol
+    # Index bundles case-insensitively and by base symbol; also seed known UCITS ETF roots
+    etf_roots.update(normalize_issuer_root(s) for s in _ETF_TECH_PENETRATION_PCT)
+    if isinstance(deployment_gate, dict):
+        for etf_sym in deployment_gate.get("etf_set") or []:
+            if etf_sym:
+                etf_roots.add(normalize_issuer_root(str(etf_sym)))
     bundle_lookup: dict[str, TickerMarketBundle] = {}
     for sym, b in bmap.items():
         bundle_lookup[sym.upper()] = b
         bundle_lookup.setdefault(sym.upper().split(".")[0], b)
         if b.quote_type.upper() == "ETF":
             etf_roots.add(normalize_issuer_root(sym))
+
+    # v5.4.0 zero-quota exemption: recompute equity-only BUY counts from raw order history so
+    # that core-ETF buys (VWRP.L etc.) and SELL-side cleanups never consume quota. When
+    # portfolio is None the caller-supplied trade_behavior is read verbatim (legacy contract).
+    effective_behavior = dict(trade_behavior) if trade_behavior else {}
+    benchmark_root = normalize_issuer_root(str(strat.benchmark_symbol))
+    held_isa_syms: set[str] = set()
+    held_isa_bases: set[str] = set()
+    if portfolio is not None:
+        for p in portfolio.isa.positions:
+            held_isa_syms.add(p.yahoo_symbol.upper())
+            held_isa_bases.add(p.yahoo_symbol.upper().split(".")[0])
+        if effective_behavior:
+            recent_all = [*portfolio.isa.recent_orders, *portfolio.invest.recent_orders]
+            if recent_all:
+                anchor_ms = max(
+                    int(getattr(portfolio, "fetched_at_ms", 0) or 0),
+                    max(o.filled_at_ms for o in recent_all),
+                )
+
+                def _order_is_etf(o: Any) -> bool:
+                    root = normalize_issuer_root(str(getattr(o, "ticker", "") or ""))
+                    sym = str(getattr(o, "yahoo_symbol", "") or "").upper()
+                    if root in etf_roots or root == benchmark_root:
+                        return True
+                    if sym and (sym in etf_roots or normalize_issuer_root(sym) in etf_roots):
+                        return True
+                    return False
+
+                equity_buys = [
+                    o
+                    for o in recent_all
+                    if str(getattr(o, "side", "") or "").upper() == "BUY" and not _order_is_etf(o)
+                ]
+                effective_behavior["buys_7d"] = sum(
+                    1 for o in equity_buys if anchor_ms - o.filled_at_ms <= 7 * 86_400_000
+                )
+                effective_behavior["buys_30d"] = sum(
+                    1 for o in equity_buys if anchor_ms - o.filled_at_ms <= 30 * 86_400_000
+                )
 
     stop_alerts: set[tuple[str, str]] = {
         (e.account.upper(), e.yahoo_symbol.upper())
@@ -1369,7 +1486,18 @@ def apply_risk_override_guardrail(
             return "CORRELATION_OVERLAP", f"与现有持仓相关性触发≥{strat.overlap_correlation_threshold:.2f}重叠拦截"
 
         if act_up in {"BUY", "ADD"}:
-            cadence_breach = _cadence_violation(trade_behavior or {}, sym_up, base, strat)
+            root = normalize_issuer_root(base)
+            b = bundle_lookup.get(sym_up) or bundle_lookup.get(base)
+            benchmark_up = str(strat.benchmark_symbol).strip().upper()
+            is_etf = bool(
+                (b is not None and b.quote_type.upper() == "ETF")
+                or (root in etf_roots)
+                or (root == benchmark_root)
+                or sym_up == benchmark_up
+                or base == benchmark_up
+            )
+            # v5.4.0: core wide-base ETF buys are 100% quota-exempt (zero Quota).
+            cadence_breach = _cadence_violation(effective_behavior, sym_up, base, strat, is_etf=is_etf)
             if cadence_breach is not None:
                 guard_mode = _cadence_guard_mode(strat)
                 if guard_mode == "hard":
@@ -1382,12 +1510,15 @@ def apply_risk_override_guardrail(
                     )
                     if note not in cadence_advisories:
                         cadence_advisories.append(note)
-            root = normalize_issuer_root(base)
-            b = bundle_lookup.get(sym_up) or bundle_lookup.get(base)
-            is_etf = bool((b and b.quote_type.upper() == "ETF") or (root in etf_roots))
 
             if not is_etf:
                 issuer_w = issuer_weights.get(root, 0.0)
+                # v5.4.0 hard single-name cap across both accounts (12% of the whole portfolio).
+                if issuer_w >= strat.max_single_name_portfolio_pct:
+                    return (
+                        "ISSUER_OVERWEIGHT",
+                        f"同发行人跨账户占全组合{issuer_w:.1f}%(≥单票硬上限{strat.max_single_name_portfolio_pct:.0f}%)",
+                    )
                 if issuer_w >= strat.max_total_portfolio_weight_pct:
                     return (
                         "ISSUER_OVERWEIGHT",
@@ -1399,6 +1530,21 @@ def apply_risk_override_guardrail(
                     return (
                         "ACCOUNT_OVERWEIGHT",
                         f"占{account}单仓达{acct_w:.1f}%(≥上限{acct_cap:.0f}%)",
+                    )
+                # v5.4.0: ISA satellite layer saturated (holdings + pending equity buys over
+                # 30% / 8 names) — block NEW ISA equity buys, wide-base ETFs stay allowed.
+                if (
+                    is_pick
+                    and acct_up == "ISA"
+                    and sym_up not in held_isa_syms
+                    and base not in held_isa_bases
+                    and isinstance(deployment_gate, dict)
+                    and isinstance(deployment_gate.get("isa"), dict)
+                    and deployment_gate["isa"].get("isa_satellite_saturated")
+                ):
+                    return (
+                        "ISA_SATELLITE_SATURATED",
+                        "ISA 个股卫星层已饱和，暂停新开个股，请归拢核心宽基",
                     )
 
             if (acct_up, sym_up) in stop_alerts or any(

@@ -19,19 +19,20 @@
 | :--- | :--- | :--- |
 | `config.py`, `config.yaml`, `version.py` | Pydantic 配置、`.env`、热重载自选/选股池、版本号 | `test_llm_pricing_and_usage.py` |
 | `engine/calendar_utils.py` | `US/UK/XETRA/EURONEXT` 交易日历、半日市、夏令时错位周 | `test_calendar_and_scheduler.py` |
-| `storage/db.py` | SQLite `WAL` 异步仓、周期/快照/结算/行情与搜索缓存、`wallet_balances` 双钱包锚点、`quant_health_audits.ai_diagnosis`、`user_preference_notes` 与 `pending_order_snapshots` 挂单成交快照、`nav_history` 日频净值锚点（GBP 标量，**永不清理**）、`get_settled_outcome_series` 原始 Alpha 序列 | `test_db_storage.py`, `test_sidecar_memory_and_weekly.py`, `test_intraday_sentinel.py`, `test_nav_performance.py` |
+| `storage/db.py` | SQLite `WAL` 异步仓、周期/快照/结算/行情与搜索缓存、`get_recent_context_packs` 门控迟滞只读衔接、`wallet_balances` 双钱包锚点、`quant_health_audits.ai_diagnosis`、`user_preference_notes` 与 `pending_order_snapshots` 挂单成交快照、`nav_history` 日频净值锚点（GBP 标量，**永不清理**）、`get_settled_outcome_series` 原始 Alpha 序列 | `test_db_storage.py`, `test_sidecar_memory_and_weekly.py`, `test_intraday_sentinel.py`, `test_nav_performance.py` |
 | `data_providers/t212_client.py` | T212 双账户只读、限流退避、挂单量化（**按挂单限价**核 R:R）与元/分红归档、成交频率/冷却 0-Token 统计 | `test_t212_client.py` |
 | `data_providers/market_data.py` | Yahoo+Finnhub+FRED 并发聚合、`2y` 缓存、盘前 15m 跳空、Yahoo v8 chart 兜底（仅 yfinance 抛异常时）、Finnhub Basic Financials（PB/EV-EBITDA/流动比率别名补值） | `test_market_data.py` |
 | `data_providers/analytics.py` | 复权自愈、CYQ、周线/ATR/ADX、去 Beta 相关性、CVaR、**TWR 组合绩效（剔入金）／交易归因（分币种）／信号 t 值与衰减／HHI 集中度／波动 2 年分位** | `test_analytics_and_rules.py`, `test_nav_performance.py` |
-| `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride`、双钱包摩擦+价差估算、R:R≥2:1、以损定仓、频率/冷却三态护栏（`advisory` 默认仅提示）；`v5.3.4` 起 **`/pick` 买入侧确定性复算**：`RR_BELOW_FLOOR` / `RR_UNVERIFIED` / `EX_DIV_WINDOW` 三态护栏 + 建议股数写入 `risk_note`（VWRP 基准化） | `test_analytics_and_rules.py` |
+| `engine/deployment_gate.py` | `v5.4.0` 纯确定性 CIO 组合门控：账本恒等式与挂单三分法、ISA 核心≥60%/卫星≤30%·≤8只闸门、Invest 在险槽位与以盈解锁、`gate_epoch_date` 历史包袱豁免、去汇率失真 `SPY` Regime（进 1d / 退 3d 防死锁）、A/B/C/D 触发器与 `DEFEND` 四步协议、PM 单向收紧钳位、`<=110` 字门控横幅与 2 年离线回放 | `test_report_pick_gate.py` |
+| `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride`、双钱包摩擦+价差估算、R:R≥2:1、以损定仓、频率/冷却三态护栏（宽基 ETF 与老仓清理 **100% 零 Quota 豁免**）；`v5.3.4` 起 `/pick` 买入侧复算（`RR_BELOW_FLOOR`/`RR_UNVERIFIED`/`EX_DIV_WINDOW`）；`v5.4.0` 起跨双账户单票 `12%` 硬上限、`/pick` `ISA_SATELLITE_SATURATED` 拦截与 `<£1,200` 历史散仓顺风反弹温和归核（单次最多浮出 2 只） | `test_analytics_and_rules.py`, `test_report_pick_gate.py` |
 | `engine/screener.py`, `engine/universe_seeds.py`, `refresh_pool.py` | 四维双轨量化选股（维度3 含 PB / EV-EBITDA 估值倍数）、150 只海选底池、VPVR/Stage2/VCP、Invest 钱包摩擦加权、候选行「财报/除息」双日历锚点 | `test_analytics_and_rules.py`, `test_universe_audition.py` |
 | `agents/llm_client.py` | `GeminiClient`（Gemini+DeepSeek 混合路由/双向灾备）、Thinking 钳位、工具裁剪、Search 额度预警、硬超时快速灾备（`timeout_max_retries`，默认 0）+ `is_degraded_llm_output` 哨兵识别 | `test_llm_pricing_and_usage.py` |
 | `agents/ds_sidecar.py` | DeepSeek 侧车唯一出口：`ds_helper_available` 凭证门控、`call_ds_json` 硬超时 + 静默降级、`extract_json_object`、`sanitize_plain_text` | `test_ds_pick_prefilter_and_auditor.py` |
-| `agents/semantic_auditor.py` | `/report` & `/pick` 只读语义质检（幻觉价位/挂单计息/驳回外泄/红线冲突）、`build_fact_baseline` | `test_ds_pick_prefilter_and_auditor.py` |
-| `agents/prompts.py`, `agents/schemas.py` | 投资者画像（VWRP 基准化/资金分桶/卖出三分类/开仓硬纪律）、JSON 自修复、`[🛡️风控护栏修正]` 倒金字塔渲染 | `test_db_and_end_to_end.py` |
+| `agents/semantic_auditor.py` | `/report` & `/pick` 只读语义质检（幻觉价位/挂单计息/驳回外泄/红线冲突）、`build_fact_baseline`（含净可用占比与总现金占比双口径） | `test_ds_pick_prefilter_and_auditor.py`, `test_report_pick_gate.py` |
+| `agents/prompts.py`, `agents/schemas.py` | 投资者画像（VWRP 基准化/ISA 核心-卫星/零 Quota 豁免/Invest 在险槽位以盈解锁）、`PickGateDecision`、JSON 自修复、二段首行 `gate_banner` 与 `[🛡️风控护栏修正]` 倒金字塔渲染 | `test_db_and_end_to_end.py`, `test_report_pick_gate.py` |
 | `agents/tools.py` | 分域 Google 强搜（英文搜/中文出）与 `MarketToolkit` | `test_v504_ops_and_grounding.py` |
-| `agents/report_agent.py` | `/report` 三步流水线（Step 2 总时长护栏 + 中性降级占位）、`AnalysisContextPack`、`/us` 异动门控、语义质检接线、盘中异动快报 | `test_db_and_end_to_end.py`, `test_intraday_sentinel.py`, `test_report_step2_budget.py` |
-| `agents/pick_agent.py` | `/pick` 宽漏斗 DeepSeek ID 初筛 -> Researcher -> Risk Critic -> Post-Screen 硬拦截落库 + 偏好注入 | `test_db_and_end_to_end.py`, `test_ds_pick_prefilter_and_auditor.py` |
+| `agents/report_agent.py` | `/report` 三步流水线（Step 2 总时长护栏 + 中性降级占位）、`AnalysisContextPack`、护栏后确定性 `deployment_gate` 求值与落库、`/us` 异动门控、语义质检接线、盘中异动快报 | `test_db_and_end_to_end.py`, `test_intraday_sentinel.py`, `test_report_step2_budget.py`, `test_report_pick_gate.py` |
+| `agents/pick_agent.py` | `/pick` 宽漏斗 DeepSeek ID 初筛 -> Researcher -> Risk Critic -> Post-Screen 硬拦截落库（联动 `deployment_gate` 饱和分流、跨账户同票去重、`ROTATE` 置换源核验、连损恢复 `0.5R` 半仓算仓） + 偏好注入 | `test_db_and_end_to_end.py`, `test_ds_pick_prefilter_and_auditor.py`, `test_report_pick_gate.py` |
 | `agents/chat_agent.py` | `/pos` 0-Token 查仓、Implicit Cache 前缀、标的切片、`/deep` 与带原话偏好注入（dynamic_tail） | `test_db_and_end_to_end.py` |
 | `bot/handlers.py`, `bot/scheduler.py`, `bot/telegram_client.py` | 指令路由、`execution_lock` 互斥、`/perf` 0-Token 绩效看板（TWR/回撤/Alpha-Beta-IR/胜率/HHI/t 值）、自动日程、盘后 21:40 NAV 补采、`T+5/10/20` 结算、`/wallet`/`/usd` 双钱包校准、盘中哨兵、挂单成交回执（快照比对 + 历史成交交叉验证）、周六策略周报（含 VWRP 基准闭环）、偏好抽取 | `test_calendar_and_scheduler.py`, `test_db_and_end_to_end.py`, `test_sidecar_memory_and_weekly.py`, `test_intraday_sentinel.py`, `test_nav_performance.py` |
 | `ops_notifier.py`, `healthcheck.py`, `main.py` | `ops-notify` 双态告警、心跳/只读 DB 探活、生命周期管理 | `test_v504_ops_and_grounding.py` |
@@ -81,7 +82,7 @@
 2. 是否新增日志/异常打印 `api_key` / `token` / `secret` / `cfg.env`？
 3. 是否新增读取环境变量（尤其凭据类）？
 4. 是否改动 `base_url` / 超时 / 重试 / 灾备链？
-5. 是否改动风控护栏开关（`pick_rr_guard_mode` / `trade_cadence_guard_mode` / `intraday_fill_receipt_enabled` 等）？
+5. 是否改动风控护栏开关（`deployment_gate_mode` / `pick_rr_guard_mode` / `trade_cadence_guard_mode` / `intraday_fill_receipt_enabled` 等）？
 
 任一为「是」→ 必须在该次变更说明中显式列出并等待人工确认。
 
@@ -97,4 +98,5 @@
 
 - 禁止执行：`git push`、`D:\HOMELAB\scripts\deploy-n95.ps1`、`sync-up.ps1`、`ssh`、`docker exec ... env`、`pip install`、任何 `curl | bash`。
 - 密钥只做**布尔探测**（`Test-Path` / `[bool]$env:X`），严禁 `Get-Content .env`，严禁在回复中回显密钥片段。
+- 文件读取黑名单（原 `.clineignore` 语义，Cline 下线后由本节承载）：`.env`、`.env.*`、`data/`、`logs/`、`*.db`、`*.db-wal`、`*.db-shm`、`*.sqlite`、`*.sqlite3`、`*.log`、`_ref/` 一律不读。
 

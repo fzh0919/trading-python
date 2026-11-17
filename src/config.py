@@ -284,6 +284,51 @@ class StrategySection(BaseModel):
     min_rr_ratio: float = Field(default=2.0, gt=0.0, le=10.0)
     ex_div_entry_guard_days: int = Field(default=3, ge=0, le=30)
 
+    # --- v5.4.0 组合门控、ISA 核心-卫星结构与 Invest 渐进式火力引擎 ---
+    # off = 完全关闭旁路 | log = 仅写日志与 context_pack | advise = 早报渲染并联动 /pick
+    deployment_gate_mode: Literal["off", "log", "advise"] = "advise"
+    # 新纪元起算日(YYYY-MM-DD)：此日期前的历史亏损与老仓出清不计入连损冷静惩罚
+    gate_epoch_date: str = "2026-11-18"
+
+    # 1) 集中度与 ISA 核心-卫星结构护栏
+    max_single_name_portfolio_pct: float = Field(default=12.0, gt=0.0, le=100.0)  # 单一公司跨双账户占全组合硬上限（核心宽基 ETF 豁免）
+    isa_core_etf_target_pct: float = Field(default=60.0, gt=0.0, le=100.0)  # ISA 核心宽基目标占比（%）
+    isa_satellite_max_total_pct: float = Field(default=30.0, gt=0.0, le=100.0)  # ISA 个股卫星层（持仓+未成交个股BUY挂单）占 ISA 硬上限（%）
+    isa_satellite_max_count: int = Field(default=8, ge=1, le=50)  # ISA 个股卫星层最大只数（持仓+未成交新个股BUY挂单）
+    isa_crumb_pruning_max_per_report: int = Field(default=2, ge=1, le=5)  # 单次早报最多温和提示顺势归核的边角料只数
+    isa_crumb_near_breakeven_floor_pct: float = Field(default=-3.0, ge=-50.0, le=50.0)  # 边角料顺风归核浮亏下限（>=-3% 视为接近回本/微盈区）
+    isa_cash_band_low_pct: float = Field(default=5.0, ge=0.0, le=100.0)  # ISA 结构现金垫下沿（%）
+    isa_cash_band_high_pct: float = Field(default=15.0, ge=0.0, le=100.0)  # ISA 常规现金上沿（%）
+    min_deploy_excess_pct: float = Field(default=3.0, ge=0.0, le=50.0)  # 超过现金上沿多少百分点触发 ISA 宽基 dca（15+3=18%）
+
+    # 2) Invest 在险槽位与以盈解锁（仅核算 Invest 账户自身）
+    invest_slots_risk_on: int = Field(default=2, ge=0, le=10)  # RISK_ON 最大同时未脱险个股槽位数
+    invest_slots_neutral: int = Field(default=1, ge=0, le=10)  # NEUTRAL 最大同时未脱险个股槽位数（单侦察兵）
+    invest_slots_risk_off: int = Field(default=0, ge=0, le=10)  # RISK_OFF 个股槽位数（0 = 冻结新开个股）
+    max_new_equity_entries_per_day: int = Field(default=1, ge=1, le=10)  # 单日最多新开/新挂个股笔数（Best Idea Only）
+    consecutive_loss_limit: int = Field(default=2, ge=1, le=10)  # gate_epoch_date 后近 14 天连续止损笔数阈值
+    consecutive_loss_lookback_days: int = Field(default=14, ge=1, le=60)  # 连损回溯窗口（天）
+    consecutive_loss_cooldown_days: int = Field(default=5, ge=1, le=30)  # 连损触发后的个股冷静观察天数（交易日/自然日折算 7 天）
+    recovery_pilot_risk_scale: float = Field(default=0.5, gt=0.0, le=1.0)  # 冷静期满首笔试探单风险缩放系数（0.5R = £42.5）
+
+    # 3) 去汇率失真市场状态（Regime）与 A/C 触发器
+    regime_benchmark_symbol: str = "SPY"  # 美元原币种全球/美股核心趋势锚（防 GBP/USD 扭曲 VWRP.L）
+    regime_vix_risk_on: float = Field(default=18.0, gt=0.0, le=100.0)  # 进入 RISK_ON 的波动率上限
+    regime_vix_exit_risk_off: float = Field(default=25.0, gt=0.0, le=100.0)  # 退出 RISK_OFF 回到 NEUTRAL 的波动率缓解线（严禁用 18.0 防死锁！）
+    regime_ma200_band_pct: float = Field(default=3.0, gt=0.0, le=50.0)  # 实质跌破 MA200 的缓冲带（%）
+    regime_drawdown_neutral_pct: float = Field(default=8.0, gt=0.0, le=100.0)  # 常规回调进入 NEUTRAL 阈值（%）
+    regime_drawdown_risk_off_pct: float = Field(default=15.0, gt=0.0, le=100.0)  # 深度回撤进入 RISK_OFF 阈值（%）
+    regime_hy_oas_risk_off_pct: float = Field(default=5.5, gt=0.0, le=50.0)  # 高收益债利差进入 RISK_OFF 阈值（%）
+    regime_confirm_enter_days: int = Field(default=1, ge=1, le=10)  # 进入 RISK_OFF 快速确认天数
+    regime_confirm_exit_days: int = Field(default=3, ge=1, le=10)  # 退出 RISK_OFF / 进入 RISK_ON 稳定确认天数
+    core_etf_drawdown_steps_pct: list[float] = Field(
+        default_factory=lambda: [5.0, 10.0, 15.0, 20.0]
+    )  # ISA 宽基距52周高点分档折扣触发阶梯
+    trigger_ma_tolerance_pct: float = Field(default=1.5, gt=0.0, le=20.0)  # 右侧趋势个股回踩 MA50 容差带（%）
+    trigger_max_symbols: int = Field(default=3, ge=1, le=10)  # A 触发器最多输出候选标的数
+    inflow_trigger_pct: float = Field(default=2.0, gt=0.0, le=100.0)  # C 触发器单日外部净入金占账户比例（%）
+    inflow_trigger_min_gbp: float = Field(default=400.0, ge=0.0)  # C 触发器最小净入金绝对额（£）
+
     @field_validator("benchmark_symbol")
     @classmethod
     def _clean_benchmark_symbol(cls, v: Any) -> str:
@@ -300,6 +345,12 @@ class StrategySection(BaseModel):
     def _normalize_pick_rr_guard_mode(cls, v: Any) -> str:
         mode = str(v or "advisory").strip().lower()
         return mode if mode in {"off", "advisory", "hard"} else "advisory"
+
+    @field_validator("deployment_gate_mode", mode="before")
+    @classmethod
+    def _normalize_deployment_gate_mode(cls, v: Any) -> str:
+        mode = str(v or "advise").strip().lower()
+        return mode if mode in {"off", "log", "advise"} else "advise"
 
 
 class UniverseSection(BaseModel):

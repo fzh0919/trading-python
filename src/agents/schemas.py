@@ -78,6 +78,15 @@ def _as_flagged_position_item(item: Any) -> FlaggedPositionItem | None:
     return _coerce_flagged_position_str(str(item))
 
 
+class PickGateDecision(BaseModel):
+    """v5.4.0 PM-level pick gate — deterministic rules are the bottom line, PM may only tighten."""
+
+    allow: bool = Field(default=True, description="是否允许本轮 /pick 新开仓位（false 为 PM 主动收紧否决）")
+    mode: str = Field(default="none", description="run=可运行选股 | rotate=须等风险置换 | none=无可用通道")
+    funding_from: str = Field(default="", description="ROTATE 模式的合法腾挪资金源（平掉/撤掉的标的代码），缺省为空")
+    reason: str = Field(default="", description="一句话说明允许或收紧的原因（不超过45字）")
+
+
 class MorningReportDecision(BaseModel):
     headline: str = Field(description="一句话定调今日核心策略与现金态度（不超过45字）")
     top_actions: list[ReportActionItem] = Field(
@@ -108,6 +117,13 @@ class MorningReportDecision(BaseModel):
     earnings_watch: list[str] = Field(
         default_factory=list,
         description="近7日财报预警与应对预案（每条<=30字，无则为空数组）",
+    )
+    pick_gate: PickGateDecision = Field(
+        default_factory=PickGateDecision,
+        description=(
+            "今日 /pick 组合门控收紧权（仅可收紧：仅在发现重大宏观/事件风险时把 allow 置 false 并写明理由；"
+            "严禁把组合门控的 WAIT/DEFEND 升为 RUN；ROTATE 时必须给出 funding_from 合法置换源）"
+        ),
     )
 
     @field_validator("flagged_positions", mode="before")
@@ -395,8 +411,14 @@ def render_morning_report(
     max_chars: int = 1800,
     *,
     risk_override: RiskOverrideResult | None = None,
+    gate_banner: str = "",
 ) -> str:
-    """Render MorningReportDecision as inverted-pyramid Telegram report strictly <= max_chars with zero overlap."""
+    """Render MorningReportDecision as inverted-pyramid Telegram report strictly <= max_chars with zero overlap.
+
+    v5.4.0: when ``gate_banner`` is non-empty it is pinned as the FIRST line of section 2
+    (【宏观、账户与今日风控红线】) so the deterministic deployment-gate conclusion can never
+    be trimmed away by the tail-char truncator.
+    """
     ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
     if isinstance(ro_decision, MorningReportDecision):
         decision = ro_decision
@@ -435,9 +457,10 @@ def render_morning_report(
     )
     sec2 = (
         "【宏观、账户与今日风控红线】\n"
-        f"• 宏观与现金：{decision.macro_and_cash}\n"
-        f"• 双账户与集中度：{decision.account_diagnosis}\n"
-        f"• 今日风控红线：{veto_str}"
+        + (f"{gate_banner.strip()}\n" if gate_banner.strip() else "")
+        + f"• 宏观与现金：{decision.macro_and_cash}\n"
+        + f"• 双账户与集中度：{decision.account_diagnosis}\n"
+        + f"• 今日风控红线：{veto_str}"
     )
 
     covered_syms: set[str] = set()

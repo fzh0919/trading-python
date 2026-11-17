@@ -686,6 +686,37 @@ class AdvisorDatabase:
             logger.warning("Failed to parse morning context_pack_json: %s", exc)
             return None
 
+    async def get_recent_context_packs(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Return the most recent valid morning context packs (most recent first).
+
+        Read-only helper for the v5.4.0 deployment gate's 1d-enter / 3d-exit regime
+        confirmation hysteresis — the gate engine reads prior raw_regime streaks from
+        these packs. Never writes, never alters any table.
+        """
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT context_pack_json FROM morning_reports
+                WHERE context_pack_json IS NOT NULL AND TRIM(context_pack_json) != ''
+                ORDER BY updated_at_ms DESC LIMIT ?
+                """,
+                (max(0, int(limit)),),
+            )
+            rows = await cur.fetchall()
+        packs: list[dict[str, Any]] = []
+        for row in rows:
+            raw_json = str(row[0] or "").strip()
+            if not raw_json:
+                continue
+            try:
+                parsed = json.loads(raw_json)
+            except Exception as exc:
+                logger.warning("Failed to parse morning context_pack_json: %s", exc)
+                continue
+            if isinstance(parsed, dict):
+                packs.append(parsed)
+        return packs
+
     async def append_premarket_note(self, memo_text: str, cycle_date: str | None = None) -> None:
         cdate = cycle_date or self._cycle_id()
         now_ms = int(time.time() * 1000)
