@@ -111,6 +111,11 @@ strategy:
   spread_estimate_us_pct: 0.05            # 美股/欧股买卖价差估算（半价差口径，%）
   spread_estimate_uk_eu_pct: 0.20         # 英股/LSE ETF 买卖价差估算（半价差口径，%）
 
+  # v5.3.4 /pick 买入侧确定性护栏（把 2:1 门槛与以损定仓从提示词搬进 Python）
+  pick_rr_guard_mode: "advisory"          # off=不检查 / advisory=仅提示（默认） / hard=Python 硬拦截
+  min_rr_ratio: 2.0                       # Python 复算 R:R 下限（目标空间扣摩擦 ÷ 止损幅度）
+  ex_div_entry_guard_days: 3              # 距除息 ≤N 天的新建仓提示/拦截窗口（0=关闭）
+
   # /us intraday anomaly gate & T+N settlement horizon (IMP-12 / IMP-16)
   us_anomaly_move_pct: 1.8
   us_anomaly_vix_change_pct: 4.0

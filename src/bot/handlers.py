@@ -17,6 +17,12 @@ from src.agents.pick_agent import generate_pick_radar
 from src.agents.report_agent import generate_morning_report, generate_us_sentinel
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
+from src.data_providers.analytics import (
+    compute_concentration_metrics,
+    compute_portfolio_performance,
+    compute_signal_quality,
+    compute_trade_attribution,
+)
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import T212Client, reconcile_invest_wallets
 from src.engine.screener import run_universe_audition
@@ -41,6 +47,7 @@ BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "us", "description": "美股盘前/盘中/收盘增量哨兵"},
     {"command": "deep", "description": "深度单聊（/deep 问题，4 轮多维推演）"},
     {"command": "stats", "description": "历史选股 T+N 胜率、Alpha 与 MFE/MAE 看板"},
+    {"command": "perf", "description": "实盘绩效看板（TWR/回撤/Alpha-Beta-IR/胜率/HHI）"},
     {"command": "help", "description": "查看核心与运维全部指令说明"},
 ]
 
@@ -166,6 +173,9 @@ class AdvisorBot:
             "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报（平稳≤450字，异动≤600字）\n"
             "• /deep <问题> — 深度单聊升级版（1000~1200字、最多4轮工具的多维推演，Token 消耗更高）\n"
             "• /stats — 历史推荐 T+5/10/20 胜率与 Alpha、MFE/MAE 极值、近期教训与量化体检\n"
+            "• /perf — 实盘绩效看板（TWR 剔入金收益、Sortino/最大回撤与修复天数、相对基准 Alpha-Beta-IR、\n"
+            "  实盘胜率盈亏比期望、集中度 HHI、信号 t 值与衰减；0 Token 纯本地计算）\n"
+
             "• /wallet — Invest GBP+USD 双钱包对账（实时总现金、实时汇率、推算/实报 GBP 与校准差额）\n"
             "• /usd <金额> [挂单占用] — 上报 Invest USD 余额；/wallet gbp 1500 [usd 600] 单报或双报\n"
             "• /help — 显示本指令说明（/start 同义）；指令支持 /cmd@机器人名 形式，参数大小写不敏感\n"
@@ -401,6 +411,10 @@ class AdvisorBot:
             await self._send_reply(chat_id, await self._build_stats_message())
             return
 
+        if lower.startswith("/perf"):
+            await self._send_reply(chat_id, await self._build_perf_message())
+            return
+
         if lower.startswith("/wallet") or lower.startswith("/usd"):
             await self._send_reply(chat_id, await self._handle_wallet_command(text))
             return
@@ -437,6 +451,137 @@ class AdvisorBot:
         if symbol.strip().upper().endswith(".L") and (0.005 <= ratio <= 0.05 or 20.0 <= ratio <= 200.0):
             return None, True
         return (ratio - 1.0) * 100.0, False
+
+    async def _build_perf_message(self) -> str:
+        """0-Token live performance board: TWR curve, trade attribution and signal quality."""
+        nav_rows: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_nav_history"):
+            try:
+                nav_rows = await self.db.get_nav_history(limit=420)
+            except Exception as exc:
+                logger.warning("get_nav_history failed: %s", exc)
+
+        bench_symbol = str(getattr(self.cfg.strategy, "benchmark_symbol", "VWRP.L") or "VWRP.L")
+        portfolio = None
+        if self.t212 is not None:
+            try:
+                portfolio = await self.t212.get_portfolio(use_cache=True)
+            except Exception as exc:
+                logger.warning("/perf portfolio fetch failed: %s", exc)
+
+        bench_hist = None
+        if nav_rows:
+            try:
+                bench_map = await self.market_data.get_histories([bench_symbol], period="1y")
+                bench_hist = bench_map.get(bench_symbol)
+            except Exception as exc:
+                logger.warning("/perf benchmark fetch failed: %s", exc)
+
+        rf_pct: float | None = None
+        if portfolio is not None:
+            rf_pct = float(getattr(portfolio, "cash_interest_rate_pct", 0.0) or 0.0)
+        elif nav_rows and nav_rows[-1].get("cash_rate_pct") is not None:
+            rf_pct = float(nav_rows[-1]["cash_rate_pct"])
+
+        perf = compute_portfolio_performance(
+            nav_rows, benchmark_hist=bench_hist, risk_free_annual_pct=rf_pct
+        )
+
+        lines = [f"📈 实盘绩效看板（基准 {bench_symbol}，GBP 口径）"]
+        if not perf.get("ok"):
+            reason = perf.get("reason") or "快照样本不足"
+            lines.append(f"• 净值序列: {reason}")
+            lines.append("• 说明: 每日 /report 盘前自动写入 1 条 NAV，累计 ≥2 天后开始出数。")
+        else:
+            lines.append(
+                f"• 区间: {perf['first_date']} → {perf['last_date']} "
+                f"（{perf['samples']} 快照 / 覆盖 {perf['coverage_pct']:.0f}%）"
+            )
+            lines.append(f"• TWR 累计收益（剔入金）: {perf['total_return_pct']:+.2f}%")
+            risk_bits = []
+            if perf.get("ann_vol_pct") is not None:
+                risk_bits.append(f"年化波动 {perf['ann_vol_pct']:.1f}%")
+            if perf.get("sortino") is not None:
+                risk_bits.append(f"Sortino {perf['sortino']:.2f}（rf {perf['risk_free_annual_pct']:.1f}%）")
+            if risk_bits:
+                lines.append("• " + " | ".join(risk_bits))
+            dd = (
+                f"最大回撤 {perf['max_drawdown_pct']:.2f}%"
+                f"（{perf['drawdown_peak_date']}→{perf['drawdown_trough_date']}）"
+            )
+            if perf.get("drawdown_recovery_days") is not None:
+                dd += f"，{perf['drawdown_recovery_days']} 天修复"
+            elif perf.get("drawdown_unrecovered"):
+                dd += "，尚未修复"
+            lines.append(f"• {dd}")
+            if perf.get("cagr_pct") is not None:
+                tail = f"，Calmar {perf['calmar']:.2f}" if perf.get("calmar") is not None else ""
+                lines.append(f"• 年化收益 CAGR {perf['cagr_pct']:+.2f}%{tail}")
+            else:
+                lines.append("• 年化收益 CAGR: 样本 <3 个月，暂不出年化（避免误导）")
+            if perf.get("bench_beta") is not None:
+                ir_val = perf["bench_info_ratio"] if perf.get("bench_info_ratio") is not None else 0.0
+                lines.append(
+                    f"• 相对基准: Beta {perf['bench_beta']:.2f} | 年化 Alpha {perf['bench_alpha_annual_pct']:+.2f}% "
+                    f"| 信息比率 {ir_val:.2f}"
+                )
+            else:
+                lines.append("• 相对基准: 基准序列不足，暂无法回归")
+            if perf.get("cash_drag_pct") is not None:
+                lines.append(f"• 现金拖累: 平均现金占比 {perf['cash_drag_pct']:.1f}%")
+
+        if portfolio is not None:
+            attribution = compute_trade_attribution(portfolio)
+            if attribution.get("ok"):
+                ccy_bits = []
+                for ccy, item in sorted(attribution["by_currency"].items()):
+                    pf = f"{item['profit_factor']:.2f}" if item.get("profit_factor") is not None else "N/A"
+                    ccy_bits.append(
+                        f"{ccy} 胜率 {item['win_rate_pct']:.0f}%({item['wins']}/{item['sells']}) "
+                        f"盈亏比 {pf} 期望 {item['expectancy']:+.2f}"
+                    )
+                lines.append("• 实盘交易: " + " | ".join(ccy_bits))
+                if attribution.get("avg_holding_days") is not None:
+                    lines.append(f"• 平均持仓: {attribution['avg_holding_days']:.1f} 天（近似，首笔买入起算）")
+                divs = attribution.get("dividends_by_currency") or {}
+                if divs:
+                    div_s = " ".join(f"{c} {v:+.0f}" for c, v in sorted(divs.items()))
+                    lines.append(f"• 累计派息: {div_s} | 汇率影响 £{attribution['fx_impact_gbp']:+.2f}")
+            else:
+                lines.append("• 实盘交易: 近 30 天无卖出成交，暂无胜率样本")
+
+            concentration = compute_concentration_metrics(portfolio)
+            if concentration.get("ok"):
+                lines.append(
+                    f"• 集中度: {concentration['positions']} 只 | HHI {concentration['hhi']:.3f} "
+                    f"| 有效标的 {concentration['effective_n']:.1f} | Top1 {concentration['top1_pct']:.0f}% "
+                    f"| Top3 {concentration['top3_pct']:.0f}%"
+                )
+
+        settled_rows: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_settled_outcome_series"):
+            try:
+                settled_rows = await self.db.get_settled_outcome_series(limit=400)
+            except Exception as exc:
+                logger.warning("/perf settled series failed: %s", exc)
+        if settled_rows:
+            quality = compute_signal_quality(settled_rows)
+            if quality.get("ok"):
+                bits = []
+                for key in ("t5", "t10", "t20"):
+                    item = quality["horizons"][key]
+                    if item.get("mean_pct") is None:
+                        continue
+                    t_s = f"t={item['t_stat']:.2f}" if item.get("t_stat") is not None else "t=N/A"
+                    flag = "显著" if item["significant"] else "不显著"
+                    bits.append(f"{key.upper()} {item['mean_pct']:+.2f}%({t_s},{flag})")
+                lines.append("• 信号质检: " + " | ".join(bits))
+                decay = quality.get("decay_t20_minus_t5_pct")
+                decay_s = f"，T20−T5 衰减 {decay:+.2f}pct" if decay is not None else ""
+                sample_note = "n<30 仅作参考，不构成统计证据" if quality["sample"] < 30 else "样本充足"
+                lines.append(f"• 样本 n={quality['sample']}（{sample_note}）{decay_s}")
+
+        return "\n".join(lines)
 
     async def _build_stats_message(self) -> str:
         async def _empty_audit() -> dict[str, Any] | None:

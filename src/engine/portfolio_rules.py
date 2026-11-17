@@ -57,7 +57,7 @@ class RiskOverrideRecord(BaseModel):
     symbol: str
     from_action: str
     to_action: str
-    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT
+    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT | EX_DIV_WINDOW | RR_BELOW_FLOOR | RR_UNVERIFIED
     reason: str
 
 
@@ -327,6 +327,221 @@ def _compute_analyst_upside_pct(bundle: TickerMarketBundle | None) -> float | No
     ):
         return ((bundle.target_mean_price / bundle.current_price) - 1.0) * 100.0
     return None
+
+
+# ---------------------------------------------------------------------------
+# v5.3.4 BUY-side deterministic guards (R:R floor / ex-dividend entry / sizing)
+# ---------------------------------------------------------------------------
+_PICK_RR_TARGET_TOLERANCE_PCT = 15.0
+
+
+def _pick_guard_mode(strategy: StrategySection) -> str:
+    """Resolve the BUY-side R:R / ex-dividend guard strength (off / advisory / hard)."""
+    mode = str(getattr(strategy, "pick_rr_guard_mode", "advisory") or "advisory").strip().lower()
+    return mode if mode in {"off", "advisory", "hard"} else "advisory"
+
+
+def _ex_div_yield_hint(bundle: TickerMarketBundle | None) -> str:
+    div_yield = float(bundle.dividend_yield_pct) if (bundle and bundle.dividend_yield_pct) else 0.0
+    if div_yield <= 0:
+        return "股息率待核"
+    return f"年化{div_yield:.1f}%/季息≈{div_yield / 4.0:.2f}%"
+
+
+def _estimate_entry_friction_pct(
+    symbol: str,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    account: str = "ISA",
+    wallet: AccountSnapshot | None = None,
+) -> float:
+    """Round-trip friction for a NOT-yet-held symbol (mirrors ``_round_trip_friction_pct``)."""
+    is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
+    inst_ccy = str(getattr(bundle, "currency", "") or "").upper()
+    is_uk = symbol.upper().endswith(".L") or inst_ccy in {"GBP", "GBX"}
+    is_invest = str(account or "").strip().upper() == "INVEST"
+    enabled, usd_avail, gbp_avail = wallet_friction_context(wallet) if is_invest else (False, 0.0, 0.0)
+    spread = float(
+        getattr(strategy, "spread_estimate_uk_eu_pct", 0.20)
+        if is_uk
+        else getattr(strategy, "spread_estimate_us_pct", 0.05)
+    )
+    if is_invest and enabled:
+        fx = float(strategy.fx_fee_pct)
+        if is_uk:
+            stamp = 0.0 if is_etf else float(strategy.uk_stamp_duty_pct)
+            return stamp + (0.0 if gbp_avail > 0.01 else fx) + spread
+        if inst_ccy == "EUR":
+            return fx * 2.0 + spread
+        return (0.0 if usd_avail > 0.01 else fx) + spread
+    if is_uk and is_etf:
+        return spread
+    if is_uk:
+        return float(strategy.uk_stamp_duty_pct) + spread
+    return float(strategy.fx_fee_pct) * 2.0 + spread
+
+
+def _rescale_price_pair(price: float, ref: float) -> float:
+    """Fix the classic GBp/GBP 100x slip between LLM-supplied prices and the quote currency."""
+    if price <= 0 or ref <= 0:
+        return price
+    ratio = price / ref
+    if ratio >= 50.0:
+        return price / 100.0
+    if ratio <= 0.02:
+        return price * 100.0
+    return price
+
+
+def _resolve_pick_rr(
+    item: Any,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    *,
+    symbol: str = "",
+    account: str = "",
+    wallet: AccountSnapshot | None = None,
+) -> dict[str, Any]:
+    """Recompute BUY-side R:R in Python from structured prices instead of trusting LLM arithmetic."""
+    out: dict[str, Any] = {
+        "entry": 0.0,
+        "stop": 0.0,
+        "target": 0.0,
+        "risk_pct": None,
+        "upside_pct": None,
+        "rr": None,
+        "friction_pct": None,
+        "target_replaced": False,
+        "price_rescaled": False,
+    }
+    entry = float(getattr(item, "entry_price", 0.0) or 0.0)
+    if entry <= 0 and bundle is not None and bundle.current_price and bundle.current_price > 0:
+        entry = float(bundle.current_price)
+    if entry <= 0:
+        return out
+
+    stop = float(getattr(item, "stop_price", 0.0) or 0.0)
+    target = float(getattr(item, "target_price", 0.0) or 0.0)
+    rescaled_stop = _rescale_price_pair(stop, entry)
+    rescaled_target = _rescale_price_pair(target, entry)
+    if rescaled_stop != stop or rescaled_target != target:
+        out["price_rescaled"] = True
+    stop, target = rescaled_stop, rescaled_target
+
+    analyst_target = 0.0
+    if (
+        bundle is not None
+        and (bundle.analyst_count or 0) >= 3
+        and bundle.target_mean_price is not None
+        and bundle.target_mean_price > 0
+    ):
+        analyst_target = _rescale_price_pair(float(bundle.target_mean_price), entry)
+    if analyst_target > 0:
+        if target <= 0:
+            target = analyst_target
+            out["target_replaced"] = True
+        elif abs(target - analyst_target) / analyst_target * 100.0 > _PICK_RR_TARGET_TOLERANCE_PCT:
+            # LLM 自报目标价与分析师均值偏离过大 => 判为幻觉价位，改用 Python 侧均值复算。
+            target = analyst_target
+            out["target_replaced"] = True
+
+    risk_pct = ((entry - stop) / entry) * 100.0 if 0 < stop < entry else None
+    upside_pct = ((target / entry) - 1.0) * 100.0 if target > 0 else None
+    friction_pct = _estimate_entry_friction_pct(
+        symbol or str(getattr(item, "symbol", "") or ""),
+        bundle,
+        strategy,
+        account or str(getattr(item, "account", "") or ""),
+        wallet,
+    )
+    out.update(
+        {
+            "entry": round(entry, 4),
+            "stop": round(stop, 4),
+            "target": round(target, 4),
+            "risk_pct": round(risk_pct, 2) if risk_pct is not None else None,
+            "upside_pct": round(upside_pct, 2) if upside_pct is not None else None,
+            "friction_pct": round(friction_pct, 2),
+        }
+    )
+    if risk_pct is not None and risk_pct > 0 and upside_pct is not None:
+        out["rr"] = round((upside_pct - friction_pct) / risk_pct, 2)
+    return out
+
+
+def _shares_from_gbp(
+    gbp_amount: float,
+    price_local: float,
+    currency: str,
+    symbol: str,
+    gbp_usd_rate: float | None = None,
+) -> int | None:
+    """Convert a GBP risk budget into an integer share count, or None when FX/currency is unknown."""
+    if gbp_amount <= 0 or price_local <= 0:
+        return None
+    raw_ccy = str(currency or "")
+    upper = raw_ccy.upper()
+    if raw_ccy in {"GBp", "GBx"} or upper == "GBX":
+        price_gbp = price_local / 100.0
+    elif upper == "GBP":
+        price_gbp = price_local
+    elif upper == "USD" and gbp_usd_rate and float(gbp_usd_rate) > 0:
+        price_gbp = price_local / float(gbp_usd_rate)
+    elif not raw_ccy and symbol.upper().endswith(".L"):
+        price_gbp = price_local / 100.0
+    else:
+        return None
+    if price_gbp <= 0:
+        return None
+    return max(0, int(gbp_amount // price_gbp))
+
+
+def _build_pick_size_note(
+    item: Any,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    *,
+    account: str,
+    account_total_value_gbp: float | None = None,
+    gbp_usd_rate: float | None = None,
+    wallet: AccountSnapshot | None = None,
+) -> str:
+    """Deterministic risk-based sizing hint: risk budget / stop distance, capped by single-name headroom."""
+    symbol = str(getattr(item, "symbol", "") or "")
+    info = _resolve_pick_rr(item, bundle, strategy, symbol=symbol, account=account, wallet=wallet)
+    entry = float(info.get("entry") or 0.0)
+    stop = float(info.get("stop") or 0.0)
+    risk_pct = info.get("risk_pct")
+    if entry <= 0 or stop <= 0 or not risk_pct:
+        return ""
+    sizing = compute_risk_based_size_gbp(
+        account=account,
+        strategy=strategy,
+        effective_stop_pct=-abs(float(risk_pct)),
+        is_etf=bool(bundle and bundle.quote_type.upper() == "ETF"),
+        account_total_value_gbp=account_total_value_gbp,
+        existing_position_value_gbp=0.0,
+    )
+    suggested = sizing.get("suggested_gbp")
+    if not suggested or float(suggested) <= 0:
+        return ""
+    cap_pct = float(sizing.get("single_name_cap_pct") or 0.0)
+    parts = [
+        f"以损定仓上限 £{float(suggested):,.0f}"
+        f"（预算£{float(sizing.get('risk_budget_gbp') or 0.0):,.0f}÷止损{float(risk_pct):.1f}%，单仓≤{cap_pct:.0f}%）"
+    ]
+    shares = _shares_from_gbp(
+        float(suggested),
+        entry,
+        str(getattr(bundle, "currency", "") or ""),
+        symbol,
+        gbp_usd_rate,
+    )
+    if shares is not None and shares > 0:
+        parts.append(f"≈{shares}股")
+    if sizing.get("below_min_order"):
+        parts.append(f"低于最小建仓额£{float(sizing.get('min_order_gbp') or 0.0):,.0f}，勿碎单")
+    return "，".join(parts)
 
 
 def evaluate_holding(
@@ -1070,6 +1285,7 @@ def apply_risk_override_guardrail(
     issuer_weights: dict[str, float] = {}
     acct_weights: dict[tuple[str, str], float] = {}
     etf_roots: set[str] = set()
+    account_totals: dict[str, float] = {}
     if portfolio is not None:
         total_all = _resolve_total_portfolio_gbp(portfolio)
         pos_by_sym = {p.yahoo_symbol: p for p in portfolio.all_positions()}
@@ -1119,7 +1335,14 @@ def apply_risk_override_guardrail(
     }
     cadence_advisories: list[str] = []
 
-    def _check_symbol_violation(account: str, symbol: str, action: str) -> tuple[str, str] | None:
+    def _check_symbol_violation(
+        account: str,
+        symbol: str,
+        action: str,
+        item: Any | None = None,
+        *,
+        is_pick: bool = False,
+    ) -> tuple[str, str] | None:
         sym_up = symbol.strip().upper()
         base = sym_up.split(".")[0]
         acct_up = account.strip().upper()
@@ -1186,6 +1409,62 @@ def apply_risk_override_guardrail(
             if b and b.days_to_earnings is not None and 0 <= b.days_to_earnings <= 5:
                 return "EARNINGS_WINDOW", f"距财报仅{b.days_to_earnings}天，禁止财报前主动加仓"
 
+            # v5.3.4: BUY-side ex-dividend window + Python-recomputed R:R floor (pick only).
+            guard_mode = _pick_guard_mode(strat)
+            if is_pick and guard_mode != "off":
+                wallet = (
+                    portfolio.invest
+                    if (portfolio is not None and acct_up == "INVEST")
+                    else None
+                )
+                ex_window = int(getattr(strat, "ex_div_entry_guard_days", 3) or 0)
+                ex_days = int(b.days_to_ex_dividend) if (b and b.days_to_ex_dividend is not None) else None
+                if ex_days is not None and ex_window > 0 and 0 < ex_days <= ex_window:
+                    ex_msg = (
+                        f"距除息仅{ex_days}天({b.ex_dividend_date or '日期待核'})，"
+                        f"除权低开≈{_ex_div_yield_hint(b)}；"
+                        "ISA 股息免税可抢息，Invest 应税须按股息税后净额核 R:R"
+                    )
+                    if guard_mode == "hard":
+                        return "EX_DIV_WINDOW", ex_msg
+                    advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {ex_msg}"
+                    if advisory not in cadence_advisories:
+                        cadence_advisories.append(advisory)
+
+                if item is not None:
+                    rr_info = _resolve_pick_rr(
+                        item,
+                        b,
+                        strat,
+                        symbol=sym_up,
+                        account=acct_up,
+                        wallet=wallet,
+                    )
+                    rr = rr_info.get("rr")
+                    min_rr = float(getattr(strat, "min_rr_ratio", 2.0) or 2.0)
+                    if rr is None:
+                        rr_msg = (
+                            "Python 无法复核 R:R（stop_price / target_price 未给出有效数字）；"
+                            "hard 模式要求先给出数值止损与目标价"
+                        )
+                        if guard_mode == "hard":
+                            return "RR_UNVERIFIED", rr_msg
+                        advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
+                        if advisory not in cadence_advisories:
+                            cadence_advisories.append(advisory)
+                    elif float(rr) < min_rr:
+                        rr_msg = (
+                            f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 门槛；"
+                            f"目标空间{float(rr_info['upside_pct'] or 0.0):+.1f}% "
+                            f"扣摩擦{float(rr_info['friction_pct'] or 0.0):.2f}% "
+                            f"vs 止损{float(rr_info['risk_pct'] or 0.0):.1f}%)"
+                        )
+                        if guard_mode == "hard":
+                            return "RR_BELOW_FLOOR", rr_msg
+                        advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
+                        if advisory not in cadence_advisories:
+                            cadence_advisories.append(advisory)
+
             if macro_high_risk and macro_vix is not None:
                 return "MACRO_VIX", f"VIX={macro_vix:.1f}(≥{vix_danger_threshold:.0f}高危阈值)，暂停主动买入/加仓"
 
@@ -1230,8 +1509,12 @@ def apply_risk_override_guardrail(
     if hasattr(decision, "selected_actions"):
         kept_actions = []
         new_rejected = list(getattr(decision, "rejected_or_frozen", []) or [])
+        sizing_applied = False
+        gbp_usd_rate = getattr(portfolio, "gbp_usd_rate", None) if portfolio is not None else None
         for item in decision.selected_actions:
-            violation = _check_symbol_violation(item.account, item.symbol, item.action)
+            violation = _check_symbol_violation(
+                item.account, item.symbol, item.action, item, is_pick=True
+            )
             if violation is not None:
                 trig, why = violation
                 overrides.append(
@@ -1248,12 +1531,30 @@ def apply_risk_override_guardrail(
                 notes.append(note)
                 new_rejected.append(note)
             else:
-                kept_actions.append(item)
+                keep_item = item
+                if str(item.action).strip().upper() in {"BUY", "ADD"}:
+                    acct_up = item.account.strip().upper()
+                    sym_up = item.symbol.strip().upper()
+                    sym_base = sym_up.split(".")[0]
+                    size_note = _build_pick_size_note(
+                        item,
+                        bundle_lookup.get(sym_up) or bundle_lookup.get(sym_base),
+                        strat,
+                        account=item.account,
+                        account_total_value_gbp=account_totals.get(acct_up),
+                        gbp_usd_rate=gbp_usd_rate,
+                        wallet=portfolio.invest if (portfolio is not None and acct_up == "INVEST") else None,
+                    )
+                    if size_note:
+                        # risk_note 是 Python 侧保留字段：模型必须返回空串，落地前由这里写入。
+                        keep_item = item.model_copy(update={"risk_note": size_note})
+                        sizing_applied = True
+                kept_actions.append(keep_item)
         copied = (
             decision.model_copy(
                 update={"selected_actions": kept_actions, "rejected_or_frozen": new_rejected}
             )
-            if overrides
+            if (overrides or sizing_applied)
             else decision.model_copy()
         )
         notes.extend(cadence_advisories)

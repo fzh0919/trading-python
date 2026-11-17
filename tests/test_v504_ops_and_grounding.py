@@ -338,7 +338,7 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
             # Left "/" menu keeps the core commands (ops-only commands live in /help)
             self.assertEqual(
                 [c["command"] for c in BOT_COMMANDS],
-                ["pos", "wallet", "usd", "report", "pick", "us", "deep", "stats", "help"],
+                ["pos", "wallet", "usd", "report", "pick", "us", "deep", "stats", "perf", "help"],
             )
             # Telegram API constraints: every menu entry must be a real routed command with a short label
             for item in BOT_COMMANDS:

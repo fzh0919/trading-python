@@ -24,6 +24,7 @@ from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.analytics import (
     _normalize_adjusted_ohlcv,
+    build_nav_row,
     compute_window_return_pct,
     resolve_market_benchmark,
 )
@@ -55,6 +56,11 @@ LONDON_TZ = ZoneInfo("Europe/London")
 MORNING_CATCHUP_END_MINUTES = 9 * 60 + 30  # 09:30 UK
 DAILY_SETTLEMENT_START_MINUTES = 22 * 60  # 22:00 UK (after US/UK/EU close & Friday radar)
 DAILY_SETTLEMENT_END_MINUTES = 23 * 60 + 30  # 23:30 UK catch-up cutoff
+# IMP-18: evening EOD NAV snapshot so the TWR curve samples post-close, not only pre-market.
+# Starts after prewarm (21:20) and the Friday weekly radar (21:30~21:35) to avoid job collisions,
+# and stays before the 22:00 settlement job.
+NAV_SNAPSHOT_START_MINUTES = 21 * 60 + 40  # 21:40 UK (US close 21:00 UK in both BST and GMT)
+NAV_SNAPSHOT_END_MINUTES = 22 * 60  # 22:00 UK, hands over to the settlement job
 WEEKLY_AUDIT_START_MINUTES = 10 * 60  # 10:00 UK Saturday idle window
 WEEKLY_AUDIT_END_MINUTES = 22 * 60  # 22:00 UK Saturday cutoff
 INTRADAY_SENTINEL_START_MINUTES = 8 * 60  # 08:00 UK (LSE open)
@@ -1422,6 +1428,36 @@ class TradingScheduler:
                 if self.current_job_name == "daily_settlement":
                     self.current_job_name = None
 
+    async def _run_nav_snapshot_job(self) -> str:
+        """Persist one post-close GBP NAV row so the TWR curve samples EOD, not pre-market.
+
+        Reuses the /report row when the day already exists (``uk_date`` is the primary key),
+        so this simply refreshes it with closing values. Fallback portfolios are never
+        written (iron rule 2).
+        """
+        portfolio = await self.t212.get_portfolio(use_cache=False)
+        if portfolio is None or getattr(portfolio, "is_fallback", False):
+            return "skipped: portfolio fallback"
+        if float(getattr(portfolio, "total_combined_value", 0.0) or 0.0) <= 0.0:
+            return "skipped: zero net value"
+
+        bench_symbol = str(getattr(self.cfg.strategy, "benchmark_symbol", "VWRP.L") or "VWRP.L")
+        bench_close: float | None = None
+        try:
+            hist_map = await self.market_data.get_histories([bench_symbol], period="1mo")
+            bench_hist = hist_map.get(bench_symbol)
+            if bench_hist is not None and not getattr(bench_hist, "empty", True):
+                close_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
+                if close_col in bench_hist.columns:
+                    bench_close = float(bench_hist[close_col].dropna().iloc[-1])
+        except Exception as exc:
+            logger.debug("NAV snapshot benchmark close unavailable: %s", exc)
+
+        row = build_nav_row(portfolio, benchmark_close=bench_close)
+        await self.db.upsert_nav_history(row)
+        logger.info("NAV snapshot persisted: %s £%.2f", row.get("uk_date"), row.get("total_value_gbp", 0.0))
+        return f"nav {row.get('uk_date')} £{row.get('total_value_gbp', 0.0):,.2f}"
+
     async def _run_daily_settlement_job(self, now_utc: datetime) -> str:
         summary = await self._run_daily_settlement_impl(now_utc=now_utc)
         pruned_total = sum(summary["pruned"].values())
@@ -2069,6 +2105,22 @@ class TradingScheduler:
                             ops_notifier=self.ops,
                         ),
                     )
+
+        # 3b. Evening EOD NAV snapshot (21:05~22:00 UK, weekdays): one post-close NAV row
+        if (
+            NAV_SNAPSHOT_START_MINUTES <= uk_min_of_day < NAV_SNAPSHOT_END_MINUTES
+            and dt_uk.weekday() < 5
+        ):
+            if await self._claim_job_run("nav_snapshot", uk_date, uk_now_str):
+                fired.append("nav_snapshot")
+                logger.info("Running post-close NAV snapshot (%s)", uk_date)
+                await self._execute_job(
+                    job_name="nav_snapshot",
+                    chat_id=chat_id,
+                    uk_now_str=uk_now_str,
+                    coro=self._run_nav_snapshot_job(),
+                    send_to_tg=False,
+                )
 
         # 4. Daily Post-Close T+N Recommendation Settlement & 90-Day Pruning (22:00 ~ 23:30 UK)
         if DAILY_SETTLEMENT_START_MINUTES <= uk_min_of_day < DAILY_SETTLEMENT_END_MINUTES:

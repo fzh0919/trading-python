@@ -14,7 +14,7 @@ from src.data_providers.analytics import (
     compute_technical_snapshot,
     max_correlation_against_portfolio,
 )
-from src.data_providers.market_data import MarketDataService, TickerMarketBundle
+from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import AccountSnapshot, HistoricalOrderItem, PositionItem
 from src.engine.portfolio_rules import (
     _round_trip_friction_pct,
@@ -2728,7 +2728,8 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         }
         res = apply_risk_override_guardrail(
             self._pick("BUY"),
-            strategy=StrategySection(trade_cadence_guard_mode="off"),
+            # v5.3.4: 买入侧 R:R/除息护栏是独立开关，这里同时关机才能验证 cadence 的 off 语义。
+            strategy=StrategySection(trade_cadence_guard_mode="off", pick_rr_guard_mode="off"),
             trade_behavior=behavior,
         )
         self.assertFalse(res.applied)
@@ -2742,6 +2743,12 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
             StrategySection(trade_cadence_guard_mode="nonsense").trade_cadence_guard_mode, "advisory"
         )
         self.assertEqual(StrategySection().trade_cadence_guard_mode, "advisory")
+        self.assertEqual(
+            StrategySection(pick_rr_guard_mode="HARD").pick_rr_guard_mode, "hard"
+        )
+        self.assertEqual(
+            StrategySection(pick_rr_guard_mode="nonsense").pick_rr_guard_mode, "advisory"
+        )
 
     def test_isa_weak_trend_triggers_opportunity_cost_not_cash_veto(self) -> None:
         from src.data_providers.analytics import TechnicalSnapshot
@@ -2777,6 +2784,283 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         self.assertIn("不以现金利息否决", joined)
         self.assertNotIn("现金+摩擦门槛", joined)
         self.assertEqual(ev.action_bias, "HOLD")
+
+
+class TestV534PickBuyGuards(unittest.TestCase):
+    """v5.3.4: deterministic BUY-side R:R floor, ex-dividend window and risk-based sizing."""
+
+    @staticmethod
+    def _pick(
+        symbol: str = "MSFT",
+        account: str = "Invest",
+        action: str = "BUY",
+        entry: float = 100.0,
+        stop: float = 0.0,
+        target: float = 0.0,
+    ):
+        from src.agents.schemas import PickActionItem, PickDecision
+
+        return PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account=account,
+                    symbol=symbol,
+                    action=action,
+                    thesis="测试逻辑",
+                    entry_zone="100 附近",
+                    stop_condition="跌破 95",
+                    target_window="3个月",
+                    entry_price=entry,
+                    stop_price=stop,
+                    target_price=target,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+
+    def test_rr_below_floor_advisory_then_hard(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        bundle = TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD", current_price=100.0)
+        # 入场 100 / 止损 95（风险 5%）/ 目标 106（空间 6%）扣 USD 往返摩擦 0.35% => R:R 约 1.13:1
+        payload = dict(
+            bundle_map={"MSFT": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        advisory = apply_risk_override_guardrail(
+            self._pick(stop=95.0, target=106.0),
+            strategy=StrategySection(pick_rr_guard_mode="advisory"),
+            **payload,
+        )
+        self.assertFalse(advisory.applied)
+        self.assertEqual(len(advisory.decision.selected_actions), 1)
+        self.assertTrue(any("Python 复算 R:R" in n for n in advisory.notes))
+        self.assertIn("[⚠️纪律提醒]", " ".join(advisory.notes))
+
+        hard = apply_risk_override_guardrail(
+            self._pick(stop=95.0, target=106.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            **payload,
+        )
+        self.assertTrue(hard.applied)
+        self.assertEqual(hard.overrides[0].trigger_type, "RR_BELOW_FLOOR")
+        self.assertEqual(hard.decision.selected_actions, [])
+
+    def test_rr_above_floor_kept_and_missing_numbers_flagged(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        bundle = TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD", current_price=100.0)
+        payload = dict(
+            bundle_map={"MSFT": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        good = apply_risk_override_guardrail(
+            self._pick(stop=95.0, target=120.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            **payload,
+        )
+        self.assertFalse(good.applied)
+        self.assertEqual(len(good.decision.selected_actions), 1)
+        self.assertFalse(any("R:R" in n for n in good.notes))
+
+        # 未给数值止损/目标价 => advisory 只提示，hard 必须拦下（强制模型输出数字）
+        missing_adv = apply_risk_override_guardrail(
+            self._pick(),
+            strategy=StrategySection(pick_rr_guard_mode="advisory"),
+            **payload,
+        )
+        self.assertFalse(missing_adv.applied)
+        self.assertTrue(any("无法复核 R:R" in n for n in missing_adv.notes))
+
+        missing_hard = apply_risk_override_guardrail(
+            self._pick(),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            **payload,
+        )
+        self.assertTrue(missing_hard.applied)
+        self.assertEqual(missing_hard.overrides[0].trigger_type, "RR_UNVERIFIED")
+
+    def test_analyst_target_overrides_hallucinated_price(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        # 模型自报目标 101（空间仅 1%，R:R 约 0.13:1 本该被否决），分析师均值 140 偏离 27.8%>15%
+        # => Python 判为幻觉价位改用均值复算（空间 40%，R:R 约 7.9:1），应放行且不拦截。
+        bundle = TickerMarketBundle(
+            symbol="MSFT",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            target_mean_price=140.0,
+            analyst_count=12,
+        )
+        res = apply_risk_override_guardrail(
+            self._pick(stop=95.0, target=101.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={"MSFT": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(len(res.decision.selected_actions), 1)
+
+    def test_gbp_100x_slip_rescaled(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        # 英股 GBp 计价入场 3500，模型把目标写成 42（GBP 口径）=> 自动 ×100 回 4200，不误判为负 R:R
+        bundle = TickerMarketBundle(symbol="RIO.L", quote_type="EQUITY", currency="GBp", current_price=3500.0)
+        res = apply_risk_override_guardrail(
+            self._pick(symbol="RIO.L", entry=3500.0, stop=3400.0, target=42.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={"RIO.L": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(len(res.decision.selected_actions), 1)
+        self.assertIn("止损2.9%", res.decision.selected_actions[0].risk_note)
+
+
+    def test_ex_div_window_advisory_then_hard(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        bundle = TickerMarketBundle(
+            symbol="CF",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            dividend_yield_pct=6.0,
+            ex_dividend_date="2026-11-20",
+            days_to_ex_dividend=2,
+        )
+        payload = dict(
+            bundle_map={"CF": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        advisory = apply_risk_override_guardrail(
+            self._pick(symbol="CF", stop=95.0, target=120.0),
+            strategy=StrategySection(pick_rr_guard_mode="advisory"),
+            **payload,
+        )
+        self.assertFalse(advisory.applied)
+        joined = " ".join(advisory.notes)
+        self.assertIn("距除息仅2天", joined)
+        self.assertIn("季息≈1.50%", joined)
+
+        hard = apply_risk_override_guardrail(
+            self._pick(symbol="CF", stop=95.0, target=120.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            **payload,
+        )
+        self.assertTrue(hard.applied)
+        self.assertEqual(hard.overrides[0].trigger_type, "EX_DIV_WINDOW")
+        self.assertEqual(hard.decision.selected_actions, [])
+
+    def test_risk_based_sizing_note_with_shares(self) -> None:
+        from src.data_providers.t212_client import PortfolioData
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-18 07:30",
+            fetched_at_ms=1763451000000,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=0.0),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=2000.0),
+            total_combined_value=2000.0,
+            gbp_usd_rate=1.25,
+        )
+        bundle = TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD", current_price=100.0)
+        res = apply_risk_override_guardrail(
+            self._pick(stop=95.0, target=120.0),
+            strategy=StrategySection(pick_rr_guard_mode="advisory"),
+            portfolio=portfolio,
+            bundle_map={"MSFT": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        note = res.decision.selected_actions[0].risk_note
+        # 预算 £85 ÷ 止损 5% = £1700，单仓 25% × £2000 = £500 封顶 => £500 ≈ 6 股（$100/1.25 = £80）
+        self.assertIn("以损定仓上限 £500", note)
+        self.assertIn("≈6股", note)
+        self.assertIn("低于最小建仓额", note)
+
+    def test_guard_off_is_silent(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        bundle = TickerMarketBundle(
+            symbol="CF",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            dividend_yield_pct=6.0,
+            ex_dividend_date="2026-11-20",
+            days_to_ex_dividend=1,
+        )
+        res = apply_risk_override_guardrail(
+            self._pick(symbol="CF"),
+            strategy=StrategySection(pick_rr_guard_mode="off"),
+            bundle_map={"CF": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(res.notes, [])
+        self.assertEqual(res.decision.selected_actions[0].risk_note, "")
+
+    def test_candidate_line_shows_ex_dividend(self) -> None:
+        from src.data_providers.analytics import TechnicalSnapshot
+        from src.engine.screener import _format_summary_line
+
+        tech = TechnicalSnapshot(
+            symbol="HSBA.L",
+            last_close=700.0,
+            ret_5d_pct=1.0,
+            ret_20d_pct=3.0,
+            dist_ma50_pct=1.5,
+            dist_ma200_pct=6.0,
+            rsi14=58.0,
+            drawdown_52w_pct=-6.0,
+        )
+        common = dict(
+            symbol="HSBA.L",
+            track="ISA_LONG_TERM",
+            asset_type="EQUITY",
+            score=72.0,
+            tech=tech,
+            upside_pct=12.0,
+            corr_holding=None,
+            max_corr=None,
+            rs_20d_pct=2.0,
+            marginal_vol_delta_pct=None,
+            regime_tag="",
+            dimension_pct={},
+            pros=[],
+            cons=[],
+        )
+        upcoming = _format_summary_line(
+            bundle=TickerMarketBundle(
+                symbol="HSBA.L",
+                currency="GBp",
+                dividend_yield_pct=6.4,
+                ex_dividend_date="2026-11-21",
+                days_to_ex_dividend=3,
+            ),
+            **common,
+        )
+        self.assertIn("除息 2026-11-21(3天后)", upcoming)
+
+        today_line = _format_summary_line(
+            bundle=TickerMarketBundle(
+                symbol="HSBA.L",
+                currency="GBp",
+                ex_dividend_date="2026-11-18",
+                days_to_ex_dividend=0,
+            ),
+            **common,
+        )
+        self.assertIn("今日除息", today_line)
 
 
 if __name__ == "__main__":

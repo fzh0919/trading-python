@@ -139,6 +139,21 @@ class PickActionItem(BaseModel):
     stop_condition: str = Field(description="硬止损位或证伪条件")
     target_window: str = Field(description="目标位或观察周期")
     entry_price: float = Field(default=0.0, description="当前参考现价数字（用于数据库记录，未知填0）")
+    stop_price: float = Field(
+        default=0.0,
+        description=(
+            "数值硬止损价（标的本地货币，如 113.50 或 3480 GBp，必须 >0）；"
+            "Python 用它复算 R:R 与以损定仓，禁止只写在 stop_condition 文本里；确实无法定价才填 0"
+        ),
+    )
+    target_price: float = Field(
+        default=0.0,
+        description="数值目标价（标的本地货币，必须 >0，优先取分析师目标均值）；与分析师均值偏离>15% 时 Python 会改用均值复核",
+    )
+    risk_note: str = Field(
+        default="",
+        description="内部保留字段，模型输出时请一律返回空字符串 ''（由 Python 写入 R:R 与仓位校验结论）",
+    )
 
 
 class PickDecision(BaseModel):
@@ -500,6 +515,8 @@ def render_pick_report(
                 f"   逻辑：{item.thesis}\n"
                 f"   区间：{item.entry_zone} | 止损：{item.stop_condition} | 目标：{item.target_window}"
             )
+            if str(getattr(item, "risk_note", "") or "").strip():
+                sec1_lines.append(f"   校验：{item.risk_note.strip()}")
     for gnote in guardrail_notes[:4]:
         sec1_lines.append(f"• {gnote}")
     sec1 = "【本轮精选行动（四要素直给）】\n" + "\n".join(sec1_lines)

@@ -2,6 +2,32 @@
 
 > 仅维护当前活跃版本（`v5.2.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.1.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.3.4`（2026-11-18）
+
+`/pick` 买入侧纪律从「提示词自觉」搬到「Python 硬约束」：R:R ≥2:1 由 Python 用数值止损/目标价独立复算，除息窗口进入选股视野，并以损定仓直接给出建议股数上限。修复此前「模型自报 2:1、实际 1.3:1 仍成交」与「新买入候选完全看不到除息日」两个盲区（CF 案例复盘）。
+
+1. **结构化价格字段（`src/agents/schemas.py`）**：`PickActionItem` 新增 `stop_price` / `target_price`（标的本地货币数值，默认 `0.0` 向后兼容）与内部保留字段 `risk_note`（模型必须返回空串，由 Python 写入 R:R 与仓位校验结论）；`render_pick_report()` 在每条形动下追加「校验：」一行。
+2. **Python 确定性复算（`src/engine/portfolio_rules.py`）**：新增 `_pick_guard_mode()` / `_resolve_pick_rr()` / `_estimate_entry_friction_pct()` / `_rescale_price_pair()` / `_shares_from_gbp()` / `_build_pick_size_note()`：未持仓标的按「spread + 印花税 + 换汇」估算往返摩擦（与持仓口径一致），R:R = (目标空间 − 摩擦) ÷ 止损幅度；LLM 自报目标价与分析师 `target_mean_price` 偏离 >15% 时判为幻觉价位、改用均值复算；`GBp`/`GBP` 100 倍混写按量级自动纠正。
+3. **两条 BUY 侧护栏（`portfolio_rules.py`）**：`_check_symbol_violation()` 新增 `item` / `is_pick` 入参，`/pick` 的 BUY/ADD 走新增校验 —— `RR_BELOW_FLOOR`（复算 R:R < `min_rr_ratio`）、`RR_UNVERIFIED`（未给数值止损/目标价，无法复核）、`EX_DIV_WINDOW`（距除息 1~`ex_div_entry_guard_days` 天且将在除权后才完成建仓）；默认 `advisory` 只发 `[⚠️纪律提醒]` 不拦截，`hard` 模式直接拦截，`off` 完全关闭；`RiskOverrideRecord.trigger_type` 注释同步补三种新类型。
+4. **以损定仓落地（`portfolio_rules.py` Branch 2）**：通过的 BUY/ADD 用 `compute_risk_based_size_gbp()` 复算「预算 ÷ 止损幅度」与单仓上限，写入 `risk_note`，含 GBP/USD/GBp 三种计价下的建议股数（EUR 等未知汇率只给金额），低于最小建仓额时标注「勿碎单」。
+5. **选股可见性（`src/engine/screener.py`）**：`_format_summary_line()` 候选行新增「除息 2026-11-20(3天后) / 今日除息 / 除息已过1天」标注（-3~+7 天窗口），复用已在内存的 `bundle.days_to_ex_dividend`，**零新增网络请求**。
+6. **提示词对齐（`src/agents/pick_agent.py`）**：Critic 六重护栏第 1 条要求显式输出 `stop_price` / `target_price` 数值（禁止只写文本价位），第 5 条由「财报/过热排雷」升级为「财报/除息/过热排雷」，要求 ≤3 天除息的新建仓在 thesis 写明抢息或等除息，Invest 应税轨按股息税后净额核 R:R。
+7. **配置（`src/config.py`, `config.yaml`）**：`StrategySection` 新增 `pick_rr_guard_mode`（`off|advisory|hard`，默认 `advisory`）、`min_rr_ratio`（默认 `2.0`）、`ex_div_entry_guard_days`（默认 `3`，`0` 关闭除息窗口）。
+8. **离线单测**：`tests/test_analytics_and_rules.py` 新增 `TestV534PickBuyGuards`（R:R 硬拦与 advisory 提示、目标价幻觉替换为分析师均值、GBp 100x 自动纠正、除息窗口提示与 hard 拦截、以损定仓股数与最小建仓额、`pick_rr_guard_mode="off"` 全静默、候选行除息标注）。
+
+9. **净值锚点轻量表（`src/storage/db.py`）**：幂等新增 `nav_history`（`uk_date` 主键，仅存 GBP 标量：总净值/现金/持仓/外部净流入/双账户拆分/基准收盘/现金利率），新增 `upsert_nav_history()`（`ON CONFLICT(uk_date) DO UPDATE`，同日重跑不产生重复行）与 `get_nav_history(limit)`；**该表不进入 `prune_old_records()` 清理范围**，作为长期净值曲线唯一真源，`portfolio_snapshots` 的 90 天策略保持不变。
+10. **TWR 绩效计算层（`src/data_providers/analytics.py`）**：新增 `build_nav_row()` / `compute_portfolio_performance()` / `compute_trade_attribution()` / `compute_signal_quality()` / `compute_concentration_metrics()`。口径要点：TWR 逐期 `r_t=(NAV_t−CF_t)/NAV_{t−1}−1`（入金/出金/费用/利息计为外部现金流，**分红不计**，因其已在净值内）；最大回撤含起点 1.0 并给出修复天数与「尚未修复」标记；年化周期数按快照实际间隔自适应（`365/平均间隔`，夹 12~366），避免周末/缺日把年化虚高；CAGR 仅在跨度 ≥3 个月时输出；Sortino 目标收益取 T212 现金利率（`cash_interest_rate_pct`，账户真实无风险替代），**不再用 rf=0 冒充**；基准 alpha/beta/信息比率/跟踪误差来自快照内 `benchmark_close` 或外部 K 线（`ffill` 上限 3 天，缺日不填充）。交易归因按钱包币种分组，**严禁跨币种求和**（铁律 3），输出胜率/盈亏比/期望值/平均盈亏/税费/近似持仓天数；信号质检输出 T+5/10/20 Alpha 的 t 值与衰减斜率，`n<3` 时 `t_stat=None` 且 `significant=False`。
+11. **采集接线（`src/agents/report_agent.py`）**：`/report` 在写 `portfolio_snapshots` 之后沿用同一门禁（`not is_fallback`）追加一条 NAV，基准价取已在内存的 `cfg.strategy.benchmark_symbol` 收盘，**零新增网络请求**；任何异常仅 `warning`，绝不打断晨报。
+12. **`/perf` 指令（`src/bot/handlers.py`）**：新增 0-Token 直出看板（不进入 AI 任务队列），覆盖账户层（TWR/年化波动/Sortino/最大回撤与修复天数/CAGR/基准 Alpha-Beta-IR/现金拖累）、交易层（分币种胜率/盈亏比/期望/派息/汇率影响/平均持仓）、集中度（HHI/有效标的/Top1/Top3）、信号层（t 值/衰减/样本量提示）；纯文本禁 `#`/`**`，样本不足时明确写「n<30 仅作参考」。`BOT_COMMANDS` 与 `/help` 同步收录。
+13. **K 线兜底（`src/data_providers/market_data.py`）**：新增 `_fetch_yahoo_chart_sync()`（`httpx` 直连 Yahoo v8 chart，`query1`→`query2` 双主机顺序尝试，解析 OHLCV + `adjclose`），仅在 yfinance **抛异常**（429/crumb/session）后触发；**干净返回空的标的（退市/拼写错误）不触发**，避免无谓请求。原计划的 Stooq 源经实测已启用 JS 反爬验证（返回验证页而非 CSV）故弃用；Polygon（免费档仅美股 EOD + 5 次/分）与 Alpha Vantage（免费档 25 次/日）均无法覆盖 LSE 主战场，暂不引入。
+14. **波动分位（`analytics.py`）**：`TechnicalSnapshot` 新增 `vol_60d_percentile`，把当日 60 日年化波动放进自身近 2 年滚动分布取分位，`format_technical_line` 渲染为「年化波动 32%(2年78分位)」，为 regime 判断提供相对尺度（纯本地计算，零新增请求）。
+15. **离线单测（`tests/test_nav_performance.py` 新增 14 例）**：入金不计入收益、最大回撤与修复天数、基准 beta/alpha、样本不足不猜测、跨币种隔离、胜率/盈亏比/期望、t 值与小样本不显著、HHI、`nav_history` 幂等且不被清理、Yahoo 兜底双分支（全失败返回空 / 正常解析 OHLCV+adjclose）、`/perf` 文案直出。全量回归：`test_analytics_and_rules 49`、`test_db_and_end_to_end 32`、`test_t212_client+wallet 43`、`test_calendar+scheduler 31`、`test_universe/ds/intraday/llm 62`、`test_v504 22`、`test_db_storage 10`、`test_market_data 14`、`test_nav_performance 14` 全绿。
+16. **收盘后净值补采（`src/bot/scheduler.py`）**：新增 `NAV_SNAPSHOT_START_MINUTES=21:40` / `NAV_SNAPSHOT_END_MINUTES=22:00`（UK，工作日）与 `_run_nav_snapshot_job()`：盘后拉一次 `get_portfolio(use_cache=False)`，`is_fallback` 或净值 ≤0 直接跳过（铁律 2），用缓存中的基准 VWRP 收盘价构造并 upsert 一行 NAV（`uk_date` 主键 → 覆盖当日 07:30 盘前值，整条曲线统一为收盘口径）；窗口排在 prewarm（21:20）与周五 weekly_radar（21:30~21:35）之后、每日结算（22:00）之前，避免作业互抢；`_claim_job_run("nav_snapshot")` 保证每日只跑一次。
+17. **Finnhub Basic Financials 补值（`src/data_providers/market_data.py`, `src/engine/screener.py`）**：新增 `FinnhubClient.get_basic_financials()`（`/stock/metric?metric=all`，免费档、仅美股），字段按别名候选解析（`pb|pbAnnual|priceToBookRatio`、`evEbitdaTTM|evEbitda|…`、`currentRatio|currentRatioAnnual|currentRatioQuarterly`、`beta`），只接受正的有限值，`0/null/n-a` 一律视为缺失；新增纯函数 `apply_basic_financials()` **只补空位、不覆盖 yfinance 已有值**；`TickerMarketBundle` 增 `price_to_book` / `ev_ebitda` / `current_ratio` / `metrics_source`；`get_bundles` 在 `include_info` 阶段对美股（非 ETF）并发补齐，**上限 40 只**防止宽漏斗打爆 60 次/分免费额度；`score_candidate` 维度 3 新增 PB（ISA 1~6 倍、Invest 1.5~8 倍线性）与 EV/EBITDA（8~25 倍）两项，仅在数据存在时计分，缺失不加不减，维度 3 仍夹 0~25 不变。
+18. **单测**：`tests/test_nav_performance.py` 扩至 19 例（新增 Basic Financials 别名解析 / 零值拒绝 / 只补不覆盖 / 空数据无操作，以及盘后 NAV 作业写入与 fallback 跳过）；全量回归 `test_analytics_and_rules 49`、`test_db_and_end_to_end 32`、`test_t212+sidecar+intraday+ds+llm+wallet 120`、`test_v504+db_storage+step2 39`、`test_universe+market_data 21`、`test_calendar_and_scheduler 9`、`test_nav_performance 19` 全绿。
+
+
+
 ### `v5.3.3`（2026-11-17）
 
 挂单成交回执（Fill Receipt）：挂单成交/部分成交后用盘中哨兵已有的 0-Token 扫描推一条 Telegram 回执，并顺带提醒校准双钱包（0 额外 Token、0 额外 API 调用）。

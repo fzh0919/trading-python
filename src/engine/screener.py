@@ -714,6 +714,23 @@ def _format_summary_line(
         else ""
     )
     ed_str = f" | 财报 {bundle.earnings_date}" if bundle and bundle.earnings_date else ""
+    ex_div_str = ""
+    if bundle is not None and bundle.days_to_ex_dividend is not None:
+        try:
+            ex_days = int(bundle.days_to_ex_dividend)
+        except (TypeError, ValueError):
+            ex_days = None
+        if ex_days is not None and -3 <= ex_days <= 7:
+            if ex_days > 0:
+                ex_div_str = (
+                    f" | 除息 {bundle.ex_dividend_date}({ex_days}天后)"
+                    if bundle.ex_dividend_date
+                    else f" | 除息({ex_days}天后)"
+                )
+            elif ex_days == 0:
+                ex_div_str = " | 今日除息"
+            else:
+                ex_div_str = f" | 除息已过{abs(ex_days)}天"
     corr_str = f" | 最高相关({corr_holding})={max_corr:.2f}" if max_corr is not None and corr_holding else ""
     rs_str = f" | 20日RS {rs_20d_pct:+.1f}%" if rs_20d_pct is not None else ""
     mvol_str = f" | 增量波动 {marginal_vol_delta_pct:+.2f}%" if marginal_vol_delta_pct is not None else ""
@@ -745,10 +762,10 @@ def _format_summary_line(
             f"5日 {tech.ret_5d_pct:+.1f}% / 20日 {tech.ret_20d_pct:+.1f}% | "
             f"距MA50 {tech.dist_ma50_pct:+.1f}% / MA200 {tech.dist_ma200_pct:+.1f}% | "
             f"RSI {tech.rsi14:.0f} | 距52w高点 {tech.drawdown_52w_pct:+.1f}%"
-            f"{pe_str}{roe_str}{div_str}{upside_str}{rs_str}{cyq_str}{ed_str}{corr_str}{mvol_str}{reg_str}"
+            f"{pe_str}{roe_str}{div_str}{upside_str}{rs_str}{cyq_str}{ed_str}{ex_div_str}{corr_str}{mvol_str}{reg_str}"
             f"{pros_str}{cons_str}"
         )
-    return f"• [{track}][{asset_type}] {symbol} | 分数 {score:.0f}{dim_str}{reg_str}{pros_str}{cons_str}"
+    return f"• [{track}][{asset_type}] {symbol} | 分数 {score:.0f}{dim_str}{reg_str}{ex_div_str}{pros_str}{cons_str}"
 
 
 def score_candidate(
@@ -975,6 +992,14 @@ def score_candidate(
             dim3 += _linear_scale(bundle.debt_to_equity, 30.0, 200.0, 1.0, -2.0)
             if bundle.debt_to_equity >= 180.0:
                 cons.append(f"高杠杆(D/E={bundle.debt_to_equity:.0f}%)")
+        # IMP-18: Finnhub /stock/metric value multiples (only when the vendor supplied them).
+        if bundle.price_to_book is not None and bundle.price_to_book > 0.0:
+            if track == "ISA_LONG_TERM":
+                dim3 += _linear_scale(bundle.price_to_book, 1.0, 6.0, 2.5, -1.5)
+            else:
+                dim3 += _linear_scale(bundle.price_to_book, 1.5, 8.0, 1.5, -1.5)
+        if bundle.ev_ebitda is not None and bundle.ev_ebitda > 0.0:
+            dim3 += _linear_scale(bundle.ev_ebitda, 8.0, 25.0, 1.0, -1.0)
     elif is_etf:
         dim3 += 2.0
 

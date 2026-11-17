@@ -205,6 +205,12 @@ class StrategySection(BaseModel):
     spread_estimate_us_pct: float = Field(default=0.05, ge=0.0, le=5.0)
     spread_estimate_uk_eu_pct: float = Field(default=0.20, ge=0.0, le=5.0)
 
+    # v5.3.4 BUY-side deterministic guards: R:R floor, ex-dividend entry window and risk-based sizing.
+    # The 2:1 hurdle used to live only inside prompts; these knobs move it into Python.
+    pick_rr_guard_mode: Literal["off", "advisory", "hard"] = "advisory"
+    min_rr_ratio: float = Field(default=2.0, gt=0.0, le=10.0)
+    ex_div_entry_guard_days: int = Field(default=3, ge=0, le=30)
+
     @field_validator("benchmark_symbol")
     @classmethod
     def _clean_benchmark_symbol(cls, v: Any) -> str:
@@ -213,6 +219,12 @@ class StrategySection(BaseModel):
     @field_validator("trade_cadence_guard_mode", mode="before")
     @classmethod
     def _normalize_cadence_guard_mode(cls, v: Any) -> str:
+        mode = str(v or "advisory").strip().lower()
+        return mode if mode in {"off", "advisory", "hard"} else "advisory"
+
+    @field_validator("pick_rr_guard_mode", mode="before")
+    @classmethod
+    def _normalize_pick_rr_guard_mode(cls, v: Any) -> str:
         mode = str(v or "advisory").strip().lower()
         return mode if mode in {"off", "advisory", "hard"} else "advisory"
 

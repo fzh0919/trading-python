@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -29,6 +30,22 @@ logger = logging.getLogger(__name__)
 
 _MINOR_UNIT_CURRENCIES = {"GBp", "GBX", "ZAc", "ILA"}
 _PLACEHOLDER_STRINGS = {"none", "n/a", "na", "nan", "null", "-"}
+
+# IMP-17: yfinance-independent Yahoo transport (same vendor, no new key).
+_YAHOO_CHART_HOSTS: tuple[str, ...] = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
+_YAHOO_CHART_PERIODS: dict[str, str] = {
+    "1mo": "1mo",
+    "3mo": "3mo",
+    "6mo": "6mo",
+    "1y": "1y",
+    "2y": "2y",
+    "5y": "5y",
+    "max": "max",
+}
+_YAHOO_CHART_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 
 def _clean_text(value: Any) -> str:
@@ -260,6 +277,69 @@ def _deserialize_ohlcv_json(payload_json: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _fetch_yahoo_chart_sync(symbol: str, period: str = "2y") -> pd.DataFrame:
+    """Direct Yahoo v8 chart fetch, used only when yfinance itself fails.
+
+    Same vendor, independent transport: bypasses yfinance session/crumb/429 failures
+    without adding an API key or a new vendor. Returns a standard OHLCV frame
+    (Open/High/Low/Close/Volume/Adj Close) with a tz-naive daily index, or empty.
+    """
+    clean = (symbol or "").strip()
+    if not clean:
+        return pd.DataFrame()
+    rng = _YAHOO_CHART_PERIODS.get(str(period or "").strip().lower(), "2y")
+    params = {"range": rng, "interval": "1d", "includeAdjustedClose": "true", "events": "div,splits"}
+    headers = {"User-Agent": _YAHOO_CHART_UA, "Accept": "application/json"}
+
+    for host in _YAHOO_CHART_HOSTS:
+        url = f"https://{host}/v8/finance/chart/{quote(clean, safe='')}"
+        try:
+            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+                response = client.get(url, params=params, headers=headers)
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+        except Exception as exc:  # network / TLS / JSON errors: try the next host
+            logger.debug("Yahoo chart fallback failed for %s via %s: %s", clean, host, exc)
+            continue
+
+        try:
+            results = ((payload or {}).get("chart") or {}).get("result") or []
+            if not results:
+                continue
+            node = results[0] or {}
+            stamps = node.get("timestamp") or []
+            quote_block = (((node.get("indicators") or {}).get("quote")) or [{}])[0] or {}
+            if not stamps or not quote_block:
+                continue
+            index = pd.to_datetime(stamps, unit="s", utc=True).tz_convert(None).normalize()
+            frame = pd.DataFrame(
+                {
+                    "Open": quote_block.get("open"),
+                    "High": quote_block.get("high"),
+                    "Low": quote_block.get("low"),
+                    "Close": quote_block.get("close"),
+                    "Volume": quote_block.get("volume"),
+                },
+                index=index,
+            )
+            adj_block = (((node.get("indicators") or {}).get("adjclose")) or [{}])[0] or {}
+            adj_values = adj_block.get("adjclose")
+            if adj_values is not None and len(adj_values) == len(frame):
+                frame["Adj Close"] = adj_values
+            frame = frame.apply(pd.to_numeric, errors="coerce").dropna(subset=["Close"])
+            if frame.empty:
+                continue
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+            logger.info("Yahoo chart fallback recovered %d bars for %s via %s", len(frame), clean, host)
+            return frame
+        except Exception as exc:
+            logger.debug("Yahoo chart payload parse failed for %s via %s: %s", clean, host, exc)
+            continue
+
+    return pd.DataFrame()
+
+
 class TickerMarketBundle(BaseModel):
     symbol: str
     quote_type: str = ""
@@ -282,6 +362,10 @@ class TickerMarketBundle(BaseModel):
     revenue_growth_pct: float | None = None
     roe_pct: float | None = None
     debt_to_equity: float | None = None
+    price_to_book: float | None = None
+    ev_ebitda: float | None = None
+    current_ratio: float | None = None
+    metrics_source: str = ""
     analyst_count: int | None = None
     recommendation_key: str = ""
     earnings_date: str | None = None
@@ -389,6 +473,62 @@ class MacroSnapshot(BaseModel):
             return "（宏观与汇率快照暂不可用）"
         text = " | ".join(parts)
         return f"[陈旧缓存] {text}" if self.is_stale else text
+
+
+# IMP-18: Finnhub /stock/metric field aliases (TTM / Annual / Quarterly naming drifts).
+_FINNHUB_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "price_to_book": ("pb", "pbAnnual", "priceToBookRatio"),
+    "ev_ebitda": ("evEbitdaTTM", "evEbitda", "enterpriseValueOverEBITDATTM"),
+    "current_ratio": ("currentRatio", "currentRatioAnnual", "currentRatioQuarterly"),
+    "beta": ("beta",),
+}
+
+
+def _pick_metric(metrics: dict[str, Any], aliases: tuple[str, ...]) -> float | None:
+    """Return the first finite positive numeric value found under any alias key."""
+    for key in aliases:
+        try:
+            value = float(metrics.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return None
+
+
+def apply_basic_financials(bundle: TickerMarketBundle, metrics: dict[str, Any] | None) -> bool:
+    """Merge Finnhub basic-financial metrics into a bundle. Returns True when anything changed.
+
+    Only fills gaps (never overwrites a vendor value already present) and only accepts
+    positive finite numbers, so a vendor ``0``/null never masquerades as a real ratio.
+    """
+    if not isinstance(metrics, dict) or not metrics:
+        return False
+    changed = False
+
+    if bundle.price_to_book is None:
+        pb = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["price_to_book"])
+        if pb is not None:
+            bundle.price_to_book = round(pb, 3)
+            changed = True
+    if bundle.ev_ebitda is None:
+        ev = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["ev_ebitda"])
+        if ev is not None:
+            bundle.ev_ebitda = round(ev, 3)
+            changed = True
+    if bundle.current_ratio is None:
+        ratio = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["current_ratio"])
+        if ratio is not None:
+            bundle.current_ratio = round(ratio, 3)
+            changed = True
+    if bundle.beta is None:
+        beta = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["beta"])
+        if beta is not None:
+            bundle.beta = round(beta, 3)
+            changed = True
+    if changed:
+        bundle.metrics_source = "finnhub_metric"
+    return changed
 
 
 class FinnhubClient:
@@ -664,6 +804,39 @@ class FinnhubClient:
         except Exception as exc:
             self.last_error = f"insider-sentiment {type(exc).__name__}: {exc}"
             return None
+
+
+    async def get_basic_financials(
+        self, client: httpx.AsyncClient, symbol: str
+    ) -> dict[str, Any] | None:
+        """Fetch /stock/metric (Basic Financials) and return the raw ``metric`` dict.
+
+        Free-tier endpoint; US symbols only (LSE/EU coverage is thin). Field names are
+        resolved through alias candidates in :func:`apply_basic_financials` because the
+        vendor's key naming has shifted between TTM / Annual / Quarterly variants.
+        """
+        clean = (symbol or "").strip().upper()
+        if not self.enabled or not clean or not _is_us_symbol(clean):
+            return None
+        try:
+            res = await client.get(
+                f"{self.BASE_URL}/stock/metric",
+                params={"symbol": clean, "metric": "all", "token": self.api_key},
+                timeout=10.0,
+            )
+            if res.status_code != 200:
+                self.last_error = f"metric HTTP {res.status_code} ({clean})"
+                return None
+            payload = res.json() or {}
+            metrics = payload.get("metric") if isinstance(payload, dict) else None
+            if not isinstance(metrics, dict) or not metrics:
+                return None
+            self.last_error = None
+            return metrics
+        except Exception as exc:
+            self.last_error = f"metric {type(exc).__name__}: {exc}"
+            return None
+
 
 
 class FredClient:
@@ -1100,6 +1273,7 @@ class MarketDataService:
             batch_map.update(chunk_res)
 
         missing = [s for s in symbols if s not in batch_map or batch_map[s].empty]
+        transport_failures: set[str] = set()
         if missing:
             async def _fallback_one(sym: str) -> tuple[str, pd.DataFrame]:
                 try:
@@ -1114,6 +1288,9 @@ class MarketDataService:
                         )
                     return sym, df
                 except Exception as exc:
+                    # Only transport-level failures justify the extra HTTP transport below;
+                    # a symbol that cleanly returns empty is genuinely absent (delisted/typo).
+                    transport_failures.add(sym)
                     logger.debug("Fallback history fetch failed for %s: %s", sym, exc)
                     return sym, pd.DataFrame()
 
@@ -1121,6 +1298,24 @@ class MarketDataService:
             for sym, df in fb_pairs:
                 if not df.empty:
                     batch_map[sym] = df
+
+        # IMP-17: last-resort transport, only for symbols whose yfinance call actually raised
+        # (429 / crumb / session failures). Cleanly-empty symbols are never re-fetched.
+        still_missing = [s for s in symbols if s in transport_failures]
+        if still_missing:
+            async def _chart_one(sym: str) -> tuple[str, pd.DataFrame]:
+                try:
+                    async with self._sem:
+                        frame = await asyncio.to_thread(_fetch_yahoo_chart_sync, sym, period)
+                    return sym, frame
+                except Exception as exc:
+                    logger.debug("Yahoo chart fallback failed for %s: %s", sym, exc)
+                    return sym, pd.DataFrame()
+
+            chart_pairs = await asyncio.gather(*(_chart_one(s) for s in still_missing))
+            for sym, frame in chart_pairs:
+                if not frame.empty:
+                    batch_map[sym] = frame
         return batch_map
 
     async def get_histories(self, symbols: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
@@ -1481,6 +1676,29 @@ class MarketDataService:
                         if changed:
                             b.identity_summary = b.build_identity_anchor()
                             self._set_cached_bundle(sym, prof_now, b)
+
+                # IMP-18: PB / EV-EBITDA / current ratio for US equities. Gap-filling only,
+                # capped at 40 symbols so a wide /pick shortlist cannot burn the 60/min quota.
+                metric_targets = [
+                    (sym, b)
+                    for sym, b in bundles.items()
+                    if _is_us_symbol(sym) and b.quote_type.upper() != "ETF" and b.price_to_book is None
+                ][:40]
+                if metric_targets:
+                    metric_results = await asyncio.gather(
+                        *(self.finnhub.get_basic_financials(client, sym) for sym, _ in metric_targets),
+                        return_exceptions=True,
+                    )
+                    metric_now = time.monotonic()
+                    enriched = 0
+                    for (sym, b), metrics in zip(metric_targets, metric_results):
+                        if not isinstance(metrics, dict):
+                            continue
+                        if apply_basic_financials(b, metrics):
+                            self._set_cached_bundle(sym, metric_now, b)
+                            enriched += 1
+                    if enriched:
+                        logger.debug("Finnhub basic financials enriched %d/%d US bundles", enriched, len(metric_targets))
 
             self.finnhub.last_error = batch_errors[0] if batch_errors else None
             if batch_errors:

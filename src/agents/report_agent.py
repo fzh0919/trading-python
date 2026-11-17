@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from src.ops_notifier import OpsNotifier
 from src.data_providers.analytics import (
     TechnicalSnapshot,
+    build_nav_row,
     compute_exposure_summary,
     compute_technical_snapshot,
     compute_window_return_pct,
@@ -1070,6 +1071,18 @@ async def generate_morning_report(
 
     if not portfolio.is_fallback:
         await db.save_snapshot(portfolio)
+        # IMP-17: one lightweight GBP NAV row per day feeds the TWR performance loop.
+        try:
+            bench_symbol = cfg.strategy.benchmark_symbol
+            bench_hist = histories.get(bench_symbol) if histories else None
+            bench_close = None
+            if bench_hist is not None and not getattr(bench_hist, "empty", True):
+                close_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
+                if close_col in bench_hist.columns:
+                    bench_close = float(bench_hist[close_col].dropna().iloc[-1])
+            await db.upsert_nav_history(build_nav_row(portfolio, benchmark_close=bench_close))
+        except Exception as exc:  # never break /report on a performance-ledger hiccup
+            logger.warning("nav_history upsert skipped: %s", exc)
     else:
         logger.warning("Skipping save_snapshot because portfolio is fallback data (%s)", portfolio.fallback_note)
 

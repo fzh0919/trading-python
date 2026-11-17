@@ -145,6 +145,21 @@ class AdvisorDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_snapshots_fetched_ms ON portfolio_snapshots(fetched_at_ms);
 
+                -- IMP-17: lightweight daily NAV anchor for TWR performance (never pruned; GBP-only scalars)
+                CREATE TABLE IF NOT EXISTS nav_history (
+                    uk_date TEXT PRIMARY KEY,
+                    total_value_gbp REAL NOT NULL,
+                    cash_gbp REAL NOT NULL DEFAULT 0,
+                    invested_gbp REAL NOT NULL DEFAULT 0,
+                    net_flow_gbp REAL NOT NULL DEFAULT 0,
+                    isa_value_gbp REAL NOT NULL DEFAULT 0,
+                    invest_value_gbp REAL NOT NULL DEFAULT 0,
+                    benchmark_close REAL,
+                    cash_rate_pct REAL,
+                    created_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_nav_history_created ON nav_history(created_at_ms);
+
                 CREATE TABLE IF NOT EXISTS morning_reports (
                     cycle_date TEXT PRIMARY KEY,
                     report_text TEXT NOT NULL,
@@ -506,6 +521,81 @@ class AdvisorDatabase:
         except Exception as exc:
             logger.warning("Failed to parse latest portfolio snapshot JSON: %s", exc)
             return None
+
+    async def upsert_nav_history(self, row: dict[str, Any]) -> None:
+        """Idempotently persist one day's NAV scalar row (GBP-only) for TWR performance.
+
+        Never pruned by ``prune_old_records``: this table is the long-horizon equity
+        curve anchor, while ``portfolio_snapshots`` keeps the heavy JSON payloads.
+        """
+        uk_date = str(row.get("uk_date") or "").strip()[:10]
+        if not uk_date:
+            return
+        now_ms = int(time.time() * 1000)
+        payload = (
+            uk_date,
+            float(row.get("total_value_gbp") or 0.0),
+            float(row.get("cash_gbp") or 0.0),
+            float(row.get("invested_gbp") or 0.0),
+            float(row.get("net_flow_gbp") or 0.0),
+            float(row.get("isa_value_gbp") or 0.0),
+            float(row.get("invest_value_gbp") or 0.0),
+            (None if row.get("benchmark_close") is None else float(row["benchmark_close"])),
+            (None if row.get("cash_rate_pct") is None else float(row["cash_rate_pct"])),
+            now_ms,
+        )
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT INTO nav_history (
+                    uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
+                    isa_value_gbp, invest_value_gbp, benchmark_close, cash_rate_pct, created_at_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uk_date) DO UPDATE SET
+                    total_value_gbp = excluded.total_value_gbp,
+                    cash_gbp = excluded.cash_gbp,
+                    invested_gbp = excluded.invested_gbp,
+                    net_flow_gbp = excluded.net_flow_gbp,
+                    isa_value_gbp = excluded.isa_value_gbp,
+                    invest_value_gbp = excluded.invest_value_gbp,
+                    benchmark_close = COALESCE(excluded.benchmark_close, nav_history.benchmark_close),
+                    cash_rate_pct = COALESCE(excluded.cash_rate_pct, nav_history.cash_rate_pct),
+                    created_at_ms = excluded.created_at_ms
+                """,
+                payload,
+            )
+            await db.commit()
+
+    async def get_nav_history(self, limit: int = 420) -> list[dict[str, Any]]:
+        """Return persisted daily NAV rows ordered by ``uk_date`` ascending (oldest first)."""
+        max_rows = max(2, int(limit))
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
+                       isa_value_gbp, invest_value_gbp, benchmark_close, cash_rate_pct
+                FROM nav_history
+                ORDER BY uk_date DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            )
+            rows = await cur.fetchall()
+        cols = (
+            "uk_date",
+            "total_value_gbp",
+            "cash_gbp",
+            "invested_gbp",
+            "net_flow_gbp",
+            "isa_value_gbp",
+            "invest_value_gbp",
+            "benchmark_close",
+            "cash_rate_pct",
+        )
+        out = [dict(zip(cols, row)) for row in rows]
+        out.reverse()
+        return out
 
     async def save_morning_report(
         self,
@@ -960,6 +1050,32 @@ class AdvisorDatabase:
             "avg_mfe_pct": round(float(row[10]), 2) if row[10] is not None else None,
             "avg_mae_pct": round(float(row[11]), 2) if row[11] is not None else None,
         }
+
+    async def get_settled_outcome_series(self, limit: int = 400) -> list[dict[str, Any]]:
+        """Return raw settled-recommendation Alpha rows (not averaged) for t-stat / decay math."""
+        max_rows = max(1, int(limit))
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT symbol, created_at_uk, alpha_pct, t10_alpha_pct, t20_alpha_pct
+                FROM pick_recommendations
+                WHERE outcome_status = 'SETTLED'
+                ORDER BY created_at_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (max_rows,),
+            )
+            rows = await cur.fetchall()
+        return [
+            {
+                "symbol": row[0],
+                "created_at_uk": row[1],
+                "alpha_pct": row[2],
+                "t10_alpha_pct": row[3],
+                "t20_alpha_pct": row[4],
+            }
+            for row in rows
+        ]
 
     async def append_chat_turn(
         self, user_query: str, bot_reply: str, max_turns: int = 12, cycle_date: str | None = None
