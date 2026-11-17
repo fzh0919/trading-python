@@ -46,6 +46,13 @@ models:
   google_search_free_quota_monthly: 5000    # Google Search Grounding 月免费额度参考线
   google_search_warn_pct: 85.0              # 达到月免费额度该百分比时预警提醒
 
+  # [DeepSeek V4.1 Flash 侧车] 仅做 ID 筛选 / 只读语义质检 / 独立周报与盘中快报 / 带原话锚点记忆抽取
+  ds_helper_model: "deepseek-flash"
+  ds_helper_thinking_level: "HIGH"
+  ds_helper_timeout_seconds: 20.0           # 单次侧车硬超时（超时静默降级回原逻辑）
+  ds_pick_prefilter_enabled: true           # /pick 宽漏斗 30 只 -> 8+8 ID 初筛
+  ds_semantic_audit_enabled: true           # /report 与 /pick 渲染后只读语义质检（只告警不拦截）
+
 schedule:
   morning_report_hour: 7
   morning_report_minute: 30
@@ -87,6 +94,11 @@ strategy:
   us_anomaly_move_pct: 1.8
   us_anomaly_vix_change_pct: 4.0
   settlement_holding_days: 5
+
+  # /pick wide funnel: quant screener returns up to 15/track, DeepSeek keeps 8/track (raw objects untouched)
+  pick_wide_funnel_top_n: 15
+  pick_prefilter_keep_per_track: 8
+  pick_search_symbols_per_track: 8          # Google Search / Finnhub 深挖的每轨标的数
 
 # Optional priority symbols (Yahoo Finance symbols, e.g. ["TSM", "AZN.L", "ASML.AS"])
 watchlist: []

@@ -10,9 +10,11 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.agents.ds_sidecar import call_ds_json, ds_helper_available
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.schemas import PickDecision, parse_or_repair_structured_json, render_pick_report
+from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
 from src.agents.tools import MarketToolkit, _format_us_deep_intel, run_forced_market_grounding
 from src.config import AppConfig
 
@@ -138,6 +140,92 @@ def _extract_morning_audit_context(
             return "\n".join(sec_lines)[:900], symbol_tags, top_actions
 
     return "", symbol_tags, top_actions
+
+
+_PREFILTER_SYSTEM = (
+    "你是量化初筛名单筛选器（ID Filter），只做候选取舍，不写分析、不改任何数值。\n"
+    "输入是 Python 量化引擎已算好的候选清单（原始分数、维度、优缺点、形态、重叠标记）。\n"
+    "任务：为 ISA 长线赛道与 Invest 短线赛道各保留最值得深挖的标的，淘汰基本面/形态/风险明显更差的。\n"
+    "硬约束：只能从输入清单里选择代码，严禁发明新代码；每轨保留不超过 {keep} 只。\n"
+    "仅输出严格 JSON：{\"keep_isa\": [\"SYM\"], \"keep_invest\": [\"SYM\"], \"flags\": {\"被淘汰SYM\": \"<=15字原因\"}}，"
+    "不要任何解释文字。"
+)
+
+
+def _prefilter_row(candidate: ScreenerCandidate) -> str:
+    """Render one 0-token, network-free candidate row for the DeepSeek ID filter."""
+    dims = " ".join(f"{k}={float(v):.0f}" for k, v in list(candidate.dimension_pct.items())[:3])
+    pros = ";".join(str(x) for x in candidate.pros[:2])
+    cons = ";".join(str(x) for x in candidate.cons[:2])
+    patterns = ";".join(str(x) for x in candidate.pattern_signals[:2])
+    state: list[str] = []
+    if candidate.is_already_held:
+        state.append("已持有")
+    if candidate.overlap_warning:
+        state.append("高重叠")
+    return (
+        f"{candidate.symbol} | {candidate.track} | 分 {candidate.score:.1f} | {dims or '无维度'} | "
+        f"{candidate.asset_type}/{candidate.currency or '?'} | 优点 {pros or '-'} | 风险 {cons or '-'} | "
+        f"形态 {patterns or '-'} | {'/'.join(state) or '无'}"
+    )
+
+
+def _resolve_keep_candidates(
+    raw_keep: Any,
+    candidates: list[ScreenerCandidate],
+    keep_n: int,
+) -> list[ScreenerCandidate]:
+    """Map DS-returned tickers back onto the ORIGINAL ScreenerCandidate objects (raw order, capped)."""
+    if not isinstance(raw_keep, list) or not candidates:
+        return []
+    wanted = {str(item or "").strip().upper() for item in raw_keep if str(item or "").strip()}
+    if not wanted:
+        return []
+    kept = [c for c in candidates if c.symbol.strip().upper() in wanted]
+    return kept[:keep_n]
+
+
+async def _prefilter_candidates_with_ds(
+    cfg: AppConfig,
+    llm: LLMBackend,
+    isa_cands: list[ScreenerCandidate],
+    invest_cands: list[ScreenerCandidate],
+) -> tuple[list[ScreenerCandidate], list[ScreenerCandidate]]:
+    """Narrow the wide quant funnel with a DeepSeek ID filter, always falling back to raw top-N objects."""
+    keep_n = max(1, int(cfg.strategy.pick_prefilter_keep_per_track))
+    fallback_isa = isa_cands[:keep_n]
+    fallback_invest = invest_cands[:keep_n]
+    if not cfg.models.ds_pick_prefilter_enabled or not ds_helper_available(llm, cfg):
+        return fallback_isa, fallback_invest
+    if len(isa_cands) + len(invest_cands) <= 12:
+        return isa_cands, invest_cands
+
+    lines = [
+        "【ISA 长线赛道候选】",
+        *(_prefilter_row(c) for c in isa_cands),
+        "【Invest 短线赛道候选】",
+        *(_prefilter_row(c) for c in invest_cands),
+    ]
+    payload = await call_ds_json(
+        cfg,
+        llm,
+        prompt="\n".join(lines),
+        system_instruction=_PREFILTER_SYSTEM.replace("{keep}", str(keep_n)),
+        usage_label="pick_prefilter",
+    )
+    if not payload:
+        return fallback_isa, fallback_invest
+
+    keep_isa = _resolve_keep_candidates(payload.get("keep_isa"), isa_cands, keep_n)
+    keep_invest = _resolve_keep_candidates(payload.get("keep_invest"), invest_cands, keep_n)
+    if not keep_isa and not keep_invest:
+        logger.warning("/pick DS prefilter returned no valid symbols; falling back to quant top-%d.", keep_n)
+        return fallback_isa, fallback_invest
+    flags = payload.get("flags")
+    if isinstance(flags, dict) and flags:
+        # Never forward淘汰标签 to the main model or Telegram: log only, to avoid polluting the source of truth.
+        logger.debug("/pick DS prefilter flags: %s", flags)
+    return (keep_isa or fallback_isa), (keep_invest or fallback_invest)
 
 
 def _format_candidates_with_morning_tags(
@@ -347,6 +435,9 @@ async def _post_screen_validate_decision(
     invest_cands: list[ScreenerCandidate],
     guardrails: list[str],
     report_actions: list[dict[str, Any]] | None = None,
+    llm: LLMBackend | None = None,
+    ops_notifier: OpsNotifier | None = None,
+    trade_ctx: dict[str, str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Backfill native entry_price, apply deterministic risk override guardrail, and render."""
     all_bundles = dict(held_bundles)
@@ -435,6 +526,34 @@ async def _post_screen_validate_decision(
         }
         for item in resolved_decision.selected_actions
     ]
+    if llm is not None and not final_text.startswith("⚠️"):
+        selected_syms = {
+            item.symbol.strip().upper()
+            for item in resolved_decision.selected_actions
+            if item.symbol.strip() and item.symbol.strip().upper() != "CASH"
+        }
+        held_syms = {s.strip().upper() for s in portfolio.unique_yahoo_symbols()}
+        rejected_syms = {
+            c.symbol.strip().upper() for c in (*isa_cands, *invest_cands)
+        } - selected_syms - held_syms
+        await audit_generated_output(
+            llm,
+            cfg=cfg,
+            scope="pick",
+            fact_baseline=build_fact_baseline(
+                scope="pick",
+                portfolio=portfolio,
+                evals=evals,
+                trade_ctx=trade_ctx,
+                guardrails=guardrails,
+            ),
+            rendered_text=final_text,
+            strategy=cfg.strategy,
+            ops_notifier=ops_notifier,
+            headline=resolved_decision.headline,
+            selected_symbols=selected_syms,
+            known_symbols=rejected_syms,
+        )
     return final_text, parsed_picks
 
 
@@ -501,12 +620,14 @@ async def generate_pick_radar(
         "watchlist": cfg.watchlist,
         "strategy": cfg.strategy,
         "existing_histories": held_histories,
-        "top_n_per_track": 8,
+        "top_n_per_track": cfg.strategy.pick_wide_funnel_top_n,
     }
     if active_pool_rows:
         screener_kwargs["active_pool_rows"] = active_pool_rows
 
     isa_cands, invest_cands = await run_quant_screener(**screener_kwargs)
+    # Wide funnel -> DeepSeek ID filter: only tickers are selected; the raw candidate objects stay untouched.
+    isa_cands, invest_cands = await _prefilter_candidates_with_ds(cfg, llm, isa_cands, invest_cands)
 
     pack_symbols = (
         context_pack.get("symbols", {})
@@ -581,7 +702,12 @@ async def generate_pick_radar(
     )
 
     cand_syms = list(
-        dict.fromkeys([*(c.symbol for c in isa_cands[:6]), *(c.symbol for c in invest_cands[:6])])
+        dict.fromkeys(
+            [
+                *(c.symbol for c in isa_cands[: cfg.strategy.pick_search_symbols_per_track]),
+                *(c.symbol for c in invest_cands[: cfg.strategy.pick_search_symbols_per_track]),
+            ]
+        )
     )
     lesson_syms = list(dict.fromkeys([*cand_syms, *tracked_syms]))
 
@@ -801,6 +927,9 @@ async def generate_pick_radar(
             invest_cands=invest_cands,
             guardrails=guardrails,
             report_actions=report_top_actions,
+            llm=llm,
+            ops_notifier=ops_notifier,
+            trade_ctx=trade_ctx,
         )
     else:
         logger.warning("Pick Critic structured parse fell back to plain text.")

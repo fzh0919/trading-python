@@ -2,6 +2,14 @@
 
 > 仅维护当前活跃版本（`v5.2.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.1.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.3.0`（2026-11-17）
+DeepSeek V4.1 Flash 侧车增强（防「传话筒效应」：FactSheet、持仓与挂单数值、`daily_vetoes` 始终由 Python/SQLite 直出主模型，DS 只做 ID 筛选、只读质检、独立快报与带原话锚点的记忆抽取）：
+
+1. **共享侧车底座（新增 `src/agents/ds_sidecar.py`；`src/config.py`, `config.yaml`）**：新增 `ModelsSection.ds_helper_model="deepseek-flash"`、`ds_helper_thinking_level="HIGH"`、`ds_helper_timeout_seconds=20.0`、`ds_pick_prefilter_enabled`、`ds_semantic_audit_enabled` 与 `StrategySection.pick_wide_funnel_top_n=15` / `pick_prefilter_keep_per_track=8` / `pick_search_symbols_per_track=8`。`ds_helper_available()` 强制校验真实 `DEEPSEEK_API_KEY`，**杜绝缺 key 时静默回落 Gemini 顶包**；`call_ds_json()` 统一硬超时 + 非 JSON/异常静默降级，`extract_json_object()` 容忍 ```json 围栏与前后噪声，`sanitize_plain_text()` 统一去 Markdown 控字。
+2. **Phase 1 `/pick` 宽漏斗初筛（`src/agents/pick_agent.py`）**：`run_quant_screener` 由 `top_n_per_track=8` 放宽至可配 15（最多 30 只候选），新增 `_prefilter_candidates_with_ds()` 用 0-Token 本地维度聚合让 DS 输出 `{"keep_isa","keep_invest","flags"}`，Python 侧做幻觉 symbol 丢弃、按原始 screener 排名重排、单轨截断 8 只并**回传未经改动的原始 `ScreenerCandidate` 对象**；`flags` 只进 DEBUG 日志，绝不进入 Prompt/Telegram。解析异常、空集、开关关闭或 DS 不可用一律确定性回退前 8；Google 检索与 Finnhub 深挖标的扩至每轨 8 只。
+3. **Phase 2 语义质检侧车（新增 `src/agents/semantic_auditor.py`；`src/agents/report_agent.py`, `src/agents/pick_agent.py`）**：`audit_generated_output()` 在 `/report` 落库后返回前、`/pick` 渲染后执行，逐条核对幻觉价位、违背挂单计息、headline 内部驳回外泄、与 `daily_vetoes` 冲突四项红线；`/pick` 先跑 0-Token 确定性预检（headline 提及未入选且非持仓的候选代码），再交 DS 复核。初期只告警不拦截：违规仅 `ops.notify(WARN, alert_key=semantic_audit_{scope})` + `logger.warning`，渲染文本一字不改；超时/异常静默 `skipped=True`。
+4. **离线单测**：新增 `tests/test_ds_pick_prefilter_and_auditor.py`（19 条：侧车门控/JSON 提取/超时降级、初筛对象恒等与回退、开关与缺 key 零调用、语义质检告警与静默降级），全量回归 `176 tests OK`。
+
 ### `v5.2.1`（2026-11-17）
 围绕 Trading 212 双账户币种隔离与 Invest `GBP + USD` 双钱包管理完成 Phase 1~5 全链路改造（ISA 维持纯 GBP 单钱包与全量换汇门槛，Invest 落地 `GBP 4.0% / USD 3.4%` 双钱包对称换汇摩擦、`/wallet` & `/usd` 对账与周六提醒，全套 `157 tests OK`）：
 

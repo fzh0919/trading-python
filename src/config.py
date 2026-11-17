@@ -78,6 +78,12 @@ class ModelsSection(BaseModel):
     report_priority_search_model: str = "gemini-4-hydrogen"
     report_search_model: str = "gemini-3.5-flash-lite"
     search_model: str = "gemini-3.5-flash-lite"
+    # DeepSeek V4.1 Flash sidecar (ID filter / read-only linter / independent briefs / quoted memory)
+    ds_helper_model: str = "deepseek-flash"
+    ds_helper_thinking_level: ThinkingLevelLiteral = "HIGH"
+    ds_helper_timeout_seconds: float = Field(default=20.0, ge=5.0, le=60.0)
+    ds_pick_prefilter_enabled: bool = True
+    ds_semantic_audit_enabled: bool = True
 
     report_analyst_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_auditor_thinking_level: ThinkingLevelLiteral = "HIGH"
@@ -158,6 +164,10 @@ class StrategySection(BaseModel):
     us_anomaly_move_pct: float = Field(default=1.8, gt=0.0)
     us_anomaly_vix_change_pct: float = Field(default=4.0, gt=0.0)
     settlement_holding_days: int = Field(default=5, ge=1)
+    # /pick wide funnel + DeepSeek ID filter (raw ScreenerCandidate objects are never mutated)
+    pick_wide_funnel_top_n: int = Field(default=15, ge=8, le=20)
+    pick_prefilter_keep_per_track: int = Field(default=8, ge=4, le=12)
+    pick_search_symbols_per_track: int = Field(default=8, ge=4, le=12)
 
 
 class UniverseSection(BaseModel):

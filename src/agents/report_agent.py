@@ -13,6 +13,7 @@ import pandas as pd
 
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
+from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
 from src.agents.schemas import (
     MorningReportDecision,
     parse_or_repair_structured_json,
@@ -934,6 +935,23 @@ async def generate_morning_report(
             short_conclusion,
             guardrails=guardrails,
             context_pack=context_pack,
+        )
+        # Read-only semantic linter (DeepSeek sidecar): never rewrites or blocks the report text.
+        await audit_generated_output(
+            llm,
+            cfg=cfg,
+            scope="report",
+            fact_baseline=build_fact_baseline(
+                scope="report",
+                portfolio=portfolio,
+                evals=evals,
+                trade_ctx=trade_ctx,
+                guardrails=guardrails,
+                fact_sheet=fact_sheet,
+            ),
+            rendered_text=final_report,
+            strategy=cfg.strategy,
+            ops_notifier=ops_notifier,
         )
     return final_report
 
