@@ -26,11 +26,17 @@ _SCOPE_LABELS = {"report": "/report 早报", "pick": "/pick 选股雷达"}
 _SYSTEM = (
     "你是只读合规语义质检员（Semantic Linter）。你只做一件事：核对渲染文本是否违反下列语义红线，绝不改写文本。\n"
     "红线：\n"
-    "1. 幻觉价位：出现【原始数字底座】之外的现价/均价/止损/目标价/挂单价，或把 GBp 与 GBP 混用导致 100 倍量级错位。\n"
+    "1. 幻觉事实价：文本以【事实口吻】陈述现价/持仓成本/止损价/挂单价/目标价，但数值不在【原始数字底座】中，"
+    "或 GBp 与 GBP 混用导致 100 倍量级错位。\n"
+    "   • 底座只含「已存在的真实数字」；今日新建议的价位天然不在底座中，不得据此判违规。\n"
+    "   • ADD/BUY/TRIM/减仓/清仓/撤单改挂 后紧跟的价位属于【建议执行价】，只校验方向："
+    "买入建议价明显高于底座现价（>3% 且未写明突破追买理由）或卖出建议价低于底座现价才算异常。\n"
+    "   • 底座中若没有该标的现价，禁止据此判违规。\n"
     "2. 违背挂单计息：建议撤销/放弃限价买单以便吃现金利息，或声称未成交挂单不再计息。\n"
     "3. 内部驳回外泄：headline 出现未入选/被否决/被冻结的标的代码或方向。\n"
     "4. 与今日红线冲突：建议与 daily_vetoes 明确冲突的加仓或开仓。\n"
     "只报告有明确文本证据的违规，每条 <=60 字并引用原句片段；没有违规就返回空数组。\n"
+    "违规条目加前缀分类：[事实价不符] 或 [建议价方向异常]。\n"
     "仅输出严格 JSON：{\"passed\": true/false, \"violations\": [\"...\"]}"
 )
 
@@ -58,7 +64,7 @@ def build_fact_baseline(
     fact_sheet: str = "",
 ) -> str:
     """Assemble a deterministic numeric baseline (Python/SQLite truth) for the linter to compare against."""
-    lines = [f"【原始数字底座 | {_SCOPE_LABELS.get(scope, scope)}】"]
+    lines = [f"【原始数字底座（只含已存在的事实价） | {_SCOPE_LABELS.get(scope, scope)}】"]
     lines.append(
         f"账户：总净值 £{_fmt_num(getattr(portfolio, 'total_combined_value', None))}"
         f" | 总现金 £{_fmt_num(getattr(portfolio, 'total_combined_cash', None))}"
@@ -191,7 +197,7 @@ async def audit_generated_output(
         f"{fact_baseline}\n\n"
         "=== 待质检渲染文本（Telegram 原文，禁止改写）===\n"
         f"{text}\n\n"
-        "请对照原始数字底座逐条核对上述 4 条红线，只输出 JSON。"
+        "请对照原始数字底座逐条核对上述 4 条红线（严格区分【事实价】与【今日建议执行价】），只输出 JSON。"
     )
     payload = await call_ds_json(
         cfg,

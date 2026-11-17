@@ -59,6 +59,7 @@ from src.engine.portfolio_rules import (
     HoldingEvaluation,
     apply_risk_override_guardrail,
     build_disagreement_matrix,
+    build_report_size_notes,
     evaluate_portfolio,
     format_disagreement_matrix_text,
     format_evaluations_text,
@@ -1085,6 +1086,7 @@ async def generate_morning_report(
         "严格去重与排版准则（违反将导致重要信息被截断）：\n"
         "• 对【本地多空证据冲突对照】中列出的标的，必须正面裁决采纳 Bull 还是 Bear 依据，严禁和稀泥。\n"
         "• `top_actions`【只放现有持仓的 ADD/TRIM/STOP/HOLD】（1~3条）；所有活动挂单的撤改留在 `pending_order_audits`，严禁把 CANCEL_ORDER/MODIFY_ORDER 重复写进 `top_actions`！\n"
+        "• `size_hint` 必填数量口径：TRIM 写减仓比例（如 30%、1/3）或英镑金额（如 £2,300），ADD 写加仓金额或比例，STOP 写「全出」，HOLD/CASH 留空；严禁写股数（由 Python 按持仓确定性换算）。\n"
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
         "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=35字）。\n"
@@ -1224,6 +1226,7 @@ async def generate_morning_report(
             max_chars=max_body_chars,
             risk_override=override_res,
             gate_banner=gate_banner,
+            size_notes=build_report_size_notes(resolved_decision.top_actions, portfolio),
         )
         guardrails = list(resolved_decision.daily_vetoes)
         actions_summary = "; ".join(

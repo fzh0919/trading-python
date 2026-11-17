@@ -25,8 +25,8 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **`/report` Step 1 联网（核心）** | `report_priority_search_model` / `report_search_model` | 宏观&1v1 `Hydrogen` (`LOW`) / 批量 `3.5-flash-lite` (`LOW`) | `GoogleSearch`（每批 `<=3` 标的，`Semaphore(3)`，3h SQLite 快照，英文搜/中文出，禁切 DeepSeek） | 注入内部上下文 |
 | **`/report` Step 2A 机会（核心）** | `report_analyst_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 2B 风控（核心）** | `report_auditor_model` | `gemini-4-carbon` (`HIGH`) *(备援 Hydrogen / DeepSeek)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH+Schema)* | `MorningReportDecision`（含 `PickGateDecision` 单向收紧权）+ 自修复 + `RiskOverride` + 护栏后 `deployment_gate` 横幅注入与落库 | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
+| **`/report` Step 2B 风控（核心）** | `report_auditor_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 `3.5-flash-lite` LOW / DeepSeek)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
+| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-carbon` (`HIGH`) *(备援 Hydrogen HIGH → DeepSeek HIGH + 自修复)* | `MorningReportDecision`（含 `PickGateDecision` 单向收紧权）+ 自修复 + `RiskOverride` + 护栏后 `deployment_gate` 横幅注入与落库 | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
 | **`/pick` Stage 1 投研员** | `pick_researcher_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH)* | 四维量化+新闻/评级预聚合 + `MarketToolkit`（`<=2` 轮，带方向 `<=3` 轮） | 内部提案 |
 | **`/pick` Stage 2 风控官** | `pick_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH+Schema)* | `PickDecision` + 自修复 + Post-Screen 确定性校验（联动 `deployment_gate` ISA 饱和拦截、跨账户去重、`ROTATE` 置换源核验、`0.5R` 半仓算仓） | **Telegram `<=1000` 字** |
 | **`/us` 美股增量哨兵（分级门控）** | `us_sentinel_model` / `us_anomaly_model` | 平稳 `deepseek-flash` (`HIGH`) / 异动 `Hydrogen` (`HIGH`) | 本地 Anomaly Gate：平稳免工具核对；异动切 Gemini+搜+工具深挖 | **平稳 `<=450` / 异动 `<=600` 字** |

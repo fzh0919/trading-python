@@ -44,9 +44,9 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         cfg = load_config("config.yaml", env_file=None)
         self.assertEqual(cfg.models.report_analyst_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_analyst_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_auditor_model, "gemini-4-carbon")
+        self.assertEqual(cfg.models.report_auditor_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_auditor_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.models.report_model, "gemini-4-carbon")
         self.assertEqual(cfg.models.report_thinking_level, "HIGH")
         self.assertEqual(cfg.models.us_sentinel_model, "deepseek-flash")
         self.assertEqual(cfg.models.us_thinking_level, "HIGH")
@@ -282,6 +282,10 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(usage_records[0]["success"])
         self.assertTrue(usage_records[1]["success"])
         self.assertTrue(any(e["severity"] == "WARN" and "已自动降级" in e["message"] for e in ops.events))
+        # v5.4.1 regression: the timeout log must not raise NameError and mask the real cause.
+        fallback_msg = next(e["message"] for e in ops.events if "已自动降级" in e["message"])
+        self.assertIn("TimeoutError", fallback_msg)
+        self.assertNotIn("NameError", fallback_msg)
 
     async def test_hard_timeout_respects_explicit_retry_budget(self) -> None:
         ops_events: list[dict] = []

@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -53,7 +54,12 @@ from src.engine.deployment_gate import (
     reconcile_pm_pick_gate,
     replay_deployment_gate_history,
 )
-from src.engine.portfolio_rules import apply_risk_override_guardrail, evaluate_portfolio
+from src.engine.portfolio_rules import (
+    apply_risk_override_guardrail,
+    build_report_size_notes,
+    derive_action_size_note,
+    evaluate_portfolio,
+)
 from src.storage.db import AdvisorDatabase
 
 LONDON = ZoneInfo("Europe/London")
@@ -1407,6 +1413,78 @@ class TestPostAuditRegressions(unittest.IsolatedAsyncioTestCase):
             await md.close()
         self.assertEqual(len(picks), 1)
         self.assertEqual(picks[0]["symbol"], "AZN.L")
+
+
+class TestReportSizeHint(unittest.TestCase):
+    """v5.4.1: /report must state action size; share counts are derived in Python, never by the LLM."""
+
+    def _position(self) -> PositionItem:
+        return _pos(
+            "ISA",
+            "GOOGL",
+            "GOOGL",
+            value=3000.0,
+            qty=10.0,
+            avg=250.0,
+            cur=300.0,
+            return_pct=20.0,
+            weight_pct=5.0,
+        )
+
+    def test_trim_percent_and_fraction_convert_to_shares(self) -> None:
+        pos = self._position()
+        self.assertEqual(derive_action_size_note("TRIM", "30%", pos), "≈3股")
+        self.assertEqual(derive_action_size_note("TRIM", "1/4", pos), "≈2.50股")
+
+    def test_trim_gbp_amount_uses_position_gbp_per_share(self) -> None:
+        pos = self._position()  # 3000 GBP / 10 shares = 300 GBP per share
+        self.assertEqual(derive_action_size_note("TRIM", "£600", pos), "≈2股")
+
+    def test_full_exit_and_stop_semantics(self) -> None:
+        pos = self._position()
+        self.assertEqual(derive_action_size_note("TRIM", "清仓", pos), "")
+        self.assertEqual(derive_action_size_note("STOP", "", pos), "触发即全出")
+        self.assertEqual(derive_action_size_note("STOP", "全出", pos), "")
+
+    def test_add_percentage_is_never_guessed(self) -> None:
+        self.assertEqual(derive_action_size_note("ADD", "30%", self._position()), "")
+        self.assertEqual(derive_action_size_note("HOLD", "30%", self._position()), "")
+
+    def test_render_shows_hint_and_derived_shares(self) -> None:
+        dec = MorningReportDecision(
+            headline="数量口径测试",
+            top_actions=[
+                ReportActionItem(
+                    account="ISA",
+                    symbol="GOOGL",
+                    action="TRIM",
+                    price_zone="285-295 USD",
+                    size_hint="30%",
+                    reason="降科技集中度",
+                )
+            ],
+            daily_vetoes=["冻结科技"],
+            macro_and_cash="现金待命。",
+            account_diagnosis="ISA 个股超限。",
+            hold_summary="其余持有",
+            trade_review="近30天平稳",
+        )
+        notes = build_report_size_notes(dec.top_actions, SimpleNamespace(all_positions=lambda: [self._position()]))
+        self.assertEqual(notes, {("ISA", "GOOGL"): "≈3股"})
+        rendered = render_morning_report(dec, max_chars=1800, size_notes=notes)
+        self.assertIn("TRIM GOOGL @ 285-295 USD · 30% (≈3股)", rendered)
+
+    def test_render_without_notes_keeps_legacy_line(self) -> None:
+        dec = MorningReportDecision(
+            headline="无数量",
+            top_actions=[ReportActionItem(account="ISA", symbol="CASH", action="HOLD", price_zone="", reason="观望")],
+            macro_and_cash="现金。",
+            account_diagnosis="无。",
+            hold_summary="持有",
+            trade_review="平稳",
+        )
+        rendered = render_morning_report(dec, max_chars=1800)
+        self.assertIn("HOLD CASH — 观望", rendered)
 
 
 if __name__ == "__main__":

@@ -533,6 +533,7 @@ class GeminiClient:
         make_config: Callable[[types.ThinkingConfig | None], types.GenerateContentConfig],
         thinking_cfg: types.ThinkingConfig | None,
         effective_level: str,
+        usage_label: str = "",
     ) -> tuple[Any, types.ThinkingConfig | None, str]:
         assert self._client is not None
 
@@ -639,6 +640,7 @@ class GeminiClient:
                     make_config=_make_config,
                     thinking_cfg=thinking_cfg,
                     effective_level=effective_level,
+                    usage_label=usage_label,
                 )
                 api_rounds += 1
                 search_queries += self._extract_search_query_count(response)

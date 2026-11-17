@@ -287,6 +287,22 @@ class TestSemanticAuditor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ops.events[0]["alert_key"], "semantic_audit_report")
         self.assertEqual(rendered, "今日建议持有 VWRP.L，现金 4% 利息。")
 
+    async def test_prompt_separates_fact_prices_from_proposed_prices(self) -> None:
+        cfg = _cfg()
+        llm = _DsStubLLM({"semantic_audit_report": '{"passed": true, "violations": []}'})
+        await audit_generated_output(
+            llm,
+            cfg=cfg,
+            scope="report",
+            fact_baseline="【原始数字底座（只含已存在的事实价）】VWRP 挂单 135.50",
+            rendered_text="ADD VWRP @ 137.50-138.00；TRIM GOOGL @ 285-295",
+            strategy=cfg.strategy,
+        )
+        self.assertEqual(len(llm.calls), 1)
+        self.assertIn("建议执行价", llm.calls[0]["system_instruction"])
+        self.assertIn("不得据此判违规", llm.calls[0]["system_instruction"])
+        self.assertIn("区分【事实价】与【今日建议执行价】", llm.calls[0]["prompt"])
+
     async def test_pick_headline_leak_is_deterministic(self) -> None:
         cfg = _cfg()
         llm = _DsStubLLM({"semantic_audit_pick": '{"passed": true, "violations": []}'})

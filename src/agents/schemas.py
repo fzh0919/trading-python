@@ -23,6 +23,13 @@ class ReportActionItem(BaseModel):
     symbol: str = Field(description="现有持仓标的代码，若今日持仓观望无调仓可写 CASH（挂单撤改勿放此处）")
     action: str = Field(description="仅限持仓动作：ADD / TRIM / STOP / HOLD（撤改挂单只放 pending_order_audits，禁止重复放此处）")
     price_zone: str = Field(description="建议触发价位或区间，如 '355-358 USD' 或 '4500 GBp'")
+    size_hint: str = Field(
+        default="",
+        description=(
+            "数量口径（v5.4.1）：ADD/TRIM 必填比例或英镑金额，如 '30%'、'1/3'、'£2,300'；"
+            "STOP 填 '全出'；HOLD/CASH 留空。严禁写股数（由 Python 按持仓确定性换算）"
+        ),
+    )
     reason: str = Field(
         description=(
             "一句话核心依据（不超过35字）；Invest 调仓须标明资金路径，"
@@ -412,12 +419,16 @@ def render_morning_report(
     *,
     risk_override: RiskOverrideResult | None = None,
     gate_banner: str = "",
+    size_notes: dict[tuple[str, str], str] | None = None,
 ) -> str:
     """Render MorningReportDecision as inverted-pyramid Telegram report strictly <= max_chars with zero overlap.
 
     v5.4.0: when ``gate_banner`` is non-empty it is pinned as the FIRST line of section 2
     (【宏观、账户与今日风控红线】) so the deterministic deployment-gate conclusion can never
     be trimmed away by the tail-char truncator.
+
+    v5.4.1: ``size_notes`` carries Python-derived share counts keyed by (ACCOUNT, SYMBOL); the
+    model only ever supplies ``size_hint`` (percentage / GBP amount / 全出), never share counts.
     """
     ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
     if isinstance(ro_decision, MorningReportDecision):
@@ -433,10 +444,21 @@ def render_morning_report(
         )
     ]
 
+    notes = size_notes or {}
     action_lines = [f"📌 今日定调：{decision.headline}"]
     for idx, act in enumerate(filtered_actions[:4], 1):
         pz = f" @ {act.price_zone}" if act.price_zone else ""
-        action_lines.append(f"{idx}. [{act.account}] {act.action} {act.symbol}{pz} — {act.reason}")
+        act_up = act.action.strip().upper()
+        hint = act.size_hint.strip() if act_up in {"ADD", "TRIM", "STOP"} else ""
+        note = notes.get((act.account.strip().upper(), act.symbol.strip().upper()), "")
+        if act_up in {"ADD", "TRIM"}:
+            size_txt = f" · {hint}" if hint else " · 数量未定"
+        else:
+            size_txt = f" · {hint}" if hint else ""
+        note_txt = f" ({note})" if note else ""
+        action_lines.append(
+            f"{idx}. [{act.account}] {act.action} {act.symbol}{pz}{size_txt}{note_txt} — {act.reason}"
+        )
 
     override_notes = _extract_override_notes(risk_override)
     for note in override_notes[:4]:

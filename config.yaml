@@ -12,8 +12,8 @@ app:
 models:
   # [混合路由 + 双向灾备] 搜索与核心决策留 Gemini，日常单聊 / 平稳 /us / T+5 反思用 DeepSeek V4.1 Flash (HIGH)
   report_analyst_model: "gemini-4-hydrogen"         # /report Step 2A 机会分析
-  report_auditor_model: "gemini-4-carbon"           # /report Step 2B Bear 挑刺审计官 (旗舰推理)
-  report_model: "gemini-4-hydrogen"                 # /report Step 3 PM 拍板
+  report_auditor_model: "gemini-4-hydrogen"         # /report Step 2B Bear 挑刺审计官 (HIGH)
+  report_model: "gemini-4-carbon"                   # /report Step 3 PM 拍板 (旗舰推理 HIGH)
   us_sentinel_model: "deepseek-flash"               # /us 平稳日哨兵 (HIGH)
   us_anomaly_model: "gemini-4-hydrogen"             # /us 触发异动门控时自动切入高阶模型
   pick_researcher_model: "gemini-4-hydrogen"        # /pick Stage 1 投研探测
@@ -28,7 +28,7 @@ models:
   search_model: "gemini-3.5-flash-lite"             # 单聊 / /pick / /us 联网搜索模型
 
   report_analyst_thinking_level: "HIGH"             # 机会分析保持 HIGH 深度挖掘
-  report_auditor_thinking_level: "HIGH"             # Carbon Bear 挑刺审计深度
+  report_auditor_thinking_level: "HIGH"             # Hydrogen Bear 挑刺审计深度
   report_thinking_level: "HIGH"                     # PM 拍板保持 HIGH
   us_thinking_level: "HIGH"                         # /us 平稳日 DeepSeek 保持 HIGH（不用 LOW）
   us_anomaly_thinking_level: "HIGH"                 # /us 异动日 Gemini 保持 HIGH

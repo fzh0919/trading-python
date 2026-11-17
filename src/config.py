@@ -137,8 +137,8 @@ class AppSection(BaseModel):
 class ModelsSection(BaseModel):
     # Hybrid Gemini + DeepSeek routing with cross-vendor failover
     report_analyst_model: str = "gemini-4-hydrogen"
-    report_auditor_model: str = "gemini-4-carbon"
-    report_model: str = "gemini-4-hydrogen"
+    report_auditor_model: str = "gemini-4-hydrogen"
+    report_model: str = "gemini-4-carbon"
     us_sentinel_model: str = "deepseek-flash"
     us_anomaly_model: str = "gemini-4-hydrogen"
     pick_researcher_model: str = "gemini-4-hydrogen"

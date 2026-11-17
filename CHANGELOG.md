@@ -2,6 +2,16 @@
 
 > 仅维护当前活跃版本（`v5.2.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.1.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.4.1`（2026-11-17）
+
+四处执行可读性、诊断与路由调整：`/report` 首次给出「卖多少」的数量口径；硬超时降级不再被 `NameError` 掩盖；语义质检区分「事实价」与「建议价」，消除对前瞻性价位的系统性误报；PM 拍板升级 Carbon HIGH、Bear 降为 Hydrogen HIGH。
+
+1. **`/report` 数量口径（`src/agents/schemas.py`, `src/engine/portfolio_rules.py`, `src/agents/report_agent.py`）**：`ReportActionItem` 新增 `size_hint`（TRIM/ADD 必填比例或英镑金额、STOP 填「全出」、HOLD/CASH 留空；**严禁写股数**）；新增 `derive_action_size_note()` / `build_report_size_notes()`，由 Python 按持仓把 `30%` / `1/3` / `£2,300` 确定性换算为建议股数（TRIM 以持仓数量为基准、GBP 金额用该仓位 GBP 每股价折算，ADD 比例因基数歧义不做猜测）；`render_morning_report(..., size_notes=...)` 渲染为 `TRIM GOOGL @ 285-295 USD · 30% (≈3股)`；ADD/TRIM 若模型漏填则明确渲染 `数量未定`，不再静默省略；旧数据无 `size_hint` 时其余字段逐字兼容。
+2. **硬超时降级诊断修复（`src/agents/llm_client.py`）**：`_call_single_round()` 的超时告警引用了不在作用域的 `usage_label`，触发 `NameError` 并掩盖真实 `TimeoutError`（v5.3.3 引入的潜伏 bug：降级本身仍成功，故单测未捕获）；现补 `usage_label` 形参并由 `_run_model_once()` 透传，运维告警恢复显示真实超时原因（本次 `gemini-4-carbon` 120s 单轮硬超时即属此类）。
+3. **语义质检误报收敛（`src/agents/semantic_auditor.py`）**：红线 1 由「底座之外一律算幻觉」收敛为「以事实口吻陈述的现价/持仓成本/止损价/挂单价不符才判违规」；`ADD/TRIM/减仓/清仓/撤单改挂` 后的价位视为今日建议执行价，只校验方向（买入价高于底座现价 >3% 且未说明突破追买理由、卖出价低于底座现价），底座中无该标的现价时禁止判违规；违规条目要求 `[事实价不符]` / `[建议价方向异常]` 分类前缀，底座标题改为「只含已存在的事实价」。仍保持只读、不拦截、超时静默降级。
+4. **离线单测**：`tests/test_report_pick_gate.py` 新增 `TestReportSizeHint`（百分比/分数/英镑金额换算、全出与 STOP 语义、ADD 比例不猜、渲染与旧数据兼容）；`tests/test_llm_pricing_and_usage.py` 硬超时用例新增「告警含 `TimeoutError` 且不含 `NameError`」断言；`tests/test_ds_pick_prefilter_and_auditor.py` 新增提示词区分事实价/建议价的断言。
+5. **`/report` 角色重路由（`src/config.py`, `config.yaml`, `DEVELOPER_GUIDE.md`）**：PM 拍板（`report_model`）升级为 `gemini-4-carbon` (`HIGH`)，把旗舰推理预算集中到最终裁决；Bear 挑刺审计（`report_auditor_model`）降为 `gemini-4-hydrogen` (`HIGH`)，Bull（`report_analyst_model`）保持 Hydrogen HIGH。降级链随之变为：Carbon PM 单轮 120s 超时 → Hydrogen HIGH 备援；Hydrogen Bear 失败 → `3.5-flash-lite` LOW / DeepSeek HIGH 兜底，**不再反向占用 Carbon**。`config.yaml` 默认值与 `test_llm_pricing_and_usage` / `test_db_and_end_to_end` 的路由断言同步更新。
+
 ### `v5.4.0`（2026-11-17）
 
 组合门控（CIO Gate）批次：以确定性规则连接 `/report`（每日单一事实源）与 `/pick`（独立选股雷达）——管住 ISA 结构偏离与 Invest 手痒冲动，同时用「以盈解锁」保证绝不踏空右侧主升浪。策略与规则设计留档 [`docs/plans/2026-11-17-report-pick-gate-design.md`](./docs/plans/2026-11-17-report-pick-gate-design.md)（v3 大师审定稿），实施蓝本留档 [`docs/plans/2026-11-17-v540-deployment-gate-plan.md`](./docs/plans/2026-11-17-v540-deployment-gate-plan.md)。

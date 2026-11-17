@@ -715,8 +715,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pipeline_calls],
                     [
                         ("report_analyst", "gemini-4-hydrogen", "HIGH"),
-                        ("report_auditor", "gemini-4-carbon", "HIGH"),
-                        ("report_pm", "gemini-4-hydrogen", "HIGH"),
+                        ("report_auditor", "gemini-4-hydrogen", "HIGH"),
+                        ("report_pm", "gemini-4-carbon", "HIGH"),
                     ],
                 )
                 self.assertTrue(

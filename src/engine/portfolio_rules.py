@@ -503,6 +503,90 @@ def _shares_from_gbp(
     return max(0, int(gbp_amount // price_gbp))
 
 
+_SIZE_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_SIZE_FRAC_RE = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)")
+_SIZE_GBP_RE = re.compile(r"£\s*([\d,]+(?:\.\d+)?)")
+_FULL_EXIT_TOKENS = ("全出", "清仓", "全部卖出", "全卖", "全部清仓")
+
+
+def _fmt_shares(shares: float) -> str:
+    if shares <= 0:
+        return ""
+    if abs(shares - round(shares)) < 0.005:
+        return f"≈{int(round(shares)):,}股"
+    return f"≈{shares:,.2f}股"
+
+
+def derive_action_size_note(action: str, size_hint: str, position: Any | None = None) -> str:
+    """Deterministic share-count note for /report top_actions (never LLM arithmetic).
+
+    TRIM percentages/fractions are applied to the existing holding; GBP amounts are converted
+    with the position's own GBP-per-share mark, so GBp/GBP 100x mix-ups cannot leak in.
+    ADD percentages stay as-is because their base (cash vs target weight) is ambiguous.
+    """
+    act = str(action or "").strip().upper()
+    hint = str(size_hint or "").strip()
+    if act not in {"ADD", "TRIM", "STOP"}:
+        return ""
+    if any(tok in hint for tok in _FULL_EXIT_TOKENS):
+        return ""
+    if act == "STOP":
+        return "触发即全出" if not hint else ""
+    if not hint:
+        return ""
+    qty = float(getattr(position, "quantity", 0.0) or 0.0) if position is not None else 0.0
+    if act != "TRIM":
+        return ""
+    m = _SIZE_PCT_RE.search(hint)
+    if m and qty > 0:
+        return _fmt_shares(qty * float(m.group(1)) / 100.0)
+    frac = _SIZE_FRAC_RE.search(hint)
+    if frac and qty > 0:
+        den = float(frac.group(2))
+        if den > 0:
+            return _fmt_shares(qty * float(frac.group(1)) / den)
+    amt = _SIZE_GBP_RE.search(hint)
+    if amt and position is not None and qty > 0:
+        try:
+            amount = float(amt.group(1).replace(",", ""))
+        except ValueError:
+            return ""
+        value = float(getattr(position, "current_value", 0.0) or 0.0)
+        if amount > 0 and value > 0:
+            return _fmt_shares(amount / (value / qty))
+    return ""
+
+
+def build_report_size_notes(top_actions: list[Any] | None, portfolio: Any | None) -> dict[tuple[str, str], str]:
+    """Map ``(ACCOUNT, SYMBOL)`` -> deterministic size note for :func:`render_morning_report`."""
+    notes: dict[tuple[str, str], str] = {}
+    if portfolio is None:
+        return notes
+    positions = list(portfolio.all_positions())
+    for act in top_actions or []:
+        account = str(getattr(act, "account", "") or "").strip().upper()
+        symbol = str(getattr(act, "symbol", "") or "").strip().upper()
+        if not symbol or symbol == "CASH":
+            continue
+        pos = next(
+            (
+                p
+                for p in positions
+                if str(getattr(p, "account", "")).strip().upper() == account
+                and symbol
+                in {
+                    str(getattr(p, "yahoo_symbol", "")).strip().upper(),
+                    str(getattr(p, "ticker", "")).strip().upper(),
+                }
+            ),
+            None,
+        )
+        note = derive_action_size_note(getattr(act, "action", ""), getattr(act, "size_hint", ""), pos)
+        if note:
+            notes[(account, symbol)] = note
+    return notes
+
+
 def _build_pick_size_note(
     item: Any,
     bundle: TickerMarketBundle | None,
