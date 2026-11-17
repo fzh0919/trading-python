@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.agents.ds_sidecar import call_ds_json, ds_helper_available, sanitize_plain_text
 from src.agents.llm_client import LLMBackend
 from src.agents.pick_agent import generate_pick_radar
 from src.agents.report_agent import generate_morning_report, generate_us_sentinel
@@ -215,6 +216,19 @@ def _clean_reflection_lesson(raw_text: str, max_chars: int = 200) -> str:
     return clipped.rstrip()
 
 
+def _normalize_quote(text: str) -> str:
+    """Normalize whitespace so verbatim quote checks tolerate spacing differences only."""
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _quote_is_verbatim(quote: str, corpus: list[str]) -> bool:
+    """True only when the extracted quote appears verbatim inside one raw user utterance."""
+    needle = _normalize_quote(quote)
+    if len(needle) < 4:
+        return False
+    return any(needle in _normalize_quote(item) for item in corpus)
+
+
 class TradingScheduler:
     """Deterministic minute-tick scheduler with per-job isolation and Telegram ops alerting."""
 
@@ -293,7 +307,7 @@ class TradingScheduler:
 
                 detail = msg[:120] if not send_to_tg else ""
                 self.last_job_runs[job_name] = {"status": "OK", "uk_time": uk_now_str, "detail": detail}
-                if send_to_tg and chat_id:
+                if send_to_tg and chat_id and msg.strip():
                     await self.tg.send_message(chat_id, msg)
                 return True
             except asyncio.CancelledError:
@@ -383,6 +397,61 @@ class TradingScheduler:
             or self.cfg.universe.etf_symbols
         )
 
+    async def _generate_weekly_diagnosis(
+        self,
+        audit: dict[str, Any],
+        *,
+        uk_date: str,
+    ) -> str:
+        """One-hop DeepSeek diagnosis over raw audit numbers + raw T+N settlement stats (no summary-of-summary)."""
+        if not ds_helper_available(self.llm, self.cfg):
+            return ""
+        try:
+            stats = await self.db.get_recommendation_stats()
+            lessons = await self.db.get_recent_lessons(limit=8)
+        except Exception as exc:
+            logger.warning("Weekly diagnosis could not load settlement stats: %s", exc)
+            return ""
+
+        bt = audit.get("threshold_backtest") or {}
+        lines = [
+            f"【本周体检 {uk_date}】池 {audit.get('universe_count', 0)} 只 | "
+            f"重叠 {len(audit.get('overlap_candidates') or [])} | "
+            f"僵尸 {len(audit.get('zombie_candidates') or [])}",
+            f"【阈值回测原始数字】样本 {bt.get('sample_count', 0)} | {str(bt)[:600]}",
+            f"【T+N 后验原始数字】总数 {stats.get('total_count', 0)} | 已结算 {stats.get('settled_count', 0)} | "
+            f"原始胜率 {stats.get('win_rate_pct')} | Alpha 胜率 {stats.get('alpha_win_rate_pct')} | "
+            f"T+10 Alpha {stats.get('avg_t10_alpha_pct')} | T+20 Alpha {stats.get('avg_t20_alpha_pct')} | "
+            f"MFE {stats.get('avg_mfe_pct')} | MAE {stats.get('avg_mae_pct')}",
+            "【近期已结算原话教训】",
+        ]
+        for row in lessons or []:
+            lesson = str(row.get("reflection_lesson") or "").strip()
+            if not lesson:
+                continue
+            lines.append(
+                f"- {row.get('symbol')} {row.get('action')} 收益 {row.get('raw_return_pct')} "
+                f"vs {row.get('benchmark_symbol')} Alpha {row.get('alpha_pct')}: {lesson[:120]}"
+            )
+
+        payload = await call_ds_json(
+            self.cfg,
+            self.llm,
+            prompt="\n".join(lines),
+            system_instruction=(
+                "你是量化策略诊断官（只读）。根据原始回测与 T+5/10/20 后验数字，输出 3 条以内中文诊断："
+                "①参数/阈值建议 ②胜率结构问题 ③下周关注。禁止编造未给出的数字，禁止 Markdown # 与 **，总长 <=450 字。"
+                '仅输出严格 JSON：{"diagnosis": "..."}'
+            ),
+            usage_label="weekly_quant_diagnosis",
+        )
+        if not payload:
+            return ""
+        text = sanitize_plain_text(str(payload.get("diagnosis") or ""), 450)
+        if len(text) < 20:
+            return ""
+        return text
+
     async def _run_weekly_quant_audit_impl(self, now_utc: datetime | None = None) -> dict[str, Any]:
         """Run 0-token offline universe audition + threshold audit and save silently to quant_health_audits."""
         base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -465,13 +534,15 @@ class TradingScheduler:
         audit = run_offline_universe_and_threshold_audit(**audit_kwargs)
         if audition_res:
             audit["audition"] = audition_res
+        diagnosis = await self._generate_weekly_diagnosis(audit, uk_date=uk_date)
         await self.db.save_quant_audit(
             audit_date=uk_date,
             summary_text=audit["summary_text"],
             payload=audit,
             created_at_uk=uk_now_str,
+            ai_diagnosis=diagnosis,
         )
-        return {**audit, "audit_date": uk_date}
+        return {**audit, "audit_date": uk_date, "ai_diagnosis": diagnosis}
 
     async def run_pool_audition(
         self,
@@ -515,12 +586,18 @@ class TradingScheduler:
     async def _run_weekly_quant_audit_job(self, now_utc: datetime) -> str:
         audit = await self._run_weekly_quant_audit_impl(now_utc=now_utc)
         bt = audit.get("threshold_backtest") or {}
-        return (
+        summary = (
             f"体检池 {audit.get('universe_count', 0)} 只 | "
             f"重叠 {len(audit.get('overlap_candidates') or [])} | "
             f"僵尸 {len(audit.get('zombie_candidates') or [])} | "
             f"回测样本 {bt.get('sample_count', 0)}"
         )
+        diagnosis = str(audit.get("ai_diagnosis") or "").strip()
+        if diagnosis:
+            return f"📊 周六策略体检周报（{audit.get('audit_date', '')}）\n{diagnosis}\n\n{summary}"
+        # Silent fallback: keep the DB audit as the source of truth and never spam a bare one-liner.
+        logger.info("Weekly quant audit completed without AI diagnosis: %s", summary)
+        return ""
 
     async def _build_weekly_wallet_reconcile_message(self, now_utc: datetime | None = None) -> str:
         """Compose a lightweight weekly Invest GBP+USD ledger reminder (0-token, no AI calls)."""
@@ -574,6 +651,76 @@ class TradingScheduler:
 
     async def _run_weekly_wallet_reconcile_job(self, now_utc: datetime) -> str:
         return await self._build_weekly_wallet_reconcile_message(now_utc=now_utc)
+
+    async def _extract_preference_notes(self, now_utc: datetime | None = None) -> int:
+        """Single-hop DeepSeek extraction of explicit user preferences from today's raw chat utterances."""
+        base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        dt_uk = base.astimezone(LONDON_TZ)
+        uk_date = dt_uk.date().isoformat()
+        if not ds_helper_available(self.llm, self.cfg):
+            return 0
+        day_start = dt_uk.replace(hour=0, minute=0, second=0, microsecond=0)
+        try:
+            queries = await self.db.get_user_queries_since(int(day_start.timestamp() * 1000), limit=60)
+        except Exception as exc:
+            logger.warning("Preference extraction could not load chat history: %s", exc)
+            return 0
+        corpus = [q for q in queries if str(q).strip()]
+        if not corpus:
+            return 0
+
+        joined = "\n---\n".join(f"[{idx + 1}] {q}" for idx, q in enumerate(corpus))
+        payload = await call_ds_json(
+            self.cfg,
+            self.llm,
+            prompt=f"【今日用户原始发言（逐条独立，禁止合并改写）】\n{joined[:6000]}",
+            system_instruction=(
+                "你是用户偏好抽取器（只读）。只抽取用户主动声明的明确硬偏好/资金计划/禁忌"
+                "（例如「年底前不碰军工」「明年3月前不加仓科技」）。没有明确偏好就返回空数组。"
+                "quote 必须是某一条发言的逐字片段（不要改写、不要合并），rule 是 <=60 字可执行规则，ttl_days 1~30。\n"
+                '仅输出严格 JSON：{"notes": [{"quote": "...", "rule": "...", "ttl_days": 14}]}'
+            ),
+            usage_label="preference_extract",
+        )
+        if not payload:
+            return 0
+        raw_notes = payload.get("notes")
+        if not isinstance(raw_notes, list):
+            return 0
+
+        max_notes = max(1, int(self.cfg.strategy.preference_max_notes_per_day))
+        default_ttl = max(1, int(self.cfg.strategy.preference_ttl_days))
+        validated: list[dict[str, Any]] = []
+        for item in raw_notes[: max_notes * 2]:
+            if not isinstance(item, dict):
+                continue
+            quote = str(item.get("quote") or "").strip()
+            rule = sanitize_plain_text(str(item.get("rule") or ""), 60)
+            if not quote or not rule or not _quote_is_verbatim(quote, corpus):
+                if quote and not _quote_is_verbatim(quote, corpus):
+                    logger.info("Dropping non-verbatim preference quote: %s", quote[:40])
+                continue
+            try:
+                ttl = int(item.get("ttl_days") or default_ttl)
+            except (TypeError, ValueError):
+                ttl = default_ttl
+            ttl = min(30, max(1, ttl))
+            validated.append(
+                {
+                    "source_cycle_date": uk_date,
+                    "quote_text": sanitize_plain_text(quote, 120),
+                    "rule_summary": rule,
+                    "expires_on_uk": (dt_uk.date() + timedelta(days=ttl)).isoformat(),
+                }
+            )
+            if len(validated) >= max_notes:
+                break
+        if not validated:
+            return 0
+        saved = await self.db.upsert_preference_notes(validated)
+        if saved:
+            await self.db.prune_expired_preference_notes(uk_date)
+        return saved
 
     async def _run_daily_settlement_impl(self, now_utc: datetime | None = None) -> dict[str, Any]:
         base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -839,6 +986,12 @@ class TradingScheduler:
                     logger.warning("Weekday catch-up weekly quant audit failed: %s", exc)
 
         pruned = await self.db.prune_old_records(retention_days=90, now_utc=base)
+        preferences_saved = 0
+        if self.cfg.strategy.user_preference_memory_enabled:
+            try:
+                preferences_saved = await self._extract_preference_notes(base)
+            except Exception as exc:
+                logger.warning("Preference extraction failed: %s", exc)
         return {
             "checked": len(pending),
             "settled": settled,
@@ -848,6 +1001,7 @@ class TradingScheduler:
             "followup_updated": followup_updated,
             "weekly_audit_ran": weekly_audit_ran,
             "pruned": pruned,
+            "preferences_saved": preferences_saved,
         }
 
     async def run_daily_settlement(self, now_utc: datetime | None = None) -> dict[str, Any]:
@@ -1013,7 +1167,7 @@ class TradingScheduler:
                         chat_id=chat_id,
                         uk_now_str=uk_now_str,
                         coro=self._run_weekly_quant_audit_job(base),
-                        send_to_tg=False,
+                        send_to_tg=True,
                     )
 
             # Saturday ledger reminder window (12:00 ~ 22:00 UK): weekly Idempotent GBP+USD reconcile nudge

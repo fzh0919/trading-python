@@ -123,3 +123,29 @@ def build_agent_system_instruction(
         f"{role_instruction.strip()}\n\n"
         f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule)}"
     )
+
+
+def format_preference_notes_block(
+    notes: list[dict[str, Any]] | None,
+    *,
+    max_notes: int = 6,
+) -> str:
+    """Render TTL-bound user preferences with verbatim quote anchors (never paraphrase-only)."""
+    if not notes:
+        return ""
+    lines: list[str] = []
+    for note in notes[: max(1, max_notes)]:
+        if not isinstance(note, dict):
+            continue
+        quote = str(note.get("quote_text") or "").strip()
+        rule = str(note.get("rule_summary") or "").strip()
+        if not quote or not rule:
+            continue
+        date = str(note.get("source_cycle_date") or "").strip()[:10]
+        expires = str(note.get("expires_on_uk") or "").strip()[:10]
+        head = f'[{date} · 原话: "{quote[:80]}"]' if date else f'[原话: "{quote[:80]}"]'
+        tail = f"（有效至 {expires}）" if expires else ""
+        lines.append(f"• {head} {rule}{tail}")
+    if not lines:
+        return ""
+    return "【用户长期偏好与资金计划（含原话锚点，优先遵守）】：\n" + "\n".join(lines)

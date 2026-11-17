@@ -560,6 +560,10 @@ class AdvisorBot:
             summary_txt = str(latest_audit.get("summary_text") or "").strip()
             if summary_txt:
                 lines.append(summary_txt)
+            diagnosis = str(latest_audit.get("ai_diagnosis") or "").strip()
+            if diagnosis:
+                lines.append("【AI 策略诊断】")
+                lines.append(diagnosis)
 
         return "\n".join(lines)
 

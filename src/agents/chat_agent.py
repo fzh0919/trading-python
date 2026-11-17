@@ -9,7 +9,11 @@ import unicodedata
 from typing import TYPE_CHECKING, Any
 
 from src.agents.llm_client import LLMBackend
-from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
+from src.agents.prompts import (
+    build_agent_system_instruction,
+    build_wallet_context_text,
+    format_preference_notes_block,
+)
 from src.agents.schemas import trim_text_at_line_boundary
 from src.agents.tools import MarketToolkit
 from src.config import AppConfig
@@ -652,6 +656,7 @@ async def answer_user_chat(
         history_turns,
         prev_cycle_turns,
         context_pack,
+        pref_notes,
     ) = await asyncio.gather(
         db.get_morning_context(include_premarket=False),
         db.get_morning_context(include_premarket=True),
@@ -660,11 +665,13 @@ async def answer_user_chat(
         db.get_chat_history(limit=cfg.strategy.max_daily_chat_turns),
         db.get_previous_cycle_chat_history(limit=2),
         db.get_context_pack(allow_fallback=True),
+        db.get_active_preference_notes(),
     )
 
     is_deep_query = user_query.strip().lower().startswith("/deep")
     history_block = _format_chat_history_compact(history_turns, recent_full_turns=3 if is_deep_query else 2)
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（无）"
+    preference_block = format_preference_notes_block(pref_notes)
     sched = get_us_market_schedule_uk()
     calendar_alerts = get_market_calendar_alerts()
     calendar_inline = ("｜" + "；".join(calendar_alerts)) if calendar_alerts else ""
@@ -752,6 +759,7 @@ async def answer_user_chat(
         f"美股状态：{sched.phase}（常规开盘 {sched.open_time_uk} UK，收盘 {sched.close_time_uk} UK）。\n\n"
         + (f"{premarket_tail}\n\n" if premarket_tail else "")
         + f"{build_wallet_context_text(portfolio, cfg.strategy, compact=True)}\n\n"
+        + (f"{preference_block}\n\n" if preference_block else "")
         + f"【ISA 账户】\n{format_account_overview(portfolio.isa)}\n{isa_pos_text}\n\n"
         f"【Invest 账户】\n{format_account_overview(portfolio.invest)}\n{invest_pos_text}\n\n"
         f"【当前挂单与近7日成交】\n{trade_ctx['pending_orders_text']}\n{trade_ctx['recent_trades_text']}\n\n"

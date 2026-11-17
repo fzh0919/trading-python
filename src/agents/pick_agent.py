@@ -12,7 +12,11 @@ import pandas as pd
 
 from src.agents.ds_sidecar import call_ds_json, ds_helper_available
 from src.agents.llm_client import LLMBackend
-from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
+from src.agents.prompts import (
+    build_agent_system_instruction,
+    build_wallet_context_text,
+    format_preference_notes_block,
+)
 from src.agents.schemas import PickDecision, parse_or_repair_structured_json, render_pick_report
 from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
 from src.agents.tools import MarketToolkit, _format_us_deep_intel, run_forced_market_grounding
@@ -584,6 +588,7 @@ async def generate_pick_radar(
         guardrails,
         context_pack,
         recent_lessons,
+        pref_notes,
     ) = await asyncio.gather(
         market_data.get_bundles(
             tracked_syms,
@@ -596,6 +601,7 @@ async def generate_pick_radar(
         db.get_daily_guardrails(),
         db.get_context_pack(allow_fallback=False),
         db.get_recent_lessons(limit=5),
+        db.get_active_preference_notes(),
     )
 
     # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
@@ -682,6 +688,7 @@ async def generate_pick_radar(
         )
     )
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未运行 /report，请独立执行全部风控红线检查）"
+    preference_block = format_preference_notes_block(pref_notes)
     us_sched = get_us_market_schedule_uk()
     calendar_alerts = get_market_calendar_alerts()
     calendar_note = f"｜{'；'.join(calendar_alerts)}" if calendar_alerts else ""
@@ -827,7 +834,8 @@ async def generate_pick_radar(
         f"早报基调：{morning_conclusion or '（暂无）'}\n"
         f"{morning_audit_block}"
         f"红线清单：\n{veto_block}\n\n"
-        f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训（禁止重蹈覆辙）】：\n{lessons_text}\n\n"
+        + (f"{preference_block}\n\n" if preference_block else "")
+        + f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训（禁止重蹈覆辙）】：\n{lessons_text}\n\n"
         f"【精确现金底座（禁止自行估算比例）】：{exact_cash_summary}\n"
         f"【宏观快照】：{macro.to_text()}\n"
         f"【行业与跨账户暴露】：\n{exposure_text}\n"
@@ -883,7 +891,8 @@ async def generate_pick_radar(
         f"【今日 /report 基线】：{morning_conclusion or '（暂无）'}\n"
         + (f"【今日 /report 持仓与挂单裁决（默认遵循）】：\n{morning_audits_text}\n" if morning_audits_text else "")
         + f"【今日红线】：\n{veto_block}\n\n"
-        f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
+        + (f"{preference_block}\n\n" if preference_block else "")
+        + f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
         f"【双钱包明细与资金路径】：\n{build_wallet_context_text(portfolio, cfg.strategy)}\n"

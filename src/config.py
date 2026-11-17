@@ -168,6 +168,10 @@ class StrategySection(BaseModel):
     pick_wide_funnel_top_n: int = Field(default=15, ge=8, le=20)
     pick_prefilter_keep_per_track: int = Field(default=8, ge=4, le=12)
     pick_search_symbols_per_track: int = Field(default=8, ge=4, le=12)
+    # Long-term user preference memory (verbatim quote anchored, auto-expiring)
+    user_preference_memory_enabled: bool = True
+    preference_ttl_days: int = Field(default=14, ge=1, le=90)
+    preference_max_notes_per_day: int = Field(default=3, ge=1, le=5)
 
 
 class UniverseSection(BaseModel):

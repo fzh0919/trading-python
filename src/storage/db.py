@@ -278,8 +278,19 @@ class AdvisorDatabase:
                     audit_date TEXT PRIMARY KEY,
                     created_at_uk TEXT NOT NULL,
                     summary_text TEXT NOT NULL,
-                    payload_json TEXT DEFAULT '{}'
+                    payload_json TEXT DEFAULT '{}',
+                    ai_diagnosis TEXT DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS user_preference_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_cycle_date TEXT NOT NULL DEFAULT '',
+                    quote_text TEXT NOT NULL DEFAULT '',
+                    rule_summary TEXT NOT NULL DEFAULT '',
+                    expires_on_uk TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_pref_expires ON user_preference_notes(expires_on_uk);
 
                 CREATE TABLE IF NOT EXISTS fundamentals_cache (
                     symbol TEXT PRIMARY KEY,
@@ -386,6 +397,11 @@ class AdvisorDatabase:
                 db,
                 "llm_usage_logs",
                 {"search_queries": "INTEGER NOT NULL DEFAULT 0"},
+            )
+            await _ensure_columns(
+                db,
+                "quant_health_audits",
+                {"ai_diagnosis": "TEXT DEFAULT ''"},
             )
             await db.executescript(
                 """
@@ -1904,6 +1920,7 @@ class AdvisorDatabase:
         payload: dict[str, Any] | None = None,
         *,
         created_at_uk: str | None = None,
+        ai_diagnosis: str = "",
     ) -> None:
         """Persist weekly offline universe and strategy threshold health audit idempotently by audit_date."""
         uk_ts = created_at_uk or datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
@@ -1912,10 +1929,10 @@ class AdvisorDatabase:
             await db.execute(
                 """
                 INSERT OR REPLACE INTO quant_health_audits (
-                    audit_date, created_at_uk, summary_text, payload_json
-                ) VALUES (?, ?, ?, ?)
+                    audit_date, created_at_uk, summary_text, payload_json, ai_diagnosis
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (str(audit_date), uk_ts, str(summary_text or ""), payload_str),
+                (str(audit_date), uk_ts, str(summary_text or ""), payload_str, str(ai_diagnosis or "")),
             )
             await db.commit()
 
@@ -1924,7 +1941,7 @@ class AdvisorDatabase:
         async with self._connect() as db:
             cur = await db.execute(
                 """
-                SELECT audit_date, created_at_uk, summary_text, payload_json
+                SELECT audit_date, created_at_uk, summary_text, payload_json, ai_diagnosis
                 FROM quant_health_audits
                 ORDER BY audit_date DESC, created_at_uk DESC
                 LIMIT 1
@@ -1946,7 +1963,107 @@ class AdvisorDatabase:
             "summary_text": str(row[2]),
             "payload_json": raw_payload,
             "payload": parsed,
+            "ai_diagnosis": str(row[4] or ""),
         }
+
+    async def get_user_queries_since(self, start_ms: int, limit: int = 60) -> list[str]:
+        """Return raw user utterances since an epoch-ms cutoff (oldest first) for verbatim quote anchoring."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT user_query FROM chat_history
+                WHERE created_at_ms >= ?
+                ORDER BY created_at_ms ASC, id ASC
+                LIMIT ?
+                """,
+                (int(start_ms), int(limit)),
+            )
+            rows = await cur.fetchall()
+        return [str(r[0]) for r in rows if r and str(r[0]).strip()]
+
+    async def upsert_preference_notes(self, notes: list[dict[str, Any]]) -> int:
+        """Insert validated preference notes, skipping duplicates of the same rule within the last 14 days."""
+        if not notes:
+            return 0
+        now_ms = int(time.time() * 1000)
+        dedupe_window_ms = 14 * 86_400_000
+        saved = 0
+        async with self._connect(write=True) as db:
+            for note in notes:
+                if not isinstance(note, dict):
+                    continue
+                quote = str(note.get("quote_text") or "").strip()
+                rule = str(note.get("rule_summary") or "").strip()
+                expires = str(note.get("expires_on_uk") or "").strip()
+                if not quote or not rule or not expires:
+                    continue
+                cur = await db.execute(
+                    """
+                    SELECT 1 FROM user_preference_notes
+                    WHERE rule_summary = ? AND created_at_ms >= ?
+                    LIMIT 1
+                    """,
+                    (rule, now_ms - dedupe_window_ms),
+                )
+                if await cur.fetchone():
+                    continue
+                await db.execute(
+                    """
+                    INSERT INTO user_preference_notes (
+                        source_cycle_date, quote_text, rule_summary, expires_on_uk, created_at_ms
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (str(note.get("source_cycle_date") or ""), quote, rule, expires, now_ms),
+                )
+                saved += 1
+            if saved:
+                await db.commit()
+        return saved
+
+    async def get_active_preference_notes(
+        self,
+        now_uk: str | None = None,
+        limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Return non-expired preference notes (oldest first) for prompt injection."""
+        today = (
+            now_uk or datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d")
+        )[:10]
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT source_cycle_date, quote_text, rule_summary, expires_on_uk
+                FROM user_preference_notes
+                WHERE expires_on_uk >= ?
+                ORDER BY created_at_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (today, int(limit)),
+            )
+            rows = await cur.fetchall()
+        notes = [
+            {
+                "source_cycle_date": str(r[0]),
+                "quote_text": str(r[1]),
+                "rule_summary": str(r[2]),
+                "expires_on_uk": str(r[3]),
+            }
+            for r in rows
+        ]
+        return list(reversed(notes))
+
+    async def prune_expired_preference_notes(self, now_uk: str | None = None) -> int:
+        """Delete preference notes whose TTL has elapsed."""
+        today = (
+            now_uk or datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d")
+        )[:10]
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                "DELETE FROM user_preference_notes WHERE expires_on_uk < ?",
+                (today,),
+            )
+            await db.commit()
+        return max(0, int(cur.rowcount or 0))
 
     async def get_grounding_news_cache(
         self,
