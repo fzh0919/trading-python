@@ -17,6 +17,7 @@ import pandas as pd
 from src.data_providers.market_data import TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    HistoricalOrderItem,
     HistoricalTransactionItem,
     PendingOrderItem,
     PortfolioData,
@@ -24,8 +25,10 @@ from src.data_providers.t212_client import (
     T212Client,
     build_trade_context,
     clean_t212_ticker,
+    compute_trade_behavior_stats,
     format_account_overview,
     format_positions_text,
+    format_trade_behavior_text,
     reconcile_invest_wallets,
     to_yahoo_symbol,
 )
@@ -1147,6 +1150,235 @@ class TestWalletSnapshotCompat(unittest.TestCase):
         self.assertIn("现金利息 +3.40 USD", text)
         self.assertNotIn("503.40 GBP", text)
 
+
+_NOW_MS = 1_763_000_000_000
+
+
+def _hist_order(
+    *,
+    oid: str,
+    side: str,
+    ticker: str,
+    account: str = "ISA",
+    days_ago: float = 1.0,
+    net_value: float = 800.0,
+    wallet_currency: str = "GBP",
+    tax_total: float = 0.0,
+) -> HistoricalOrderItem:
+    ms = _NOW_MS - int(days_ago * 86400 * 1000)
+    return HistoricalOrderItem(
+        id=oid,
+        account=account,
+        raw_ticker=f"{ticker}_US_EQ",
+        ticker=ticker,
+        yahoo_symbol=ticker,
+        name=ticker,
+        inst_currency=wallet_currency,
+        side=side,
+        order_type="MARKET",
+        filled_at="2026-11-16T10:00:00Z",
+        filled_at_ms=ms,
+        uk_time_str="2026-11-16 10:00",
+        quantity=1.0,
+        price=net_value,
+        net_value=net_value,
+        wallet_currency=wallet_currency,
+        realised_pnl=0.0,
+        tax_total=tax_total,
+    )
+
+
+def _empty_portfolio(**kwargs: object) -> PortfolioData:
+    return PortfolioData(
+        fetched_at_uk="2026-11-17 07:00",
+        fetched_at_ms=_NOW_MS,
+        isa=kwargs.get("isa") or AccountSnapshot(ok=True, account_label="ISA"),
+        invest=kwargs.get("invest") or AccountSnapshot(ok=True, account_label="Invest"),
+        gbp_usd_rate=kwargs.get("gbp_usd_rate"),
+    )
+
+
+class TestTradeBehaviorStats(unittest.TestCase):
+    """Stage 1 (v5.3.2): 0-Token cadence / ticket size / fee / cooldown statistics."""
+
+    def test_cadence_ticket_size_and_fee_ratio(self) -> None:
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            recent_orders=[
+                _hist_order(oid="b1", side="BUY", ticker="NVDA", days_ago=2, net_value=800.0, tax_total=4.0),
+                _hist_order(oid="b2", side="BUY", ticker="MSFT", days_ago=20, net_value=1000.0, tax_total=5.0),
+                _hist_order(oid="s1", side="SELL", ticker="AAPL", days_ago=3, net_value=1200.0),
+                _hist_order(oid="s2", side="SELL", ticker="TSLA", days_ago=40, net_value=500.0),
+            ],
+        )
+        stats = compute_trade_behavior_stats(_empty_portfolio(isa=isa), now_ms=_NOW_MS)
+        self.assertEqual(stats["buys_7d"], 1)
+        self.assertEqual(stats["buys_30d"], 2)
+        self.assertEqual(stats["sells_7d"], 1)
+        self.assertEqual(stats["sells_30d"], 1)  # 40-day-old fill outside the 30d window
+        self.assertEqual(stats["avg_buy_amount_by_currency"]["GBP"], 900.0)
+        self.assertAlmostEqual(stats["fees_pct_of_turnover"], 0.3, places=3)
+        self.assertFalse(stats["partial"])
+
+    def test_cooldown_list_skips_held_and_stale_tickers(self) -> None:
+        held = PositionItem(
+            account="ISA",
+            raw_ticker="NVDA_US_EQ",
+            ticker="NVDA",
+            yahoo_symbol="NVDA",
+            name="NVIDIA",
+            inst_currency="USD",
+            quantity=2.0,
+            avg_price=100.0,
+            cur_price=110.0,
+            current_value=220.0,
+            total_cost=200.0,
+            pnl=20.0,
+            fx_impact=0.0,
+            return_pct=10.0,
+        )
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            positions=[held],
+            recent_orders=[
+                _hist_order(oid="s1", side="SELL", ticker="AAPL", days_ago=10, net_value=900.0),
+                _hist_order(oid="s2", side="SELL", ticker="NVDA", days_ago=5, net_value=900.0),
+                _hist_order(oid="s3", side="SELL", ticker="OLD", days_ago=40, net_value=900.0),
+            ],
+        )
+        stats = compute_trade_behavior_stats(_empty_portfolio(isa=isa), now_ms=_NOW_MS, cooldown_days=15)
+        closed = {row["ticker"]: row for row in stats["recently_closed"]}
+        self.assertEqual(set(closed), {"AAPL"})
+        self.assertTrue(closed["AAPL"]["in_cooldown"])
+        self.assertAlmostEqual(closed["AAPL"]["days_since_sell"], 10.0, places=1)
+
+    def test_partial_history_flag_and_empty_history(self) -> None:
+        isa = AccountSnapshot(
+            ok=True,
+            recent_orders=[_hist_order(oid="b1", side="BUY", ticker="NVDA", days_ago=5, net_value=750.0)],
+        )
+        stats = compute_trade_behavior_stats(_empty_portfolio(isa=isa), now_ms=_NOW_MS)
+        self.assertTrue(stats["partial"])
+        self.assertAlmostEqual(stats["coverage_days"], 5.0, places=1)
+
+        empty = compute_trade_behavior_stats(_empty_portfolio(), now_ms=_NOW_MS)
+        self.assertFalse(empty["partial"])
+        self.assertEqual(empty["coverage_days"], 0.0)
+        self.assertEqual(empty["buys_30d"], 0)
+
+    def test_mixed_currency_never_inflates_gbp_total(self) -> None:
+        isa = AccountSnapshot(
+            ok=True,
+            recent_orders=[_hist_order(oid="b1", side="BUY", ticker="VUAG", days_ago=4, net_value=700.0)],
+        )
+        invest = AccountSnapshot(
+            ok=True,
+            account_label="Invest",
+            recent_orders=[
+                _hist_order(
+                    oid="b2",
+                    side="BUY",
+                    ticker="MSFT",
+                    account="Invest",
+                    days_ago=6,
+                    net_value=1000.0,
+                    wallet_currency="USD",
+                )
+            ],
+        )
+        with_rate = compute_trade_behavior_stats(
+            _empty_portfolio(isa=isa, invest=invest, gbp_usd_rate=1.25),
+            now_ms=_NOW_MS,
+        )
+        self.assertEqual(with_rate["avg_buy_amount_by_currency"], {"GBP": 700.0, "USD": 1000.0})
+        self.assertAlmostEqual(with_rate["avg_buy_gbp"], 750.0, places=2)
+
+        without_rate = compute_trade_behavior_stats(_empty_portfolio(isa=isa, invest=invest), now_ms=_NOW_MS)
+        self.assertIsNone(without_rate["avg_buy_gbp"])
+
+    def test_format_text_exposes_cooldown_and_partial_warning(self) -> None:
+        text = format_trade_behavior_text(
+            {
+                "buys_7d": 1,
+                "buys_30d": 3,
+                "sells_7d": 0,
+                "sells_30d": 1,
+                "avg_buy_amount_by_currency": {"GBP": 780.0},
+                "avg_buy_gbp": 780.0,
+                "fees_pct_of_turnover": 0.42,
+                "recently_closed": [{"ticker": "AAPL", "account": "ISA", "days_since_sell": 4.0, "in_cooldown": True}],
+                "cooldown_days": 15,
+                "coverage_days": 12.0,
+                "partial": True,
+            }
+        )
+        self.assertIn("近7天买入 1 笔 / 近30天 3 笔", text)
+        self.assertIn("税费占成交额 0.42%", text)
+        self.assertIn("清仓 15 天冷却清单: AAPL(4天·冷却)", text)
+        self.assertIn("频率统计不完整", text)
+        self.assertEqual(format_trade_behavior_text({}), "")
+
+
+class TestPendingOrderLimitUpside(unittest.TestCase):
+    """Stage 1 (v5.3.2): pending BUY audits must anchor upside on the LIMIT price."""
+
+    def test_limit_upside_anchored_on_limit_price_not_live_price(self) -> None:
+        portfolio = _empty_portfolio(
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                pending_orders=[
+                    PendingOrderItem(
+                        id="o-dip",
+                        account="ISA",
+                        raw_ticker="MSFT_US_EQ",
+                        ticker="MSFT",
+                        yahoo_symbol="MSFT",
+                        name="Microsoft",
+                        side="BUY",
+                        order_type="LIMIT",
+                        quantity=1.0,
+                        value=90.0,
+                        limit_price=90.0,
+                        currency="USD",
+                        time_in_force="GTC",
+                    ),
+                    PendingOrderItem(
+                        id="o-chase",
+                        account="ISA",
+                        raw_ticker="MSFT_US_EQ",
+                        ticker="MSFT",
+                        yahoo_symbol="MSFT",
+                        name="Microsoft",
+                        side="BUY",
+                        order_type="LIMIT",
+                        quantity=1.0,
+                        value=102.0,
+                        limit_price=102.0,
+                        currency="USD",
+                        time_in_force="GTC",
+                    ),
+                ],
+            )
+        )
+        bundles = {
+            "MSFT": TickerMarketBundle(
+                symbol="MSFT",
+                currency="USD",
+                current_price=100.0,
+                target_mean_price=120.0,
+            )
+        }
+        text = build_trade_context(portfolio, bundles=bundles)["pending_orders_text"]
+        # Limit 90 vs live 100 with a 120 target => +33.3% upside measured from the LIMIT price.
+        self.assertIn("距现价 -10.0%", text)
+        self.assertIn("限价空间 +33.3%", text)
+        self.assertIn("[有效回踩埋伏单]", text)
+        self.assertIn("[追价单]", text)
+        # Live price sits 20% below target, so a live-price audit would wrongly show +20.0%.
+        self.assertNotIn("限价空间 +20.0%", text)
 
 if __name__ == "__main__":
     unittest.main()

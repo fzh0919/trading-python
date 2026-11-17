@@ -90,6 +90,21 @@ strategy:
   overlap_correlation_threshold: 0.85
   correlation_window_days: 60
 
+  # 基准相对收益 + 对称攻防纪律（VWRP.L = 全球宽基基准；现金利息仅作等待期保底，不再是投资终点）
+  benchmark_symbol: "VWRP.L"
+  min_invest_order_gbp: 700.0             # Invest 单笔最小建仓额（防碎单）
+  min_isa_equity_order_gbp: 1200.0        # ISA 个股单笔最小建仓额
+  min_isa_etf_order_gbp: 400.0            # ISA 宽基/主题 ETF 单笔最小建仓额
+  invest_risk_budget_gbp: 85.0            # 单笔最大可承受亏损（以损定仓）
+  max_weekly_new_buys: 2                  # 近 7 天新开仓笔数硬上限
+  max_monthly_new_buys: 6                 # 近 30 天新开仓笔数硬上限
+  rebuy_cooldown_days: 15                 # 清仓后同标的冷却天数
+  trade_cadence_guard_mode: "advisory"    # off=不检查 / advisory=仅提示，模型自主决定（默认） / hard=Python 硬拦截
+  isa_cash_deploy_trigger_pct: 15.0       # ISA 现金占比高于此值须给出具体部署提案
+  invest_cash_idle_warn_pct: 40.0         # Invest 现金长期高于此值提醒资金效率低下
+  spread_estimate_us_pct: 0.05            # 美股/欧股买卖价差估算（半价差口径，%）
+  spread_estimate_uk_eu_pct: 0.20         # 英股/LSE ETF 买卖价差估算（半价差口径，%）
+
   # /us intraday anomaly gate & T+N settlement horizon (IMP-12 / IMP-16)
   us_anomaly_move_pct: 1.8
   us_anomaly_vix_change_pct: 4.0

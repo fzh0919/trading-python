@@ -728,7 +728,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(pipeline_calls[0].get("max_tool_rounds"), 2)
                 self.assertEqual(pipeline_calls[1].get("max_tool_rounds"), 2)
                 self.assertTrue(all(c.get("system_instruction") for c in pipeline_calls))
-                self.assertTrue(all("必须直白建议撤单（CANCEL）" in c["system_instruction"] for c in pipeline_calls))
+                self.assertTrue(all("一律按挂单限价核算" in c["system_instruction"] for c in pipeline_calls))
                 self.assertIn("实时 Google Search", pipeline_calls[0]["prompt"])
                 self.assertIn("现金与双钱包", pipeline_calls[0]["prompt"])
                 self.assertIn("USD 钱包 $400.00", pipeline_calls[0]["prompt"])
@@ -781,8 +781,12 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("实时 Google Search", pick_pipeline[0]["prompt"])
                 self.assertIn("双钱包明细与资金路径", pick_pipeline[1]["prompt"])
                 self.assertTrue(
-                    all("必须直白建议撤单（CANCEL）" not in c["system_instruction"] for c in pick_pipeline)
+                    all("一律按挂单限价核算" not in c["system_instruction"] for c in pick_pipeline)
                 )
+                self.assertTrue(
+                    all("四重护栏" not in c["system_instruction"] for c in pick_pipeline)
+                )
+                self.assertTrue(any("六重护栏" in c["system_instruction"] for c in pick_pipeline))
                 pick_msg = tg.messages[-1]
                 self.assertLessEqual(len(pick_msg), 1000)
                 self.assertTrue(pick_msg.startswith("【本轮精选行动（四要素直给）】"))
@@ -825,7 +829,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(chat_call["model"], "deepseek-flash")
                 self.assertEqual(chat_call["thinking_level"], "HIGH")
                 self.assertTrue(chat_call.get("system_instruction"))
-                self.assertIn("必须直白建议撤单（CANCEL）", chat_call["system_instruction"])
+                self.assertIn("一律按挂单限价核算", chat_call["system_instruction"])
                 # morning_report already embeds "• 今日风控红线：..." so chat skips duplicate 【今日风控红线】
                 self.assertNotIn("【今日风控红线】", chat_call["prompt"])
                 self.assertIn("Invest半导体占比超限，冻结新开芯片仓", chat_call["prompt"])
@@ -2469,6 +2473,116 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("持仓期极值分布: 平均最大浮盈(MFE) +17.5% | 平均最大回撤(MAE) -3.2%", stats_msg)
             self.assertIn("【周末候选池与阈值体检】", stats_msg)
             self.assertIn("扫描池 51 只候选", stats_msg)
+
+
+class TestStage3BenchmarkMandatePrompts(unittest.TestCase):
+    """v5.3.2 Stage 3: replace the cash-hoarding bias with a benchmark-relative mandate."""
+
+    def test_investor_profile_uses_benchmark_rr_and_size_discipline(self) -> None:
+        from src.agents.prompts import build_investor_profile
+        from src.config import StrategySection
+
+        profile = build_investor_profile(StrategySection())
+        self.assertIn("VWRP.L", profile)
+        self.assertIn("£85", profile)
+        self.assertIn("R:R ≥ 2:1", profile)
+        self.assertIn("卖出三分类", profile)
+        self.assertIn("严禁把“守住现金吃息”当默认结论", profile)
+        self.assertIn("一律按挂单限价核算", profile)
+        self.assertNotIn("必须直白建议撤单", profile)
+        self.assertNotIn("明显跑赢4.0%现金利息", profile)
+
+    def test_profile_can_omit_order_audit_rule(self) -> None:
+        from src.agents.prompts import build_investor_profile
+        from src.config import StrategySection
+
+        profile = build_investor_profile(StrategySection(), include_order_audit_rule=False)
+        self.assertNotIn("一律按挂单限价核算", profile)
+        self.assertIn("VWRP.L", profile)
+
+    def test_schema_descriptions_drop_cash_interest_wording(self) -> None:
+        from src.agents.schemas import MorningReportDecision, PickActionItem, PickDecision
+
+        macro_desc = MorningReportDecision.model_fields["macro_and_cash"].description or ""
+        self.assertIn("VWRP", macro_desc)
+        self.assertNotIn("4%现金安全垫", macro_desc)
+
+        thesis_desc = PickActionItem.model_fields["thesis"].description or ""
+        self.assertIn("R:R", thesis_desc)
+        self.assertNotIn("现金利息对比", thesis_desc)
+
+        headline_desc = PickDecision.model_fields["headline"].description or ""
+        self.assertIn("VWRP", headline_desc)
+        self.assertNotIn("现金拿住吃4%利息", headline_desc)
+
+    def test_fallback_veto_text_is_benchmark_relative(self) -> None:
+        from src.agents.schemas import MorningReportDecision
+
+        dec = MorningReportDecision(
+            headline="测试定调",
+            macro_and_cash="现金占比 20%，VWRP 回踩 MA200 分批部署",
+            account_diagnosis="双账户均衡",
+            hold_summary="其余持有",
+            trade_review="本周 1 笔买入",
+        )
+        rendered = render_morning_report(dec, max_chars=1800)
+        self.assertIn("相对基准 VWRP 跟踪", rendered)
+        self.assertNotIn("严守4%现金门槛", rendered)
+        self.assertLessEqual(len(rendered), 1800)
+
+    def test_empty_pick_render_no_longer_pushes_cash_hoarding(self) -> None:
+        from src.agents.schemas import PickDecision
+
+        dec = PickDecision(
+            headline="现金待命待回踩",
+            selected_actions=[],
+            consistency_and_cash_note="ISA 现金 22%",
+        )
+        rendered = render_pick_report(dec, max_chars=1000)
+        self.assertIn("现金待命待回踩", rendered)
+        self.assertNotIn("吃 4.0% 年化利息", rendered)
+        self.assertLessEqual(len(rendered), 1000)
+
+    def test_advisory_note_renders_without_guardrail_tag(self) -> None:
+        from src.agents.schemas import PickDecision
+        from src.engine.portfolio_rules import RiskOverrideResult
+
+        dec = PickDecision(
+            headline="基准回踩分批部署",
+            selected_actions=[],
+            consistency_and_cash_note="ISA 现金 20%",
+        )
+        res = RiskOverrideResult(
+            decision=dec,
+            applied=False,
+            overrides=[],
+            notes=["[⚠️纪律提醒] [ISA] MSFT: 近 7 天已新开仓 2 笔(≥上限2)；advisory 模式不拦截"],
+        )
+        rendered = render_pick_report(dec, max_chars=1000, risk_override=res)
+        self.assertIn("[⚠️纪律提醒]", rendered)
+        self.assertNotIn("[🛡️风控护栏修正]", rendered)
+
+    def test_pick_render_still_capped_at_1000(self) -> None:
+        from src.agents.schemas import PickActionItem, PickDecision
+
+        dec = PickDecision(
+            headline="基准相对强度占优，宽基分批部署",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA",
+                    symbol="VWRP.L",
+                    action="BUY",
+                    thesis="R:R 2.5:1，相对基准配置",
+                    entry_zone="£1,200 于 118~120 分批",
+                    stop_condition="跌破 MA200 且跑输基准",
+                    target_window="12个月",
+                )
+            ],
+            consistency_and_cash_note="执行后 ISA 现金占比 18%",
+        )
+        rendered = render_pick_report(dec, max_chars=1000)
+        self.assertLessEqual(len(rendered), 1000)
+        self.assertIn("VWRP.L", rendered)
 
 
 if __name__ == "__main__":

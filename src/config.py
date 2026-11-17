@@ -178,6 +178,35 @@ class StrategySection(BaseModel):
     intraday_move_alert_pct: float = Field(default=3.5, gt=0.0)
     intraday_order_near_pct: float = Field(default=1.5, gt=0.0)
 
+    # Benchmark-relative mandate (v5.3.2): long-term alpha vs global broad index,
+    # symmetric attack/defence discipline, risk-based sizing and hard trade-cadence caps.
+    # Cash interest (4.0%/3.4%) is demoted to a parking-yield floor, NOT the investment goal.
+    benchmark_symbol: str = "VWRP.L"
+    min_invest_order_gbp: float = Field(default=700.0, gt=0.0)
+    min_isa_equity_order_gbp: float = Field(default=1200.0, gt=0.0)
+    min_isa_etf_order_gbp: float = Field(default=400.0, gt=0.0)
+    invest_risk_budget_gbp: float = Field(default=85.0, gt=0.0)
+    max_weekly_new_buys: int = Field(default=2, ge=0)
+    max_monthly_new_buys: int = Field(default=6, ge=0)
+    rebuy_cooldown_days: int = Field(default=15, ge=0)
+    # Cadence guard strength: off = 不检查 / advisory = 仅提示并由模型自主决定（默认） / hard = Python 硬拦截
+    trade_cadence_guard_mode: Literal["off", "advisory", "hard"] = "advisory"
+    isa_cash_deploy_trigger_pct: float = Field(default=15.0, gt=0.0, le=100.0)
+    invest_cash_idle_warn_pct: float = Field(default=40.0, gt=0.0, le=100.0)
+    spread_estimate_us_pct: float = Field(default=0.05, ge=0.0, le=5.0)
+    spread_estimate_uk_eu_pct: float = Field(default=0.20, ge=0.0, le=5.0)
+
+    @field_validator("benchmark_symbol")
+    @classmethod
+    def _clean_benchmark_symbol(cls, v: Any) -> str:
+        return str(v or "").strip().upper() or "VWRP.L"
+
+    @field_validator("trade_cadence_guard_mode", mode="before")
+    @classmethod
+    def _normalize_cadence_guard_mode(cls, v: Any) -> str:
+        mode = str(v or "advisory").strip().lower()
+        return mode if mode in {"off", "advisory", "hard"} else "advisory"
+
 
 class UniverseSection(BaseModel):
     isa_long_term: list[str] = Field(default_factory=list)

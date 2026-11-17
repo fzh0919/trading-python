@@ -336,6 +336,132 @@ class TestStatsDiagnosisDisplay(_DbTestCase):
         self.assertIn("体检池 150 只", msg)
 
 
+class TestBenchmarkDashboard(unittest.IsolatedAsyncioTestCase):
+    """v5.3.2 Stage 4: VWRP benchmark closed-loop (7d/30d vs account & fee drag)."""
+
+    def test_compute_window_return_pct_uses_bar_offsets(self) -> None:
+        import pandas as pd
+
+        from src.data_providers.analytics import compute_window_return_pct
+
+        dates = pd.date_range("2026-09-01", periods=40, freq="B")
+        closes = [100.0 + i for i in range(40)]  # last = 139, -6 = 134, -22 = 118
+        hist = pd.DataFrame({"Close": closes}, index=dates)
+        self.assertAlmostEqual(
+            compute_window_return_pct(hist, 5), ((139.0 - 134.0) / 134.0) * 100.0, places=6
+        )
+        self.assertAlmostEqual(
+            compute_window_return_pct(hist, 21), ((139.0 - 118.0) / 118.0) * 100.0, places=6
+        )
+
+    def test_compute_window_return_pct_returns_none_when_short(self) -> None:
+        import pandas as pd
+
+        from src.data_providers.analytics import compute_window_return_pct
+
+        self.assertIsNone(compute_window_return_pct(None, 5))
+        self.assertIsNone(compute_window_return_pct(pd.DataFrame(), 5))
+        short = pd.DataFrame(
+            {"Close": [100.0, 101.0]}, index=pd.date_range("2026-09-01", periods=2, freq="B")
+        )
+        self.assertIsNone(compute_window_return_pct(short, 5))
+        self.assertIsNone(compute_window_return_pct(short, 0))
+
+    async def test_weekly_dashboard_says_whether_we_beat_the_benchmark(self) -> None:
+        import pandas as pd
+
+        from src.data_providers.t212_client import HistoricalOrderItem
+
+        cfg = _cfg()
+        db = AdvisorDatabase(Path(tempfile.mkdtemp()) / "advisor.db")
+        await db.init()
+        sched = TradingScheduler(cfg, _StubT212(), _StubMarketData(), _DsStubLLM(), db, _StubTg())
+
+        now_ms = 1_763_000_000_000
+        sell = HistoricalOrderItem(
+            id="s1",
+            account="ISA",
+            raw_ticker="NVDA_US_EQ",
+            ticker="NVDA",
+            yahoo_symbol="NVDA",
+            name="NVIDIA",
+            inst_currency="USD",
+            side="SELL",
+            order_type="MARKET",
+            filled_at="2026-11-10T10:00:00Z",
+            filled_at_ms=now_ms - 4 * 86400 * 1000,
+            uk_time_str="2026-11-10 10:00",
+            quantity=1.0,
+            price=900.0,
+            net_value=900.0,
+            wallet_currency="GBP",
+            realised_pnl=120.0,
+            tax_total=4.0,
+        )
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 09:00",
+            fetched_at_ms=now_ms,
+            total_combined_value=10000.0,
+            total_combined_cash=2500.0,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=10000.0,
+                total_cash=2500.0,
+                recent_orders=[sell],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        previous = PortfolioData(
+            fetched_at_uk="2026-11-10 09:00",
+            fetched_at_ms=now_ms - 7 * 86400 * 1000,
+            total_combined_value=9800.0,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=9800.0),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        dates = pd.date_range("2026-09-01", periods=40, freq="B")
+        bench = pd.DataFrame({"Close": [100.0 + i for i in range(40)]}, index=dates)
+        dash = sched._build_benchmark_dashboard(
+            portfolio,
+            {"VWRP.L": bench},
+            previous_snapshot=previous,
+            now_ms=now_ms,
+        )
+        self.assertEqual(dash["benchmark_symbol"], "VWRP.L")
+        self.assertAlmostEqual(dash["benchmark_ret_7d_pct"], 3.73, places=2)
+        self.assertAlmostEqual(dash["account_change_pct"], 2.04, places=2)
+        self.assertIn("跑输基准", dash["verdict"])
+        self.assertEqual(dash["realized_pnl_by_currency"], {"GBP": 120.0})
+        self.assertAlmostEqual(dash["fees_pct_of_turnover_30d"], 0.444, places=3)
+
+    async def test_weekly_job_message_carries_benchmark_line(self) -> None:
+        cfg = _cfg()
+        db = AdvisorDatabase(Path(tempfile.mkdtemp()) / "advisor.db")
+        await db.init()
+        llm = _DsStubLLM()
+
+        class _JobScheduler(TradingScheduler):
+            async def _run_weekly_quant_audit_impl(self, now_utc=None):
+                return {
+                    "universe_count": 150,
+                    "overlap_candidates": [],
+                    "zombie_candidates": [],
+                    "threshold_backtest": {"sample_count": 42},
+                    "audit_date": "2026-11-14",
+                    "ai_diagnosis": "参数建议：收紧追踪止盈。",
+                    "benchmark_dashboard": {
+                        "summary_text": "VWRP.L 近7天 +1.2% | 近30天 +3.4% | 账户净值 +0.5% | 近7天跑输基准 -0.7pct"
+                    },
+                }
+
+        sched = _JobScheduler(cfg, _StubT212(), _StubMarketData(), llm, db, _StubTg())
+        msg = await sched._run_weekly_quant_audit_job(datetime(2026, 11, 14, 12, 0, tzinfo=timezone.utc))
+        self.assertIn("VWRP.L 近7天 +1.2%", msg)
+        self.assertIn("跑输基准", msg)
+        self.assertNotIn("#", msg)
+        self.assertNotIn("**", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
 

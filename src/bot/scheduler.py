@@ -22,9 +22,18 @@ from src.agents.report_agent import (
 )
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
-from src.data_providers.analytics import _normalize_adjusted_ohlcv, resolve_market_benchmark
+from src.data_providers.analytics import (
+    _normalize_adjusted_ohlcv,
+    compute_window_return_pct,
+    resolve_market_benchmark,
+)
 from src.data_providers.market_data import MarketDataService
-from src.data_providers.t212_client import AccountSnapshot, PortfolioData, T212Client
+from src.data_providers.t212_client import (
+    AccountSnapshot,
+    PortfolioData,
+    T212Client,
+    compute_trade_behavior_stats,
+)
 from src.engine.calendar_utils import (
     add_trading_days,
     get_us_market_schedule_uk,
@@ -497,6 +506,94 @@ class TradingScheduler:
             or self.cfg.universe.etf_symbols
         )
 
+    def _build_benchmark_dashboard(
+        self,
+        portfolio: PortfolioData,
+        histories: dict[str, pd.DataFrame],
+        *,
+        previous_snapshot: PortfolioData | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """VWRP 7d/30d benchmark returns vs account net value, realised P/L and fee drag."""
+        symbol = self.cfg.strategy.benchmark_symbol
+        hist = histories.get(symbol)
+        if hist is None or getattr(hist, "empty", True):
+            hist = histories.get(symbol.split(".")[0])
+        ret_7 = compute_window_return_pct(hist, 5)  # 5 trading bars ≈ 7 calendar days
+        ret_30 = compute_window_return_pct(hist, 21)  # 21 trading bars ≈ 30 calendar days
+
+        now = int(now_ms if now_ms is not None else datetime.now(timezone.utc).timestamp() * 1000)
+        behavior = compute_trade_behavior_stats(
+            portfolio,
+            recent_days=7,
+            history_days=self.cfg.strategy.order_history_days,
+            cooldown_days=self.cfg.strategy.rebuy_cooldown_days,
+            now_ms=now,
+        )
+        realized_by_ccy: dict[str, float] = {}
+        for o in (*portfolio.isa.recent_orders, *portfolio.invest.recent_orders):
+            if (o.side or "").upper() != "SELL":
+                continue
+            ccy = str(o.wallet_currency or "GBP").strip().upper() or "GBP"
+            realized_by_ccy[ccy] = realized_by_ccy.get(ccy, 0.0) + float(o.realised_pnl or 0.0)
+
+        account_change_pct: float | None = None
+        baseline_age_days: float | None = None
+        if previous_snapshot is not None:
+            prev_val = float(previous_snapshot.total_combined_value or 0.0)
+            cur_val = float(portfolio.total_combined_value or 0.0)
+            if prev_val > 0 and cur_val > 0:
+                account_change_pct = ((cur_val - prev_val) / prev_val) * 100.0
+            base_ms = int(previous_snapshot.fetched_at_ms or 0)
+            if base_ms > 0:
+                baseline_age_days = round((now - base_ms) / 86400000.0, 1)
+
+        if ret_7 is not None and account_change_pct is not None:
+            alpha = account_change_pct - ret_7
+            verdict = f"近7天{'跑赢' if alpha >= 0 else '跑输'}基准 {alpha:+.1f}pct"
+        elif ret_7 is not None:
+            verdict = f"近7天基准 {ret_7:+.1f}%（缺少账户基线快照，暂无法算超额）"
+        else:
+            verdict = "基准行情数据不足"
+
+        dashboard: dict[str, Any] = {
+            "benchmark_symbol": symbol,
+            "benchmark_ret_7d_pct": round(ret_7, 2) if ret_7 is not None else None,
+            "benchmark_ret_30d_pct": round(ret_30, 2) if ret_30 is not None else None,
+            "account_total_value_gbp": round(float(portfolio.total_combined_value or 0.0), 2),
+            "account_change_pct": round(account_change_pct, 2) if account_change_pct is not None else None,
+            "baseline_age_days": baseline_age_days,
+            "realized_pnl_by_currency": {k: round(v, 2) for k, v in realized_by_ccy.items() if abs(v) >= 0.01},
+            "fees_pct_of_turnover_30d": behavior.get("fees_pct_of_turnover"),
+            "buys_7d": behavior.get("buys_7d"),
+            "buys_30d": behavior.get("buys_30d"),
+            "verdict": verdict,
+        }
+        dashboard["summary_text"] = self._format_benchmark_dashboard_text(dashboard)
+        return dashboard
+
+    @staticmethod
+    def _format_benchmark_dashboard_text(dash: dict[str, Any]) -> str:
+        """Render the dashboard as one compact plain-text line (no markdown)."""
+        symbol = dash.get("benchmark_symbol") or "VWRP.L"
+        ret_7 = dash.get("benchmark_ret_7d_pct")
+        ret_30 = dash.get("benchmark_ret_30d_pct")
+        parts = [
+            f"{symbol} 近7天 {ret_7:+.1f}%" if ret_7 is not None else f"{symbol} 近7天 N/A",
+            f"近30天 {ret_30:+.1f}%" if ret_30 is not None else "近30天 N/A",
+        ]
+        change = dash.get("account_change_pct")
+        if change is not None:
+            parts.append(f"账户净值 {float(change):+.1f}%")
+        realized = dash.get("realized_pnl_by_currency") or {}
+        if realized:
+            parts.append("已实现 " + " ".join(f"{ccy} {float(amt):+.0f}" for ccy, amt in sorted(realized.items())))
+        fees = dash.get("fees_pct_of_turnover_30d")
+        if fees is not None:
+            parts.append(f"税费占成交额 {float(fees):.2f}%")
+        parts.append(str(dash.get("verdict") or ""))
+        return " | ".join(p for p in parts if p)
+
     async def _generate_weekly_diagnosis(
         self,
         audit: dict[str, Any],
@@ -514,10 +611,12 @@ class TradingScheduler:
             return ""
 
         bt = audit.get("threshold_backtest") or {}
+        bench_dash = str((audit.get("benchmark_dashboard") or {}).get("summary_text") or "N/A")
         lines = [
             f"【本周体检 {uk_date}】池 {audit.get('universe_count', 0)} 只 | "
             f"重叠 {len(audit.get('overlap_candidates') or [])} | "
             f"僵尸 {len(audit.get('zombie_candidates') or [])}",
+            f"【基准对照原始数字】{bench_dash[:300]}",
             f"【阈值回测原始数字】样本 {bt.get('sample_count', 0)} | {str(bt)[:600]}",
             f"【T+N 后验原始数字】总数 {stats.get('total_count', 0)} | 已结算 {stats.get('settled_count', 0)} | "
             f"原始胜率 {stats.get('win_rate_pct')} | Alpha 胜率 {stats.get('alpha_win_rate_pct')} | "
@@ -539,8 +638,9 @@ class TradingScheduler:
             self.llm,
             prompt="\n".join(lines),
             system_instruction=(
-                "你是量化策略诊断官（只读）。根据原始回测与 T+5/10/20 后验数字，输出 3 条以内中文诊断："
-                "①参数/阈值建议 ②胜率结构问题 ③下周关注。禁止编造未给出的数字，禁止 Markdown # 与 **，总长 <=450 字。"
+                "你是量化策略诊断官（只读）。根据原始回测、T+5/10/20 后验与基准对照数字，输出 3 条以内中文诊断："
+                "①相对 VWRP 基准是跑赢还是跑输及主因（仓位/择时/摩擦）②参数/阈值与胜率结构建议 ③下周关注。"
+                "禁止编造未给出的数字，禁止 Markdown # 与 **，总长 <=450 字。"
                 '仅输出严格 JSON：{"diagnosis": "..."}'
             ),
             usage_label="weekly_quant_diagnosis",
@@ -614,7 +714,11 @@ class TradingScheduler:
                 + list(self.cfg.universe.invest_tactical)
                 + list(self.cfg.universe.etf_symbols)
             )
-        all_syms = list(dict.fromkeys(s for s in (held_syms + pool_syms) if s))
+        all_syms = list(
+            dict.fromkeys(
+                s for s in (held_syms + pool_syms + [self.cfg.strategy.benchmark_symbol]) if s
+            )
+        )
 
         histories: dict[str, pd.DataFrame] = {}
         if all_syms:
@@ -634,6 +738,17 @@ class TradingScheduler:
         audit = run_offline_universe_and_threshold_audit(**audit_kwargs)
         if audition_res:
             audit["audition"] = audition_res
+        previous_snapshot: PortfolioData | None = None
+        try:
+            previous_snapshot = await self.db.get_previous_snapshot(min_age_hours=24 * 6)
+        except Exception as exc:
+            logger.debug("Weekly benchmark baseline snapshot unavailable: %s", exc)
+        audit["benchmark_dashboard"] = self._build_benchmark_dashboard(
+            portfolio,
+            histories,
+            previous_snapshot=previous_snapshot,
+            now_ms=int(base.timestamp() * 1000),
+        )
         diagnosis = await self._generate_weekly_diagnosis(audit, uk_date=uk_date)
         await self.db.save_quant_audit(
             audit_date=uk_date,
@@ -693,8 +808,13 @@ class TradingScheduler:
             f"回测样本 {bt.get('sample_count', 0)}"
         )
         diagnosis = str(audit.get("ai_diagnosis") or "").strip()
+        dash = str((audit.get("benchmark_dashboard") or {}).get("summary_text") or "").strip()
+        benchmark_block = f"\n{dash}" if dash else ""
         if diagnosis:
-            return f"📊 周六策略体检周报（{audit.get('audit_date', '')}）\n{diagnosis}\n\n{summary}"
+            return (
+                f"📊 周六策略体检周报（{audit.get('audit_date', '')}）\n"
+                f"{diagnosis}{benchmark_block}\n\n{summary}"
+            )
         # Silent fallback: keep the DB audit as the source of truth and never spam a bare one-liner.
         logger.info("Weekly quant audit completed without AI diagnosis: %s", summary)
         return ""

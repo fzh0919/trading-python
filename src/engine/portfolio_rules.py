@@ -32,6 +32,10 @@ class HoldingEvaluation(BaseModel):
     pending_buy_weight_pct: float = 0.0
     has_pending_stop: bool = False
     ex_div_guarded: bool = False
+    # v5.3.2 benchmark-relative sizing (Python-computed, never left to the LLM)
+    rr_ratio: float | None = None
+    suggested_size_gbp: float | None = None
+    min_order_gbp: float | None = None
 
 
 class DisagreementItem(BaseModel):
@@ -114,29 +118,37 @@ def _round_trip_friction_pct(
     strategy: StrategySection,
     wallet: AccountSnapshot | None = None,
 ) -> float:
-    """Round-trip friction for the target position, asymmetric for the Invest dual wallet."""
+    """Round-trip friction for the target position, asymmetric for the Invest dual wallet.
+
+    Includes a conservative bid/ask spread estimate (full width, charged once per round trip).
+    """
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     is_uk = _is_uk_listing(pos.yahoo_symbol, pos.inst_currency)
     is_invest = pos.account.upper() == "INVEST"
     enabled, usd_avail, gbp_avail = wallet_friction_context(wallet) if is_invest else (False, 0.0, 0.0)
+    spread = float(
+        getattr(strategy, "spread_estimate_uk_eu_pct", 0.20)
+        if is_uk
+        else getattr(strategy, "spread_estimate_us_pct", 0.05)
+    )
 
     if is_invest and enabled:
         fx = float(strategy.fx_fee_pct)
         if is_uk:
             stamp = 0.0 if is_etf else float(strategy.uk_stamp_duty_pct)
-            return stamp + (0.0 if gbp_avail > 0.01 else fx)
+            return stamp + (0.0 if gbp_avail > 0.01 else fx) + spread
         if pos.inst_currency.upper() == "EUR":
-            return fx * 2.0
-        return 0.0 if usd_avail > 0.01 else fx
+            return fx * 2.0 + spread
+        return (0.0 if usd_avail > 0.01 else fx) + spread
 
     if is_uk and is_etf:
-        return 0.0
+        return spread
     if is_uk:
-        return float(strategy.uk_stamp_duty_pct)
-    return float(strategy.fx_fee_pct) * 2.0
+        return float(strategy.uk_stamp_duty_pct) + spread
+    return float(strategy.fx_fee_pct) * 2.0 + spread
 
 
-def _friction_hint(
+def _friction_hint_base(
     pos: PositionItem,
     bundle: TickerMarketBundle | None,
     strategy: StrategySection,
@@ -172,6 +184,74 @@ def _friction_hint(
     if pos.inst_currency.upper() == "EUR":
         return f"欧股({strategy.fx_fee_pct:.2f}%单边换汇)"
     return f"美股({strategy.fx_fee_pct * 2:.2f}%往返换汇)"
+
+
+def _friction_hint(
+    pos: PositionItem,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    wallet: AccountSnapshot | None = None,
+) -> str:
+    """Friction label enriched with the conservative spread estimate used in R:R maths."""
+    base = _friction_hint_base(pos, bundle, strategy, wallet)
+    spread = float(
+        getattr(strategy, "spread_estimate_uk_eu_pct", 0.20)
+        if _is_uk_listing(pos.yahoo_symbol, pos.inst_currency)
+        else getattr(strategy, "spread_estimate_us_pct", 0.05)
+    )
+    return f"{base}(含价差估算{spread:.2f}%)"
+
+
+def compute_risk_based_size_gbp(
+    *,
+    account: str,
+    strategy: StrategySection,
+    effective_stop_pct: float | None = None,
+    is_etf: bool = False,
+    account_total_value_gbp: float | None = None,
+    existing_position_value_gbp: float = 0.0,
+) -> dict[str, Any]:
+    """Risk-based ticket size: risk budget / |stop %|, capped by remaining single-name headroom.
+
+    ``suggested_gbp`` never goes below zero; ``below_min_order`` flags an unfundable idea so the
+    LLM layer must widen the stop or pick another vehicle instead of placing a fractional order.
+    """
+    account_up = (account or "").strip().upper()
+    is_invest = account_up == "INVEST"
+    if is_invest:
+        min_order = float(strategy.min_invest_order_gbp)
+        cap_pct = float(strategy.max_invest_single_weight_pct)
+    else:
+        min_order = float(strategy.min_isa_etf_order_gbp if is_etf else strategy.min_isa_equity_order_gbp)
+        cap_pct = float(strategy.max_isa_single_weight_pct)
+
+    risk_budget = float(strategy.invest_risk_budget_gbp)
+    stop_pct = (
+        abs(float(effective_stop_pct))
+        if (effective_stop_pct is not None and float(effective_stop_pct) < 0)
+        else None
+    )
+    budget_sized = (risk_budget / (stop_pct / 100.0)) if stop_pct else None
+
+    headroom: float | None = None
+    if account_total_value_gbp is not None and float(account_total_value_gbp) > 0:
+        cap_value = float(account_total_value_gbp) * cap_pct / 100.0
+        headroom = max(0.0, cap_value - float(existing_position_value_gbp or 0.0))
+
+    candidates = [v for v in (budget_sized, headroom) if v is not None]
+    suggested = min(candidates) if candidates else None
+
+    return {
+        "account": account_up or account,
+        "min_order_gbp": round(min_order, 2),
+        "risk_budget_gbp": round(risk_budget, 2),
+        "budget_sized_gbp": round(budget_sized, 2) if budget_sized is not None else None,
+        "headroom_gbp": round(headroom, 2) if headroom is not None else None,
+        "suggested_gbp": round(suggested, 2) if suggested is not None else None,
+        "below_min_order": bool(suggested is not None and suggested < min_order),
+        "effective_stop_pct": round(-stop_pct, 2) if stop_pct else None,
+        "single_name_cap_pct": cap_pct,
+    }
 
 
 def _native_return_pct(pos: PositionItem) -> float | None:
@@ -534,17 +614,41 @@ def evaluate_holding(
             ):
                 reasons.append("CYQ筹码支撑结构良好")
 
-    # Cash hurdle + round-trip friction gate (dual-wallet aware for Invest)
+    # Hurdle gate v5.3.2: ISA judged on opportunity cost vs long-term trend, Invest on R:R.
+    # Cash interest (4.0%/3.4%) is a parking-yield floor only — never a veto on long-term ISA holdings.
     upside_pct = _compute_analyst_upside_pct(bundle)
-    if upside_pct is not None:
-        cash_basis_pct = _wallet_cash_basis_pct(pos, strategy, wallet)
-        hurdle_pct = cash_basis_pct + _round_trip_friction_pct(pos, bundle, strategy, wallet)
-        if upside_pct < hurdle_pct:
+    friction_pct = _round_trip_friction_pct(pos, bundle, strategy, wallet)
+    cash_floor_pct = _wallet_cash_basis_pct(pos, strategy, wallet)
+    rr_ratio: float | None = None
+    if is_invest and effective_stop is not None and float(effective_stop) < 0 and upside_pct is not None:
+        risk_pct = abs(float(effective_stop))
+        rr_ratio = (upside_pct - friction_pct) / risk_pct if risk_pct > 0 else None
+        if rr_ratio is not None and rr_ratio < 2.0:
+            add_score = 0
             reasons.append(
-                f"一致目标价空间仅{upside_pct:+.1f}%(低于{cash_basis_pct:.1f}%现金+摩擦门槛{hurdle_pct:.1f}%)"
+                f"风险回报比仅{rr_ratio:.2f}:1(<2:1门槛；目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}% "
+                f"vs 止损{risk_pct:.1f}%，现金停车{cash_floor_pct:.1f}%仅作等待期保底)"
             )
-            if add_score > 0:
-                add_score = max(0, add_score - 1)
+    elif not is_invest and upside_pct is not None:
+        weak_long_trend = bool(
+            tech is not None
+            and tech.dist_ma200_pct is not None
+            and tech.dist_ma200_pct < 0.0
+            and tech.trend_regime == "WEAK"
+        )
+        if weak_long_trend and (upside_pct - friction_pct) <= 0.0:
+            reasons.append(
+                f"长期弱势(MA200下方)+目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}%后不足,触发机会成本置换复核(不以现金利息否决)"
+            )
+
+    sizing = compute_risk_based_size_gbp(
+        account=pos.account,
+        strategy=strategy,
+        effective_stop_pct=effective_stop,
+        is_etf=is_etf,
+        account_total_value_gbp=inferred_acct_total,
+        existing_position_value_gbp=pos.current_value,
+    )
 
     if earnings_soon and bundle and bundle.earnings_date:
         reasons.append(f"⚠️ 距财报仅{bundle.days_to_earnings}天({bundle.earnings_date}),财报前谨慎重仓加码")
@@ -580,6 +684,9 @@ def evaluate_holding(
         pending_buy_weight_pct=round(pending_buy_weight_pct, 2),
         has_pending_stop=has_pending_stop,
         ex_div_guarded=ex_div_guard,
+        rr_ratio=round(rr_ratio, 2) if rr_ratio is not None else None,
+        suggested_size_gbp=sizing["suggested_gbp"],
+        min_order_gbp=sizing["min_order_gbp"],
     )
 
 
@@ -636,7 +743,7 @@ _CONFLICT_HINTS: dict[str, str] = {
     "BULL_VS_OVERWEIGHT": "趋势向好但仓位触及上限，严禁加码并逢高控仓",
     "BULL_VS_EARNINGS_RISK": "多头结构遇财报窗口，暂停主动加仓等待业绩落地",
     "TREND_VS_CROWDED": "趋势多头但短线超买/获利盘拥挤，勿追高可分批兑现",
-    "UPSIDE_VS_CASH_HURDLE": "技术形态尚可但预期空间跑不赢4%现金+摩擦，不建议增配",
+    "UPSIDE_VS_CASH_HURDLE": "技术形态尚可但盈亏比不足 2:1（目标空间扣摩擦后偏薄），不建议增配",
     "FX_DISTORTION": "账面受汇率波动干扰明显，按本币趋势与基本面单独核验",
     "SUPPORT_VS_WEAK_TREND": "估值/超卖有修复空间但右侧尚未转强，等待均线企稳",
     "MIXED_SIGNALS": "多空证据并存，PM须结合摩擦成本后独立裁决",
@@ -674,8 +781,8 @@ def build_disagreement_matrix(
         )
         native_ret = _native_return_pct(pos)
         upside_pct = _compute_analyst_upside_pct(bundle)
-        cash_basis_pct = _wallet_cash_basis_pct(pos, strategy, data.invest)
-        hurdle_pct = cash_basis_pct + _round_trip_friction_pct(pos, bundle, strategy, data.invest)
+        friction_pct = _round_trip_friction_pct(pos, bundle, strategy, data.invest)
+        eff_stop = (ev.effective_stop_pct if ev else None) or _compute_adaptive_invest_stop_pct(tech, strategy)
 
         bull_points: list[str] = []
         bear_points: list[str] = []
@@ -711,10 +818,21 @@ def build_disagreement_matrix(
                 conflict_tags.add("SUPPORT_VS_WEAK_TREND")
 
         if upside_pct is not None:
-            if upside_pct >= hurdle_pct + 4.0:
-                bull_points.append(f"一致目标空间{upside_pct:+.1f}%")
-            elif upside_pct < hurdle_pct:
-                bear_points.append(f"目标空间{upside_pct:+.1f}%<现金门槛{hurdle_pct:.1f}%")
+            if is_invest and eff_stop is not None and float(eff_stop) < 0:
+                rr = (upside_pct - friction_pct) / abs(float(eff_stop))
+                if rr >= 2.0:
+                    bull_points.append(f"盈亏比{rr:.1f}:1(目标空间{upside_pct:+.1f}%)")
+                else:
+                    bear_points.append(
+                        f"盈亏比仅{rr:.1f}:1<2:1(目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}%)"
+                    )
+                    conflict_tags.add("UPSIDE_VS_CASH_HURDLE")
+            elif upside_pct >= friction_pct + 10.0:
+                bull_points.append(f"目标空间{upside_pct:+.1f}%(扣摩擦{friction_pct:.2f}%仍厚)")
+            elif upside_pct < friction_pct:
+                bear_points.append(
+                    f"目标空间{upside_pct:+.1f}%<往返摩擦{friction_pct:.2f}%(机会成本置换复核)"
+                )
                 conflict_tags.add("UPSIDE_VS_CASH_HURDLE")
 
         if not is_etf and (pos.weight_pct >= max_acct or issuer_w >= strategy.max_total_portfolio_weight_pct):
@@ -725,7 +843,6 @@ def build_disagreement_matrix(
             bear_points.append(f"{bundle.days_to_earnings}日内财报事件风险")
             conflict_tags.add("BULL_VS_EARNINGS_RISK")
 
-        eff_stop = (ev.effective_stop_pct if ev else None) or _compute_adaptive_invest_stop_pct(tech, strategy)
         if is_invest and pos.return_pct <= eff_stop:
             bear_points.append(f"浮亏{pos.return_pct:.1f}%触止损线{eff_stop:.1f}%")
         elif (not is_invest) and pos.return_pct <= strategy.isa_deep_drawdown_review_pct:
@@ -869,6 +986,55 @@ def _build_report_action_blocks(
     return blocks
 
 
+def _cadence_guard_mode(strategy: StrategySection) -> str:
+    """Resolve the cadence guard strength (off / advisory / hard)."""
+    mode = str(getattr(strategy, "trade_cadence_guard_mode", "advisory") or "advisory").strip().lower()
+    return mode if mode in {"off", "advisory", "hard"} else "advisory"
+
+
+def _cadence_violation(
+    behavior: dict[str, Any],
+    sym_up: str,
+    base: str,
+    strategy: StrategySection,
+) -> tuple[str, str] | None:
+    """Detect a cadence/cooldown breach: weekly/monthly BUY caps or the re-buy cooldown.
+
+    Returns ``None`` whenever the fetched order history is incomplete (``partial``) so that a
+    short history window can never silently freeze all new deployment. This function only
+    *detects* the breach — whether it blocks or merely advises is decided by
+    ``trade_cadence_guard_mode``.
+    """
+    if not behavior or behavior.get("partial"):
+        return None
+    weekly_cap = int(getattr(strategy, "max_weekly_new_buys", 0) or 0)
+    monthly_cap = int(getattr(strategy, "max_monthly_new_buys", 0) or 0)
+    if weekly_cap > 0 and int(behavior.get("buys_7d") or 0) >= weekly_cap:
+        return (
+            "FREQUENCY_CAP",
+            f"近 7 天已新开仓 {int(behavior.get('buys_7d') or 0)} 笔(≥上限{weekly_cap})，本周额度已用完",
+        )
+    if monthly_cap > 0 and int(behavior.get("buys_30d") or 0) >= monthly_cap:
+        return (
+            "FREQUENCY_CAP",
+            f"近 30 天已新开仓 {int(behavior.get('buys_30d') or 0)} 笔(≥上限{monthly_cap})，本月额度已用完",
+        )
+    base_root = normalize_issuer_root(base)
+    for row in behavior.get("recently_closed") or []:
+        if not row.get("in_cooldown"):
+            continue
+        ticker = str(row.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        if ticker == sym_up or ticker == base or normalize_issuer_root(ticker) == base_root:
+            return (
+                "REBUY_COOLDOWN",
+                f"{ticker} 于 {float(row.get('days_since_sell') or 0):.0f} 天前清仓，处于 "
+                f"{int(behavior.get('cooldown_days') or 0)} 天再买冷却期",
+            )
+    return None
+
+
 def apply_risk_override_guardrail(
     decision: Any,
     *,
@@ -880,6 +1046,7 @@ def apply_risk_override_guardrail(
     high_correlation_symbols: set[str] | None = None,
     daily_vetoes: list[str] | None = None,
     report_actions: list[Any] | None = None,
+    trade_behavior: dict[str, Any] | None = None,
     vix_danger_threshold: float = 28.0,
 ) -> RiskOverrideResult:
     """Apply deterministic post-LLM risk override guardrails to MorningReportDecision or PickDecision."""
@@ -950,6 +1117,7 @@ def apply_risk_override_guardrail(
         for e in (evals or [])
         if e.action_bias == "REVIEW_STOP"
     }
+    cadence_advisories: list[str] = []
 
     def _check_symbol_violation(account: str, symbol: str, action: str) -> tuple[str, str] | None:
         sym_up = symbol.strip().upper()
@@ -978,6 +1146,19 @@ def apply_risk_override_guardrail(
             return "CORRELATION_OVERLAP", f"与现有持仓相关性触发≥{strat.overlap_correlation_threshold:.2f}重叠拦截"
 
         if act_up in {"BUY", "ADD"}:
+            cadence_breach = _cadence_violation(trade_behavior or {}, sym_up, base, strat)
+            if cadence_breach is not None:
+                guard_mode = _cadence_guard_mode(strat)
+                if guard_mode == "hard":
+                    return cadence_breach
+                if guard_mode == "advisory":
+                    _trig, _why = cadence_breach
+                    note = (
+                        f"[⚠️纪律提醒] [{account}] {symbol}: {_why}；"
+                        "advisory 模式不拦截，若仍执行请在理由中写明催化/避险依据"
+                    )
+                    if note not in cadence_advisories:
+                        cadence_advisories.append(note)
             root = normalize_issuer_root(base)
             b = bundle_lookup.get(sym_up) or bundle_lookup.get(base)
             is_etf = bool((b and b.quote_type.upper() == "ETF") or (root in etf_roots))
@@ -1037,6 +1218,7 @@ def apply_risk_override_guardrail(
             else:
                 new_actions.append(act)
         copied = decision.model_copy(update={"top_actions": new_actions}) if overrides else decision.model_copy()
+        notes.extend(cadence_advisories)
         return RiskOverrideResult(
             decision=copied,
             applied=bool(overrides),
@@ -1074,6 +1256,7 @@ def apply_risk_override_guardrail(
             if overrides
             else decision.model_copy()
         )
+        notes.extend(cadence_advisories)
         return RiskOverrideResult(
             decision=copied,
             applied=bool(overrides),

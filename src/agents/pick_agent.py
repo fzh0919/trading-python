@@ -36,6 +36,7 @@ from src.data_providers.t212_client import (
     PortfolioData,
     T212Client,
     build_trade_context,
+    compute_trade_behavior_stats,
     format_account_overview,
 )
 from src.engine.calendar_utils import get_market_calendar_alerts, get_us_market_schedule_uk
@@ -287,7 +288,7 @@ def _format_lessons_section(
             _append_row(row)
 
     if not lines:
-        return f"（暂无已结算的 T+{horizon_days} 选股复盘教训；请严格按四重护栏与交易摩擦门槛审核）"
+        return f"（暂无已结算的 T+{horizon_days} 选股复盘教训；请严格按六重护栏与交易摩擦门槛审核）"
     return "\n".join(lines[:8])
 
 
@@ -497,6 +498,12 @@ async def _post_screen_validate_decision(
         all_histories,
         cfg,
     )
+    trade_behavior = compute_trade_behavior_stats(
+        portfolio,
+        recent_days=7,
+        history_days=cfg.strategy.order_history_days,
+        cooldown_days=cfg.strategy.rebuy_cooldown_days,
+    )
     override_res = apply_risk_override_guardrail(
         hydrated_decision,
         portfolio=portfolio,
@@ -507,6 +514,7 @@ async def _post_screen_validate_decision(
         high_correlation_symbols=high_corr_syms,
         daily_vetoes=guardrails,
         report_actions=report_actions,
+        trade_behavior=trade_behavior,
     )
     resolved_decision = (
         override_res.decision
@@ -666,6 +674,7 @@ async def generate_pick_radar(
         bundles=held_bundles,
         tech_map=tech_map,
         histories=held_histories,
+        cooldown_days=cfg.strategy.rebuy_cooldown_days,
     )
 
     morning_audits_text, morning_symbol_tags, report_top_actions = _extract_morning_audit_context(
@@ -868,21 +877,32 @@ async def generate_pick_radar(
 
     # ---------- Stage 2: Risk & Bear Critic -> Structured PickDecision ----------
     critic_sys = build_agent_system_instruction(
-        "你是独立风控官（Risk & Bear Critic）。请按四重护栏与今日 `/report` 红线严格审核投研员提案，"
+        "你是独立风控官（Risk & Bear Critic）。请按下列六重护栏与今日 `/report` 红线严格审核投研员提案，"
         "直接输出最终结构化 JSON Decision（渲染后将限制在 1000 字内，结论置顶、废话为零）。\n\n"
-        "【四重一票否决硬护栏】：\n"
-        f"1. 现金与 GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税；"
-        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%，用 USD 钱包买美股比 {cfg.strategy.usd_cash_interest_rate_pct:.1f}%、"
-        f"GBP 不足 USD 换回比 {cfg.strategy.usd_cash_interest_rate_pct:.1f}%+{cfg.strategy.fx_fee_pct:.2f}%）：跑不赢对应币种现金利息的平庸机会直接枪毙。\n"
-        f"2. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
-        "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
-        "4. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线与挂单/持仓裁决"
+        "【六重护栏】：\n"
+        f"1. 盈亏比与摩擦：按目标空间扣除交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税 + 买卖价差估算；"
+        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%）计算 R:R，低于 2:1 一律否决；"
+        f"GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 现金利息仅作等待期保底，不得作为否决理由。\n"
+        "2. 穿透科技暴露：结合上下文“穿透后真实科技暴露(估算)”（ETF 隐含科技 + 直接科技个股），加仓后科技因子明显集中的须降级或改用低科技权重宽基。\n"
+        f"3. 频率与冷却（模式 {cfg.strategy.trade_cadence_guard_mode}）：近 7 天参考 ≤{cfg.strategy.max_weekly_new_buys} 笔、"
+        f"近 30 天 ≤{cfg.strategy.max_monthly_new_buys} 笔，清仓 {cfg.strategy.rebuy_cooldown_days} 天内同标的回补需谨慎；"
+        + (
+            "该约束由 Python 硬拦截，不要重复推荐已被拦截的标的。\n"
+            if str(cfg.strategy.trade_cadence_guard_mode).lower() == "hard"
+            else "若确有必要超额开仓或抢回补（强催化/避险切换），必须在该条 thesis 写明破例依据。\n"
+        )
+        + f"4. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
+        "5. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
+        "6. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线与挂单/持仓裁决"
         "（对早报已裁决 CANCEL/MODIFY 的活动挂单及 TRIM/STOP 的持仓，除非投研员提供早报之后的新催化或股价显著跌至早报认可区间的新证据，否则不得推翻或继续按早报否决的旧价位推荐；"
         "仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
         "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
         "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
         "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
-        f"若无优质机会，直接让 `selected_actions` 为空数组 `[]`，并在 headline 直说“本轮无推荐，建议现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
+        f"若无个股达到 R:R≥2:1，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%（或 Invest 现金 >{cfg.strategy.invest_cash_idle_warn_pct:.0f}%），"
+        f"应优先输出低摩擦宽基 ETF（如 VWRP.L / VUAG.L）的分批定投方案：写明具体价位、单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}）与节奏；"
+        "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无 R:R≥2:1 标的，现金待命 + 下一次部署触发条件”，"
+        f"严禁默认写“现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
         cfg.strategy,
         include_order_audit_rule=False,
     )
@@ -893,6 +913,7 @@ async def generate_pick_radar(
         + f"【今日红线】：\n{veto_block}\n\n"
         + (f"{preference_block}\n\n" if preference_block else "")
         + f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
+        f"【交易频率与冷却（Python 计算）】：{trade_ctx['trade_behavior_text']}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
         f"【双钱包明细与资金路径】：\n{build_wallet_context_text(portfolio, cfg.strategy)}\n"

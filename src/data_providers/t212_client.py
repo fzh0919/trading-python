@@ -1870,6 +1870,8 @@ def _compute_pending_order_quant_note(
     )
     if raw_trig is None or raw_trig <= 0:
         return ""
+    is_buy = (o.side or "").upper() == "BUY"
+    is_limit_buy = is_buy and o.limit_price is not None and float(o.limit_price) > 0
 
     b_curr = getattr(bundle, "currency", None) if bundle is not None else None
     b_price = getattr(bundle, "current_price", None) if bundle is not None else None
@@ -1947,15 +1949,36 @@ def _compute_pending_order_quant_note(
         except Exception as exc:
             logger.debug("Touch prob calc skipped for %s: %s", o.yahoo_symbol, exc)
 
+    # Anchor the R:R / upside view on the ORDER LIMIT PRICE, never on the live price:
+    # a low-ball rebound order must not be judged as "no upside" just because price dropped.
+    limit_upside_pct: float | None = None
+    target_mean = getattr(bundle, "target_mean_price", None) if bundle is not None else None
+    denom = 1.0 + dist_pct / 100.0
+    if (
+        is_limit_buy
+        and b_price is not None
+        and float(b_price) > 0
+        and target_mean is not None
+        and float(target_mean) > 0
+        and abs(denom) > 1e-6
+    ):
+        cur_upside_pct = ((float(target_mean) / float(b_price)) - 1.0) * 100.0
+        limit_upside_pct = (((1.0 + cur_upside_pct / 100.0) / denom) - 1.0) * 100.0
+
     metrics_parts = [f"距现价 {dist_pct:+.1f}%"]
+    if limit_upside_pct is not None:
+        metrics_parts.append(f"限价空间 {limit_upside_pct:+.1f}%")
     if atr_mult is not None:
         metrics_parts.append(f"{atr_mult:.1f}倍ATR")
     if touch_prob_20d_pct is not None:
         metrics_parts.append(f"20日触价率 {touch_prob_20d_pct:.0f}%")
 
     tags: list[str] = []
-    is_buy = (o.side or "").upper() == "BUY"
     is_stop = (o.stop_price is not None) or ("STOP" in (o.order_type or "").upper())
+    if is_limit_buy and -12.0 <= dist_pct <= -3.0:
+        tags.append("[有效回踩埋伏单]")
+    if is_limit_buy and dist_pct > 0.5:
+        tags.append("[追价单]")
     if is_buy and atr_mult is not None and atr_mult > 4.0 and touch_prob_20d_pct is not None and touch_prob_20d_pct < 5.0:
         tags.append("[远端低概率单]")
     if is_stop and atr_mult is not None and atr_mult < 0.8:
@@ -1973,6 +1996,150 @@ def _compute_pending_order_quant_note(
     return f" | {' / '.join(metrics_parts)}{tag_str}"
 
 
+def compute_trade_behavior_stats(
+    data: PortfolioData,
+    *,
+    recent_days: int = 7,
+    history_days: int = 30,
+    cooldown_days: int = 15,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """0-Token trade cadence, ticket size, fee ratio and post-exit cooldown statistics.
+
+    ``partial`` is True when the fetched order history covers less than ``history_days``;
+    callers must treat cadence caps as advisory (never a hard block) in that case.
+    Amounts stay in each fill's wallet currency — USD never inflates GBP totals.
+    """
+    now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    orders = sorted(
+        [*data.isa.recent_orders, *data.invest.recent_orders],
+        key=lambda o: o.filled_at_ms,
+        reverse=True,
+    )
+    recent_cutoff = now - max(1, recent_days) * 86400 * 1000
+    history_cutoff = now - max(1, history_days) * 86400 * 1000
+
+    buys_7d = buys_30d = sells_7d = sells_30d = 0
+    buy_amt_by_ccy: dict[str, float] = {}
+    buy_cnt_by_ccy: dict[str, int] = {}
+    turnover_30d = taxes_30d = 0.0
+    last_sell_ms: dict[tuple[str, str], int] = {}
+    oldest_ms: int | None = None
+
+    for o in orders:
+        if oldest_ms is None or o.filled_at_ms < oldest_ms:
+            oldest_ms = o.filled_at_ms
+        is_buy = (o.side or "").upper() != "SELL"
+        ccy = str(o.wallet_currency or "GBP").strip().upper() or "GBP"
+        in_30d = o.filled_at_ms >= history_cutoff
+        in_7d = o.filled_at_ms >= recent_cutoff
+        if in_30d:
+            turnover_30d += abs(float(o.net_value or 0.0))
+            taxes_30d += abs(float(o.tax_total or 0.0))
+            if is_buy:
+                buys_30d += 1
+            else:
+                sells_30d += 1
+        if in_7d:
+            if is_buy:
+                buys_7d += 1
+            else:
+                sells_7d += 1
+        if is_buy and in_30d:
+            buy_amt_by_ccy[ccy] = buy_amt_by_ccy.get(ccy, 0.0) + float(o.net_value or 0.0)
+            buy_cnt_by_ccy[ccy] = buy_cnt_by_ccy.get(ccy, 0) + 1
+        if not is_buy:
+            key = ((o.account or "").upper(), (o.ticker or "").upper())
+            prev = last_sell_ms.get(key)
+            if prev is None or o.filled_at_ms > prev:
+                last_sell_ms[key] = o.filled_at_ms
+
+    avg_buy_by_ccy = {
+        ccy: round(amt / buy_cnt_by_ccy[ccy], 2)
+        for ccy, amt in buy_amt_by_ccy.items()
+        if buy_cnt_by_ccy.get(ccy, 0) > 0
+    }
+
+    rate = float(data.gbp_usd_rate) if (data.gbp_usd_rate or 0.0) > 0 else None
+    gbp_total = 0.0
+    gbp_complete = True
+    for ccy, amt in buy_amt_by_ccy.items():
+        if ccy in {"GBP", "GBX"}:
+            gbp_total += amt
+        elif ccy == "USD" and rate is not None:
+            gbp_total += amt / rate
+        else:
+            gbp_complete = False
+    avg_buy_gbp = round(gbp_total / buys_30d, 2) if (gbp_complete and buys_30d > 0) else None
+
+    held = {(p.ticker or "").upper() for p in data.all_positions()}
+    cooldown_window = max(int(cooldown_days), int(history_days))
+    recently_closed: list[dict[str, Any]] = []
+    for (acct, ticker), ms in last_sell_ms.items():
+        if not ticker or ticker in held:
+            continue
+        days_since = (now - ms) / 86400000.0
+        if days_since > cooldown_window:
+            continue
+        recently_closed.append(
+            {
+                "ticker": ticker,
+                "account": acct,
+                "days_since_sell": round(days_since, 1),
+                "in_cooldown": days_since <= float(cooldown_days),
+            }
+        )
+    recently_closed.sort(key=lambda r: r["days_since_sell"])
+
+    coverage_days = round((now - oldest_ms) / 86400000.0, 1) if oldest_ms is not None else 0.0
+    partial = bool(oldest_ms is not None and coverage_days < float(history_days) - 0.5)
+
+    return {
+        "buys_7d": buys_7d,
+        "buys_30d": buys_30d,
+        "sells_7d": sells_7d,
+        "sells_30d": sells_30d,
+        "avg_buy_amount_by_currency": avg_buy_by_ccy,
+        "avg_buy_gbp": avg_buy_gbp,
+        "taxes_30d": round(taxes_30d, 2),
+        "turnover_30d": round(turnover_30d, 2),
+        "fees_pct_of_turnover": round((taxes_30d / turnover_30d) * 100.0, 3) if turnover_30d > 0 else 0.0,
+        "recently_closed": recently_closed[:12],
+        "cooldown_days": int(cooldown_days),
+        "coverage_days": coverage_days,
+        "partial": partial,
+    }
+
+
+def format_trade_behavior_text(behavior: dict[str, Any]) -> str:
+    """Render the structured cadence/cooldown stats as one compact plain-text line."""
+    if not behavior:
+        return ""
+    parts = [
+        f"近7天买入 {behavior.get('buys_7d', 0)} 笔 / 近30天 {behavior.get('buys_30d', 0)} 笔",
+        f"卖出 {behavior.get('sells_7d', 0)} 笔 / {behavior.get('sells_30d', 0)} 笔",
+    ]
+    avg_by_ccy = behavior.get("avg_buy_amount_by_currency") or {}
+    avg_parts = [f"{ccy} {float(amt):,.0f}" for ccy, amt in sorted(avg_by_ccy.items()) if float(amt) > 0]
+    if avg_parts:
+        parts.append("平均单笔买入 " + " / ".join(avg_parts))
+    avg_gbp = behavior.get("avg_buy_gbp")
+    if avg_gbp is not None and float(avg_gbp) > 0:
+        parts.append(f"折合 £{float(avg_gbp):,.0f}")
+    parts.append(f"税费占成交额 {float(behavior.get('fees_pct_of_turnover') or 0.0):.2f}%")
+    closed = behavior.get("recently_closed") or []
+    if closed:
+        cooldown = int(behavior.get("cooldown_days") or 0)
+        items = "、".join(
+            f"{row['ticker']}({float(row['days_since_sell']):.0f}天{'·冷却' if row.get('in_cooldown') else ''})"
+            for row in closed[:6]
+        )
+        parts.append(f"清仓 {cooldown} 天冷却清单: {items}")
+    if behavior.get("partial"):
+        parts.append(f"⚠️成交历史仅覆盖 {behavior.get('coverage_days', 0)} 天，频率统计不完整")
+    return " | ".join(parts)
+
+
 def build_trade_context(
     data: PortfolioData,
     recent_days: int = 7,
@@ -1983,7 +2150,8 @@ def build_trade_context(
     pending_us_only: bool = False,
     tech_map: dict[str, Any] | None = None,
     histories: dict[str, Any] | None = None,
-) -> dict[str, str]:
+    cooldown_days: int = 15,
+) -> dict[str, Any]:
     """Build pending orders, 7-day fills, and 30-day ticker behavior stats for AI prompts."""
     all_orders = sorted(
         [*data.isa.recent_orders, *data.invest.recent_orders],
@@ -2218,10 +2386,19 @@ def build_trade_context(
         cf_lines = [line for _, line in merged_events[:6]]
         cash_flow_summary_text = cf_header + ("\n" + "\n".join(cf_lines) if cf_lines else "")
 
+    trade_behavior = compute_trade_behavior_stats(
+        data,
+        recent_days=recent_days,
+        history_days=history_days,
+        cooldown_days=cooldown_days,
+    )
+
     return {
         "recent_trades_text": recent_text,
         "trade_summary_30d_text": summary_text,
         "pending_orders_text": pending_text,
         "cash_flow_summary_text": cash_flow_summary_text,
         "traded_tickers": ", ".join(dict.fromkeys(o.ticker for o in all_orders)) or "无",
+        "trade_behavior": trade_behavior,
+        "trade_behavior_text": format_trade_behavior_text(trade_behavior),
     }

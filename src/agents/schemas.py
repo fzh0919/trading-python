@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 _GUARDRAIL_TAG = "[🛡️风控护栏修正]"
+_ADVISORY_TAG = "[⚠️纪律提醒]"
 
 
 class ReportActionItem(BaseModel):
@@ -91,7 +92,12 @@ class MorningReportDecision(BaseModel):
         default_factory=list,
         description="2~4条今日硬性风控红线（供后续/pick与/us严格继承，每条不超过35字）",
     )
-    macro_and_cash: str = Field(description="宏观利率/VIX/汇率与4%现金安全垫精炼要点（不超过90字）")
+    macro_and_cash: str = Field(
+        description=(
+            "宏观利率/VIX/汇率精炼要点，并说明相对基准 VWRP 的配置态度与现金部署计划"
+            "（现金占比、触发阈值、下一步具体价位与金额；不超过90字）"
+        )
+    )
     account_diagnosis: str = Field(description="ISA与Invest净值、FX影响、行业/跨账户集中度痛点（不超过130字）")
     flagged_positions: list[FlaggedPositionItem] = Field(
         default_factory=list,
@@ -125,7 +131,7 @@ class PickActionItem(BaseModel):
     action: Literal["BUY", "ADD", "TRIM", "SWAP"] = Field(description="BUY / ADD / TRIM / SWAP")
     thesis: str = Field(
         description=(
-            "交易逻辑与催化，含扣费与对应币种现金利息对比（不超过55字）；"
+            "交易逻辑与催化剂，说明相对基准 VWRP 的配置理由、目标空间/盈亏比(R:R)与摩擦承受度（不超过55字）；"
             "Invest 动作用须标明资金路径，如「用 USD 钱包免换汇」或「GBP 不足需 USD 换回含 0.15% 损耗」"
         )
     )
@@ -137,11 +143,14 @@ class PickActionItem(BaseModel):
 
 class PickDecision(BaseModel):
     headline: str = Field(
-        description="一句话定调本轮最终选股结论与现金安排（不超过55字；严禁提及任何未入选、内部讨论或被否决的候选标的/方向；若无推荐，直接写“本轮无推荐标的，建议现金拿住吃4%利息”）"
+        description=(
+            "一句话定调本轮最终选股结论与现金部署计划（不超过55字；严禁提及任何未入选、内部讨论或被否决的候选标的/方向；"
+            "若无推荐，写明“本轮无 R:R≥2:1 标的，现金待命待回踩”并给出基准 VWRP 相对态度或下一次部署触发条件）"
+        )
     )
     selected_actions: list[PickActionItem] = Field(
         default_factory=list,
-        description="通过风控官四重护栏的最终推荐（0~3条）；若均未达标请返回空数组",
+        description="通过风控官六重护栏的最终推荐（0~3条）；若均未达标请返回空数组",
     )
     rejected_or_frozen: list[str] = Field(
         default_factory=list,
@@ -332,7 +341,7 @@ def _format_guardrail_note(text: str) -> str:
     cleaned = text.strip().lstrip("•-* ").strip()
     if not cleaned:
         return ""
-    if _GUARDRAIL_TAG in cleaned:
+    if _GUARDRAIL_TAG in cleaned or _ADVISORY_TAG in cleaned:
         return cleaned
     return f"{_GUARDRAIL_TAG} {cleaned}"
 
@@ -404,7 +413,11 @@ def render_morning_report(
             )
     sec1 = "【今日核心行动与挂单裁决】\n" + "\n".join(action_lines)
 
-    veto_str = "；".join(decision.daily_vetoes[:4]) if decision.daily_vetoes else "严守4%现金门槛，不追高。"
+    veto_str = (
+        "；".join(decision.daily_vetoes[:4])
+        if decision.daily_vetoes
+        else "相对基准 VWRP 跟踪，严守 R:R≥2:1 与最小建仓额，不追高。"
+    )
     sec2 = (
         "【宏观、账户与今日风控红线】\n"
         f"• 宏观与现金：{decision.macro_and_cash}\n"
@@ -479,7 +492,7 @@ def render_pick_report(
 
     sec1_lines = [f"📌 本轮结论：{decision.headline}"]
     if not decision.selected_actions:
-        sec1_lines.append("• ⚪ 本轮无推荐标的，建议现金拿住继续吃 4.0% 年化利息。")
+        sec1_lines.append("• ⚪ 本轮无 R:R≥2:1 标的，现金待命待回踩（非永久空仓）。")
     else:
         for idx, item in enumerate(decision.selected_actions[:3], 1):
             sec1_lines.append(

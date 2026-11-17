@@ -87,17 +87,18 @@ class TestDualWalletFrictionMatrix(unittest.TestCase):
     def test_isa_us_equity_keeps_round_trip_fx_and_gbp_basis(self) -> None:
         pos = self._pos("ISA", "MSFT", "USD")
         wallet = _wallet_snap(usd=600.0, gbp=1520.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.30)
+        # 0.30% round-trip FX + 0.05% conservative US spread estimate (v5.3.2)
+        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.35)
         self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, wallet), 4.0)
 
     def test_invest_us_equity_with_usd_wallet_is_zero_fx(self) -> None:
         pos = self._pos("Invest", "NVDA", "USD")
         self.assertAlmostEqual(
-            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=600.0, gbp=0.0)), 0.0
+            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=600.0, gbp=0.0)), 0.05
         )
         self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, _wallet_snap(usd=600.0, gbp=0.0)), 3.4)
         self.assertAlmostEqual(
-            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=0.0, gbp=900.0)), 0.15
+            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=0.0, gbp=900.0)), 0.20
         )
         self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, _wallet_snap(usd=0.0, gbp=900.0)), 4.0)
 
@@ -107,19 +108,19 @@ class TestDualWalletFrictionMatrix(unittest.TestCase):
         etf_bundle = TickerMarketBundle(symbol="VUAG.L", quote_type="ETF")
 
         rich = _wallet_snap(usd=0.0, gbp=900.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, rich), 0.50)
-        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, rich), 0.0)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, rich), 0.70)
+        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, rich), 0.20)
         self.assertAlmostEqual(_wallet_cash_basis_pct(uk, self.strategy, rich), 4.0)
 
         poor = _wallet_snap(usd=600.0, gbp=0.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, poor), 0.65)
-        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, poor), 0.15)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, poor), 0.85)
+        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, poor), 0.35)
         self.assertAlmostEqual(_wallet_cash_basis_pct(uk, self.strategy, poor), 3.4)
 
     def test_invest_eur_equity_keeps_round_trip_and_gbp_basis(self) -> None:
         pos = self._pos("Invest", "ASML.AS", "EUR")
         wallet = _wallet_snap(usd=600.0, gbp=0.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.30)
+        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.35)
         self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, wallet), 4.0)
 
     def test_evaluate_holding_friction_note_reflects_funding_source(self) -> None:
@@ -952,7 +953,8 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertTrue(ev_with_stop.has_pending_stop)
         self.assertIn("已有在途卖出/止损挂单保护@335.00", " ".join(ev_with_stop.reasons))
 
-        # 4% cash hurdle + friction gate dampens marginal upside ADD_CANDIDATE
+        # v5.3.2: ISA long-term holdings are no longer vetoed by the 4.0% cash hurdle;
+        # the same thin-upside setup on Invest must be blocked by the R:R < 2:1 gate instead.
         tech_borderline = TechnicalSnapshot(
             symbol="MSFT",
             last_close=400.0,
@@ -963,12 +965,19 @@ class TestAnalyticsAndRules(unittest.TestCase):
         bundle_low_upside = TickerMarketBundle(
             symbol="MSFT",
             current_price=400.0,
-            target_mean_price=410.0,  # +2.5% < 4.3% hurdle
+            target_mean_price=410.0,  # +2.5% far below a 2:1 reward vs a 12% stop
             analyst_count=12,
         )
-        ev_low_upside = evaluate_holding(pos_msft.model_copy(update={"weight_pct": 10.0}), tech_borderline, bundle_low_upside, strategy)
-        self.assertNotEqual(ev_low_upside.action_bias, "ADD_CANDIDATE")
-        self.assertIn("现金+摩擦门槛", " ".join(ev_low_upside.reasons))
+        ev_low_upside_isa = evaluate_holding(
+            pos_msft.model_copy(update={"weight_pct": 10.0}), tech_borderline, bundle_low_upside, strategy
+        )
+        self.assertNotIn("现金+摩擦门槛", " ".join(ev_low_upside_isa.reasons))
+        self.assertNotIn("风险回报比", " ".join(ev_low_upside_isa.reasons))
+
+        pos_invest_thin = pos_msft.model_copy(update={"account": "Invest", "weight_pct": 10.0, "return_pct": 1.0})
+        ev_low_upside_inv = evaluate_holding(pos_invest_thin, tech_borderline, bundle_low_upside, strategy)
+        self.assertNotEqual(ev_low_upside_inv.action_bias, "ADD_CANDIDATE")
+        self.assertIn("风险回报比仅", " ".join(ev_low_upside_inv.reasons))
 
         # Crowded CYQ profit + RSI>=70 + volume spike triggers TRIM_ALERT
         tech_crowded = TechnicalSnapshot(
@@ -2429,6 +2438,345 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertIn("DUP1", summary)
         self.assertIn("ZOMB1", summary)
         self.assertIn("阈值回测", summary)
+
+
+class TestStage2PenetrationAndSizing(unittest.TestCase):
+    """v5.3.2 Stage 2: ETF look-through tech exposure + risk-based ticket sizing."""
+
+    def _pos(self, account: str, symbol: str, ccy: str, value: float) -> PositionItem:
+        return PositionItem(
+            account=account,
+            raw_ticker=symbol.replace(".", "_"),
+            ticker=symbol.split(".")[0],
+            yahoo_symbol=symbol,
+            name=symbol,
+            inst_currency=ccy,
+            quantity=10,
+            avg_price=100.0,
+            cur_price=value / 10.0,
+            current_value=value,
+            total_cost=value,
+            pnl=0.0,
+            fx_impact=0.0,
+            return_pct=0.0,
+            weight_pct=value / 20.0,
+        )
+
+    def test_penetration_merges_etf_implied_and_direct_tech(self) -> None:
+        from src.data_providers.analytics import estimate_penetration_tech_exposure
+        from src.data_providers.t212_client import PortfolioData
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 07:30",
+            fetched_at_ms=1763105400000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=2000.0,
+                positions=[
+                    self._pos("ISA", "VWRP.L", "GBp", 1000.0),
+                    self._pos("ISA", "NVDA", "USD", 500.0),
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=2000.0,
+        )
+        res = estimate_penetration_tech_exposure(portfolio, {})
+        self.assertAlmostEqual(res["etf_implied_value"], 250.0, places=2)  # 25% of £1,000
+        self.assertAlmostEqual(res["direct_value"], 500.0, places=2)
+        self.assertAlmostEqual(res["combined_value"], 750.0, places=2)
+        self.assertAlmostEqual(res["combined_pct"], 37.5, places=1)
+        self.assertEqual(res["etf_breakdown"][0]["symbol"], "VWRP.L")
+
+    def test_penetration_skips_unmapped_etf_and_marks_it(self) -> None:
+        from src.data_providers.analytics import estimate_penetration_tech_exposure
+        from src.data_providers.t212_client import PortfolioData
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 07:30",
+            fetched_at_ms=1763105400000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=1000.0,
+                positions=[self._pos("ISA", "ZZZZ.L", "GBP", 300.0)],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=1000.0,
+        )
+        bundles = {"ZZZZ.L": TickerMarketBundle(symbol="ZZZZ.L", quote_type="ETF")}
+        res = estimate_penetration_tech_exposure(portfolio, bundles)
+        self.assertEqual(res["combined_value"], 0.0)
+        self.assertAlmostEqual(res["unmapped_etf_value"], 300.0, places=2)
+
+    def test_exposure_summary_reports_penetration_line(self) -> None:
+        from src.data_providers.analytics import compute_exposure_summary
+        from src.data_providers.t212_client import PortfolioData
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 07:30",
+            fetched_at_ms=1763105400000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=2000.0,
+                positions=[self._pos("ISA", "VUAG.L", "GBp", 1000.0)],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=2000.0,
+        )
+        text = compute_exposure_summary(portfolio, {})
+        self.assertIn("穿透后真实科技暴露(估算)", text)
+        self.assertIn("静态权重近似", text)
+
+    def test_risk_based_size_uses_budget_and_flags_fractional_orders(self) -> None:
+        from src.engine.portfolio_rules import compute_risk_based_size_gbp
+
+        strategy = StrategySection()
+        wide = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-12.0,
+            account_total_value_gbp=10000.0,
+            existing_position_value_gbp=0.0,
+        )
+        self.assertAlmostEqual(wide["budget_sized_gbp"], 708.33, places=2)  # £85 / 12%
+        self.assertAlmostEqual(wide["suggested_gbp"], 708.33, places=2)
+        self.assertFalse(wide["below_min_order"])
+
+        tight = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-8.0,
+            account_total_value_gbp=10000.0,
+        )
+        self.assertAlmostEqual(tight["budget_sized_gbp"], 1062.5, places=2)
+
+        too_wide = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-50.0,
+            account_total_value_gbp=10000.0,
+        )
+        self.assertAlmostEqual(too_wide["suggested_gbp"], 170.0, places=2)
+        self.assertTrue(too_wide["below_min_order"])
+
+    def test_risk_based_size_caps_by_headroom_and_isa_min_tickets(self) -> None:
+        from src.engine.portfolio_rules import compute_risk_based_size_gbp
+
+        strategy = StrategySection()
+        capped = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-8.0,
+            account_total_value_gbp=3000.0,
+            existing_position_value_gbp=700.0,
+        )
+        # 25% single-name cap = £750, minus £700 held => only £50 headroom left
+        self.assertAlmostEqual(capped["headroom_gbp"], 50.0, places=2)
+        self.assertAlmostEqual(capped["suggested_gbp"], 50.0, places=2)
+        self.assertTrue(capped["below_min_order"])
+
+        isa_etf = compute_risk_based_size_gbp(account="ISA", strategy=strategy, is_etf=True)
+        isa_eq = compute_risk_based_size_gbp(account="ISA", strategy=strategy, is_etf=False)
+        self.assertAlmostEqual(isa_etf["min_order_gbp"], 400.0)
+        self.assertAlmostEqual(isa_eq["min_order_gbp"], 1200.0)
+
+class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
+    """v5.3.2 Stage 2: frequency caps, re-buy cooldown and ISA opportunity-cost replacement."""
+
+    def _pick(self, action: str, symbol: str = "MSFT", account: str = "ISA"):
+        from src.agents.schemas import PickActionItem, PickDecision
+
+        return PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account=account,
+                    symbol=symbol,
+                    action=action,
+                    thesis="测试逻辑",
+                    entry_zone="£700 于 400 下方",
+                    stop_condition="跌破 380",
+                    target_window="3个月",
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+
+    def test_frequency_cap_blocks_new_buy_but_not_trim(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {
+            "buys_7d": 2,
+            "buys_30d": 3,
+            "partial": False,
+            "recently_closed": [],
+            "cooldown_days": 15,
+        }
+        res = apply_risk_override_guardrail(
+            self._pick("BUY"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[0].trigger_type, "FREQUENCY_CAP")
+        self.assertIn("近 7 天已新开仓", res.overrides[0].reason)
+
+        trim_res = apply_risk_override_guardrail(
+            self._pick("TRIM"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertFalse(trim_res.applied)
+
+    def test_monthly_cap_blocks_when_weekly_still_open(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {"buys_7d": 1, "buys_30d": 6, "partial": False, "recently_closed": [], "cooldown_days": 15}
+        res = apply_risk_override_guardrail(
+            self._pick("ADD"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[0].trigger_type, "FREQUENCY_CAP")
+        self.assertIn("近 30 天已新开仓", res.overrides[0].reason)
+
+    def test_rebuy_cooldown_blocks_reentry_but_not_other_names(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {
+            "buys_7d": 0,
+            "buys_30d": 1,
+            "partial": False,
+            "recently_closed": [
+                {"ticker": "NVDA", "account": "ISA", "days_since_sell": 3.0, "in_cooldown": True}
+            ],
+            "cooldown_days": 15,
+        }
+        blocked = apply_risk_override_guardrail(
+            self._pick("BUY", symbol="NVDA"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertTrue(blocked.applied)
+        self.assertEqual(blocked.overrides[0].trigger_type, "REBUY_COOLDOWN")
+        self.assertIn("再买冷却期", blocked.overrides[0].reason)
+
+        allowed = apply_risk_override_guardrail(
+            self._pick("BUY", symbol="MSFT"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertFalse(allowed.applied)
+
+    def test_partial_history_never_hard_blocks(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {
+            "buys_7d": 9,
+            "buys_30d": 20,
+            "partial": True,
+            "recently_closed": [
+                {"ticker": "MSFT", "account": "ISA", "days_since_sell": 1.0, "in_cooldown": True}
+            ],
+            "cooldown_days": 15,
+        }
+        res = apply_risk_override_guardrail(
+            self._pick("BUY"),
+            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            trade_behavior=behavior,
+        )
+        self.assertFalse(res.applied)
+
+    def test_advisory_mode_keeps_action_and_only_advises(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {
+            "buys_7d": 2,
+            "buys_30d": 6,
+            "partial": False,
+            "recently_closed": [],
+            "cooldown_days": 15,
+        }
+        res = apply_risk_override_guardrail(
+            self._pick("BUY"), strategy=StrategySection(), trade_behavior=behavior
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(res.overrides, [])
+        self.assertEqual(len(res.decision.selected_actions), 1)
+        notes = " ".join(res.notes)
+        self.assertIn("[⚠️纪律提醒]", notes)
+        self.assertIn("近 7 天已新开仓", notes)
+        self.assertIn("advisory 模式不拦截", notes)
+        # Tone consistency: advisory must not read as a prohibition
+        self.assertIn("本周额度已用完", notes)
+        self.assertNotIn("禁止继续买入", notes)
+
+    def test_off_mode_is_silent_and_never_blocks(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        behavior = {
+            "buys_7d": 9,
+            "buys_30d": 20,
+            "partial": False,
+            "recently_closed": [
+                {"ticker": "MSFT", "account": "ISA", "days_since_sell": 1.0, "in_cooldown": True}
+            ],
+            "cooldown_days": 15,
+        }
+        res = apply_risk_override_guardrail(
+            self._pick("BUY"),
+            strategy=StrategySection(trade_cadence_guard_mode="off"),
+            trade_behavior=behavior,
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(res.notes, [])
+
+    def test_cadence_guard_mode_normalizes_unknown_values(self) -> None:
+        self.assertEqual(
+            StrategySection(trade_cadence_guard_mode="HARD").trade_cadence_guard_mode, "hard"
+        )
+        self.assertEqual(
+            StrategySection(trade_cadence_guard_mode="nonsense").trade_cadence_guard_mode, "advisory"
+        )
+        self.assertEqual(StrategySection().trade_cadence_guard_mode, "advisory")
+
+    def test_isa_weak_trend_triggers_opportunity_cost_not_cash_veto(self) -> None:
+        from src.data_providers.analytics import TechnicalSnapshot
+
+        strategy = StrategySection()
+        pos = PositionItem(
+            account="ISA",
+            raw_ticker="MSFT_US_EQ",
+            ticker="MSFT",
+            yahoo_symbol="MSFT",
+            name="Microsoft",
+            inst_currency="USD",
+            quantity=10,
+            avg_price=500.0,
+            cur_price=400.0,
+            current_value=4000.0,
+            total_cost=5000.0,
+            pnl=-1000.0,
+            fx_impact=0.0,
+            return_pct=-20.0,
+            weight_pct=20.0,
+        )
+        tech_weak = TechnicalSnapshot(
+            symbol="MSFT",
+            last_close=400.0,
+            dist_ma200_pct=-5.0,
+            trend_regime="WEAK",
+        )
+        bundle = TickerMarketBundle(symbol="MSFT", current_price=400.0, target_mean_price=401.0, analyst_count=8)
+        ev = evaluate_holding(pos, tech_weak, bundle, strategy)
+        joined = " ".join(ev.reasons)
+        self.assertIn("机会成本置换复核", joined)
+        self.assertIn("不以现金利息否决", joined)
+        self.assertNotIn("现金+摩擦门槛", joined)
+        self.assertEqual(ev.action_bias, "HOLD")
 
 
 if __name__ == "__main__":

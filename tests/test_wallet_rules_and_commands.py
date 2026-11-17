@@ -72,21 +72,22 @@ class TestWalletFrictionRules(unittest.TestCase):
         eur = _pos("Invest", "ASML.AS", "EUR")
 
         rich = _wallet(usd=600.0, gbp=1520.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(us, None, self.strategy, rich), 0.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(uk_stock, None, self.strategy, rich), 0.50)
+        # v5.3.2: conservative spread estimates are part of round-trip friction
+        self.assertAlmostEqual(_round_trip_friction_pct(us, None, self.strategy, rich), 0.05)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk_stock, None, self.strategy, rich), 0.70)
         self.assertAlmostEqual(
-            _round_trip_friction_pct(uk_etf, _etf_bundle("VUAG.L"), self.strategy, rich), 0.0
+            _round_trip_friction_pct(uk_etf, _etf_bundle("VUAG.L"), self.strategy, rich), 0.20
         )
-        self.assertAlmostEqual(_round_trip_friction_pct(eur, None, self.strategy, rich), 0.30)
+        self.assertAlmostEqual(_round_trip_friction_pct(eur, None, self.strategy, rich), 0.35)
 
         usd_only = _wallet(usd=600.0, gbp=0.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(uk_stock, None, self.strategy, usd_only), 0.65)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk_stock, None, self.strategy, usd_only), 0.85)
         self.assertAlmostEqual(
-            _round_trip_friction_pct(uk_etf, _etf_bundle("VUAG.L"), self.strategy, usd_only), 0.15
+            _round_trip_friction_pct(uk_etf, _etf_bundle("VUAG.L"), self.strategy, usd_only), 0.35
         )
 
         no_usd = _wallet(usd=0.0, gbp=1520.0)
-        self.assertAlmostEqual(_round_trip_friction_pct(us, None, self.strategy, no_usd), 0.15)
+        self.assertAlmostEqual(_round_trip_friction_pct(us, None, self.strategy, no_usd), 0.20)
 
     def test_isa_friction_is_unchanged_by_wallet(self) -> None:
         isa_us = _pos("ISA", "MSFT", "USD")
@@ -94,10 +95,10 @@ class TestWalletFrictionRules(unittest.TestCase):
         isa_etf = _pos("ISA", "VUAG.L", "GBP")
         rich = _wallet(usd=600.0, gbp=1520.0)
 
-        self.assertAlmostEqual(_round_trip_friction_pct(isa_us, None, self.strategy, rich), 0.30)
-        self.assertAlmostEqual(_round_trip_friction_pct(isa_uk, None, self.strategy, rich), 0.50)
+        self.assertAlmostEqual(_round_trip_friction_pct(isa_us, None, self.strategy, rich), 0.35)
+        self.assertAlmostEqual(_round_trip_friction_pct(isa_uk, None, self.strategy, rich), 0.70)
         self.assertAlmostEqual(
-            _round_trip_friction_pct(isa_etf, _etf_bundle("VUAG.L"), self.strategy, rich), 0.0
+            _round_trip_friction_pct(isa_etf, _etf_bundle("VUAG.L"), self.strategy, rich), 0.20
         )
         self.assertAlmostEqual(_wallet_cash_basis_pct(isa_us, self.strategy, rich), 4.0)
 

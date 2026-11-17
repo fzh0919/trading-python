@@ -30,6 +30,7 @@ from src.data_providers.analytics import (
     TechnicalSnapshot,
     compute_exposure_summary,
     compute_technical_snapshot,
+    compute_window_return_pct,
     format_technical_line,
 )
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
@@ -190,6 +191,59 @@ def _compute_portfolio_diff_text(
     if not changes:
         return f"{anchor_note} 无净值或仓位数量变动"
     return f"{anchor_note} | " + "; ".join(changes)
+
+
+def _account_change_pct(
+    portfolio: PortfolioData,
+    prev_snap: PortfolioData | None,
+) -> float | None:
+    """Signed % net-value change vs the previous snapshot (None when no usable baseline)."""
+    if prev_snap is None:
+        return None
+    prev_val = float(prev_snap.total_combined_value or 0.0)
+    cur_val = float(portfolio.total_combined_value or 0.0)
+    if prev_val <= 0 or cur_val <= 0:
+        return None
+    return ((cur_val - prev_val) / prev_val) * 100.0
+
+
+def _lookup_benchmark_hist(
+    histories: dict[str, pd.DataFrame] | None,
+    symbol: str,
+) -> pd.DataFrame | None:
+    """Fetch the benchmark history tolerating case / suffix differences (never bool() a DataFrame)."""
+    if not histories:
+        return None
+    for key in (symbol, symbol.upper(), symbol.split(".")[0]):
+        hist = histories.get(key)
+        if hist is not None and not getattr(hist, "empty", True):
+            return hist
+    return None
+
+
+def _format_benchmark_line(
+    benchmark_symbol: str,
+    hist: pd.DataFrame | None,
+    *,
+    account_change_pct: float | None = None,
+) -> str:
+    """One-line 'market vs me' dashboard: benchmark 7d/30d returns plus account change.
+
+    Kept to ~60 characters of numbers so the /report 1800-char hard cap is never squeezed.
+    """
+    bench = (benchmark_symbol or "VWRP.L").strip().upper()
+    ret_7 = compute_window_return_pct(hist, 5)  # 5 trading bars ≈ 7 calendar days
+    ret_30 = compute_window_return_pct(hist, 21)  # 21 trading bars ≈ 30 calendar days
+    if ret_7 is None and ret_30 is None:
+        return f"{bench} 行情未就绪，暂无基准对照"
+    parts = [f"{bench} 近7天 {ret_7:+.1f}%" if ret_7 is not None else f"{bench} 近7天 N/A"]
+    parts.append(f"近30天 {ret_30:+.1f}%" if ret_30 is not None else "近30天 N/A")
+    line = " / ".join(parts)
+    if account_change_pct is not None:
+        line += f"；本账户较上次快照 {account_change_pct:+.1f}%"
+        if ret_7 is not None:
+            line += f"(相对基准 {account_change_pct - ret_7:+.1f}%)"
+    return line
 
 
 def _extract_conclusion_fallback(report_text: str) -> str:
@@ -730,7 +784,14 @@ async def generate_morning_report(
         bundles=bundles,
         tech_map=tech_map,
         histories=histories,
+        cooldown_days=cfg.strategy.rebuy_cooldown_days,
     )
+    benchmark_line = _format_benchmark_line(
+        cfg.strategy.benchmark_symbol,
+        _lookup_benchmark_hist(histories, cfg.strategy.benchmark_symbol),
+        account_change_pct=_account_change_pct(portfolio, prev_snap),
+    )
+    context_pack["benchmark_dashboard"] = benchmark_line
     cash_flow_text = trade_ctx.get("cash_flow_summary_text") or "（近30天无外部出入金或派息流水）"
     diff_text = _compute_portfolio_diff_text(
         portfolio,
@@ -764,10 +825,12 @@ async def generate_morning_report(
         f"【Stocks ISA】\n{format_account_overview(portfolio.isa)}\n持仓：\n{format_positions_text(portfolio.isa)}\n\n"
         f"【Invest】\n{format_account_overview(portfolio.invest)}\n持仓：\n{format_positions_text(portfolio.invest)}\n\n"
         f"【净值变动与出入金归因】{diff_text}\n"
+        f"【基准对照（大盘 vs 本账户）】{benchmark_line}\n"
         f"【近{cfg.strategy.order_history_days}天出入金与派息流水（区分外部资金与交易盈亏）】\n{cash_flow_text}\n\n"
         f"【当前活动挂单（含市场现价/目标价）】\n{trade_ctx['pending_orders_text']}\n\n"
         f"【近7天实盘成交】\n{trade_ctx['recent_trades_text']}\n\n"
         f"【近{cfg.strategy.order_history_days}天行为统计】\n{trade_ctx['trade_summary_30d_text']}\n\n"
+        f"【交易频率与冷却（Python 计算）】{trade_ctx['trade_behavior_text']}\n\n"
         f"=== 二、量化事实底座 ===\n{fact_sheet}"
         + (f"\n\n=== 三、实时 Google Search 全市场（英/欧/美/ETF/宏观）深度新闻 ===\n{grounding_brief}" if grounding_brief else "")
     )
@@ -789,7 +852,9 @@ async def generate_morning_report(
         "1. 宏观利率/汇率主线与今日整体交易气候；\n"
         "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
         "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
-        "4. 近 7 日财报事件应对预案。\n"
+        f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%（或 Invest 现金 >{cfg.strategy.invest_cash_idle_warn_pct:.0f}%）"
+        "且存在 MA200 上方健康回踩的宽基/优质标的，必须主动给出具体价位、金额（不低于最小建仓额）与分批节奏的部署提案，禁止只写“继续观望/持币吃息”；\n"
+        "5. 近 7 日财报事件应对预案。\n"
         "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与 Step 1 全市场 Google Search 摘要已涵盖全部持仓及挂单的量价、CYQ、目标价、财报日、深度情报与最新新闻，"
         "严禁对已列出数据的持仓重复调用 `inspect_ticker`；仅当文中明确缺失某未入表新代码数据时才允许调用工具。",
         cfg.strategy,
@@ -802,11 +867,12 @@ async def generate_morning_report(
         "1. 行业集中度与跨账户重叠审计：基于 Python 算出的行业权重、CVaR 与跨账户重叠，明确哪些行业/标的是否已超载、今天必须冻结禁止加码（列出红线）。\n"
         "2. 破位与弱势持仓审计：跌破 MA200 或触及止损线（尤其 Invest 短线仓）或临近 5 日内财报的标的，明确减仓/硬止损/严禁补仓指令；"
         "所有持仓的技术面、Finnhub 新闻与 Step 1 全市场 Google Search 摘要已完整注入上方上下文，常规持仓严禁重复调 `inspect_ticker`，直接依据既有证据严格审计即可。\n"
-        "3. 【活动挂单零情面独立审计】：逐一核查【当前活动挂单】！"
-        "无论挂单是用户手动下单还是前序 AI 建议，结合当前现价、均线位置、分析师目标价、"
-        f"{cfg.strategy.uk_stamp_duty_pct:.1f}% 印花税/{cfg.strategy.fx_fee_pct * 2:.2f}% 往返换汇费以及 {cfg.strategy.cash_interest_rate_pct:.1f}% 现金利息门槛——"
-        f"注意挂单占用资金在未成交前照常产生 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息，严禁以“释放冻结现金吃息”为由撤单；"
-        "仅当限价过高、成交后预期净空间跑不赢现金利息+摩擦或基本面/技术面风险过大时，必须敢于直白裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！\n"
+        "3. 【活动挂单零情面独立审计（一律按挂单限价核算）】：逐一核查【当前活动挂单】！"
+        "无论挂单是用户手动下单还是前序 AI 建议，都以该挂单的限价（而非现价）为成本基线，结合均线位置、分析师目标价、"
+        f"{cfg.strategy.uk_stamp_duty_pct:.1f}% 印花税/{cfg.strategy.fx_fee_pct * 2:.2f}% 往返换汇费与买卖价差估算，核算成交后 R:R；"
+        f"挂单占用资金在未成交前照常计息，距现价 -3%~-12% 且基本面未坏的回踩埋伏单属有效等待，"
+        "严禁以“释放冻结现金吃息”或“现价空间不足”为由撤单；"
+        "仅当按限价成交后 R:R <2:1、限价明显高于合理回踩区或基本面/技术面已证伪时，必须敢于裁决【CANCEL 建议撤单】或【MODIFY 建议下调限价至具体数字】！\n"
         # [用户授权调整] 1200 字草稿集中用于异动/分歧/挂单；IMP-12 请保留。
         "4. 篇幅聚焦：常规无异常 HOLD 持仓合并略过，把 1200 字集中分配给异动标的、分歧标的与活动挂单。",
         cfg.strategy,
@@ -863,6 +929,8 @@ async def generate_morning_report(
         + f"=== 账户速览与净值变动 ===\n"
         f"{wallet_text}\n"
         f"净值变动：{diff_text}\n"
+        f"基准对照（大盘 vs 本账户）：{benchmark_line}\n"
+        f"交易频率与冷却：{trade_ctx['trade_behavior_text']}\n"
         f"资金流水：{cash_flow_text}\n"
         f"活动挂单：\n{trade_ctx['pending_orders_text']}\n\n"
         f"=== 本地多空证据冲突对照 (Bull vs Bear Disagreement Matrix) ===\n{disagreement_text}\n\n"
@@ -901,6 +969,7 @@ async def generate_morning_report(
             strategy=cfg.strategy,
             bundle_map=bundles,
             evals=evals,
+            trade_behavior=trade_ctx.get("trade_behavior"),
         )
         resolved_decision = override_res.decision if isinstance(override_res.decision, MorningReportDecision) else decision
         context_pack["report_decision"] = {

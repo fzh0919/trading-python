@@ -757,6 +757,29 @@ _EU_LSE_ETFS: set[str] = {
 _EU_SUFFIXES: tuple[str, ...] = (".DE", ".AS", ".PA", ".MI", ".MC", ".BR", ".SW", ".HE", ".ST", ".CO", ".OL")
 
 
+def compute_window_return_pct(hist: pd.DataFrame | None, days: int) -> float | None:
+    """Close-to-close return over the last ``days`` trading bars (None when data is short).
+
+    Callers map calendar windows to bars: 5 bars ≈ 7 days, 21 bars ≈ 30 days.
+    """
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    try:
+        bars = int(days)
+    except (TypeError, ValueError):
+        return None
+    if bars < 1:
+        return None
+    closes = _extract_close_series(hist, bars + 10)
+    if closes is None or len(closes) < bars + 1:
+        return None
+    start = float(closes.iloc[-(bars + 1)])
+    end = float(closes.iloc[-1])
+    if start <= 0 or not (np.isfinite(start) and np.isfinite(end)):
+        return None
+    return ((end - start) / start) * 100.0
+
+
 def _market_timezone_zone(symbol: str) -> str:
     """Classify trading venue closing timezone ('EU_UK' closes ~16:30 UK vs 'US' closes ~21:00 UK)."""
     clean = (symbol or "").strip().upper()
@@ -1142,6 +1165,80 @@ _ISSUER_ALIASES: dict[str, str] = {
     "BRK-A": "BRK-B",
 }
 
+# US mega-cap tech / semiconductor factor bucket used for look-through exposure hints.
+_TECH_FACTOR_TICKERS: frozenset[str] = frozenset(
+    {
+        "MSFT",
+        "AVGO",
+        "NVDA",
+        "AAPL",
+        "GOOG",
+        "META",
+        "AMZN",
+        "TSLA",
+        "AMD",
+        "NFLX",
+        "ORCL",
+        "CRM",
+        "ADBE",
+        "INTC",
+        "QCOM",
+        "TXN",
+        "MU",
+        "PLTR",
+        "ARM",
+        "SMCI",
+        "TSM",
+        "ASML",
+    }
+)
+
+# Static APPROXIMATE implied tech weight inside broad UCITS ETFs.
+# These are published order-of-magnitude anchors, NOT a live look-through file:
+# they only feed a coarse "how much tech do I really own" hint and must never
+# be used for a hard risk block.
+_ETF_TECH_PENETRATION_PCT: dict[str, float] = {
+    # Global all-world / developed
+    "VWRP": 25.0,
+    "VWRP.L": 25.0,
+    "VWRL": 25.0,
+    "VWRL.L": 25.0,
+    "SWDA": 25.0,
+    "SWDA.L": 25.0,
+    "IWDA": 24.0,
+    "IWDA.L": 24.0,
+    "SSAC": 24.0,
+    "SSAC.L": 24.0,
+    "FWRG": 24.0,
+    "FWRG.L": 24.0,
+    # S&P 500
+    "VUAG": 32.0,
+    "VUAG.L": 32.0,
+    "CSP1": 32.0,
+    "CSP1.L": 32.0,
+    "VUSA": 32.0,
+    "VUSA.L": 32.0,
+    "IUSA": 32.0,
+    "IUSA.L": 32.0,
+    "SPY": 32.0,
+    "VOO": 32.0,
+    "IVV": 32.0,
+    # NASDAQ 100
+    "CNX1": 50.0,
+    "CNX1.L": 50.0,
+    "EQGB": 50.0,
+    "EQGB.L": 50.0,
+    "EQQQ": 50.0,
+    "EQQQ.L": 50.0,
+    "QQQ": 50.0,
+    "QQQM": 50.0,
+    # FTSE 100 (tech weight is negligible)
+    "ISF": 1.0,
+    "ISF.L": 1.0,
+    "VUKE": 1.0,
+    "VUKE.L": 1.0,
+}
+
 # Underlying index family mapping for duplicate/clone ETF exposure aggregation
 _ETF_INDEX_FAMILY_MAP: dict[str, str] = {
     # S&P 500 trackers
@@ -1251,6 +1348,65 @@ def infer_etf_index_family(
     if "gilt" in combined_name:
         return "UK Gilts (英国国债)"
     return None
+
+
+def estimate_penetration_tech_exposure(
+    portfolio: PortfolioData,
+    bundles: dict[str, TickerMarketBundle] | None = None,
+) -> dict[str, Any]:
+    """Estimate combined tech-factor exposure: direct tech holdings + static ETF look-through.
+
+    Values are approximations for context only — never used as a hard blocking threshold.
+    """
+    bmap = bundles or {}
+    raw_total = portfolio.total_combined_value or (
+        portfolio.isa.total_account_value + portfolio.invest.total_account_value
+    )
+    total_all = max(float(raw_total or 0.0), 1.0)
+
+    direct_by_ticker: dict[str, float] = {}
+    direct_val = 0.0
+    etf_implied_val = 0.0
+    unmapped_etf_val = 0.0
+    etf_rows: list[dict[str, Any]] = []
+
+    for p in portfolio.all_positions():
+        if p.current_value <= 0:
+            continue
+        root = (p.ticker or "").strip().upper()
+        if root in _TECH_FACTOR_TICKERS:
+            direct_val += p.current_value
+            direct_by_ticker[root] = direct_by_ticker.get(root, 0.0) + p.current_value
+            continue
+        sym = (p.yahoo_symbol or "").strip().upper()
+        pct = _ETF_TECH_PENETRATION_PCT.get(sym) or _ETF_TECH_PENETRATION_PCT.get(sym.split(".")[0])
+        if pct is None:
+            b = bmap.get(p.yahoo_symbol)
+            if b is not None and b.quote_type.upper() == "ETF":
+                unmapped_etf_val += p.current_value
+            continue
+        implied = p.current_value * pct / 100.0
+        etf_implied_val += implied
+        etf_rows.append(
+            {
+                "symbol": p.yahoo_symbol,
+                "account": p.account,
+                "weight_pct": pct,
+                "implied_value": round(implied, 2),
+            }
+        )
+
+    combined = direct_val + etf_implied_val
+    return {
+        "direct_value": round(direct_val, 2),
+        "direct_positions": {k: round(v, 2) for k, v in direct_by_ticker.items()},
+        "etf_implied_value": round(etf_implied_val, 2),
+        "etf_breakdown": etf_rows,
+        "unmapped_etf_value": round(unmapped_etf_val, 2),
+        "combined_value": round(combined, 2),
+        "combined_pct": round((combined / total_all) * 100.0, 1),
+        "total_value": round(total_all, 2),
+    }
 
 
 def compute_portfolio_cvar_and_risk_attribution(
@@ -1462,6 +1618,13 @@ def compute_exposure_summary(
         lines.append("• 跨账户同名重叠: 无")
     if clone_etf_lines:
         lines.extend(clone_etf_lines)
+    penetration = estimate_penetration_tech_exposure(portfolio, bundles)
+    if penetration["combined_value"] > 0:
+        lines.append(
+            f"• 穿透后真实科技暴露(估算): ETF 隐含 £{penetration['etf_implied_value']:,.0f} + "
+            f"直接科技个股 £{penetration['direct_value']:,.0f} = £{penetration['combined_value']:,.0f} "
+            f"(占总资产 {penetration['combined_pct']:.1f}%；静态权重近似，非实时持仓穿透)"
+        )
     if histories:
         risk_info = compute_portfolio_cvar_and_risk_attribution(portfolio, histories)
         top_sources = risk_info.get("top_risk_sources") or []
