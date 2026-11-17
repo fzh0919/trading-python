@@ -171,6 +171,10 @@ class ModelsSection(BaseModel):
     gemini_fallback_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     deepseek_fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_priority_search_thinking_level: ThinkingLevelLiteral = "LOW"
+    # 非联网调用的同厂备援顺序：True = Gemini 主模型失败先切 DeepSeek HIGH（强推理），
+    # 再退 3.5-flash-lite LOW；False = 保留旧顺序（flash-lite 先于 DeepSeek）。
+    # 联网调用（use_google_search=True）永远不切 DeepSeek，不受此开关影响。
+    prefer_deepseek_over_flash_lite: bool = True
 
     enable_forced_search_grounding: bool = True
     report_max_tool_rounds: int = Field(default=2, ge=1)
@@ -179,8 +183,23 @@ class ModelsSection(BaseModel):
     gemini_round_timeout_seconds: float = Field(default=120.0, ge=15.0, le=600.0)
     gemini_max_transient_retries: int = Field(default=2, ge=0, le=5)
     gemini_timeout_max_retries: int = Field(default=0, ge=0, le=2)
-    # /report Step 2 (Bull + Bear concurrent) wall-clock budget before neutral degradation.
-    report_step2_timeout_seconds: float = Field(default=240.0, ge=60.0, le=900.0)
+    # /report Step 2（R1 Bull/Bear → R2 DeepSeek 交叉质询 → R3 双中立）分段预算与总闸
+    report_step2_timeout_seconds: float = Field(default=660.0, ge=60.0, le=1800.0)
+    report_step2_round1_seconds: float = Field(default=360.0, ge=30.0, le=900.0)
+    report_step2_round2_seconds: float = Field(default=180.0, ge=0.0, le=900.0)
+    report_step2_round3_seconds: float = Field(default=120.0, ge=0.0, le=900.0)
+    # /report Step 3 PM 单次调用上限（Carbon 慢，避免 120s 硬超时被过早切备援）
+    report_pm_timeout_seconds: float = Field(default=300.0, ge=60.0, le=1200.0)
+    # /report 第二轮辩论（DeepSeek）：R2 双向质询 + R3 中立摘要/证据核验
+    report_debate_enabled: bool = True
+    report_debate_model: str = "deepseek-flash"
+    report_debate_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_debate_max_chars: int = Field(default=2400, ge=600, le=6000)
+    report_debate_max_output_tokens: int = Field(default=4096, ge=512, le=32768)
+    report_neutral_model: str = "deepseek-flash"
+    report_neutral_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_neutral_digest_max_chars: int = Field(default=900, ge=300, le=3000)
+    report_neutral_factcheck_max_chars: int = Field(default=400, ge=150, le=2000)
     google_search_free_quota_monthly: int = Field(default=5000, ge=0)
     google_search_warn_pct: float = Field(default=85.0, gt=0.0, le=100.0)
 

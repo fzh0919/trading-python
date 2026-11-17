@@ -25,17 +25,19 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **`/report` Step 1 联网（核心）** | `report_priority_search_model` / `report_search_model` | 宏观&1v1 `Hydrogen` (`LOW`) / 批量 `3.5-flash-lite` (`LOW`) | `GoogleSearch`（每批 `<=3` 标的，`Semaphore(3)`，3h SQLite 快照，英文搜/中文出，禁切 DeepSeek） | 注入内部上下文 |
 | **`/report` Step 2A 机会（核心）** | `report_analyst_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 2B 风控（核心）** | `report_auditor_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 `3.5-flash-lite` LOW / DeepSeek)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
-| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-carbon` (`HIGH`) *(备援 Hydrogen HIGH → DeepSeek HIGH + 自修复)* | `MorningReportDecision`（含 `PickGateDecision` 单向收紧权）+ 自修复 + `RiskOverride` + 护栏后 `deployment_gate` 横幅注入与落库 | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
+| **`/report` Step 2B 风控（核心）** | `report_auditor_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH → `3.5-flash-lite` LOW)* | 本地全维 `ContextPack` + `MarketToolkit`（`<=2` 轮，禁重搜） | 内部草稿 `<=1200` 字 |
+| **`/report` Step 2C 交叉质询（辩论）** | `report_debate_model` | `deepseek-flash` (`HIGH`) | 首轮草稿 + 共享 FactSheet；只反驳对手、不给最终结论；失败即跳过 | `<=2400` 字 ×2（并发） |
+| **`/report` Step 2D 中立索引** | `report_neutral_model` | `deepseek-flash` (`HIGH`) | R1+R2+分歧矩阵；摘要四段 + 争议标的原文引用 / 数字核验只标记 `[无据]` | `<=900` / `<=400` 字（并发） |
+| **`/report` Step 3 PM 拍板（核心）**| `report_model` | `gemini-4-carbon` (`HIGH`, 单次 `300s`) *(备援 Hydrogen HIGH → DeepSeek HIGH + 自修复)* | `MorningReportDecision`（含 `PickGateDecision` 单向收紧权）+ 自修复 + `RiskOverride` + 护栏后 `deployment_gate` 横幅注入与落库；PM `pick_gate.allow=false` 由 `/pick` 初筛前硬拒绝；只注入 R3 索引，不注入 R2 全文 | **Telegram `<=1800` 字** *(Prompt 1500~1650)* |
 | **`/pick` Stage 1 投研员** | `pick_researcher_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH)* | 四维量化+新闻/评级预聚合 + `MarketToolkit`（`<=2` 轮，带方向 `<=3` 轮） | 内部提案 |
-| **`/pick` Stage 2 风控官** | `pick_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH+Schema)* | `PickDecision` + 自修复 + Post-Screen 确定性校验（联动 `deployment_gate` ISA 饱和拦截、跨账户去重、`ROTATE` 置换源核验、`0.5R` 半仓算仓） | **Telegram `<=1000` 字** |
+| **`/pick` Stage 2 风控官** | `pick_model` | `gemini-4-hydrogen` (`HIGH`) *(备援 DeepSeek HIGH+Schema)* | `PickDecision` + 自修复 + Post-Screen 确定性校验（PM 否决、Invest DEFEND/冷静期/单日上限/满槽、ISA `equity_open/etf_open`、ISA 饱和、跨账户个股去重、`ROTATE` 置换源核验、`0.5R` 半仓算仓；核心 ETF 双持豁免） | **Telegram `<=1000` 字** |
 | **`/us` 美股增量哨兵（分级门控）** | `us_sentinel_model` / `us_anomaly_model` | 平稳 `deepseek-flash` (`HIGH`) / 异动 `Hydrogen` (`HIGH`) | 本地 Anomaly Gate：平稳免工具核对；异动切 Gemini+搜+工具深挖 | **平稳 `<=450` / 异动 `<=600` 字** |
 | **日常自由单聊 / `/deep`** | `chat_model` / `chat_deep_model` | 日常 `deepseek-flash` (`HIGH`) / `/deep` `Hydrogen` (`HIGH`) | 本地切片 + 静态前缀缓存 + 按需工具（`<=2` 轮，`/deep <=4`），双厂互备 | **Prompt `<=500` 字（`/deep` `1000~1200`）** |
-| **盘后 T+5 复盘微反思** | `chat_model` | `deepseek-flash` (`HIGH`) *(备援 Hydrogen MEDIUM)* | 本地算完 T+5 Alpha 后生成 `2~4` 句（`<80 tokens`）教训 | 存入 SQLite 记忆列 |
+| **盘后 T+5 复盘微反思** | `chat_model` | `deepseek-flash` (`HIGH`) *(备援 Hydrogen MEDIUM)* | 本地算完 T+N 方向感知收益（`BUY/ADD` 多头、`TRIM/STOP/SWAP` 避损；未触价 `BUY/ADD` 标记 `NOT_FILLED` 并排除胜率）后生成 `2~4` 句（`<80 tokens`）教训 | 存入 SQLite 记忆列 |
 | **DeepSeek 侧车（筛选/质检/周报/记忆）** | `ds_helper_model` / `ds_helper_thinking_level` | `deepseek-flash` (`HIGH`)，单次 `ds_helper_timeout_seconds=20s` | `ds_pick_prefilter_enabled`（ID 名单）/ `ds_semantic_audit_enabled`（只读质检）/ 周六诊断 / 偏好抽取；缺 `DEEPSEEK_API_KEY` 时 **0 调用**，绝不回落 Gemini | 名单 JSON / `violations` / `<=450` 字诊断 / 带原话锚点笔记 |
 | **盘中异动哨兵** | 复用 `chat_model` 与 `search_model` | 扫描 0-Token（实时价：Finnhub → T212 持仓 → 日线末根）；仅触发标的做 1v1 联网 + DS (`HIGH`) 判推送 | `intraday_sentinel_enabled`，工作日 `08:00~21:00 UK` 每 `30` 分钟、`execution_lock` 被占则跳过；限价/止损挂单均纳入逼近判定 | Telegram `<=250` 字纯文本（仅 `should_push=true` 且发送成功） |
 
-> **调用级韧性（`v5.3.3`）**：`gemini_round_timeout_seconds=120s` 为单轮硬超时；硬超时按 `gemini_timeout_max_retries=0` **直接切备援**（不再空转重试），5xx/429 仍按 `gemini_max_transient_retries=2` 重试；`/report` Step 2 另有 `report_step2_timeout_seconds=240s` 总护栏，到点取消未完成方并用中性占位继续 PM 拍板（`report_step2_degraded` WARN）。
+> **调用级韧性（`v5.3.3` / `v5.4.2`）**：`gemini_round_timeout_seconds=120s` 为单轮硬超时；硬超时按 `gemini_timeout_max_retries=0` **直接切备援**（不再空转重试），5xx/429 仍按 `gemini_max_transient_retries=2` 重试。`/report` Step 2 改为分段预算 `report_step2_round1/2/3_seconds=360/180/120s`（总闸 `660s`）：R1 任一侧降级即跳过 R2/R3；R2/R3 失败只发 `report_debate_degraded`，不污染 R1 的 `report_step2_degraded`。PM 单次 `report_pm_timeout_seconds=300s`（`round_timeout_seconds` 只作用首候选，备援仍用 120s）；DS 质询/中立带 `max_output_tokens` 上限（R2 4096 / 摘要 2048 / 核验 1024）。
 
 ---
 
@@ -44,7 +46,7 @@
 1. `portfolio_snapshots(id, cycle_date, fetched_at_uk, fetched_at_ms, total_combined_value, payload_json)`：双账户完整快照。
 2. `morning_reports(cycle_date PK, report_text, conclusion_text, premarket_note, daily_guardrails, context_pack_json, updated_at_ms)`：当日 `/report` 全文、红线、`/us` 笔记及当日 `AnalysisContextPack`（跨指令 0-Token 复用）。
 3. `pick_radars(id, created_at_uk, created_at_ms, focus_query, research_text, final_text)`：`/pick` 投研草稿与终审存档。
-4. `pick_recommendations(id, ..., account, symbol, action, entry_price, thesis, horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, outcome_status, reflection_lesson, t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct)`：推荐记录与 `T+5/10/20` Alpha、`MFE/MAE` 极值及反思记忆。
+4. `pick_recommendations(id, ..., account, symbol, action, entry_price, thesis, horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, outcome_status, reflection_lesson, t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct, source, fill_status)`：推荐记录与 `T+5/10/20` Alpha、`MFE/MAE` 极值及反思记忆；`source='pick'|'report'`（`/report` 的 ADD/TRIM/STOP 也进入同一 ledger），`fill_status='FILLED'|'NOT_FILLED'|'ASSUMED'|'UNKNOWN'`。
 5. `chat_history(id, cycle_date, user_query, bot_reply, created_at_ms)`：单周期对话记忆（自动保留最近 12 轮）。
 6. `llm_usage_logs(id, ..., cycle_date, call_label, model, thinking_level, api_rounds, prompt_tokens, cached_tokens, output_tokens, thought_tokens, estimated_cost_usd, latency_ms, success, search_queries)`：Token、缓存与 Search 用量账本。
 7. `ops_events(id, created_at_uk, created_at_ms, severity, source, alert_key, message, notified, suppressed_count)`：运维告警审计。

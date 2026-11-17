@@ -562,11 +562,10 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             client._candidate_chain("gemini-4-hydrogen", "HIGH"),
             [
                 ("gemini-4-hydrogen", "HIGH"),
-                ("gemini-3.5-flash-lite", "LOW"),
                 ("deepseek-flash", "HIGH"),
             ],
         )
-        # Google Search calls MUST never fall back to DeepSeek
+        # Search calls never touch DeepSeek, so flash-lite remains the only fallback.
         self.assertEqual(
             client._candidate_chain("gemini-4-hydrogen", "LOW", use_google_search=True),
             [
@@ -579,6 +578,33 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             [
                 ("gemini-3.5-flash-lite", "LOW"),
                 ("gemini-4-hydrogen", "LOW"),
+            ],
+        )
+        # Opt-out switch restores the legacy flash-lite-before-DeepSeek order.
+        legacy_client = GeminiClient(
+            api_key="dummy-gem",
+            deepseek_api_key="dummy-ds",
+            fallback_model="gemini-4-hydrogen",
+            gemini_fallback_model="gemini-4-hydrogen",
+            deepseek_fallback_model="deepseek-flash",
+            deepseek_fallback_thinking_level="HIGH",
+            prefer_deepseek_over_flash_lite=False,
+        )
+        self.assertEqual(
+            legacy_client._candidate_chain("gemini-4-hydrogen", "HIGH"),
+            [
+                ("gemini-4-hydrogen", "HIGH"),
+                ("gemini-3.5-flash-lite", "LOW"),
+                ("deepseek-flash", "HIGH"),
+            ],
+        )
+        # Missing DeepSeek key also keeps the legacy chain.
+        no_ds_client = GeminiClient(api_key="dummy-gem", fallback_model="gemini-4-hydrogen")
+        self.assertEqual(
+            no_ds_client._candidate_chain("gemini-4-hydrogen", "HIGH"),
+            [
+                ("gemini-4-hydrogen", "HIGH"),
+                ("gemini-3.5-flash-lite", "LOW"),
             ],
         )
 
@@ -841,6 +867,71 @@ class TestEgressGuards(unittest.TestCase):
             env = EnvSettings(_env_file=None)
         self.assertEqual(env.deepseek_base_url, "https://api.deepseek.com")
         self.assertEqual(env.t212_base_url, "https://live.trading212.com/api/v0")
+
+
+class TestPerCallOverrides(unittest.IsolatedAsyncioTestCase):
+    async def test_per_call_timeout_only_applies_to_primary(self) -> None:
+        client = GeminiClient(
+            api_key="dummy-gem",
+            fallback_model="gemini-4-hydrogen",
+            round_timeout_seconds=0.0,
+            max_transient_retries=0,
+            timeout_max_retries=0,
+            retry_base_delay_s=0.0,
+        )
+        attempts: list[str] = []
+
+        async def _fake_generate_content(*, model: str, contents: Any, config: Any) -> Any:
+            attempts.append(model)
+            if model == "gemini-4-argon":
+                await asyncio.sleep(30)
+            return SimpleNamespace(text="ok", function_calls=[], candidates=[], usage_metadata=None)
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate_content))
+        )
+
+        reply = await client.generate(
+            model="gemini-4-argon",
+            prompt="hi",
+            round_timeout_seconds=0.05,
+            usage_label="report_pm",
+        )
+        # The override cuts the slow primary; the fallback keeps the (disabled) client default.
+        self.assertEqual(reply, "ok")
+        self.assertEqual(attempts, ["gemini-4-argon", "gemini-4-hydrogen"])
+
+    async def test_max_output_tokens_reaches_gemini_config(self) -> None:
+        client = GeminiClient(api_key="dummy-gem")
+        captured: dict[str, Any] = {}
+
+        async def _fake_generate_content(*, model: str, contents: Any, config: Any) -> Any:
+            captured["config"] = config
+            return SimpleNamespace(text="ok", function_calls=[], candidates=[], usage_metadata=None)
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate_content))
+        )
+        await client.generate(model="gemini-4-hydrogen", prompt="hi", max_output_tokens=1234)
+        self.assertEqual(captured["config"].max_output_tokens, 1234)
+
+    async def test_max_output_tokens_reaches_deepseek_payload(self) -> None:
+        client = GeminiClient(api_key="", deepseek_api_key="dummy-ds", deepseek_max_retries=0)
+        payloads: list[dict[str, Any]] = []
+
+        async def _fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+            payloads.append(payload)
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+
+        client._post_deepseek_completion = _fake_post  # type: ignore[method-assign]
+        reply = await client.generate(model="deepseek-flash", prompt="hi", thinking_level="HIGH", max_output_tokens=1234)
+        self.assertEqual(reply, "ok")
+        self.assertEqual(payloads[0]["max_tokens"], 1234)
+        self.assertEqual(payloads[0]["thinking"], {"type": "enabled"})
+        self.assertEqual(payloads[0]["reasoning_effort"], "high")
 
 
 if __name__ == "__main__":

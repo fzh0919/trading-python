@@ -131,6 +131,8 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
                     "alpha_pct",
                     "outcome_status",
                     "reflection_lesson",
+                    "source",
+                    "fill_status",
                 ):
                     self.assertIn(expected_col, pr_cols)
 
@@ -183,6 +185,60 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
                 context_pack="{not-valid-json",
             )
             self.assertIsNone(await db.get_context_pack(cycle_date="2026-11-16", allow_fallback=False))
+
+    async def test_stale_status_and_report_ledger_dedupe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "status.db")
+            await db.init()
+            await db.save_morning_report(
+                "old report", "old conclusion", guardrails=["旧红线"], cycle_date="2026-11-14"
+            )
+
+            text, concl, stale = await db.get_morning_context_with_status(cycle_date="2026-11-15")
+            self.assertEqual(text, "old report")
+            self.assertEqual(concl, "old conclusion")
+            self.assertTrue(stale)
+            guardrails, guard_stale = await db.get_daily_guardrails_with_status(cycle_date="2026-11-15")
+            self.assertEqual(guardrails, ["旧红线"])
+            self.assertTrue(guard_stale)
+
+            await db.save_morning_report(
+                "new report", "new conclusion", guardrails=["新红线"], cycle_date="2026-11-15"
+            )
+            text2, _, stale2 = await db.get_morning_context_with_status(cycle_date="2026-11-15")
+            self.assertEqual(text2, "new report")
+            self.assertFalse(stale2)
+            guardrails2, guard_stale2 = await db.get_daily_guardrails_with_status(cycle_date="2026-11-15")
+            self.assertEqual(guardrails2, ["新红线"])
+            self.assertFalse(guard_stale2)
+
+            item = {
+                "account": "ISA",
+                "symbol": "VWRP.L",
+                "action": "BUY",
+                "entry_price": 118.0,
+                "thesis": "归拢核心宽基",
+            }
+            await db.log_recommendations([item], source="report", dedupe_same_day=True)
+            await db.log_recommendations([item], source="report", dedupe_same_day=True)
+            rows = await db.get_recent_recommendations(limit=10)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["source"], "report")
+            self.assertEqual(rows[0]["fill_status"], "ASSUMED")
+
+            await db.settle_recommendation(
+                int(rows[0]["id"]),
+                benchmark_symbol="VWRP.L",
+                settled_at_uk="2026-11-20 22:00",
+                raw_return_pct=None,
+                alpha_pct=None,
+                outcome_status="NOT_FILLED",
+                fill_status="NOT_FILLED",
+            )
+            stats = await db.get_recommendation_stats()
+            self.assertEqual(stats["not_filled_count"], 1)
+            self.assertEqual(stats["settled_count"], 0)
+            self.assertEqual(await db.get_pending_settlements(), [])
 
     async def test_recommendation_settlement_idempotency_lessons_and_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

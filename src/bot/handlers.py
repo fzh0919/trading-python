@@ -425,8 +425,13 @@ class AdvisorBot:
             await self._send_reply(chat_id, self._format_usage_message(summary))
             return
 
-        # Cancel any still-running heavy command when user issues a new query
-        if self._active_task and not self._active_task.done():
+        # Cancel any still-running heavy AI command when the user issues another heavy query;
+        # light commands (/pos /health) must stay lock-free and never kill a running report.
+        if (
+            self._active_task
+            and not self._active_task.done()
+            and self._is_heavy_ai_command(lower)
+        ):
             await self.cancel_active_task(chat_id)
 
         self._active_task = asyncio.create_task(self._run_query_task(chat_id, text))
@@ -626,8 +631,10 @@ class AdvisorBot:
             "📊 历史选股后验胜率与 Alpha 看板",
             (
                 f"• 样本总览: 共 {stats['total_count']} 条 "
-                f"(已结算 {stats['settled_count']} | 待结算 {stats['pending_count']} | 跳过 {stats['skipped_count']})"
+                f"(已结算 {stats['settled_count']} | 待结算 {stats['pending_count']} | "
+                f"未成交 {stats.get('not_filled_count', 0)} | 跳过 {stats['skipped_count']})"
             ),
+            "• 口径: BUY/ADD 为多头收益；TRIM/STOP/SWAP 为避损收益（价格跌=正确）",
         ]
         if stats["settled_count"] > 0:
             avg_raw = f"{stats['avg_raw_return_pct']:+.2f}%" if stats["avg_raw_return_pct"] is not None else "N/A"
@@ -684,6 +691,8 @@ class AdvisorBot:
                     alpha_s = f"{r['alpha_pct']:+.1f}%" if r.get("alpha_pct") is not None else "N/A"
                     cur_s = f" | 现价 {cur_p:.2f}" if cur_p is not None else ""
                     perf_s = f" [已结算: 收益 {raw_s}, Alpha {alpha_s}{cur_s}]"
+                elif status == "NOT_FILLED":
+                    perf_s = " [未触价·未成交，已排除出胜率]"
                 elif status == "SKIPPED":
                     perf_s = " [已跳过结算]"
                 elif cur_p is not None and entry is not None and float(entry) > 0:
@@ -882,7 +891,11 @@ class AdvisorBot:
                     reply = await generate_morning_report(
                         self.cfg, self.t212, self.market_data, self.llm, self.db, ops_notifier=self.ops
                     )
-                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 全景晨报分析完成：")
+                    await self.tg.edit_status(
+                        chat_id,
+                        status_msg_id,
+                        "⚠️ 晨报未完成（未写入当日基线）" if str(reply).lstrip().startswith("⚠️") else "✅ 全景晨报分析完成：",
+                    )
                     await self._deliver(chat_id, reply)
                     return
 
@@ -919,7 +932,12 @@ class AdvisorBot:
                         is_weekly_auto=False,
                         ops_notifier=self.ops,
                     )
-                    await self.tg.edit_status(chat_id, status_msg_id, "✅ 投研选股 + 风控官双审完成：")
+                    blocked = str(reply).lstrip().startswith(("⚠️", "⛔"))
+                    await self.tg.edit_status(
+                        chat_id,
+                        status_msg_id,
+                        "⛔ 选股未执行/已被门控拦截" if blocked else "✅ 投研选股 + 风控官双审完成：",
+                    )
                     await self._deliver(chat_id, reply)
                     return
 

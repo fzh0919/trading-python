@@ -2110,7 +2110,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     src_conn.execute(
                         "INSERT INTO pick_recommendations (created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        ("2026-10-28 15:00", rec_ms, "Invest", "NVDA", "BUY", 100.0, "AI算力需求延续"),
+                        ("2026-10-28 15:00", rec_ms, "Invest", "NVDA", "BUY", 124.0, "AI算力需求延续"),
                     )
                     src_conn.execute(
                         "INSERT INTO ops_events (created_at_uk, created_at_ms, severity, source, alert_key, message, notified, suppressed_count) "

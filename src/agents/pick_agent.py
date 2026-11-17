@@ -66,6 +66,10 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
             f"{float(isa_g.get('committed_satellite_pct') or 0.0):.1f}%）：ISA 赛道只允许宽基 ETF"
             "（VWRP.L 等），严禁推荐新开 ISA 个股，闲钱归拢核心宽基。"
         )
+    if isa_g.get("equity_open") is False:
+        lines.append("• ISA 个股通道关闭（退潮期或结构饱和）：严禁推荐 ISA 新开个股。")
+    if isa_g.get("etf_open") is False:
+        lines.append("• ISA 宽基通道关闭（退潮期未达深跌采集阶梯）：严禁推荐 ISA 新开宽基 ETF。")
     lines.append(
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
@@ -82,18 +86,37 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _is_etf_action(symbol: str, bundles: dict[str, TickerMarketBundle] | None, etf_set: set[str]) -> bool:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return False
+    base = sym.split(".")[0]
+    if sym in etf_set or base in etf_set:
+        return True
+    for candidate in (sym, symbol, base):
+        bundle = (bundles or {}).get(candidate)
+        if bundle is not None and str(getattr(bundle, "quote_type", "") or "").strip().upper() == "ETF":
+            return True
+    return False
+
+
 def _apply_gate_channel_constraints(
     decision: PickDecision,
     portfolio: PortfolioData,
     gate_ctx: dict[str, Any],
+    bundles: dict[str, TickerMarketBundle] | None = None,
 ) -> tuple[PickDecision, list[str]]:
-    """v5.4.0 post-guardrail hard interception: cross-account same-ticket dedupe + ROTATE funding.
+    """v5.4.0 post-guardrail hard interception: PM veto / account channels / dedupe / ROTATE.
 
     Never mutates the caller's decision object; returns the hardened copy and human-readable
     rejection notes (tagged so render_pick_report surfaces them).
     """
     inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
+    isa_g = gate_ctx.get("isa") if isinstance(gate_ctx.get("isa"), dict) else {}
+    pm_g = gate_ctx.get("pm") if isinstance(gate_ctx.get("pm"), dict) else {}
     funding_from = str(inv_g.get("funding_from") or "").strip().upper()
+    etf_set = {str(s).strip().upper() for s in (gate_ctx.get("etf_set") or []) if str(s).strip()}
+    buy_actions = {"BUY", "ADD", "SWAP"}
 
     held_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
     pending_buy_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
@@ -114,10 +137,54 @@ def _apply_gate_channel_constraints(
         sym = item.symbol.strip().upper()
         base = sym.split(".")[0]
         acct = item.account.strip().upper()
-        if act_up in {"BUY", "ADD"}:
+        if act_up in buy_actions:
+            is_etf = _is_etf_action(sym, bundles, etf_set)
+            # PM veto is a hard stop for all new positions (kept as a defence-in-depth
+            # check even though generate_pick_radar already returns early).
+            if pm_g.get("allow") is False:
+                notes.append(
+                    f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                    f"PM 今日门控收紧：{pm_g.get('reason') or '暂停新开仓'}"
+                )
+                continue
+            # Account-channel hard blocks (only in advise mode, because gate_ctx is None otherwise).
+            if acct == "INVEST" and not is_etf:
+                status = str(inv_g.get("status") or "").strip().upper()
+                mode = str(inv_g.get("mode") or "").strip().lower()
+                if status == "DEFEND":
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "Invest DEFEND 退潮态冻结新开个股"
+                    )
+                    continue
+                if status == "WAIT" and mode in {"cooldown", "daily_cap", "slots_full"}:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        f"Invest {mode} 暂停新开个股（{inv_g.get('reason') or status}）"
+                    )
+                    continue
+            if acct == "ISA":
+                if is_etf and isa_g.get("etf_open") is False:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "ISA 宽基通道关闭（退潮期未达深跌阶梯）"
+                    )
+                    continue
+                if not is_etf and isa_g.get("equity_open") is False:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "ISA 个股通道关闭（退潮期或结构饱和）"
+                    )
+                    continue
+            # Cross-account same-ticket dedupe applies to single-name equities only;
+            # broad-base/core ETFs are intentionally allowed in both accounts.
             other = other_acct.get(acct, "")
-            if other and (sym in held_by_acct.get(other, set()) or base in held_by_acct.get(other, set())
-                          or sym in pending_buy_by_acct.get(other, set()) or base in pending_buy_by_acct.get(other, set())):
+            if other and not is_etf and (
+                sym in held_by_acct.get(other, set())
+                or base in held_by_acct.get(other, set())
+                or sym in pending_buy_by_acct.get(other, set())
+                or base in pending_buy_by_acct.get(other, set())
+            ):
                 note = (
                     f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
                     f"跨账户同票去重：{item.symbol} 已在 {other} 持仓/挂单，请归口原持仓账户管理"
@@ -632,7 +699,9 @@ async def _post_screen_validate_decision(
     # v5.4.0: deterministic gate channel constraints (cross-account dedupe + ROTATE funding).
     final_decision = resolved_decision
     if gate_ctx is not None:
-        final_decision, _gate_notes = _apply_gate_channel_constraints(resolved_decision, portfolio, gate_ctx)
+        final_decision, _gate_notes = _apply_gate_channel_constraints(
+            resolved_decision, portfolio, gate_ctx, bundles=all_bundles
+        )
     final_text = render_pick_report(
         final_decision,
         max_chars=1000,
@@ -700,13 +769,31 @@ async def generate_pick_radar(
     tracked_syms = portfolio.unique_yahoo_symbols(include_pending=True)
     isin_map, created_at_map = _extract_holding_context(portfolio)
 
-    # Step 1: Fetch held bundles/histories + macro + today's /report ContextPack & recent lessons first
+    # Today's /report is the single source of truth: never substitute yesterday's red lines.
+    baseline_text, baseline_conclusion, baseline_stale = await db.get_morning_context_with_status()
+    if baseline_stale or not baseline_text.strip():
+        return (
+            "⛔ 今日 /report 基线尚未就绪（当前仅有上一交易日缓存），"
+            "已拒绝用旧红线选股。请先运行 /report 后再执行 /pick。"
+        )
+    guardrails = await db.get_daily_guardrails()
+    context_pack = await db.get_context_pack(allow_fallback=False)
+    if not isinstance(context_pack, dict):
+        return "⛔ 今日 /report ContextPack 缺失或不可读，/pick 暂停以避免无门控选股。请重跑 /report。"
+
+    gate_mode = str(getattr(cfg.strategy, "deployment_gate_mode", "off") or "off").strip().lower()
+    gate_ctx = context_pack.get("deployment_gate") if isinstance(context_pack, dict) else None
+    gate_ctx = gate_ctx if isinstance(gate_ctx, dict) else None
+    if gate_ctx is not None and gate_mode == "advise":
+        gate_pm = gate_ctx.get("pm") if isinstance(gate_ctx.get("pm"), dict) else {}
+        if gate_pm.get("allow") is False:
+            pm_reason = str(gate_pm.get("reason") or "PM 主动收紧否决")
+            return f"⛔ 今日组合门控已由 PM 收紧，暂停新开仓：{pm_reason}（如需复核请重跑 /report）"
+
+    # Step 1: Fetch held bundles/histories + macro + recent lessons first
     (
         (held_histories, held_bundles),
         macro,
-        (morning_report_full, morning_conclusion),
-        guardrails,
-        context_pack,
         recent_lessons,
         pref_notes,
     ) = await asyncio.gather(
@@ -717,12 +804,10 @@ async def generate_pick_radar(
             isin_map=isin_map or None,
         ),
         market_data.get_macro_snapshot(),
-        db.get_morning_context(),
-        db.get_daily_guardrails(),
-        db.get_context_pack(allow_fallback=False),
         db.get_recent_lessons(limit=5),
         db.get_active_preference_notes(),
     )
+    morning_report_full, morning_conclusion = baseline_text, baseline_conclusion
 
     # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
     if getattr(macro, "gbp_usd", None):
@@ -760,12 +845,9 @@ async def generate_pick_radar(
         if isinstance(context_pack, dict) and isinstance(context_pack.get("symbols"), dict)
         else {}
     )
-    # v5.4.0: read today's deterministic deployment gate from the /report context pack.
-    # Legacy packs without the key keep the pre-v5.4.0 behaviour 100% intact.
-    gate_ctx = context_pack.get("deployment_gate") if isinstance(context_pack, dict) else None
-    gate_ctx = gate_ctx if isinstance(gate_ctx, dict) else None
+    # v5.4.0: the deterministic deployment gate was parsed above before the screener.
     gate_block = ""
-    if gate_ctx is not None and str(getattr(cfg.strategy, "deployment_gate_mode", "off") or "off").strip().lower() == "advise":
+    if gate_ctx is not None and gate_mode == "advise":
         gate_block = _format_gate_constraint_block(gate_ctx)
     if not recent_lessons and isinstance(context_pack, dict):
         pack_recent = context_pack.get("recent_lessons")

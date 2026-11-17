@@ -340,6 +340,11 @@ def _fit_max_chars(sections: list[str], max_chars: int) -> str:
     return result + "…"
 
 
+def _sanitize_plain_output(text: str) -> str:
+    """Enforce the Telegram plain-text rule even if the model disobeys the prompt."""
+    return str(text or "").replace("**", "").replace("#", "")
+
+
 def trim_text_at_line_boundary(text: str, max_chars: int) -> str:
     """Trim multi-line text at newline boundaries, then sentence/clause boundaries before hard slicing."""
     cleaned = text.strip()
@@ -527,7 +532,7 @@ def render_morning_report(
         pos_lines.append(f"• 常规持有：{decision.hold_summary}")
 
     sec3 = "【财报预警、复盘与重点异动】\n" + "\n".join(pos_lines) if pos_lines else ""
-    return _fit_max_chars([sec1, sec2, sec3], max_chars=max_chars)
+    return _sanitize_plain_output(_fit_max_chars([sec1, sec2, sec3], max_chars=max_chars))
 
 
 def render_pick_report(
@@ -571,4 +576,4 @@ def render_pick_report(
         sec2_lines.append(f"• 基线与现金：{decision.consistency_and_cash_note}")
     sec2 = "【现金约束与风控基线】\n" + "\n".join(sec2_lines) if sec2_lines else ""
 
-    return _fit_max_chars([sec1, sec2], max_chars=max_chars)
+    return _sanitize_plain_output(_fit_max_chars([sec1, sec2], max_chars=max_chars))

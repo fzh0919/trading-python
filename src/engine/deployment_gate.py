@@ -73,6 +73,32 @@ def _sym_up(symbol: str) -> str:
     return str(symbol or "").strip().upper()
 
 
+def _is_held_symbol(pos_by_sym: dict[str, Any], symbol: str) -> bool:
+    """True when a symbol (or its base ticker) already exists in the given account book."""
+    return _find_position(pos_by_sym, symbol) is not None
+
+
+def _find_position(pos_by_sym: dict[str, Any], symbol: str) -> Any | None:
+    """Find a position by exact Yahoo symbol or base ticker (case-insensitive)."""
+    sym = _sym_up(symbol)
+    if not sym:
+        return None
+    if symbol in pos_by_sym:
+        return pos_by_sym[symbol]
+    base = sym.split(".")[0]
+    for key, pos in pos_by_sym.items():
+        key_up = _sym_up(key)
+        if key_up == sym or key_up.split(".")[0] == base:
+            return pos
+    return None
+
+
+def _position_opened_today(pos: Any, today_start_ms: int) -> bool:
+    """Best-effort check that a holding was opened today (for ADD vs NEW classification)."""
+    created_ms = _parse_order_ts_ms(getattr(pos, "created_at", None))
+    return created_ms is not None and created_ms >= today_start_ms
+
+
 def _symbol_matches(a: str, b: str) -> bool:
     sa, sb = _sym_up(a), _sym_up(b)
     if not sa or not sb:
@@ -247,28 +273,39 @@ def evaluate_tactical_quota_guards(
     lookback_ms = int(strategy.consecutive_loss_lookback_days) * 86_400_000
     cooldown_ms = int(strategy.consecutive_loss_cooldown_days) * 86_400_000
 
-    # --- Same-day best-idea-only: BUY fills today + NEW_EQUITY_BUY orders created today
-    today_equity_entries = 0
+    # --- Same-day best-idea-only: distinct NEW equity entries (ADDs do not consume the cap)
+    today_new_symbols: set[str] = set()
     today_fills: list[dict[str, Any]] = []
+    invest_pos_by_sym = {p.yahoo_symbol: p for p in portfolio.invest.positions}
     for order in portfolio.invest.recent_orders:
         if str(order.side or "").strip().upper() != "BUY":
             continue
         if _is_etf_symbol(order.yahoo_symbol, etf_set, bundles):
             continue
-        if order.filled_at_ms >= today_start_ms:
-            today_equity_entries += 1
-            today_fills.append(
-                {"symbol": order.yahoo_symbol, "filled_at_ms": order.filled_at_ms, "value": order.net_value}
-            )
+        if order.filled_at_ms < today_start_ms:
+            continue
+        today_fills.append(
+            {"symbol": order.yahoo_symbol, "filled_at_ms": order.filled_at_ms, "value": order.net_value}
+        )
+        pos_filled = _find_position(invest_pos_by_sym, order.yahoo_symbol)
+        is_new_entry = pos_filled is None or _position_opened_today(pos_filled, today_start_ms)
+        if is_new_entry:
+            today_new_symbols.add(_sym_up(order.yahoo_symbol))
     today_pending: list[str] = []
     classified = classify_pending_orders(portfolio, strategy, etf_set, bundles=bundles)
     for order in classified["by_class"][PENDING_NEW_EQUITY_BUY]:
         if order.account.strip().upper() != "INVEST":
             continue
         created_ms = _parse_order_ts_ms(order.created_at)
-        if created_ms is not None and created_ms >= today_start_ms:
-            today_equity_entries += 1
+        if created_ms is None or created_ms < today_start_ms:
+            continue
+        sym_pending = _sym_up(order.yahoo_symbol)
+        pos_pending = _find_position(invest_pos_by_sym, order.yahoo_symbol)
+        is_new_entry = pos_pending is None or _position_opened_today(pos_pending, today_start_ms)
+        if is_new_entry and sym_pending not in today_new_symbols:
+            today_new_symbols.add(sym_pending)
             today_pending.append(order.yahoo_symbol)
+    today_equity_entries = len(today_new_symbols)
 
     daily_cap = int(strategy.max_new_equity_entries_per_day)
     daily_cap_reached = today_equity_entries >= daily_cap if daily_cap > 0 else False
@@ -298,6 +335,11 @@ def evaluate_tactical_quota_guards(
             continue  # no post-epoch BUY fill -> legacy cleanup, exempt
         tactical_sells.append(order)
     tactical_sells.sort(key=lambda r: r.filled_at_ms, reverse=True)
+    # Count each symbol once: multiple partial trims of the same loser must not fake a streak.
+    latest_sell_by_sym: dict[str, HistoricalOrderItem] = {}
+    for sell in tactical_sells:
+        latest_sell_by_sym.setdefault(_sym_up(sell.yahoo_symbol), sell)
+    tactical_sells = sorted(latest_sell_by_sym.values(), key=lambda r: r.filled_at_ms, reverse=True)
 
     consecutive_losses = 0
     last_loss_ms: int | None = None
@@ -403,8 +445,8 @@ def compute_account_ledgers(
     )
     committed_satellite_pct = _pct(satellite_gbp + equity_pending_gbp)
     isa_satellite_saturated = bool(
-        committed_satellite_pct > float(strategy.isa_satellite_max_total_pct)
-        or committed_satellite_count > int(strategy.isa_satellite_max_count)
+        committed_satellite_pct >= float(strategy.isa_satellite_max_total_pct)
+        or committed_satellite_count >= int(strategy.isa_satellite_max_count)
     )
     isa_ledger = {
         "ok": isa_ok,
@@ -474,10 +516,27 @@ def compute_account_ledgers(
             unfinanced.append(sym)
             slots_used += 1
 
-    invest_pending_equity = [
-        _sym_up(o.yahoo_symbol) for o in by_class[PENDING_NEW_EQUITY_BUY] if o.account.strip().upper() == "INVEST"
-    ]
-    slots_used += len(invest_pending_equity)
+    invest_pos_by_sym = {p.yahoo_symbol: p for p in invest.positions}
+    invest_pending_all = list(
+        dict.fromkeys(
+            _sym_up(o.yahoo_symbol)
+            for o in by_class[PENDING_NEW_EQUITY_BUY]
+            if o.account.strip().upper() == "INVEST"
+        )
+    )
+    invest_pending_new: list[str] = []
+    invest_pending_add: list[str] = []
+    for order in by_class[PENDING_NEW_EQUITY_BUY]:
+        if order.account.strip().upper() != "INVEST":
+            continue
+        sym_pending = _sym_up(order.yahoo_symbol)
+        if _is_held_symbol(invest_pos_by_sym, sym_pending):
+            invest_pending_add.append(sym_pending)
+        else:
+            invest_pending_new.append(sym_pending)
+    invest_pending_new = list(dict.fromkeys(invest_pending_new))
+    invest_pending_add = list(dict.fromkeys(invest_pending_add))
+    slots_used += len(invest_pending_new)
     invest_ledger = {
         "ok": invest_ok,
         "total_account_value_gbp": _round2(invest_val),
@@ -489,7 +548,9 @@ def compute_account_ledgers(
         "heat_gbp_total": _round2(total_heat),
         "heat_breakdown": heat_breakdown,
         "slots_used": slots_used,
-        "pending_new_equity_buys": invest_pending_equity,
+        "pending_equity_buys_all": invest_pending_all,
+        "pending_new_equity_buys": invest_pending_new,
+        "pending_add_equity_buys": invest_pending_add,
         "pending_protective_stops": sorted({_sym_up(o.yahoo_symbol) for o in by_class[PENDING_PROTECTIVE_SELL_STOP]}),
     }
 
@@ -825,7 +886,7 @@ def scan_triggers_and_decide(
     b_dca = bool(
         isa["ok"]
         and isa["deployable_pct"] > float(strategy.isa_cash_band_high_pct) + float(strategy.min_deploy_excess_pct)
-        and isa["core_etf_pct"] < float(strategy.isa_core_etf_target_pct)
+        and isa["committed_core_etf_pct"] < float(strategy.isa_core_etf_target_pct)
     )
     inflow = _today_external_inflow(portfolio, strategy, now_uk)
     c_inflow = bool(inflow["triggered_accounts"])
@@ -833,7 +894,7 @@ def scan_triggers_and_decide(
     d_defend = bool(
         regime == "RISK_OFF"
         and (
-            invest["pending_new_equity_buys"]
+            invest["pending_equity_buys_all"]
             or isa["pending_new_equity_buys"]
             or invest["slots_used"] > 0
         )
@@ -860,7 +921,7 @@ def scan_triggers_and_decide(
             isa_reason = f"外部净入金 £{inflow['per_account_net_gbp']['ISA']:,.0f} 达标，引导分批配置核心宽基"
         elif b_dca:
             isa_status, isa_mode = "RUN", "dca"
-            isa_reason = f"ISA 可用现金 {isa['deployable_pct']:.1f}%>上沿且宽基仅 {isa['core_etf_pct']:.0f}%，分批归拢 VWRP"
+            isa_reason = f"ISA 可用现金 {isa['deployable_pct']:.1f}%>上沿且宽基仅 {isa['committed_core_etf_pct']:.0f}%（含挂单），分批归拢 VWRP"
         elif ladder_hit is not None:
             isa_status, isa_mode = "RUN", "ladder"
             isa_reason = f"核心宽基距52周高点回撤首次触及 -{float(ladder_hit):.0f}% 阶梯"
@@ -906,6 +967,8 @@ def scan_triggers_and_decide(
             funding_from = ""
             if invest["pending_new_equity_buys"]:
                 funding_from = invest["pending_new_equity_buys"][0]
+            elif invest.get("pending_add_equity_buys"):
+                funding_from = invest["pending_add_equity_buys"][0]
             elif invest["unfinanced_positions"]:
                 funding_from = invest["unfinanced_positions"][0]
             invest["funding_from"] = funding_from
@@ -966,7 +1029,13 @@ def scan_triggers_and_decide(
     isa_equity_open = bool(
         isa["ok"] and regime != "RISK_OFF" and not isa["isa_satellite_saturated"]
     )
-    isa_etf_open = bool(isa["ok"])
+    # In RISK_OFF the ISA wide-base channel only opens on a valid drawdown ladder step;
+    # otherwise the gate WAIT text and the actual permission would contradict each other.
+    isa_etf_open = bool(
+        isa["ok"] and (regime != "RISK_OFF" or a_core.get("hit") is not None)
+    )
+    isa["equity_open"] = isa_equity_open
+    isa["etf_open"] = isa_etf_open
     invest_open = invest_status == "RUN"
     invest_rotate = invest_status == "ROTATE"
     allow = isa_equity_open or isa_etf_open or invest_open or invest_rotate
@@ -1127,7 +1196,7 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
 
     if isa.get("isa_satellite_saturated"):
         d_pct = float(isa.get("deployable_pct") or 0.0)
-        core_pct = float(isa.get("core_etf_pct") or 0.0)
+        core_pct = float(isa.get("committed_core_etf_pct") or 0.0)
         count = int(isa.get("committed_satellite_count") or 0)
         sat_pct = float(isa.get("committed_satellite_pct") or 0.0)
         pending_eq = "、".join((isa.get("pending_new_equity_buys") or [])[:2]) or ""
@@ -1151,7 +1220,7 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
 
     if isa_status == "RUN":
         d_pct = float(isa.get("deployable_pct") or 0.0)
-        core_pct = float(isa.get("core_etf_pct") or 0.0)
+        core_pct = float(isa.get("committed_core_etf_pct") or 0.0)
         mode = str(isa.get("mode") or "dca")
         line1 = f"组合门控：ISA RUN·{mode} / Invest {invest_status}｜ISA可用 {d_pct:.1f}%（宽基{core_pct:.0f}%）"
         line2 = "→ 闲置现金分批归拢 VWRP；Invest 无右侧猎物不催买（现金吃息仅作等待保底）"

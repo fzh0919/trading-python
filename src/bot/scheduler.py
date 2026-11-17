@@ -187,13 +187,59 @@ def _align_entry_price_gbp_guard(
     return eff_entry
 
 
+def _trade_direction(action: str) -> int:
+    """+1 for long entries (BUY/ADD), -1 for risk-reducing actions (TRIM/STOP/SELL/SWAP)."""
+    return -1 if str(action or "").strip().upper() in {"TRIM", "STOP", "SELL", "SWAP"} else 1
+
+
+def _direction_adjusted_return_pct(action: str, entry: float, exit_price: float) -> float:
+    """Long return for BUY/ADD; avoided-loss return for TRIM/STOP/SWAP."""
+    if entry <= 0:
+        return 0.0
+    raw = ((exit_price - entry) / entry) * 100.0
+    return raw * _trade_direction(action)
+
+
+def _entry_fill_status(
+    action: str,
+    ohlc: pd.DataFrame,
+    rec_date: date,
+    target_date: date,
+    eff_entry: float,
+    *,
+    tolerance_pct: float = 0.0,
+) -> str:
+    """Daily-bar approximation of whether a BUY/ADD entry was actually touched.
+
+    We cannot know the exact order type from the ledger, so a BUY/ADD is treated as
+    NOT_FILLED when the low never traded at/below the reference entry. TRIM/STOP are
+    assumed executable at the reference price (they are risk-reducing actions).
+    """
+    act = str(action or "").strip().upper()
+    if act not in {"BUY", "ADD"}:
+        return "ASSUMED"
+    if ohlc.empty or eff_entry <= 0 or "Low" not in ohlc.columns:
+        return "UNKNOWN"
+    dates = ohlc.index
+    window = ohlc[(dates >= rec_date) & (dates <= target_date)]
+    if window.empty:
+        return "UNKNOWN"
+    lows = pd.to_numeric(window["Low"], errors="coerce").dropna()
+    if lows.empty:
+        return "UNKNOWN"
+    threshold = eff_entry * (1.0 + max(0.0, float(tolerance_pct)) / 100.0)
+    return "FILLED" if float(lows.min()) <= threshold else "NOT_FILLED"
+
+
 def _compute_mfe_mae_pct(
     ohlc: pd.DataFrame,
     rec_date: date,
     exit_date: date,
     eff_entry: float,
+    *,
+    direction: int = 1,
 ) -> tuple[float | None, float | None]:
-    """Compute Maximum Favorable Excursion (MFE%) and Maximum Adverse Excursion (MAE%) over (rec_date, exit_date]."""
+    """Compute MFE/MAE% over (rec_date, exit_date] in the direction of the trade."""
     if ohlc.empty or eff_entry <= 0:
         return None, None
     dates = ohlc.index
@@ -206,8 +252,12 @@ def _compute_mfe_mae_pct(
     min_low = float(window["Low"].min())
     if not (math.isfinite(max_high) and math.isfinite(min_low)):
         return None, None
-    mfe = round(((max_high - eff_entry) / eff_entry) * 100.0, 2)
-    mae = round(((min_low - eff_entry) / eff_entry) * 100.0, 2)
+    if direction >= 0:
+        mfe = round(((max_high - eff_entry) / eff_entry) * 100.0, 2)
+        mae = round(((min_low - eff_entry) / eff_entry) * 100.0, 2)
+    else:
+        mfe = round(((eff_entry - min_low) / eff_entry) * 100.0, 2)
+        mae = round(((eff_entry - max_high) / eff_entry) * 100.0, 2)
     return mfe, mae
 
 
@@ -557,6 +607,7 @@ class TradingScheduler:
         self.current_job_name: str | None = None
         self.morning_retry_cooldown_s = max(0.0, float(morning_retry_cooldown_s))
         self._fired_dates: dict[str, str] = {}
+        self._job_retry_after: dict[str, datetime] = {}
         self._morning_failures: dict[str, dict[str, Any]] = {}
         self._morning_missed_notified: set[str] = set()
         self.last_job_runs: dict[str, dict[str, str]] = {}
@@ -574,12 +625,42 @@ class TradingScheduler:
         self._fired_dates[job_name] = uk_date
         await self.db.mark_scheduler_job_fired(job_name, uk_date, uk_now_str)
 
-    async def _claim_job_run(self, job_name: str, uk_date: str, uk_now_str: str) -> bool:
+    async def _claim_job_run(
+        self,
+        job_name: str,
+        uk_date: str,
+        uk_now_str: str,
+        *,
+        now_utc: datetime | None = None,
+        retry_cooldown_s: int = 0,
+    ) -> bool:
         """Atomically check in-memory + SQLite persistence so restarts inside the trigger window never double-fire."""
+        if retry_cooldown_s > 0:
+            retry_after = self._job_retry_after.get(job_name)
+            if retry_after is not None and (now_utc or datetime.now(timezone.utc)) < retry_after:
+                return False
         if await self._is_job_locked(job_name, uk_date):
             return False
         await self._mark_job_locked(job_name, uk_date, uk_now_str)
         return True
+
+    async def _release_job_run(
+        self,
+        job_name: str,
+        uk_date: str,
+        *,
+        now_utc: datetime | None = None,
+        retry_cooldown_s: int = 120,
+    ) -> None:
+        """Release a transiently failed one-shot claim so the remaining window can retry."""
+        self._fired_dates.pop(job_name, None)
+        try:
+            await self.db.clear_scheduler_job_fired(job_name, uk_date)
+        except Exception as exc:
+            logger.warning("Failed to clear scheduler claim %s/%s: %s", job_name, uk_date, exc)
+        if retry_cooldown_s > 0:
+            base = now_utc or datetime.now(timezone.utc)
+            self._job_retry_after[job_name] = base + timedelta(seconds=retry_cooldown_s)
 
     async def _execute_job(
         self,
@@ -609,6 +690,11 @@ class TradingScheduler:
                     return False
 
                 detail = msg[:120] if not send_to_tg else ""
+                if msg.lstrip().startswith("⛔"):
+                    self.last_job_runs[job_name] = {"status": "BLOCKED", "uk_time": uk_now_str, "detail": msg[:120]}
+                    if send_to_tg and chat_id and msg.strip():
+                        await self.tg.send_message(chat_id, msg)
+                    return True
                 self.last_job_runs[job_name] = {"status": "OK", "uk_time": uk_now_str, "detail": detail}
                 if send_to_tg and chat_id and msg.strip():
                     await self.tg.send_message(chat_id, msg)
@@ -653,12 +739,14 @@ class TradingScheduler:
         benchmark_symbol: str,
         bench_return_pct: float,
         alpha_pct: float,
+        direction: int = 1,
     ) -> str:
         """Generate a concise 2-4 sentence (<80 tokens) T+N post-mortem lesson using Hydrogen LOW."""
         symbol = str(rec.get("symbol") or "").upper()
         account = str(rec.get("account") or "ISA")
         action = str(rec.get("action") or "WATCH")
         thesis = str(rec.get("thesis") or "").strip()[:220] or "未记录"
+        direction_label = "多头买入（价格涨=正确）" if direction >= 0 else "减仓/止损（价格跌=正确，避损口径）"
 
         system_instruction = (
             f"你是冷静客观的量化投研复盘教练。现在已知历史推荐在 T+{holding_days} 个交易日后的真实表现。\n"
@@ -671,6 +759,7 @@ class TradingScheduler:
         )
         prompt = (
             f"标的: {symbol} ({account} | {action})\n"
+            f"收益口径: {direction_label}\n"
             f"推荐日期: {rec_date.isoformat()} -> 结算日: {exit_date.isoformat()} (T+{holding_days})\n"
             f"入场价: {entry_price:.4g} -> 结算价: {exit_price:.4g}\n"
             f"原推荐逻辑: {thesis}\n"
@@ -1150,6 +1239,7 @@ class TradingScheduler:
         skipped = 0
         not_due = 0
         settled = 0
+        not_filled = 0
         failed = 0
         followup_updated = 0
         mature_items: list[tuple[dict[str, Any], date, date, str, int, float, list[str]]] = []
@@ -1270,7 +1360,29 @@ class TradingScheduler:
                     failed += 1
                     continue
 
-                raw_return_pct = ((exit_price - eff_entry) / eff_entry) * 100.0
+                action = str(rec.get("action") or "BUY").strip().upper()
+                direction = _trade_direction(action)
+                fill_status = (
+                    "ASSUMED"
+                    if str(rec.get("source") or "").strip().lower() == "report"
+                    else _entry_fill_status(action, stock_ohlc, rec_date, target_date, eff_entry)
+                )
+                if fill_status == "NOT_FILLED":
+                    saved = await self.db.settle_recommendation(
+                        rec_id,
+                        benchmark_symbol=bench_candidates[0] if bench_candidates else "SPY",
+                        settled_at_uk=uk_now_str,
+                        raw_return_pct=None,
+                        alpha_pct=None,
+                        outcome_status="NOT_FILLED",
+                        reflection_lesson="",
+                        fill_status="NOT_FILLED",
+                    )
+                    if saved:
+                        not_filled += 1
+                    continue
+
+                raw_return_pct = _direction_adjusted_return_pct(action, eff_entry, exit_price)
                 bench_res = _compute_benchmark_return_pct(bench_candidates, _get_closes, rec_date, exit_date)
                 if bench_res is None:
                     logger.warning("Benchmark history unavailable for settling %s (%s -> %s)", symbol, rec_date, exit_date)
@@ -1278,7 +1390,9 @@ class TradingScheduler:
                     continue
                 chosen_bench, bench_ret_pct = bench_res
                 alpha_pct = raw_return_pct - bench_ret_pct
-                mfe_pct, mae_pct = _compute_mfe_mae_pct(stock_ohlc, rec_date, exit_date, eff_entry)
+                mfe_pct, mae_pct = _compute_mfe_mae_pct(
+                    stock_ohlc, rec_date, exit_date, eff_entry, direction=direction
+                )
 
                 try:
                     lesson = await self._generate_settlement_reflection(
@@ -1292,6 +1406,7 @@ class TradingScheduler:
                         benchmark_symbol=chosen_bench,
                         bench_return_pct=bench_ret_pct,
                         alpha_pct=alpha_pct,
+                        direction=direction,
                     )
                 except Exception as exc:
                     logger.warning("Settlement reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
@@ -1308,6 +1423,7 @@ class TradingScheduler:
                     reflection_lesson=lesson,
                     mfe_pct=mfe_pct,
                     mae_pct=mae_pct,
+                    fill_status=fill_status,
                 )
                 if saved:
                     settled += 1
@@ -1319,6 +1435,8 @@ class TradingScheduler:
                 if stock_ohlc.empty:
                     continue
                 stock_closes = stock_ohlc["Close"]
+                action = str(rec.get("action") or "BUY").strip().upper()
+                direction = _trade_direction(action)
 
                 t10_ret: float | None = None
                 t10_alpha: float | None = None
@@ -1337,7 +1455,7 @@ class TradingScheduler:
                     eff_entry = _align_entry_price_gbp_guard(symbol, entry_price, stock_closes, rec_date, ex_price)
                     if eff_entry is None:
                         continue
-                    raw_ret = ((ex_price - eff_entry) / eff_entry) * 100.0
+                    raw_ret = _direction_adjusted_return_pct(action, eff_entry, ex_price)
                     bench_res = _compute_benchmark_return_pct(bench_candidates, _get_closes, rec_date, ex_date)
                     if bench_res is None:
                         continue
@@ -1361,7 +1479,9 @@ class TradingScheduler:
                     ref_exit_price = float(stock_closes.loc[furthest_exit])
                     eff_entry = _align_entry_price_gbp_guard(symbol, entry_price, stock_closes, rec_date, ref_exit_price)
                     if eff_entry is not None:
-                        mfe_new, mae_new = _compute_mfe_mae_pct(stock_ohlc, rec_date, furthest_exit, eff_entry)
+                        mfe_new, mae_new = _compute_mfe_mae_pct(
+                            stock_ohlc, rec_date, furthest_exit, eff_entry, direction=direction
+                        )
                         prev_mfe = rec.get("mfe_pct")
                         prev_mae = rec.get("mae_pct")
                         if mfe_new is not None and prev_mfe is not None:
@@ -1399,6 +1519,14 @@ class TradingScheduler:
                 except Exception as exc:
                     logger.warning("Weekday catch-up weekly quant audit failed: %s", exc)
 
+        nav_refreshed = ""
+        dt_uk_now = base.astimezone(LONDON_TZ)
+        if dt_uk_now.hour * 60 + dt_uk_now.minute >= NAV_SNAPSHOT_START_MINUTES:
+            try:
+                nav_refreshed = await self._run_nav_snapshot_job()
+            except Exception as exc:
+                logger.warning("Post-close NAV catch-up failed: %s", exc)
+
         pruned = await self.db.prune_old_records(retention_days=90, now_utc=base)
         preferences_saved = 0
         if self.cfg.strategy.user_preference_memory_enabled:
@@ -1410,10 +1538,12 @@ class TradingScheduler:
             "checked": len(pending),
             "settled": settled,
             "skipped": skipped,
+            "not_filled": not_filled,
             "not_due": not_due,
             "failed": failed,
             "followup_updated": followup_updated,
             "weekly_audit_ran": weekly_audit_ran,
+            "nav_refreshed": nav_refreshed,
             "pruned": pruned,
             "preferences_saved": preferences_saved,
         }
@@ -1468,7 +1598,8 @@ class TradingScheduler:
             )
         return (
             f"结算 {summary['settled']} 条 / 追评 {summary.get('followup_updated', 0)} / "
-            f"跳过 {summary['skipped']} / 未到期 {summary['not_due']} / 失败 {summary['failed']} / 清理 {pruned_total}"
+            f"未成交 {summary.get('not_filled', 0)} / 跳过 {summary['skipped']} / "
+            f"未到期 {summary['not_due']} / 失败 {summary['failed']} / 清理 {pruned_total}"
         )
 
     async def _run_prewarm_impl(self, scope: str, now_utc: datetime | None = None) -> dict[str, Any]:
@@ -2040,7 +2171,9 @@ class TradingScheduler:
                 )
 
         if us_sched.minutes_to_open <= lead and us_sched.minutes_to_open > lead - 5:
-            if await self._claim_job_run("premarket", uk_date, uk_now_str):
+            if await self._claim_job_run(
+                "premarket", uk_date, uk_now_str, now_utc=base, retry_cooldown_s=60
+            ):
                 fired.append("premarket")
                 if us_sched.is_us_holiday:
                     logger.info("US Market Holiday (%s): sending quiet notice.", us_sched.ny_date)
@@ -2055,7 +2188,7 @@ class TradingScheduler:
                     )
                 elif us_sched.is_us_trading_day:
                     logger.info("Running scheduled US pre-market sentinel (%s)", uk_date)
-                    await self._execute_job(
+                    ok = await self._execute_job(
                         job_name="premarket",
                         chat_id=chat_id,
                         uk_now_str=uk_now_str,
@@ -2069,6 +2202,10 @@ class TradingScheduler:
                             ops_notifier=self.ops,
                         ),
                     )
+                    if not ok:
+                        await self._release_job_run(
+                            "premarket", uk_date, now_utc=base, retry_cooldown_s=60
+                        )
 
         # 3. Friday Post-Close Weekly Opportunity Radar & -10m Silent Prewarm (respects dynamic early-close)
         if self.cfg.schedule.enable_weekly_radar and dt_uk.weekday() == 4 and us_sched.is_us_trading_day:
@@ -2086,11 +2223,13 @@ class TradingScheduler:
                         coro=self._run_prewarm_job("weekly_radar", base),
                         send_to_tg=False,
                     )
-            if after <= mins_after_close < after + 5:
-                if await self._claim_job_run("weekly_radar", uk_date, uk_now_str):
+            if after <= mins_after_close < after + 30:
+                if await self._claim_job_run(
+                    "weekly_radar", uk_date, uk_now_str, now_utc=base, retry_cooldown_s=120
+                ):
                     fired.append("weekly_radar")
                     logger.info("Running scheduled Friday weekly opportunity radar (%s)", uk_date)
-                    await self._execute_job(
+                    ok = await self._execute_job(
                         job_name="weekly_radar",
                         chat_id=chat_id,
                         uk_now_str=uk_now_str,
@@ -2105,22 +2244,32 @@ class TradingScheduler:
                             ops_notifier=self.ops,
                         ),
                     )
+                    if not ok:
+                        await self._release_job_run(
+                            "weekly_radar", uk_date, now_utc=base, retry_cooldown_s=120
+                        )
 
-        # 3b. Evening EOD NAV snapshot (21:05~22:00 UK, weekdays): one post-close NAV row
+        # 3b. Evening EOD NAV snapshot (21:40~22:00 UK, weekdays): one post-close NAV row
         if (
             NAV_SNAPSHOT_START_MINUTES <= uk_min_of_day < NAV_SNAPSHOT_END_MINUTES
             and dt_uk.weekday() < 5
         ):
-            if await self._claim_job_run("nav_snapshot", uk_date, uk_now_str):
+            if await self._claim_job_run(
+                "nav_snapshot", uk_date, uk_now_str, now_utc=base, retry_cooldown_s=60
+            ):
                 fired.append("nav_snapshot")
                 logger.info("Running post-close NAV snapshot (%s)", uk_date)
-                await self._execute_job(
+                ok = await self._execute_job(
                     job_name="nav_snapshot",
                     chat_id=chat_id,
                     uk_now_str=uk_now_str,
                     coro=self._run_nav_snapshot_job(),
                     send_to_tg=False,
                 )
+                if not ok:
+                    await self._release_job_run(
+                        "nav_snapshot", uk_date, now_utc=base, retry_cooldown_s=60
+                    )
 
         # 4. Daily Post-Close T+N Recommendation Settlement & 90-Day Pruning (22:00 ~ 23:30 UK)
         if DAILY_SETTLEMENT_START_MINUTES <= uk_min_of_day < DAILY_SETTLEMENT_END_MINUTES:

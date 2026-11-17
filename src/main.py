@@ -90,6 +90,7 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
         gemini_fallback_thinking_level=cfg.models.gemini_fallback_thinking_level,
         deepseek_fallback_model=cfg.models.deepseek_fallback_model,
         deepseek_fallback_thinking_level=cfg.models.deepseek_fallback_thinking_level,
+        prefer_deepseek_over_flash_lite=cfg.models.prefer_deepseek_over_flash_lite,
         round_timeout_seconds=cfg.models.gemini_round_timeout_seconds,
         max_transient_retries=cfg.models.gemini_max_transient_retries,
         timeout_max_retries=cfg.models.gemini_timeout_max_retries,

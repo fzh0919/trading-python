@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from src.agents.pick_agent import _apply_gate_channel_constraints, _format_gate_constraint_block
+from src.agents.report_agent import _build_report_recommendations
 from src.agents.schemas import (
     MorningReportDecision,
     PickActionItem,
@@ -439,13 +440,22 @@ class TestInvestSlotsAndFinancedUnlock(unittest.TestCase):
     def test_best_idea_only_daily_cap_blocks_second_entry(self) -> None:
         portfolio = _real_snapshot_portfolio()
         today_09 = datetime(2026, 11, 17, 9, 30, tzinfo=LONDON)
-        portfolio.invest.recent_orders = [_buy_order("Invest", "CF", "CF", at_uk=today_09)]
+        portfolio.invest.recent_orders = [_buy_order("Invest", "PANW", "PANW", at_uk=today_09)]
         gate = _run_snapshot_gate(portfolio, now_uk=datetime(2026, 11, 17, 10, 0, tzinfo=LONDON))
         invest = gate["invest"]
         self.assertEqual(invest["today_new_equity_entries"], 1)
         self.assertTrue(invest["daily_cap_reached"])
         self.assertEqual(invest["status"], "WAIT")
         self.assertEqual(invest["mode"], "daily_cap")
+
+    def test_add_to_existing_position_does_not_consume_new_entry_cap(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        today_09 = datetime(2026, 11, 17, 9, 30, tzinfo=LONDON)
+        portfolio.invest.recent_orders = [_buy_order("Invest", "CF", "CF", at_uk=today_09)]
+        gate = _run_snapshot_gate(portfolio, now_uk=datetime(2026, 11, 17, 10, 0, tzinfo=LONDON))
+        invest = gate["invest"]
+        self.assertEqual(invest["today_new_equity_entries"], 0)
+        self.assertFalse(invest["daily_cap_reached"])
 
     def test_risk_on_regime_grants_two_slots(self) -> None:
         prev = {"regime": "NEUTRAL", "raw_regime": "RISK_ON", "raw_streak_days": 2, "ease_streak_days": 0}
@@ -575,6 +585,23 @@ class TestGateEpochAndZeroQuota(unittest.TestCase):
         self.assertTrue(invest["in_loss_cooldown"])
         self.assertEqual(invest["status"], "WAIT")
         self.assertEqual(invest["mode"], "cooldown")
+
+    def test_partial_sells_of_same_loser_count_once(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        portfolio.invest.positions = []
+        portfolio.invest.recent_orders = [
+            _buy_order("Invest", "CF", "CF", at_uk=datetime(2026, 11, 19, 9, 0, tzinfo=LONDON)),
+            _sell_order("Invest", "CF", "CF", at_uk=datetime(2026, 11, 21, 9, 0, tzinfo=LONDON), pnl=-30.0),
+            _sell_order("Invest", "CF", "CF", at_uk=datetime(2026, 11, 21, 14, 0, tzinfo=LONDON), pnl=-20.0),
+        ]
+        gate = _run_snapshot_gate(
+            portfolio,
+            strategy=self._strat(),
+            now_uk=datetime(2026, 11, 24, 10, 0, tzinfo=LONDON),
+        )
+        invest = gate["invest"]
+        self.assertEqual(invest["tactical_losses_recent"], 1)
+        self.assertFalse(invest["in_loss_cooldown"])
 
     def test_cooldown_expired_recovery_pilot_runs_at_half_risk(self) -> None:
         portfolio = _real_snapshot_portfolio()
@@ -813,6 +840,7 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         isa = gate["isa"]
         self.assertEqual(isa["status"], "RUN")
         self.assertEqual(isa["mode"], "ladder")
+        self.assertTrue(isa["etf_open"])
         self.assertEqual(gate["invest"]["status"], "DEFEND")
         self.assertEqual(gate["triggers"]["A"]["core_etf_step"]["hit"], 15.0)
 
@@ -834,6 +862,8 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         self.assertFalse(isa["isa_satellite_saturated"])
         self.assertNotEqual(isa["status"], "RUN")  # equity channel shut in RISK_OFF (no ladder hit)
         self.assertEqual(isa["mode"], "none")
+        self.assertFalse(isa["equity_open"])
+        self.assertFalse(isa["etf_open"])
         self.assertEqual(gate["invest"]["status"], "DEFEND")
 
     def test_isa_extreme_low_cash_triggers_defence_note(self) -> None:
@@ -949,11 +979,82 @@ class TestPmClampBannerAndRendering(unittest.TestCase):
         # The banner is the FIRST line of section 2 — nothing may separate it from the header.
         self.assertIn(f"{header}\n{banner.splitlines()[0]}", rendered)
 
+    def test_render_strips_markdown_markers(self) -> None:
+        decision = MorningReportDecision(
+            headline="**加仓** #核心",
+            top_actions=[ReportActionItem(account="ISA", symbol="CASH", action="HOLD", price_zone="N/A", reason="**观望**")],
+            daily_vetoes=["# 禁止追高"],
+            macro_and_cash="宏观",
+            account_diagnosis="诊断",
+            hold_summary="持有",
+            trade_review="复盘",
+        )
+        rendered = render_morning_report(decision, max_chars=1800)
+        self.assertNotIn("**", rendered)
+        self.assertNotIn("#", rendered)
+        self.assertIn("加仓", rendered)
+
+    def test_report_actions_enter_the_tn_ledger(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        bundles = {
+            "CF": TickerMarketBundle(symbol="CF", quote_type="EQUITY", currency="USD", current_price=119.47),
+            "AMZN": TickerMarketBundle(symbol="AMZN", quote_type="EQUITY", currency="USD", current_price=259.0),
+            "NVDA": TickerMarketBundle(symbol="NVDA", quote_type="EQUITY", currency="USD", current_price=135.0),
+        }
+        decision = MorningReportDecision(
+            headline="测试",
+            top_actions=[
+                ReportActionItem(account="Invest", symbol="CF", action="ADD", price_zone="119", reason="加仓"),
+                ReportActionItem(account="Invest", symbol="AMZN", action="TRIM", price_zone="260", reason="减仓"),
+                ReportActionItem(account="ISA", symbol="NVDA", action="STOP", price_zone="130", reason="止损"),
+                ReportActionItem(account="ISA", symbol="CASH", action="HOLD", price_zone="N/A", reason="观望"),
+            ],
+            macro_and_cash="宏观",
+            account_diagnosis="诊断",
+            hold_summary="持有",
+            trade_review="复盘",
+        )
+        cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
+        recs = _build_report_recommendations(decision, portfolio, bundles, cfg)
+        self.assertEqual([r["symbol"] for r in recs], ["CF", "AMZN", "NVDA"])
+        self.assertTrue(all(r["source"] == "report" for r in recs))
+        self.assertTrue(all(r["fill_status"] == "ASSUMED" for r in recs))
+        self.assertTrue(all(r["entry_price"] > 0 for r in recs))
+
 
 # ===========================================================================
 # Group 7b: /report integration — off-mode passthrough & advise-mode injection
 # ===========================================================================
 class TestReportGateIntegration(unittest.IsolatedAsyncioTestCase):
+    async def test_degraded_pm_parse_does_not_persist_a_sot(self) -> None:
+        from tests.test_db_and_end_to_end import _FakeMarketData, _FakeT212, _sample_portfolio
+        from src.agents.report_agent import generate_morning_report
+
+        class _BadPMLLM:
+            async def generate(self, **kwargs):
+                return "not valid json"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "degraded_pm.db")
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+                models={"enable_forced_search_grounding": False},
+                strategy=StrategySection(deployment_gate_mode="off"),
+            )
+            md = _FakeMarketData()
+            try:
+                out = await generate_morning_report(
+                    cfg, _FakeT212(_sample_portfolio()), md, _BadPMLLM(), db
+                )
+            finally:
+                await md.close()
+            self.assertTrue(out.startswith("⚠️"))
+            text, _concl, stale = await db.get_morning_context_with_status()
+            self.assertEqual(text, "")
+            self.assertFalse(stale)
+            await db.close()
+
     async def test_off_mode_is_byte_stable_with_zero_extra_calls(self) -> None:
         from tests.test_db_and_end_to_end import _FakeMarketData, _FakeT212, _RecordingLLM, _sample_portfolio
         from src.agents.report_agent import generate_morning_report
@@ -1022,7 +1123,7 @@ class TestPickGateWiring(unittest.TestCase):
 
     def test_cross_account_duplicate_buy_is_intercepted(self) -> None:
         portfolio = _real_snapshot_portfolio()
-        gate = _run_snapshot_gate(portfolio)
+        gate = {"isa": {"equity_open": True}, "invest": {"status": "RUN", "mode": "targeted"}}
         decision = PickDecision(
             headline="测试",
             selected_actions=[
@@ -1038,6 +1139,98 @@ class TestPickGateWiring(unittest.TestCase):
         self.assertEqual(len(notes), 1)
         self.assertIn("跨账户同票去重", notes[0])
         self.assertIn("INVEST", notes[0])
+
+    def test_cross_account_core_etf_buy_is_allowed(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        portfolio.invest.positions.append(
+            _pos(
+                "Invest", "VWRP", "VWRP.L", value=1000.0, qty=8.0, avg=120.0,
+                cur=125.0, return_pct=4.0, weight_pct=7.0, ccy="GBP",
+            )
+        )
+        gate = {
+            "isa": {"equity_open": True, "etf_open": True, "isa_satellite_saturated": True},
+            "invest": {"status": "WAIT", "mode": "none"},
+            "etf_set": ["VWRP.L"],
+        }
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="VWRP.L", action="BUY", thesis="ISA 归拢核心宽基",
+                    entry_zone="118 GBP", stop_condition="100", target_window="130",
+                    entry_price=118.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual([a.symbol for a in hardened.selected_actions], ["VWRP.L"])
+        self.assertEqual(notes, [])
+
+    def test_invest_defend_blocks_new_equity(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {"invest": {"status": "DEFEND", "mode": "defend"}}
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="AZN.L", action="BUY", thesis="测试",
+                    entry_zone="100", stop_condition="90", target_window="120",
+                    entry_price=100.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertIn("DEFEND", notes[0])
+
+    def test_invest_wait_slots_full_blocks_new_equity(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {"invest": {"status": "WAIT", "mode": "slots_full", "reason": "槽位已满"}}
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="AZN.L", action="BUY", thesis="测试",
+                    entry_zone="100", stop_condition="90", target_window="120",
+                    entry_price=100.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertIn("slots_full", notes[0])
+
+    def test_isa_channels_closed_block_respective_assets(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {
+            "isa": {"equity_open": False, "etf_open": False},
+            "invest": {"status": "WAIT", "mode": "none"},
+            "etf_set": ["VWRP.L"],
+        }
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="AZN.L", action="BUY", thesis="个股",
+                    entry_zone="100", stop_condition="90", target_window="120",
+                    entry_price=100.0,
+                ),
+                PickActionItem(
+                    account="ISA", symbol="VWRP.L", action="BUY", thesis="宽基",
+                    entry_zone="118", stop_condition="100", target_window="130",
+                    entry_price=118.0,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertTrue(any("个股通道关闭" in n for n in notes))
+        self.assertTrue(any("宽基通道关闭" in n for n in notes))
 
     def test_rotate_invest_buy_without_funding_in_thesis_is_intercepted(self) -> None:
         portfolio = _real_snapshot_portfolio()
@@ -1165,6 +1358,55 @@ class TestPickGateEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("今日组合门控约束", research_call["prompt"])
             self.assertIn("ISA 个股卫星层已饱和", critic_call["prompt"])
             self.assertIn("Invest 状态 WAIT", research_call["prompt"])
+
+    async def test_pick_is_closed_by_pm_veto_and_stale_baseline(self) -> None:
+        from tests.test_db_and_end_to_end import _FakeT212, _sample_portfolio
+        from src.agents.pick_agent import generate_pick_radar
+
+        class _NoCallLLM:
+            async def generate(self, **kwargs):
+                raise AssertionError("LLM must not be called when the gate/baseline is closed")
+
+        cfg = AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            models={"enable_forced_search_grounding": False},
+        )
+        portfolio = _sample_portfolio()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "pm_veto.db")
+            await db.init()
+            await db.save_morning_report(
+                "REPORT",
+                "conclusion",
+                context_pack={
+                    "symbols": {},
+                    "deployment_gate": {
+                        "isa": {"equity_open": True, "etf_open": True},
+                        "invest": {"status": "WAIT", "mode": "none"},
+                        "pm": {"allow": False, "reason": "美联储议息夜"},
+                    },
+                },
+            )
+            out = await generate_pick_radar(
+                cfg, _FakeT212(portfolio), SimpleNamespace(), _NoCallLLM(), db
+            )
+            await db.close()
+        self.assertIn("⛔", out)
+        self.assertIn("美联储议息夜", out)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "stale_baseline.db")
+            await db.init()
+            await db.save_morning_report(
+                "OLD REPORT", "old conclusion", context_pack={"symbols": {}}, cycle_date="2020-01-01"
+            )
+            out = await generate_pick_radar(
+                cfg, _FakeT212(portfolio), SimpleNamespace(), _NoCallLLM(), db
+            )
+            await db.close()
+        self.assertIn("⛔", out)
+        self.assertIn("上一交易日", out)
 
     async def test_pick_half_risk_scale_shrinks_sizing_note(self) -> None:
         from tests.test_db_and_end_to_end import _FakeMarketData, _sample_portfolio

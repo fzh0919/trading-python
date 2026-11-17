@@ -254,6 +254,8 @@ class LLMBackend(Protocol):
         temperature: float = 0.25,
         max_tool_rounds: int = 4,
         usage_label: str = "",
+        round_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> str: ...
 
 
@@ -276,6 +278,7 @@ class GeminiClient:
         gemini_fallback_thinking_level: str = "MEDIUM",
         deepseek_fallback_model: str = "deepseek-flash",
         deepseek_fallback_thinking_level: str = "HIGH",
+        prefer_deepseek_over_flash_lite: bool = True,
         deepseek_round_timeout_seconds: float = 60.0,
         deepseek_max_retries: int = 1,
         round_timeout_seconds: float = 120.0,
@@ -300,6 +303,7 @@ class GeminiClient:
         self.gemini_fallback_thinking_level = (gemini_fallback_thinking_level or "MEDIUM").strip()
         self.deepseek_fallback_model = (deepseek_fallback_model or "deepseek-flash").strip()
         self.deepseek_fallback_thinking_level = (deepseek_fallback_thinking_level or "HIGH").strip()
+        self.prefer_deepseek_over_flash_lite = bool(prefer_deepseek_over_flash_lite)
         self.max_transient_retries = max(0, int(max_transient_retries))
         self.timeout_max_retries = max(0, min(int(timeout_max_retries), self.max_transient_retries))
         self.deepseek_max_retries = max(0, int(deepseek_max_retries))
@@ -367,8 +371,18 @@ class GeminiClient:
             elif "argon" in (primary_model or "").lower() or "carbon" in (primary_model or "").lower():
                 raw_chain.append(("gemini-4-hydrogen", "HIGH"))
             elif "flash-lite" not in (primary_model or "").lower():
-                # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon/Carbon
-                raw_chain.append(("gemini-3.5-flash-lite", "LOW"))
+                # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon/Carbon.
+                # v5.4.2: for non-search calls a configured DeepSeek key means a strong cross-vendor
+                # reasoning fallback (HIGH + thinking) is available; prefer it over the weak
+                # same-vendor 3.5-flash-lite. Search calls still fall back to flash-lite only.
+                prefer_deepseek = (
+                    self.prefer_deepseek_over_flash_lite
+                    and not use_google_search
+                    and bool(self.deepseek_api_key)
+                    and self.deepseek_fallback_model != primary_model
+                )
+                if not prefer_deepseek:
+                    raw_chain.append(("gemini-3.5-flash-lite", "LOW"))
             elif use_google_search:
                 raw_chain.append(("gemini-4-hydrogen", "LOW"))
 
@@ -534,8 +548,14 @@ class GeminiClient:
         thinking_cfg: types.ThinkingConfig | None,
         effective_level: str,
         usage_label: str = "",
+        round_timeout_seconds: float | None = None,
     ) -> tuple[Any, types.ThinkingConfig | None, str]:
         assert self._client is not None
+        effective_timeout = (
+            float(round_timeout_seconds)
+            if round_timeout_seconds is not None and round_timeout_seconds > 0
+            else self.round_timeout_seconds
+        )
 
         async def _invoke_sdk(cfg_obj: types.GenerateContentConfig) -> Any:
             coro = self._client.aio.models.generate_content(  # type: ignore[union-attr]
@@ -543,8 +563,8 @@ class GeminiClient:
                 contents=contents,
                 config=cfg_obj,
             )
-            if self.round_timeout_seconds > 0:
-                return await asyncio.wait_for(coro, timeout=self.round_timeout_seconds)
+            if effective_timeout > 0:
+                return await asyncio.wait_for(coro, timeout=effective_timeout)
             return await coro
 
         cfg = make_config(thinking_cfg)
@@ -585,7 +605,7 @@ class GeminiClient:
                         logger.warning(
                             "Hard timeout on %s after %.0fs (%s); skipping further retries to fail over sooner",
                             model,
-                            self.round_timeout_seconds,
+                            effective_timeout,
                             usage_label or "unknown",
                         )
                 raise
@@ -604,11 +624,15 @@ class GeminiClient:
         temperature: float,
         max_tool_rounds: int,
         usage_label: str,
+        round_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> tuple[str | None, str]:
         thinking_cfg, effective_level = self._build_thinking_config(model, thinking_level)
 
         def _make_config(t_cfg: types.ThinkingConfig | None) -> types.GenerateContentConfig:
             kwargs: dict[str, Any] = {"temperature": temperature}
+            if max_output_tokens and max_output_tokens > 0:
+                kwargs["max_output_tokens"] = int(max_output_tokens)
             if system_instruction:
                 kwargs["system_instruction"] = system_instruction
             if configured_tools:
@@ -641,6 +665,7 @@ class GeminiClient:
                     thinking_cfg=thinking_cfg,
                     effective_level=effective_level,
                     usage_label=usage_label,
+                    round_timeout_seconds=round_timeout_seconds,
                 )
                 api_rounds += 1
                 search_queries += self._extract_search_query_count(response)
@@ -705,11 +730,7 @@ class GeminiClient:
             "Authorization": f"Bearer {self.deepseek_api_key}",
             "Content-Type": "application/json",
         }
-        coro = http.post(url, headers=headers, json=payload)
-        if self.deepseek_round_timeout_seconds > 0:
-            resp = await asyncio.wait_for(coro, timeout=self.deepseek_round_timeout_seconds)
-        else:
-            resp = await coro
+        resp = await http.post(url, headers=headers, json=payload)
         if resp.status_code >= 400:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:220]}")
         return dict(resp.json())
@@ -723,14 +744,29 @@ class GeminiClient:
         response_schema: Any,
         temperature: float,
         thinking_level: str,
+        round_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> tuple[dict[str, Any], str]:
         eff_level, thinking_extra, thinking_enabled = _build_deepseek_thinking_params(thinking_level)
+        effective_timeout = (
+            float(round_timeout_seconds)
+            if round_timeout_seconds is not None and round_timeout_seconds > 0
+            else self.deepseek_round_timeout_seconds
+        )
+
+        async def _post(payload: dict[str, Any]) -> dict[str, Any]:
+            coro = self._post_deepseek_completion(payload)
+            if effective_timeout > 0:
+                return await asyncio.wait_for(coro, timeout=effective_timeout)
+            return await coro
 
         def _build_payload(extra_think: dict[str, Any], include_temp: bool) -> dict[str, Any]:
             body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
             }
+            if max_output_tokens and max_output_tokens > 0:
+                body["max_tokens"] = int(max_output_tokens)
             if extra_think:
                 body.update(extra_think)
             if include_temp:
@@ -745,7 +781,7 @@ class GeminiClient:
         payload = _build_payload(thinking_extra, include_temp=not thinking_enabled)
         for attempt in range(self.deepseek_max_retries + 1):
             try:
-                data = await self._post_deepseek_completion(payload)
+                data = await _post(payload)
                 return data, eff_level
             except Exception as exc:
                 err_msg = str(exc) or type(exc).__name__
@@ -754,7 +790,7 @@ class GeminiClient:
                     thinking_extra = {}
                     eff_level = "DEFAULT"
                     payload = _build_payload({}, include_temp=True)
-                    data = await self._post_deepseek_completion(payload)
+                    data = await _post(payload)
                     return data, eff_level
 
                 if attempt < self.deepseek_max_retries and _is_transient_llm_error(exc):
@@ -786,6 +822,8 @@ class GeminiClient:
         temperature: float,
         max_tool_rounds: int,
         usage_label: str,
+        round_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> tuple[str | None, str]:
         sys_text = system_instruction or ""
         if response_schema is not None:
@@ -826,6 +864,8 @@ class GeminiClient:
                     response_schema=response_schema,
                     temperature=temperature,
                     thinking_level=effective_level,
+                    round_timeout_seconds=round_timeout_seconds,
+                    max_output_tokens=max_output_tokens,
                 )
                 api_rounds += 1
 
@@ -933,6 +973,8 @@ class GeminiClient:
         temperature: float = 0.25,
         max_tool_rounds: int = 4,
         usage_label: str = "",
+        round_timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> str:
         if use_google_search and self._client is None:
             await self._emit_ops(
@@ -989,6 +1031,9 @@ class GeminiClient:
         used_fallback = bool(skipped_errors)
 
         for idx, (cand_model, cand_think) in enumerate(candidates):
+            # A per-call ceiling is only for the primary candidate: fallbacks keep the
+            # client defaults so one slow primary cannot stall the whole failover chain.
+            cand_timeout = round_timeout_seconds if idx == 0 else None
             if _is_deepseek_model(cand_model):
                 text, err_reason = await self._run_deepseek_once(
                     model=cand_model,
@@ -1001,6 +1046,8 @@ class GeminiClient:
                     temperature=temperature,
                     max_tool_rounds=max_tool_rounds,
                     usage_label=usage_label,
+                    round_timeout_seconds=cand_timeout,
+                    max_output_tokens=max_output_tokens,
                 )
             else:
                 text, err_reason = await self._run_model_once(
@@ -1014,6 +1061,8 @@ class GeminiClient:
                     temperature=temperature,
                     max_tool_rounds=max_tool_rounds,
                     usage_label=usage_label,
+                    round_timeout_seconds=cand_timeout,
+                    max_output_tokens=max_output_tokens,
                 )
             if text is not None:
                 if idx > 0 or used_fallback:

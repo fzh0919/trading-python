@@ -11,7 +11,13 @@ from pathlib import Path
 import pandas as pd
 
 from src.bot.handlers import AdvisorBot
-from src.bot.scheduler import TradingScheduler
+from src.bot.scheduler import (
+    TradingScheduler,
+    _compute_mfe_mae_pct,
+    _direction_adjusted_return_pct,
+    _entry_fill_status,
+    _trade_direction,
+)
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig, EnvSettings, UniverseSection
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
@@ -909,6 +915,52 @@ class TestWalletCommandParsing(unittest.TestCase):
         self.assertIn("格式不正确", parse("/wallet", ["usd", "abc"])[0])
         self.assertIn("负数", parse("/usd", ["-1"])[0])
         self.assertIn("用法", parse("/wallet", ["foo"])[0])
+
+
+class TestDirectionAwareSettlement(unittest.TestCase):
+    def test_trade_direction_and_adjusted_return(self) -> None:
+        self.assertEqual(_trade_direction("BUY"), 1)
+        self.assertEqual(_trade_direction("ADD"), 1)
+        self.assertEqual(_trade_direction("TRIM"), -1)
+        self.assertEqual(_trade_direction("STOP"), -1)
+        self.assertAlmostEqual(_direction_adjusted_return_pct("TRIM", 100.0, 90.0), 10.0)
+        self.assertAlmostEqual(_direction_adjusted_return_pct("BUY", 100.0, 110.0), 10.0)
+
+    def test_fill_status_requires_price_touch_for_buys(self) -> None:
+        idx = [date(2026, 11, 6), date(2026, 11, 9)]
+        ohlc = pd.DataFrame(
+            {"High": [110.0, 112.0], "Low": [105.0, 106.0], "Close": [108.0, 110.0]},
+            index=idx,
+        )
+        self.assertEqual(
+            _entry_fill_status("BUY", ohlc, date(2026, 11, 6), date(2026, 11, 9), 106.0),
+            "FILLED",
+        )
+        self.assertEqual(
+            _entry_fill_status("BUY", ohlc, date(2026, 11, 6), date(2026, 11, 9), 100.0),
+            "NOT_FILLED",
+        )
+        self.assertEqual(
+            _entry_fill_status("TRIM", ohlc, date(2026, 11, 6), date(2026, 11, 9), 100.0),
+            "ASSUMED",
+        )
+
+    def test_mfe_mae_flip_for_trim(self) -> None:
+        idx = [date(2026, 11, 6), date(2026, 11, 9), date(2026, 11, 10)]
+        ohlc = pd.DataFrame(
+            {"High": [100.0, 120.0, 110.0], "Low": [100.0, 95.0, 98.0], "Close": [100.0, 118.0, 108.0]},
+            index=idx,
+        )
+        long_mfe, long_mae = _compute_mfe_mae_pct(
+            ohlc, date(2026, 11, 6), date(2026, 11, 10), 100.0, direction=1
+        )
+        trim_mfe, trim_mae = _compute_mfe_mae_pct(
+            ohlc, date(2026, 11, 6), date(2026, 11, 10), 100.0, direction=-1
+        )
+        self.assertAlmostEqual(long_mfe, 20.0)
+        self.assertAlmostEqual(long_mae, -5.0)
+        self.assertAlmostEqual(trim_mfe, 5.0)
+        self.assertAlmostEqual(trim_mae, -20.0)
 
 
 if __name__ == "__main__":

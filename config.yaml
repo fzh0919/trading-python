@@ -39,6 +39,7 @@ models:
   fallback_thinking_level: "HIGH"
   gemini_fallback_thinking_level: "MEDIUM"          # DeepSeek 故障切回 Hydrogen MEDIUM
   deepseek_fallback_thinking_level: "HIGH"          # Gemini 故障切入 DeepSeek HIGH
+  prefer_deepseek_over_flash_lite: true             # 非联网备援先切 DeepSeek HIGH，再退 3.5-flash-lite LOW
   report_priority_search_thinking_level: "LOW"      # 早报宏观/异动 1v1 搜索用 LOW 兼顾检索深度与成本
 
   enable_forced_search_grounding: true
@@ -47,8 +48,23 @@ models:
   gemini_round_timeout_seconds: 120.0
   gemini_max_transient_retries: 2
   gemini_timeout_max_retries: 0
-  # /report Step 2（Bull+Bear 并发）总时长护栏：到点取消未完成方，用中性占位继续 PM 拍板
-  report_step2_timeout_seconds: 240.0
+  # /report Step 2（R1 Bull/Bear 并发 → R2 DeepSeek 交叉质询 → R3 双中立）分段预算 + 总闸
+  report_step2_timeout_seconds: 660.0
+  report_step2_round1_seconds: 360.0
+  report_step2_round2_seconds: 180.0
+  report_step2_round3_seconds: 120.0
+  # PM 单次调用上限：Carbon 思考慢，避免 120s 被硬切到备援
+  report_pm_timeout_seconds: 300.0
+  # 第二轮辩论：R2 双向质询（各 2400 字）+ R3 中立摘要/证据核验，每天固定跑
+  report_debate_enabled: true
+  report_debate_model: "deepseek-flash"
+  report_debate_thinking_level: "HIGH"
+  report_debate_max_chars: 2400
+  report_debate_max_output_tokens: 4096
+  report_neutral_model: "deepseek-flash"
+  report_neutral_thinking_level: "HIGH"
+  report_neutral_digest_max_chars: 900
+  report_neutral_factcheck_max_chars: 400
   google_search_free_quota_monthly: 5000    # Google Search Grounding 月免费额度参考线
   google_search_warn_pct: 85.0              # 达到月免费额度该百分比时预警提醒
 

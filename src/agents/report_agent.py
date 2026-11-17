@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -34,6 +35,7 @@ from src.data_providers.analytics import (
     compute_technical_snapshot,
     compute_window_return_pct,
     format_technical_line,
+    resolve_market_benchmark,
 )
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import (
@@ -252,13 +254,6 @@ def _format_benchmark_line(
         if ret_7 is not None:
             line += f"(相对基准 {account_change_pct - ret_7:+.1f}%)"
     return line
-
-
-def _extract_conclusion_fallback(report_text: str) -> str:
-    m = re.search(r"(?:今日定调|核心结论与策略)[：:]*\s*([\s\S]{0,600})", report_text)
-    if m:
-        return m.group(1).strip()[:500]
-    return report_text[:500].strip()
 
 
 def _compact_lesson_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -746,6 +741,366 @@ async def _gather_step2_notes(
     return notes["analyst"], notes["auditor"], degraded
 
 
+# ---------- v5.4.2: Step 2 round-2 debate (DeepSeek) + dual neutral index ----------
+
+_DEBATE_NEUTRAL_SYSTEM = (
+    "你是只读的中立辩论记录员/数字核验员，只做信息索引与事实比对，"
+    "不做投资裁决、不给买卖建议、不新增任何事实或价位。"
+)
+
+
+@dataclass
+class Step2DebateResult:
+    """R1/R2/R3 debate output handed to the PM (full transcript goes to context_pack only)."""
+
+    analyst_notes: str
+    auditor_notes: str
+    digest: str = ""
+    factcheck: str = ""
+    degraded_roles: list[str] = field(default_factory=list)
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
+async def _gather_named_notes(
+    coros: dict[str, Awaitable[str]],
+    *,
+    timeout_s: float,
+) -> tuple[dict[str, str], list[str]]:
+    """Run named coroutines concurrently under one wall-clock budget.
+
+    Unlike `_gather_step2_notes`, a failed round returns an empty string (no neutral
+    placeholder): optional debate rounds must never leak ops wording into the PM prompt.
+    """
+    tasks = {name: asyncio.ensure_future(coro) for name, coro in coros.items()}
+    degraded: list[str] = []
+    if timeout_s > 0:
+        _, pending = await asyncio.wait(set(tasks.values()), timeout=timeout_s)
+        if pending:
+            degraded.extend(name for name, task in tasks.items() if task in pending)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.warning(
+                "Report debate budget %.0fs exceeded; degraded roles: %s",
+                timeout_s,
+                ", ".join(degraded),
+            )
+    else:
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    texts: dict[str, str] = {}
+    for name, task in tasks.items():
+        text = ""
+        if not task.cancelled():
+            try:
+                text = (task.result() or "").strip()
+            except Exception as exc:  # defensive: generate() already converts its own failures
+                logger.warning("Report debate %s task raised: %s", name, exc)
+        if not text or is_degraded_llm_output(text):
+            if name not in degraded:
+                degraded.append(name)
+            text = ""
+        texts[name] = text
+    return texts, degraded
+
+
+def _build_rebuttal_prompt(
+    *,
+    side: str,
+    own_notes: str,
+    opponent_notes: str,
+    shared_context: str,
+    max_chars: int,
+) -> str:
+    if side == "bull":
+        role = "Bull（机会方）"
+        opponent = "Bear（风控审计官）"
+        focus = "逐条反驳 Bear 的风险论断，指出哪些担忧已被事实底座化解、哪些被夸大，并守住你首轮的多方立论。"
+    else:
+        role = "Bear（风控审计官）"
+        opponent = "Bull（机会方）"
+        focus = "逐条攻击 Bull 的支撑位、目标价与加仓理由，指出其最坏情况与证据缺口，并守住你首轮的空方立论。"
+    return (
+        f"【任务：{role} 第二轮交叉质询（≤{max_chars} 字）】\n"
+        "你在首轮已提交过一份草稿；本轮只做交叉质询，不重复首轮已说过的内容。\n"
+        f"{focus}\n\n"
+        f"=== 你的首轮草稿 ===\n{own_notes}\n\n"
+        f"=== 对手 {opponent} 的首轮草稿 ===\n{opponent_notes}\n\n"
+        "=== 唯一事实底座（与首轮相同） ===\n"
+        f"{shared_context}\n\n"
+        "硬规则：\n"
+        "1. 开头先写「本轮最关键的 3 个反驳点」；\n"
+        "2. 逐条回应对手的具体论点，必须引用底座中的数字/事实，不得编造；\n"
+        "3. 不得新增首轮未出现的价位或新闻；\n"
+        "4. 不要给最终买卖结论（PM 负责裁决）。"
+    )
+
+
+def _build_rebuttal_system(side: str, cfg: AppConfig, max_chars: int) -> str:
+    if side == "bull":
+        role = (
+            f"你是 Bull 阵营的第二轮交叉质询者（≤{max_chars} 字）。"
+            "基于同一份事实底座，逐条反驳 Bear 首轮的论点；不要重写研报、不要给最终买卖结论。"
+        )
+    else:
+        role = (
+            f"你是 Bear 阵营的第二轮交叉质询者（≤{max_chars} 字）。"
+            "基于同一份事实底座，逐条攻击 Bull 首轮的支撑位/目标价/加仓理由；不要重写研报、不要给最终买卖结论。"
+        )
+    return build_agent_system_instruction(role, cfg.strategy)
+
+
+def _build_debate_digest_prompt(
+    *,
+    bull_notes: str,
+    bear_notes: str,
+    bull_rebuttal: str,
+    bear_rebuttal: str,
+    disagreement_text: str,
+    max_chars: int,
+) -> str:
+    return (
+        f"【任务：中立辩论摘要（≤{max_chars} 字；只做索引，不做裁决）】\n"
+        "你只负责整理这场 Bull/Bear 辩论，不给买卖建议、不新增事实。\n\n"
+        f"=== Bull 首轮 ===\n{bull_notes}\n\n"
+        f"=== Bear 首轮 ===\n{bear_notes}\n\n"
+        f"=== Bull 对 Bear 的质询 ===\n{bull_rebuttal}\n\n"
+        f"=== Bear 对 Bull 的质询 ===\n{bear_rebuttal}\n\n"
+        f"=== 本地多空证据冲突对照 ===\n{disagreement_text}\n\n"
+        "按以下四段输出（每段 ≤3 条）：\n"
+        "1. 存活的多方论点；\n"
+        "2. 存活的空方论点；\n"
+        "3. 已被驳倒的论点及原因；\n"
+        "4. 仍无证据、需 PM 亲自裁决的冲突。\n"
+        "最后附「关键原文」：挑分歧最大的 2 个标的，各引用双方最关键的一句原话（每句 ≤200 字）。"
+    )
+
+
+def _build_factcheck_prompt(
+    *,
+    fact_sheet: str,
+    bull_rebuttal: str,
+    bear_rebuttal: str,
+    max_chars: int,
+) -> str:
+    return (
+        f"【任务：只读数字核验（≤{max_chars} 字）】\n"
+        "下面给出唯一事实底座与两份第二轮质询。只核对质询中出现的价格、持仓成本、止损价、挂单价、百分比"
+        "能否在事实底座中找到依据。\n\n"
+        f"=== 只读事实底座 ===\n{fact_sheet}\n\n"
+        f"=== Bull 质询 ===\n{bull_rebuttal}\n\n"
+        f"=== Bear 质询 ===\n{bear_rebuttal}\n\n"
+        "输出格式：逐条 `[无据] 标的 / 数字 / 出自 Bull|Bear`；没有发现则输出「未发现无据数字」。\n"
+        "硬规则：只标记、不判违规；底座中找不到不等于错误，由 PM 判断；不得新增事实。"
+    )
+
+
+def _build_debate_pm_block(digest: str, factcheck: str) -> str:
+    if not digest and not factcheck:
+        return ""
+    block = "\n\n=== 第二轮交叉质询与中立索引（DeepSeek，仅供索引，不是裁决） ===\n"
+    if digest:
+        block += f"【中立摘要】\n{digest}\n"
+    if factcheck:
+        block += f"【证据核验】\n{factcheck}\n"
+    return block
+
+
+async def _notify_debate_degraded(ops_notifier: OpsNotifier | None, roles: list[str]) -> None:
+    if ops_notifier is None or not roles:
+        return
+    await ops_notifier.notify(
+        severity="WARN",
+        source="report:debate",
+        alert_key="report_debate_degraded",
+        message=f"/report 第二轮辩论降级：{'/'.join(roles)} 未返回有效结论，PM 将按首轮材料裁决。",
+    )
+
+
+async def _run_step2_debate(
+    *,
+    cfg: AppConfig,
+    llm: LLMBackend,
+    toolkit: MarketToolkit,
+    shared_context: str,
+    fact_sheet: str,
+    disagreement_text: str,
+    analyst_sys: str,
+    auditor_sys: str,
+    analyst_prompt: str,
+    auditor_prompt: str,
+    report_rounds: int,
+    ops_notifier: OpsNotifier | None,
+) -> Step2DebateResult:
+    """Three-phase Step 2: R1 Gemini debate → R2 DeepSeek cross-exam → R3 dual neutral."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    total_budget = float(cfg.models.report_step2_timeout_seconds)
+    r1_budget = min(float(cfg.models.report_step2_round1_seconds), total_budget)
+
+    analyst_notes, auditor_notes, degraded_roles = await _gather_step2_notes(
+        llm.generate(
+            model=cfg.models.report_analyst_model,
+            prompt=analyst_prompt,
+            system_instruction=analyst_sys,
+            thinking_level=cfg.models.report_analyst_thinking_level,
+            tools=toolkit.declarations(),
+            tool_executor=toolkit.as_executor(),
+            temperature=0.2,
+            max_tool_rounds=report_rounds,
+            usage_label="report_analyst",
+        ),
+        llm.generate(
+            model=cfg.models.report_auditor_model,
+            prompt=auditor_prompt,
+            system_instruction=auditor_sys,
+            thinking_level=cfg.models.report_auditor_thinking_level,
+            tools=toolkit.declarations(),
+            tool_executor=toolkit.as_executor(),
+            temperature=0.15,
+            max_tool_rounds=report_rounds,
+            usage_label="report_auditor",
+        ),
+        timeout_s=r1_budget,
+    )
+
+    payload: dict[str, Any] = {
+        "enabled": bool(cfg.models.report_debate_enabled),
+        "degraded": list(degraded_roles),
+        "r1": {"bull": analyst_notes, "bear": auditor_notes},
+        "r2": {},
+        "r3": {},
+        "elapsed": {"r1_s": round(loop.time() - started, 1)},
+    }
+    result = Step2DebateResult(
+        analyst_notes=analyst_notes,
+        auditor_notes=auditor_notes,
+        degraded_roles=list(degraded_roles),
+        payload=payload,
+    )
+
+    if degraded_roles:
+        payload["skipped"] = "r1_degraded"
+        return result
+    if not cfg.models.report_debate_enabled or not ds_helper_available(llm, cfg):
+        payload["skipped"] = "debate_disabled" if not cfg.models.report_debate_enabled else "deepseek_unavailable"
+        return result
+
+    remaining = total_budget - (loop.time() - started)
+    r2_budget = min(float(cfg.models.report_step2_round2_seconds), max(0.0, remaining))
+    if r2_budget <= 0:
+        payload["skipped"] = "no_budget_r2"
+        return result
+
+    debate_round_timeout = max(30.0, r2_budget - 15.0)
+    max_chars = int(cfg.models.report_debate_max_chars)
+    r2_started = loop.time()
+    r2_texts, r2_degraded = await _gather_named_notes(
+        {
+            "bull_rebuttal": llm.generate(
+                model=cfg.models.report_debate_model,
+                prompt=_build_rebuttal_prompt(
+                    side="bull",
+                    own_notes=analyst_notes,
+                    opponent_notes=auditor_notes,
+                    shared_context=shared_context,
+                    max_chars=max_chars,
+                ),
+                system_instruction=_build_rebuttal_system("bull", cfg, max_chars),
+                thinking_level=cfg.models.report_debate_thinking_level,
+                temperature=0.25,
+                usage_label="report_bull_rebuttal",
+                round_timeout_seconds=debate_round_timeout,
+                max_output_tokens=cfg.models.report_debate_max_output_tokens,
+            ),
+            "bear_rebuttal": llm.generate(
+                model=cfg.models.report_debate_model,
+                prompt=_build_rebuttal_prompt(
+                    side="bear",
+                    own_notes=auditor_notes,
+                    opponent_notes=analyst_notes,
+                    shared_context=shared_context,
+                    max_chars=max_chars,
+                ),
+                system_instruction=_build_rebuttal_system("bear", cfg, max_chars),
+                thinking_level=cfg.models.report_debate_thinking_level,
+                temperature=0.2,
+                usage_label="report_bear_rebuttal",
+                round_timeout_seconds=debate_round_timeout,
+                max_output_tokens=cfg.models.report_debate_max_output_tokens,
+            ),
+        },
+        timeout_s=r2_budget,
+    )
+    r2_texts = {name: trim_text_at_line_boundary(text, max_chars) if text else "" for name, text in r2_texts.items()}
+    payload["r2"] = r2_texts
+    payload["elapsed"]["r2_s"] = round(loop.time() - r2_started, 1)
+    if r2_degraded:
+        payload["degraded"].extend(r2_degraded)
+        await _notify_debate_degraded(ops_notifier, r2_degraded)
+        return result
+
+    remaining = total_budget - (loop.time() - started)
+    r3_budget = min(float(cfg.models.report_step2_round3_seconds), max(0.0, remaining))
+    if r3_budget <= 0:
+        payload["skipped"] = "no_budget_r3"
+        return result
+
+    neutral_timeout = max(20.0, r3_budget - 10.0)
+    digest_chars = int(cfg.models.report_neutral_digest_max_chars)
+    factcheck_chars = int(cfg.models.report_neutral_factcheck_max_chars)
+    r3_started = loop.time()
+    r3_texts, r3_degraded = await _gather_named_notes(
+        {
+            "digest": llm.generate(
+                model=cfg.models.report_neutral_model,
+                prompt=_build_debate_digest_prompt(
+                    bull_notes=analyst_notes,
+                    bear_notes=auditor_notes,
+                    bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
+                    bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
+                    disagreement_text=disagreement_text,
+                    max_chars=digest_chars,
+                ),
+                system_instruction=_DEBATE_NEUTRAL_SYSTEM,
+                thinking_level=cfg.models.report_neutral_thinking_level,
+                temperature=0.1,
+                usage_label="report_debate_digest",
+                round_timeout_seconds=neutral_timeout,
+                max_output_tokens=2048,
+            ),
+            "factcheck": llm.generate(
+                model=cfg.models.report_neutral_model,
+                prompt=_build_factcheck_prompt(
+                    fact_sheet=fact_sheet,
+                    bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
+                    bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
+                    max_chars=factcheck_chars,
+                ),
+                system_instruction=_DEBATE_NEUTRAL_SYSTEM,
+                thinking_level=cfg.models.report_neutral_thinking_level,
+                temperature=0.0,
+                usage_label="report_debate_factcheck",
+                round_timeout_seconds=neutral_timeout,
+                max_output_tokens=1024,
+            ),
+        },
+        timeout_s=r3_budget,
+    )
+    result.digest = trim_text_at_line_boundary(r3_texts.get("digest", ""), digest_chars) if r3_texts.get("digest") else ""
+    result.factcheck = (
+        trim_text_at_line_boundary(r3_texts.get("factcheck", ""), factcheck_chars)
+        if r3_texts.get("factcheck")
+        else ""
+    )
+    payload["r3"] = {"digest": result.digest, "factcheck": result.factcheck}
+    payload["elapsed"]["r3_s"] = round(loop.time() - r3_started, 1)
+    if r3_degraded:
+        payload["degraded"].extend(r3_degraded)
+        await _notify_debate_degraded(ops_notifier, r3_degraded)
+    return result
+
+
 def _evaluate_deployment_gate_safely(
     cfg: AppConfig,
     portfolio: PortfolioData,
@@ -774,6 +1129,63 @@ def _evaluate_deployment_gate_safely(
     except Exception as exc:  # noqa: BLE001 - gate failure must never block the report
         logger.warning("Deployment gate evaluation failed, banner omitted: %s", exc)
         return None
+
+
+def _build_report_recommendations(
+    decision: MorningReportDecision,
+    portfolio: PortfolioData,
+    bundles: dict[str, TickerMarketBundle],
+    cfg: AppConfig,
+) -> list[dict[str, Any]]:
+    """Turn /report ADD/TRIM/STOP decisions into the same T+N ledger as /pick.
+
+    HOLD/CASH are intentionally excluded. Report actions are marked source='report' and
+    fill_status='ASSUMED' because price_zone may be a trigger zone rather than a fill price.
+    """
+    price_by_sym = {
+        p.yahoo_symbol.upper(): float(p.cur_price)
+        for p in portfolio.all_positions()
+        if p.yahoo_symbol and float(getattr(p, "cur_price", 0.0) or 0.0) > 0
+    }
+    account_ok = {
+        "ISA": bool(portfolio.isa.ok and not portfolio.isa.is_fallback),
+        "INVEST": bool(portfolio.invest.ok and not portfolio.invest.is_fallback),
+    }
+    out: list[dict[str, Any]] = []
+    for act in decision.top_actions:
+        action = str(act.action or "").strip().upper()
+        if action not in {"ADD", "TRIM", "STOP"}:
+            continue
+        sym = str(act.symbol or "").strip().upper()
+        if not sym or sym == "CASH":
+            continue
+        acct = str(act.account or "").strip().upper()
+        if acct == "ISA" and not account_ok["ISA"]:
+            continue
+        if acct == "INVEST" and not account_ok["INVEST"]:
+            continue
+        bundle = bundles.get(sym) or bundles.get(sym.split(".")[0])
+        price = None
+        if bundle is not None and bundle.current_price is not None and float(bundle.current_price) > 0:
+            price = float(bundle.current_price)
+        elif sym in price_by_sym:
+            price = price_by_sym[sym]
+        if price is None or price <= 0:
+            continue
+        out.append(
+            {
+                "account": act.account,
+                "symbol": sym,
+                "action": action,
+                "entry_price": round(price, 4),
+                "thesis": f"{act.reason} | {act.price_zone}"[:300],
+                "horizon_days": max(1, int(cfg.strategy.settlement_holding_days)),
+                "benchmark_symbol": resolve_market_benchmark(sym)[0],
+                "source": "report",
+                "fill_status": "ASSUMED",
+            }
+        )
+    return out
 
 
 async def generate_morning_report(
@@ -1043,32 +1455,22 @@ async def generate_morning_report(
     auditor_prompt = f"【任务：独立风控与挂单审计官（Bear 视角，深度审计并保留完整依据，1200 字内）】\n{shared_context}"
 
     report_rounds = max(1, int(cfg.models.report_max_tool_rounds))
-    step2_timeout_s = float(cfg.models.report_step2_timeout_seconds)
-    analyst_notes, auditor_notes, degraded_roles = await _gather_step2_notes(
-        llm.generate(
-            model=cfg.models.report_analyst_model,
-            prompt=analyst_prompt,
-            system_instruction=analyst_sys,
-            thinking_level=cfg.models.report_analyst_thinking_level,
-            tools=toolkit.declarations(),
-            tool_executor=toolkit.as_executor(),
-            temperature=0.2,
-            max_tool_rounds=report_rounds,
-            usage_label="report_analyst",
-        ),
-        llm.generate(
-            model=cfg.models.report_auditor_model,
-            prompt=auditor_prompt,
-            system_instruction=auditor_sys,
-            thinking_level=cfg.models.report_auditor_thinking_level,
-            tools=toolkit.declarations(),
-            tool_executor=toolkit.as_executor(),
-            temperature=0.15,
-            max_tool_rounds=report_rounds,
-            usage_label="report_auditor",
-        ),
-        timeout_s=step2_timeout_s,
+    debate = await _run_step2_debate(
+        cfg=cfg,
+        llm=llm,
+        toolkit=toolkit,
+        shared_context=shared_context,
+        fact_sheet=fact_sheet,
+        disagreement_text=disagreement_text,
+        analyst_sys=analyst_sys,
+        auditor_sys=auditor_sys,
+        analyst_prompt=analyst_prompt,
+        auditor_prompt=auditor_prompt,
+        report_rounds=report_rounds,
+        ops_notifier=ops_notifier,
     )
+    analyst_notes, auditor_notes = debate.analyst_notes, debate.auditor_notes
+    degraded_roles = debate.degraded_roles
     if degraded_roles and ops_notifier is not None:
         await ops_notifier.notify(
             severity="WARN",
@@ -1076,12 +1478,13 @@ async def generate_morning_report(
             alert_key="report_step2_degraded",
             message=(
                 f"/report Step 2 降级运行：{'/'.join(degraded_roles)} 未返回有效结论"
-                f"（预算 {step2_timeout_s:.0f}s），已用中性占位继续 PM 拍板。"
+                f"（首轮预算 {cfg.models.report_step2_round1_seconds:.0f}s），已用中性占位继续 PM 拍板。"
             ),
         )
 
     # ---------- Step 3: Portfolio Manager Structured Synthesis ----------
-    pm_sys = build_agent_system_instruction(
+    debate_pm_block = _build_debate_pm_block(debate.digest, debate.factcheck)
+    pm_role = (
         "你是最终投资组合经理（Portfolio Manager），负责拍板权衡「机会分析师（Bull）」与「独立风控审计官（Bear）」的冲突并输出结构化今日总纲（严格遵守 JSON Schema）。\n"
         "严格去重与排版准则（违反将导致重要信息被截断）：\n"
         "• 对【本地多空证据冲突对照】中列出的标的，必须正面裁决采纳 Bull 还是 Bear 依据，严禁和稀泥。\n"
@@ -1091,9 +1494,15 @@ async def generate_morning_report(
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
         "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=35字）。\n"
         # [用户授权调整] /report 目标篇幅调至 1500~1650 字、安全天花板 1800 字；IMP-12 请保留。
-        "• 全文必须精炼直白，控制在 1500~1650 字左右（绝不可超 1800 字），确保财报预警与操作复盘完整展示。",
-        cfg.strategy,
+        "• 全文必须精炼直白，控制在 1500~1650 字左右（绝不可超 1800 字），确保财报预警与操作复盘完整展示。"
     )
+    if debate_pm_block:
+        pm_role += (
+            "\n• 【第二轮交叉质询与中立索引】只是索引，不是裁决；仍须正面裁决 Bull 与 Bear，"
+            "索引与首轮事实冲突时以首轮与本地 FactSheet 为准；"
+            "被标记 [无据] 的数字不得作为加减仓的主要依据。"
+        )
+    pm_sys = build_agent_system_instruction(pm_role, cfg.strategy)
     calendar_block = (
         "=== 市场日历与休市/半日市提醒 ===\n" + "\n".join(f"• {a}" for a in calendar_alerts) + "\n\n"
         if calendar_alerts
@@ -1112,6 +1521,7 @@ async def generate_morning_report(
         f"=== 本地多空证据冲突对照 (Bull vs Bear Disagreement Matrix) ===\n{disagreement_text}\n\n"
         f"=== 机会分析师报告 (Bull) ===\n{analyst_notes}\n\n"
         f"=== 独立风控审计官挑刺与挂单审计 (Bear) ===\n{auditor_notes}"
+        + debate_pm_block
     )
 
     # v5.4.0: inject the deterministic gate bottom line into the PM prompt (advise mode only).
@@ -1147,6 +1557,7 @@ async def generate_morning_report(
         response_schema=MorningReportDecision,
         temperature=0.15,
         usage_label="report_pm",
+        round_timeout_seconds=cfg.models.report_pm_timeout_seconds,
     )
 
     decision, resolved_pm_raw = await parse_or_repair_structured_json(
@@ -1193,8 +1604,10 @@ async def generate_morning_report(
             )
             if gate_dict is not None:
                 pm_proposal = getattr(resolved_decision, "pick_gate", None)
-                funding_whitelist = set(gate_dict.get("invest", {}).get("unfinanced_positions") or []) | set(
-                    gate_dict.get("invest", {}).get("pending_new_equity_buys") or []
+                funding_whitelist = (
+                    set(gate_dict.get("invest", {}).get("unfinanced_positions") or [])
+                    | set(gate_dict.get("invest", {}).get("pending_new_equity_buys") or [])
+                    | set(gate_dict.get("invest", {}).get("pending_add_equity_buys") or [])
                 )
                 gate_dict["pm"] = reconcile_pm_pick_gate(
                     gate_dict,
@@ -1215,6 +1628,7 @@ async def generate_morning_report(
             if gate_mode == "advise":
                 gate_banner = str(gate_dict.get("banner") or "")
 
+        context_pack["debate"] = debate.payload
         context_pack["report_decision"] = {
             "headline": resolved_decision.headline,
             "top_actions": [a.model_dump() for a in resolved_decision.top_actions],
@@ -1234,10 +1648,11 @@ async def generate_morning_report(
         )
         short_conclusion = f"{resolved_decision.headline} | 重点动作: {actions_summary}"
     else:
-        logger.warning("Morning PM structured parse fell back to plain text.")
-        final_report = holiday_banner + resolved_pm_raw[:max_body_chars]
-        guardrails = []
-        short_conclusion = _extract_conclusion_fallback(final_report)
+        logger.warning("Morning PM structured parse failed; refusing to persist a degraded SOT.")
+        return (
+            "⚠️ /report PM 结构化解析失败，未写入当日基线（避免用半成品晨报锁死当天门控）。"
+            "请稍后重试 /report。"
+        )
 
     if not portfolio.is_fallback:
         await db.save_snapshot(portfolio)
@@ -1263,6 +1678,17 @@ async def generate_morning_report(
             guardrails=guardrails,
             context_pack=context_pack,
         )
+        try:
+            report_recs = _build_report_recommendations(resolved_decision, portfolio, bundles, cfg)
+            if report_recs:
+                await db.log_recommendations(
+                    report_recs,
+                    default_horizon_days=cfg.strategy.settlement_holding_days,
+                    source="report",
+                    dedupe_same_day=True,
+                )
+        except Exception as exc:  # the report must never fail because the ledger hiccuped
+            logger.warning("report recommendation ledger write skipped: %s", exc)
         # Read-only semantic linter (DeepSeek sidecar): never rewrites or blocks the report text.
         await audit_generated_output(
             llm,
@@ -1442,15 +1868,15 @@ async def generate_us_sentinel(
 
     (
         fact_bundle,
-        (morning_report_full, morning_conclusion),
-        guardrails,
+        (morning_report_full, morning_conclusion, morning_stale),
+        (guardrails, guardrails_stale),
         morning_pack,
         vix_hist_map,
         realtime_quotes,
     ) = await asyncio.gather(
         _assemble_fact_sheet_bundle(portfolio, market_data, cfg, us_only=True, db=db),
-        db.get_morning_context(include_premarket=False),
-        db.get_daily_guardrails(),
+        db.get_morning_context_with_status(include_premarket=False),
+        db.get_daily_guardrails_with_status(),
         db.get_context_pack(allow_fallback=False),
         _fetch_vix_hist(),
         _fetch_us_quotes(),
@@ -1513,8 +1939,12 @@ async def generate_us_sentinel(
     }.get(sched.phase, sched.phase)
 
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未生成 /report 红线）"
+    if guardrails_stale:
+        veto_block = "（以下为上一交易日旧红线，仅作参考，严禁当作今日裁决）\n" + veto_block
     # [用户授权调整] 随 /report 放宽至 1800 同步放宽基线切片；IMP-12 请保留。
     morning_baseline = morning_report_full[:1800] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
+    if morning_stale:
+        morning_baseline = "⚠️ 今日 /report 尚未生成，以下为上一交易日基线，严禁当作今日裁决。\n" + morning_baseline
     gate_block = (
         "【本地异动门控：已触发深度复核】\n" + "\n".join(f"• {r}" for r in anomaly_reasons)
         if has_anomaly

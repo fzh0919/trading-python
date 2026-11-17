@@ -25,7 +25,8 @@ _RECOMMENDATION_SELECT_COLS = (
     "id, created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis, "
     "horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, "
     "outcome_status, reflection_lesson, "
-    "t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct"
+    "t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct, "
+    "source, fill_status"
 )
 
 
@@ -70,6 +71,8 @@ def _row_to_recommendation(row: tuple[Any, ...]) -> dict[str, Any]:
         "t20_alpha_pct": row[18],
         "mfe_pct": row[19],
         "mae_pct": row[20],
+        "source": str(row[21] or "pick"),
+        "fill_status": str(row[22] or ""),
     }
 
 
@@ -200,7 +203,9 @@ class AdvisorDatabase:
                     t20_return_pct REAL,
                     t20_alpha_pct REAL,
                     mfe_pct REAL,
-                    mae_pct REAL
+                    mae_pct REAL,
+                    source TEXT DEFAULT 'pick',
+                    fill_status TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -426,6 +431,8 @@ class AdvisorDatabase:
                     "t20_alpha_pct": "REAL",
                     "mfe_pct": "REAL",
                     "mae_pct": "REAL",
+                    "source": "TEXT DEFAULT 'pick'",
+                    "fill_status": "TEXT DEFAULT ''",
                 },
             )
             await _ensure_columns(
@@ -744,6 +751,19 @@ class AdvisorDatabase:
         self, cycle_date: str | None = None, include_premarket: bool = True
     ) -> tuple[str, str]:
         """Return (full_report_with_optional_premarket, short_conclusion) for active cycle or latest available."""
+        report_text, conclusion, _stale = await self.get_morning_context_with_status(
+            cycle_date, include_premarket=include_premarket
+        )
+        return report_text, conclusion
+
+    async def get_morning_context_with_status(
+        self, cycle_date: str | None = None, include_premarket: bool = True
+    ) -> tuple[str, str, bool]:
+        """Return (report, conclusion, stale) where stale means the row is from another cycle.
+
+        ``stale=False`` when the requested cycle exists; when it is missing we fall back to
+        the latest available report and return ``stale=True`` so callers can label or reject it.
+        """
         cdate = cycle_date or self._cycle_id()
         async with self._connect() as db:
             cur = await db.execute(
@@ -751,39 +771,50 @@ class AdvisorDatabase:
                 (cdate,),
             )
             row = await cur.fetchone()
+            stale = False
             if not row:
                 cur = await db.execute(
                     "SELECT report_text, conclusion_text, premarket_note FROM morning_reports ORDER BY updated_at_ms DESC LIMIT 1"
                 )
                 row = await cur.fetchone()
+                stale = row is not None
         if not row:
-            return "", ""
+            return "", "", False
         report_text, conclusion, pre_note = row
         combined = report_text or ""
         if include_premarket and pre_note:
             combined = f"{combined}\n\n【今日美股开盘前哨补充】\n{pre_note}".strip()
-        return combined, (conclusion or "")
+        return combined, (conclusion or ""), stale
 
     async def get_daily_guardrails(self, cycle_date: str | None = None) -> list[str]:
         """Return audited daily risk vetoes / guardrails from /report for current cycle or latest."""
+        guardrails, _stale = await self.get_daily_guardrails_with_status(cycle_date)
+        return guardrails
+
+    async def get_daily_guardrails_with_status(
+        self, cycle_date: str | None = None
+    ) -> tuple[list[str], bool]:
+        """Return (guardrails, stale) for the requested cycle, falling back to the latest row."""
         cdate = cycle_date or self._cycle_id()
         async with self._connect() as db:
             cur = await db.execute(
                 "SELECT daily_guardrails FROM morning_reports WHERE cycle_date = ?", (cdate,)
             )
             row = await cur.fetchone()
+            stale = False
             if not row:
                 cur = await db.execute(
                     "SELECT daily_guardrails FROM morning_reports ORDER BY updated_at_ms DESC LIMIT 1"
                 )
                 row = await cur.fetchone()
+                stale = row is not None
         if not row or not row[0]:
-            return []
+            return [], False
         try:
             items = json.loads(row[0])
-            return [str(x) for x in items if str(x).strip()] if isinstance(items, list) else []
+            return [str(x) for x in items if str(x).strip()] if isinstance(items, list) else [], stale
         except Exception:
-            return []
+            return [], stale
 
     async def get_past_decision_context(self, limit: int = 5) -> str:
         """Brief prior decision log for Portfolio Manager continuity (TradingAgents Memory Log pattern)."""
@@ -834,12 +865,15 @@ class AdvisorDatabase:
         items: list[dict[str, Any]],
         *,
         default_horizon_days: int = 5,
+        source: str = "pick",
+        dedupe_same_day: bool = False,
     ) -> None:
         if not items:
             return
         now_ms = int(time.time() * 1000)
         now_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
         fallback_horizon = max(1, int(default_horizon_days))
+        default_source = str(source or "pick").strip().lower() or "pick"
         rows_to_insert = [
             (
                 str(item.get("created_at_uk") or now_uk),
@@ -851,17 +885,43 @@ class AdvisorDatabase:
                 str(item.get("thesis") or "")[:300],
                 max(1, int(item["horizon_days"])) if item.get("horizon_days") is not None else fallback_horizon,
                 str(item.get("benchmark_symbol") or "").strip().upper(),
+                str(item.get("source") or default_source).strip().lower() or "pick",
+                str(
+                    item.get("fill_status")
+                    or ("ASSUMED" if default_source == "report" else "")
+                ).strip().upper(),
             )
             for item in items
         ]
         async with self._connect(write=True) as db:
+            if dedupe_same_day:
+                cur = await db.execute(
+                    """
+                    SELECT account, symbol, action
+                    FROM pick_recommendations
+                    WHERE source = ? AND substr(created_at_uk, 1, 10) = ?
+                    """,
+                    (default_source, now_uk[:10]),
+                )
+                existing = {
+                    (str(r[0]).strip().upper(), str(r[1]).strip().upper(), str(r[2]).strip().upper())
+                    for r in await cur.fetchall()
+                }
+                rows_to_insert = [
+                    row
+                    for row in rows_to_insert
+                    if (str(row[2]).strip().upper(), str(row[3]).strip().upper(), str(row[4]).strip().upper())
+                    not in existing
+                ]
+                if not rows_to_insert:
+                    return
             await db.executemany(
                 """
                 INSERT INTO pick_recommendations (
                     created_at_uk, created_at_ms, account, symbol, action, entry_price,
-                    thesis, horizon_days, benchmark_symbol, outcome_status
+                    thesis, horizon_days, benchmark_symbol, source, fill_status, outcome_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
                 """,
                 rows_to_insert,
             )
@@ -907,11 +967,13 @@ class AdvisorDatabase:
         reflection_lesson: str = "",
         mfe_pct: float | None = None,
         mae_pct: float | None = None,
+        fill_status: str | None = None,
     ) -> bool:
         """Idempotently settle a PENDING recommendation; returns False if already settled."""
         status = str(outcome_status or "SETTLED").strip().upper()
         bench = str(benchmark_symbol or "").strip().upper()
         lesson = str(reflection_lesson or "").strip()[:600]
+        fill = str(fill_status or "").strip().upper()
         async with self._connect(write=True) as db:
             cur = await db.execute(
                 """
@@ -923,7 +985,8 @@ class AdvisorDatabase:
                     outcome_status = ?,
                     reflection_lesson = ?,
                     mfe_pct = COALESCE(?, mfe_pct),
-                    mae_pct = COALESCE(?, mae_pct)
+                    mae_pct = COALESCE(?, mae_pct),
+                    fill_status = CASE WHEN ? = '' THEN fill_status ELSE ? END
                 WHERE id = ? AND (outcome_status IS NULL OR outcome_status = 'PENDING')
                 """,
                 (
@@ -935,6 +998,8 @@ class AdvisorDatabase:
                     lesson,
                     mfe_pct,
                     mae_pct,
+                    fill,
+                    fill,
                     int(rec_id),
                 ),
             )
@@ -1032,6 +1097,7 @@ class AdvisorDatabase:
                     COUNT(*),
                     COALESCE(SUM(CASE WHEN outcome_status IS NULL OR outcome_status = 'PENDING' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN outcome_status = 'SKIPPED' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN outcome_status = 'NOT_FILLED' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' AND raw_return_pct > 0 THEN 1 ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' AND alpha_pct > 0 THEN 1 ELSE 0 END), 0),
@@ -1050,6 +1116,7 @@ class AdvisorDatabase:
                 "total_count": 0,
                 "pending_count": 0,
                 "skipped_count": 0,
+                "not_filled_count": 0,
                 "settled_count": 0,
                 "win_count": 0,
                 "alpha_win_count": 0,
@@ -1062,24 +1129,25 @@ class AdvisorDatabase:
                 "avg_mfe_pct": None,
                 "avg_mae_pct": None,
             }
-        settled = int(row[3] or 0)
-        win_cnt = int(row[4] or 0)
-        alpha_win_cnt = int(row[5] or 0)
+        settled = int(row[4] or 0)
+        win_cnt = int(row[5] or 0)
+        alpha_win_cnt = int(row[6] or 0)
         return {
             "total_count": int(row[0] or 0),
             "pending_count": int(row[1] or 0),
             "skipped_count": int(row[2] or 0),
+            "not_filled_count": int(row[3] or 0),
             "settled_count": settled,
             "win_count": win_cnt,
             "alpha_win_count": alpha_win_cnt,
             "win_rate_pct": round((win_cnt / settled) * 100.0, 1) if settled > 0 else 0.0,
             "alpha_win_rate_pct": round((alpha_win_cnt / settled) * 100.0, 1) if settled > 0 else 0.0,
-            "avg_raw_return_pct": round(float(row[6]), 2) if row[6] is not None else None,
-            "avg_alpha_pct": round(float(row[7]), 2) if row[7] is not None else None,
-            "avg_t10_alpha_pct": round(float(row[8]), 2) if row[8] is not None else None,
-            "avg_t20_alpha_pct": round(float(row[9]), 2) if row[9] is not None else None,
-            "avg_mfe_pct": round(float(row[10]), 2) if row[10] is not None else None,
-            "avg_mae_pct": round(float(row[11]), 2) if row[11] is not None else None,
+            "avg_raw_return_pct": round(float(row[7]), 2) if row[7] is not None else None,
+            "avg_alpha_pct": round(float(row[8]), 2) if row[8] is not None else None,
+            "avg_t10_alpha_pct": round(float(row[9]), 2) if row[9] is not None else None,
+            "avg_t20_alpha_pct": round(float(row[10]), 2) if row[10] is not None else None,
+            "avg_mfe_pct": round(float(row[11]), 2) if row[11] is not None else None,
+            "avg_mae_pct": round(float(row[12]), 2) if row[12] is not None else None,
         }
 
     async def get_settled_outcome_series(self, limit: int = 400) -> list[dict[str, Any]]:
@@ -1487,6 +1555,15 @@ class AdvisorDatabase:
                 VALUES (?, ?, ?)
                 """,
                 (job_name, uk_date, fired_at_uk),
+            )
+            await db.commit()
+
+    async def clear_scheduler_job_fired(self, job_name: str, uk_date: str) -> None:
+        """Release a claimed one-shot run so a transient failure can be retried."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "DELETE FROM scheduler_runs WHERE job_name = ? AND uk_date = ?",
+                (job_name, uk_date),
             )
             await db.commit()
 
