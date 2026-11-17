@@ -1,0 +1,12 @@
+# Cline 文件访问黑名单：凭证 / 实盘数据 / 日志 / 第三方参考仓库一律不读
+.env
+.env.*
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+_ref/

@@ -25,6 +25,18 @@
 16. **收盘后净值补采（`src/bot/scheduler.py`）**：新增 `NAV_SNAPSHOT_START_MINUTES=21:40` / `NAV_SNAPSHOT_END_MINUTES=22:00`（UK，工作日）与 `_run_nav_snapshot_job()`：盘后拉一次 `get_portfolio(use_cache=False)`，`is_fallback` 或净值 ≤0 直接跳过（铁律 2），用缓存中的基准 VWRP 收盘价构造并 upsert 一行 NAV（`uk_date` 主键 → 覆盖当日 07:30 盘前值，整条曲线统一为收盘口径）；窗口排在 prewarm（21:20）与周五 weekly_radar（21:30~21:35）之后、每日结算（22:00）之前，避免作业互抢；`_claim_job_run("nav_snapshot")` 保证每日只跑一次。
 17. **Finnhub Basic Financials 补值（`src/data_providers/market_data.py`, `src/engine/screener.py`）**：新增 `FinnhubClient.get_basic_financials()`（`/stock/metric?metric=all`，免费档、仅美股），字段按别名候选解析（`pb|pbAnnual|priceToBookRatio`、`evEbitdaTTM|evEbitda|…`、`currentRatio|currentRatioAnnual|currentRatioQuarterly`、`beta`），只接受正的有限值，`0/null/n-a` 一律视为缺失；新增纯函数 `apply_basic_financials()` **只补空位、不覆盖 yfinance 已有值**；`TickerMarketBundle` 增 `price_to_book` / `ev_ebitda` / `current_ratio` / `metrics_source`；`get_bundles` 在 `include_info` 阶段对美股（非 ETF）并发补齐，**上限 40 只**防止宽漏斗打爆 60 次/分免费额度；`score_candidate` 维度 3 新增 PB（ISA 1~6 倍、Invest 1.5~8 倍线性）与 EV/EBITDA（8~25 倍）两项，仅在数据存在时计分，缺失不加不减，维度 3 仍夹 0~25 不变。
 18. **单测**：`tests/test_nav_performance.py` 扩至 19 例（新增 Basic Financials 别名解析 / 零值拒绝 / 只补不覆盖 / 空数据无操作，以及盘后 NAV 作业写入与 fallback 跳过）；全量回归 `test_analytics_and_rules 49`、`test_db_and_end_to_end 32`、`test_t212+sidecar+intraday+ds+llm+wallet 120`、`test_v504+db_storage+step2 39`、`test_universe+market_data 21`、`test_calendar_and_scheduler 9`、`test_nav_performance 19` 全绿。
+### `v5.3.5`（2026-11-17）
+
+P1 安全加固批次：出网端点白名单在配置加载期硬校验（第三方中转须显式 allowlist 放行），日志/诊断输出统一脱敏出口，新增只读出网审计脚本（不接 CI，仅辅助人工 review）。运行期行为与指令输出零变化。
+
+
+19. **出网白名单硬校验（`src/config.py`, `.env.example`；P1 安全加固）**：`EnvSettings` 新增 `llm_egress_allowed_hosts` / `t212_egress_allowed_hosts`（默认空）与纯函数 `_normalize_https_endpoint()`，并以 `model_validator(mode="after")` 在**配置加载期**强制校验两个可配置出网端点：`DEEPSEEK_BASE_URL` 仅允许 `api.deepseek.com`（同表登记 `generativelanguage.googleapis.com` / `api.anthropic.com` 备用），`T212_BASE_URL` 仅允许 `live.trading212.com` / `demo.trading212.com`；一律强制 `https`，第三方中转必须通过 `*_EGRESS_ALLOWED_HOSTS` 显式放行，并自动去尾部斜杠。目的：杜绝「改一行 base_url 把 API Key 或持仓明文导向第三方」，且 Agent 无法仅靠修改代码常量放宽出口。`.env.example` 同步补充说明与示例。
+20. **离线单测（`tests/test_llm_pricing_and_usage.py` 新增 `TestEgressGuards` 7 例）**：默认锚定官方 https 端点、`http://` 拒绝、未登记主机拒绝、显式 allowlist 放行中转（含尾部斜杠归一）、T212 端点篡改拒绝、demo 端点放行、空值回落官方默认。
+21. **统一脱敏出口（新增 `src/redaction.py`；`src/data_providers/market_data.py`, `src/bot/handlers.py`）**：新增纯函数 `redact_secrets()`（`token=` / `api_key=` / `access_token=` / `secret=` / `password=` / `sig=` 等 query 参数与 `Bearer` / `Basic` 头值统一替换为 `***`，其余文本零改动）；`market_data.py` 新增 `_safe_exc()` 并接入 Finnhub 六类接口与 FRED 的**全部** `last_error` 异常文案（company-news / calendar / quote / profile2 / recommendation / earnings / insider-sentiment / metric / FRED）；`handlers.py` 的 `/diag`（`/health`）在渲染 `finnhub.last_error`、`fred.last_error` 与账户 `acc.error` 时二次兜底脱敏。目的：即使未来有人加 `raise_for_status()` 或把完整 URL 写进错误文案，Finnhub/FRED 的 `token=` / `api_key=` 也不会进 docker logs 或 Telegram。
+22. **出网静态审计脚本（新增 `scripts/audit_egress.py`，纯 stdlib 只读）**：扫描 `src/`（`--tests` 可扩到 `tests/`），输出六类结果——未知出网主机（FAIL）、日志/print 直接求值密钥（FAIL）、URL 字面量内嵌密钥（WARN，如 Telegram `bot{token}`，依赖 `main.py` 的 httpx 日志抑制）、环境变量读取点（INFO）、进程拉起/动态执行（INFO）、运行期依赖漂移（FAIL）。基线实测：33 个文件、7 个已知主机、0 未知、0 密钥日志、依赖零漂移，`RESULT: CLEAN`（退出码 0）。作为人工 review 的辅助工具，不接入 CI，避免脚本自身成为新的信任点。
+23. **离线单测（`tests/test_v504_ops_and_grounding.py` 新增 `TestRedaction` 5 例）**：query 参数脱敏（保留 `symbol=`）、`Bearer` / `Basic` 头脱敏、纯文本零改动、空输入安全、Finnhub `last_error` 在 `ConnectError` 携带完整 URL 且含真实 Key 时仍不含 Key。
+
+
 
 
 

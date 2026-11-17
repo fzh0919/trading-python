@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
@@ -12,6 +13,55 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 ThinkingLevelLiteral = Literal["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"]
+
+# --- Outbound egress allowlists (defence in depth) ---------------------------------------
+# A tampered `base_url` is the cheapest way to ship an API key or the full portfolio plaintext
+# to a third party, so every configurable endpoint must stay on an official vendor domain
+# unless the operator explicitly opts in through `.env`.
+_DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+_DEFAULT_T212_BASE_URL = "https://live.trading212.com/api/v0"
+_LLM_EGRESS_HOSTS: frozenset[str] = frozenset(
+    {
+        "api.deepseek.com",  # DeepSeek 官方
+        "generativelanguage.googleapis.com",  # Gemini 官方（SDK 侧固定，登记备查）
+        "api.anthropic.com",  # Claude 官方（预留：后续接入 Claude 节点时复用）
+    }
+)
+_T212_EGRESS_HOSTS: frozenset[str] = frozenset({"live.trading212.com", "demo.trading212.com"})
+
+
+def _normalize_https_endpoint(
+    raw: str,
+    *,
+    allowed: frozenset[str],
+    extra_hosts: str,
+    field: str,
+    fallback: str,
+) -> str:
+    """Validate an outbound base URL: https only, host must be allowlisted.
+
+    Third-party hosts can never be introduced by a code edit alone — they have to be opted in
+    explicitly through the matching ``*_EGRESS_ALLOWED_HOSTS`` environment variable.
+    """
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return fallback
+    parsed = urlparse(value)
+    if parsed.scheme.lower() != "https":
+        raise ValueError(
+            f"{field} 必须使用 https（当前 scheme={parsed.scheme or '空'}）；"
+            "明文传输会直接暴露 API Key 与持仓明文。"
+        )
+    host = (parsed.hostname or "").strip().lower()
+    permitted = set(allowed)
+    permitted |= {h.strip().lower() for h in str(extra_hosts or "").split(",") if h.strip()}
+    if host not in permitted:
+        raise ValueError(
+            f"{field} 主机 {host or '(空)'} 不在出网白名单内。"
+            f"官方端点：{', '.join(sorted(allowed))}；如确需第三方中转，"
+            "请在 .env 显式设置对应的 *_EGRESS_ALLOWED_HOSTS 追加主机。"
+        )
+    return value
 
 
 def _normalize_symbol_list(raw: Any) -> list[str]:
@@ -49,6 +99,29 @@ class EnvSettings(BaseSettings):
     t212_base_url: str = "https://live.trading212.com/api/v0"
     ops_notify_url: str = ""
     ops_notify_token: str = ""
+    # Explicit opt-in allowlist for third-party model relays (comma separated hostnames).
+    # Leave empty to keep every outbound base_url pinned to the official vendor domain.
+    llm_egress_allowed_hosts: str = ""
+    t212_egress_allowed_hosts: str = ""
+
+    @model_validator(mode="after")
+    def _guard_egress_endpoints(self) -> "EnvSettings":
+        """Fail fast when a base_url could ship credentials or portfolio plaintext to a third party."""
+        self.deepseek_base_url = _normalize_https_endpoint(
+            self.deepseek_base_url,
+            allowed=_LLM_EGRESS_HOSTS,
+            extra_hosts=self.llm_egress_allowed_hosts,
+            field="DEEPSEEK_BASE_URL",
+            fallback=_DEFAULT_DEEPSEEK_BASE_URL,
+        )
+        self.t212_base_url = _normalize_https_endpoint(
+            self.t212_base_url,
+            allowed=_T212_EGRESS_HOSTS,
+            extra_hosts=self.t212_egress_allowed_hosts,
+            field="T212_BASE_URL",
+            fallback=_DEFAULT_T212_BASE_URL,
+        )
+        return self
 
 
 class AppSection(BaseModel):

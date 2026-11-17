@@ -26,10 +26,17 @@ except Exception:  # pragma: no cover - defensive import across yfinance version
     class YFRateLimitError(Exception):
         pass
 
+from src.redaction import redact_secrets
+
 logger = logging.getLogger(__name__)
 
 _MINOR_UNIT_CURRENCIES = {"GBp", "GBX", "ZAc", "ILA"}
 _PLACEHOLDER_STRINGS = {"none", "n/a", "na", "nan", "null", "-"}
+
+
+def _safe_exc(exc: BaseException) -> str:
+    """Format an exception for user-facing error text with credential fragments masked."""
+    return f"{type(exc).__name__}: {redact_secrets(str(exc))}"
 
 # IMP-17: yfinance-independent Yahoo transport (same vendor, no new key).
 _YAHOO_CHART_HOSTS: tuple[str, ...] = ("query1.finance.yahoo.com", "query2.finance.yahoo.com")
@@ -586,7 +593,7 @@ class FinnhubClient:
                 )
             return out, None
         except Exception as exc:
-            err = f"company-news {type(exc).__name__}: {exc}"
+            err = f"company-news {_safe_exc(exc)}"
             logger.debug("Finnhub news error for %s: %s", symbol, exc)
             return [], err
 
@@ -624,7 +631,7 @@ class FinnhubClient:
                 mapping.setdefault(sym, (dt_str, eps_note))
             return mapping, None
         except Exception as exc:
-            err = f"calendar/earnings {type(exc).__name__}: {exc}"
+            err = f"calendar/earnings {_safe_exc(exc)}"
             logger.debug("Finnhub earnings calendar error: %s", exc)
             return {}, err
 
@@ -665,7 +672,7 @@ class FinnhubClient:
                 "prev_close": _safe_float(data.get("pc")),
             }
         except Exception as exc:
-            self.last_error = f"quote {type(exc).__name__}: {exc}"
+            self.last_error = f"quote {_safe_exc(exc)}"
             logger.debug("Finnhub quote error for %s: %s", symbol, exc)
             return None
 
@@ -697,7 +704,7 @@ class FinnhubClient:
                 "isin": clean_isin,
             }
         except Exception as exc:
-            self.last_error = f"profile2 {type(exc).__name__}: {exc}"
+            self.last_error = f"profile2 {_safe_exc(exc)}"
             logger.debug("Finnhub profile2 error for %s: %s", clean_isin, exc)
             return None
 
@@ -732,7 +739,7 @@ class FinnhubClient:
                 for r in rows[:2]
             ]
         except Exception as exc:
-            self.last_error = f"recommendation {type(exc).__name__}: {exc}"
+            self.last_error = f"recommendation {_safe_exc(exc)}"
             return []
 
     async def get_earnings_surprises(
@@ -764,7 +771,7 @@ class FinnhubClient:
                 for r in rows[:limit]
             ]
         except Exception as exc:
-            self.last_error = f"earnings {type(exc).__name__}: {exc}"
+            self.last_error = f"earnings {_safe_exc(exc)}"
             return []
 
     async def get_insider_sentiment(
@@ -802,7 +809,7 @@ class FinnhubClient:
                 "mspr": _safe_float(latest.get("mspr")),
             }
         except Exception as exc:
-            self.last_error = f"insider-sentiment {type(exc).__name__}: {exc}"
+            self.last_error = f"insider-sentiment {_safe_exc(exc)}"
             return None
 
 
@@ -834,7 +841,7 @@ class FinnhubClient:
             self.last_error = None
             return metrics
         except Exception as exc:
-            self.last_error = f"metric {type(exc).__name__}: {exc}"
+            self.last_error = f"metric {_safe_exc(exc)}"
             return None
 
 
@@ -891,7 +898,7 @@ class FredClient:
                 "change_20d": (latest - vals[20]) if len(vals) >= 21 else None,
             }, None
         except Exception as exc:
-            err = f"FRED {series_id} {type(exc).__name__}: {exc}"
+            err = f"FRED {series_id} {_safe_exc(exc)}"
             logger.debug("FRED error for %s: %s", series_id, exc)
             return {}, err
 

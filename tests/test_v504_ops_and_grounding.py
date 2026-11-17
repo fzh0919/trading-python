@@ -24,10 +24,11 @@ from src.bot.handlers import BOT_COMMANDS, REMOVE_KEYBOARD_MARKUP, AdvisorBot
 from src.bot.scheduler import TradingScheduler
 from src.bot.telegram_client import TelegramClient, TelegramPollError
 from src.config import AppConfig, AppSection, EnvSettings
-from src.data_providers.market_data import MacroSnapshot, MarketDataService
+from src.data_providers.market_data import FinnhubClient, MacroSnapshot, MarketDataService
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData, T212Client
 from src.healthcheck import check_health, write_heartbeat
 from src.ops_notifier import OpsNotifier, send_ops_notify_sync
+from src.redaction import redact_secrets
 from src.storage.db import AdvisorDatabase, get_trading_cycle_id
 from src.version import APP_VERSION
 
@@ -1603,6 +1604,48 @@ class TestTelegram502SilentFailureFix(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(tg.sent[-1][1], "第二次答案")
             finally:
                 await db.close()
+
+
+class TestRedaction(unittest.TestCase):
+    """Credentials must never survive into user-facing error text."""
+
+    def test_query_parameters_are_masked(self) -> None:
+        raw = "connect failed for https://finnhub.io/api/v1/quote?symbol=AAPL&token=SECRET123"
+        out = redact_secrets(raw)
+        self.assertNotIn("SECRET123", out)
+        self.assertIn("token=***", out)
+        self.assertIn("symbol=AAPL", out)
+
+    def test_authorization_headers_are_masked(self) -> None:
+        self.assertNotIn("sk-live-abcdef123456", redact_secrets("Authorization: Bearer sk-live-abcdef123456"))
+        self.assertNotIn("dXNlcjpwYXNzd29yZA", redact_secrets("Authorization: Basic dXNlcjpwYXNzd29yZA=="))
+
+    def test_ordinary_prose_is_not_over_redacted(self) -> None:
+        for text in ("basic description of the trade", "bearer of good news"):
+            self.assertEqual(redact_secrets(text), text)
+
+    def test_plain_text_is_untouched(self) -> None:
+        text = "T212 ISA 净值 GBP 1,234.00 | 挂单占用 0.00"
+        self.assertEqual(redact_secrets(text), text)
+
+    def test_empty_input_is_safe(self) -> None:
+        self.assertEqual(redact_secrets(""), "")
+        self.assertEqual(redact_secrets(None), "")  # type: ignore[arg-type]
+
+    def test_finnhub_last_error_never_contains_the_api_key(self) -> None:
+        async def _boom(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(f"connect failed for {request.url}", request=request)
+
+        async def _run() -> str | None:
+            finnhub = FinnhubClient(api_key="REALKEY123")
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_boom)) as client:
+                await finnhub.get_quote(client, "AAPL")
+            return finnhub.last_error
+
+        err = asyncio.run(_run())
+        assert err is not None
+        self.assertNotIn("REALKEY123", err)
+        self.assertIn("ConnectError", err)
 
 
 if __name__ == "__main__":

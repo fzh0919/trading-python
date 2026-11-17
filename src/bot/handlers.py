@@ -26,6 +26,7 @@ from src.data_providers.analytics import (
 from src.data_providers.market_data import MarketDataService
 from src.data_providers.t212_client import T212Client, reconcile_invest_wallets
 from src.engine.screener import run_universe_audition
+from src.redaction import redact_secrets
 from src.storage.db import AdvisorDatabase
 from src.version import APP_VERSION
 
@@ -732,7 +733,7 @@ class AdvisorBot:
 
         def _acc_line(label: str, acc: Any) -> str:
             if not acc.ok:
-                return f"⚠️ {label}: 失败 ({str(acc.error)[:80]})"
+                return f"⚠️ {label}: 失败 ({redact_secrets(str(acc.error))[:80]})"
             ord_s = "挂单✓" if acc.pending_orders_supported else "挂单403/关"
             hist_s = "历史✓" if acc.order_history_supported else "历史403/关"
             if getattr(acc, "is_fallback", False):
@@ -760,12 +761,12 @@ class AdvisorBot:
             yf_status = "✅ 正常"
 
         finnhub_status = (
-            f"⚠️ 异常 ({self.market_data.finnhub.last_error})"
+            f"⚠️ 异常 ({redact_secrets(str(self.market_data.finnhub.last_error))})"
             if self.market_data.finnhub.last_error
             else ("✅ 已配置正常" if self.market_data.finnhub.enabled else "➖ 未配置")
         )
         fred_status = (
-            f"⚠️ 异常 ({self.market_data.fred.last_error})"
+            f"⚠️ 异常 ({redact_secrets(str(self.market_data.fred.last_error))})"
             if self.market_data.fred.last_error
             else ("✅ 已配置正常" if self.market_data.fred.enabled else "➖ 未配置")
         )

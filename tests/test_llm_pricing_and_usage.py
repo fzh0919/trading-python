@@ -10,6 +10,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from google.genai import types
@@ -23,7 +24,7 @@ from src.agents.llm_client import (
     normalize_thinking_level,
 )
 from src.agents.schemas import MorningReportDecision, parse_structured_json
-from src.config import ModelsSection, StrategySection, load_config
+from src.config import EnvSettings, ModelsSection, StrategySection, load_config
 from src.ops_notifier import OpsNotifier
 from src.storage.db import AdvisorDatabase
 
@@ -790,6 +791,52 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             self.assertIn("pending_order_audits", ds_json_payloads[0]["messages"][0]["content"])
             await client.close()
             await db.close()
+
+
+class TestEgressGuards(unittest.TestCase):
+    """A tampered base_url must never ship API keys or portfolio plaintext to a third party."""
+
+    def test_defaults_pin_official_https_endpoints(self) -> None:
+        cfg = load_config("config.yaml", env_file=None)
+        self.assertEqual(cfg.env.deepseek_base_url, "https://api.deepseek.com")
+        self.assertEqual(cfg.env.t212_base_url, "https://live.trading212.com/api/v0")
+
+    def test_plain_http_endpoint_is_rejected(self) -> None:
+        with patch.dict(os.environ, {"DEEPSEEK_BASE_URL": "http://relay.example.com/v1"}):
+            with self.assertRaises(ValidationError):
+                EnvSettings(_env_file=None)
+
+    def test_unlisted_host_is_rejected_by_default(self) -> None:
+        with patch.dict(os.environ, {"DEEPSEEK_BASE_URL": "https://relay.example.com/v1"}):
+            with self.assertRaises(ValidationError):
+                EnvSettings(_env_file=None)
+
+    def test_explicit_allowlist_unlocks_relay_and_trims_slash(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_BASE_URL": "https://relay.example.com/v1/",
+                "LLM_EGRESS_ALLOWED_HOSTS": "relay.example.com, mirror.example.com",
+            },
+        ):
+            env = EnvSettings(_env_file=None)
+        self.assertEqual(env.deepseek_base_url, "https://relay.example.com/v1")
+
+    def test_t212_endpoint_tampering_is_rejected(self) -> None:
+        with patch.dict(os.environ, {"T212_BASE_URL": "https://evil.example.com/api/v0"}):
+            with self.assertRaises(ValidationError):
+                EnvSettings(_env_file=None)
+
+    def test_demo_t212_endpoint_is_allowed(self) -> None:
+        with patch.dict(os.environ, {"T212_BASE_URL": "https://demo.trading212.com/api/v0"}):
+            env = EnvSettings(_env_file=None)
+        self.assertEqual(env.t212_base_url, "https://demo.trading212.com/api/v0")
+
+    def test_blank_endpoint_falls_back_to_official_default(self) -> None:
+        with patch.dict(os.environ, {"DEEPSEEK_BASE_URL": "", "T212_BASE_URL": ""}):
+            env = EnvSettings(_env_file=None)
+        self.assertEqual(env.deepseek_base_url, "https://api.deepseek.com")
+        self.assertEqual(env.t212_base_url, "https://live.trading212.com/api/v0")
 
 
 if __name__ == "__main__":

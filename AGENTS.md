@@ -35,6 +35,7 @@
 | `agents/chat_agent.py` | `/pos` 0-Token 查仓、Implicit Cache 前缀、标的切片、`/deep` 与带原话偏好注入（dynamic_tail） | `test_db_and_end_to_end.py` |
 | `bot/handlers.py`, `bot/scheduler.py`, `bot/telegram_client.py` | 指令路由、`execution_lock` 互斥、`/perf` 0-Token 绩效看板（TWR/回撤/Alpha-Beta-IR/胜率/HHI/t 值）、自动日程、盘后 21:40 NAV 补采、`T+5/10/20` 结算、`/wallet`/`/usd` 双钱包校准、盘中哨兵、挂单成交回执（快照比对 + 历史成交交叉验证）、周六策略周报（含 VWRP 基准闭环）、偏好抽取 | `test_calendar_and_scheduler.py`, `test_db_and_end_to_end.py`, `test_sidecar_memory_and_weekly.py`, `test_intraday_sentinel.py`, `test_nav_performance.py` |
 | `ops_notifier.py`, `healthcheck.py`, `main.py` | `ops-notify` 双态告警、心跳/只读 DB 探活、生命周期管理 | `test_v504_ops_and_grounding.py` |
+| `redaction.py` | 日志/告警/诊断输出统一脱敏出口（`token=` / `api_key=` / `Bearer` / `Basic` → `***`）；`market_data` 全部 `last_error` 与 `/diag` 渲染均经此函数 | `test_v504_ops_and_grounding.py` |
 
 ## 三、开发验收命令
 
@@ -44,9 +45,56 @@
 ```
 
 - 单文件快测：`.\.venv\Scripts\python.exe -m unittest tests.<模块名>`（全部离线 Mock，无真实网络请求；行情桩须含 `Open/High/Low/Close/Volume`）。
+- 出网与脱敏自查：`.\.venv\Scripts\python.exe scripts\audit_egress.py`（只读扫描；未知出网主机 / 日志求值密钥 / 依赖漂移 → 退出码 1，需人工复核后再提交）。
 - 每次功能迭代完成后，将变更追加至 [`CHANGELOG.md`](./CHANGELOG.md) 顶部当前版本下。
 
 ## 四、部署与容器
 
 - 容器名 `t212-ai-advisor`；发版统一走根目录 `scripts\deploy-n95.ps1`（见根 `AGENTS.md` 红线第 6 条：自研项目走 Git + 脚本发版，严禁在 Dockge 网页端直接修改本项目 `docker-compose.yml`）。
 - 本项目无宿主机映射端口（纯出站：T212 只读 API + Telegram Long Polling），容器登记见根 `DEPLOYMENT_CHEATSHEET.md` 的「核心运维与现有容器入口总览」表。
+
+## 五、Agent / 第三方模型接入边界（P1 安全红线）
+
+> 允许用 DeepSeek / Gemini / Claude（含第三方中转站）辅助开发；但**出网目标与凭据边界不得由代码决定**。
+
+### 5.1 出网白名单（代码强制，非口头约定）
+
+`src/config.py` 的 `EnvSettings._guard_egress_endpoints` 在**配置加载期**校验，不通过直接抛 `ValueError`（进程起不来）：
+
+| 配置项 | 默认允许主机 | 放宽方式（仅 `.env`） |
+| :--- | :--- | :--- |
+| `DEEPSEEK_BASE_URL` | `api.deepseek.com`（同表登记 `generativelanguage.googleapis.com` / `api.anthropic.com` 备用） | `LLM_EGRESS_ALLOWED_HOSTS=relay.example.com` |
+| `T212_BASE_URL` | `live.trading212.com` / `demo.trading212.com` | `T212_EGRESS_ALLOWED_HOSTS=...` |
+
+- 一律强制 `https`，`http://` 直接拒绝（防 API Key 与持仓明文裸奔）。
+- **放宽出口只能改 `.env`，不得改 `_LLM_EGRESS_HOSTS` / `_T212_EGRESS_HOSTS` 常量**；任何「顺手把中转域名写进常量」的改动视为红灯。
+
+### 5.2 红线文件（禁止擅自修改，需人工逐行 review）
+
+`.gitignore`、`.dockerignore`、`src/config.py`（白名单/Envs）、`src/agents/llm_client.py`（egress/密钥）、`src/data_providers/t212_client.py`（鉴权段）、`src/ops_notifier.py`、`Dockerfile`、`docker-compose.yml`、`D:\HOMELAB\scripts\*.ps1`、`pyproject.toml` / `requirements.txt`（**新增依赖等同红灯**）。
+
+> `sync-up.ps1` 与 `deploy-n95.ps1` 已内置**敏感路径提交/推送闸**（拦截 `.env`、`data/`、`*.db`、`logs/`、`_ref/`）。该闸**不得移除、放宽或绕过**；如需调整正则，必须两侧脚本同步并经人工确认。
+
+### 5.3 交付前 diff 自查 5 条
+
+1. 是否新增 `http(s)://` 出网字面量或新域名？
+2. 是否新增日志/异常打印 `api_key` / `token` / `secret` / `cfg.env`？
+3. 是否新增读取环境变量（尤其凭据类）？
+4. 是否改动 `base_url` / 超时 / 重试 / 灾备链？
+5. 是否改动风控护栏开关（`pick_rr_guard_mode` / `trade_cadence_guard_mode` / `intraday_fill_receipt_enabled` 等）？
+
+任一为「是」→ 必须在该次变更说明中显式列出并等待人工确认。
+
+### 5.4 会话分工
+
+| 档 | 可用第三方模型 / 中转 | 范围 |
+| :--- | :--- | :--- |
+| 🟢 绿 | ✅ | 读代码、写/跑**离线**单测、文档、注释、非红线文件重构 |
+| 🟡 黄 | ✅（需 5.3 自查） | SQL / 指标计算 / 文案 / 日志措辞 |
+| 🔴 红 | ❌ 官方端点或人工逐行 review | 5.2 全部红线文件 + 任何新增依赖 |
+
+### 5.5 Agent 执行禁区
+
+- 禁止执行：`git push`、`D:\HOMELAB\scripts\deploy-n95.ps1`、`sync-up.ps1`、`ssh`、`docker exec ... env`、`pip install`、任何 `curl | bash`。
+- 密钥只做**布尔探测**（`Test-Path` / `[bool]$env:X`），严禁 `Get-Content .env`，严禁在回复中回显密钥片段。
+
