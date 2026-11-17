@@ -6,7 +6,7 @@
 盘中哨兵与语义质检的 3 处隐患修复（代码审查发现，均先复现再修）：
 
 1. **盘中哨兵不再吃日线陈旧价（`src/bot/scheduler.py`）**：`get_bundles(include_info=False)` 分支只回落到 `2y` 日线末根 `Close`，15 分钟缓存内会读到旧价、美股开盘初期还可能因当日日线未生成而整段跳过。现改为三层实时价覆盖：**Finnhub `get_us_realtime_quote()`（美股真实时价 + `prev_close`）→ T212 持仓 `cur_price` → 日线末根 Close**，并用 Finnhub `prev_close` 作为涨跌幅基准；`_intraday_move_pct()` 新增 `prev_close` 入参，日线末根为昨日时改用该根 Close 作前收（仅当滞后 >10 天才判定不可用，避免陈旧缓存伪装成日内波动）。
-2. **止损挂单纳入逼近判定 + 发送失败不占当日去重（`src/bot/scheduler.py`）**：`_order_distance_pct()` 同时兼容 `limit_price` 与 `stop_price`（取最小触发距离），修掉止损挂单逼近被漏报；推送改为检查 `send_message()` 的布尔返回值，`False` 时 `continue` 不写 `scheduler_runs("intraday_alert:{sym}")`，当天后续扫描可正常补推。
+2. **止损挂单纳入逼近判定 + 发送失败不占去重 + 英股 `GBp/GBP` 100 倍单位对齐（`src/bot/scheduler.py`）**：`_order_distance_pct()` 同时兼容 `limit_price` 与 `stop_price`（取最小触发距离），修掉止损挂单逼近被漏报；抽取 `_align_lse_unit_100x()` 为 `.L` 英股盘中涨跌与挂单距离补齐 `GBp/GBP` 100 倍防错位护栏；推送改为检查 `send_message()` 的布尔返回值，`False` 时 `continue` 不写 `scheduler_runs("intraday_alert:{sym}")`，当天后续扫描可正常补推。
 3. **语义质检数值底座放宽截断（`src/agents/semantic_auditor.py`）**：`build_fact_baseline()` 的 FactSheet 上限 `4000 → 12000` 字符，消除 ~20 只持仓时排名靠后标的正常报价被判「幻觉价位」的误报 WARN。
 4. **回归单测**：`tests/test_intraday_sentinel.py` 增至 15 条（新增 Finnhub 实时价覆盖昨日日线、`prev_close` 基准优先、止损价逼近、发送失败不占去重额度并可下轮补推、陈旧日线保护）；`tests/test_ds_pick_prefilter_and_auditor.py` 增至 20 条（新增 >4k 字符 FactSheet 尾部数值不丢）。
 

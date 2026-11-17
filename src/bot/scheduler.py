@@ -138,6 +138,20 @@ def _extract_closed_daily_closes(
     return ohlc["Close"]
 
 
+def _align_lse_unit_100x(value: float, reference: float, symbol: str = "") -> float:
+    """Align 100x GBp/GBP unit mismatch on London (.L) instruments against a reference price."""
+    if symbol and not symbol.strip().upper().endswith(".L"):
+        return value
+    if value <= 0 or reference <= 0:
+        return value
+    ratio = reference / value
+    if 20.0 <= ratio <= 200.0:
+        return value * 100.0
+    if 0.005 <= ratio <= 0.05:
+        return value * 0.01
+    return value
+
+
 def _align_entry_price_gbp_guard(
     symbol: str,
     entry_price: float,
@@ -151,11 +165,7 @@ def _align_entry_price_gbp_guard(
         prior_dates = [d for d in stock_closes.index if d <= rec_date]
         if prior_dates and (rec_date - prior_dates[-1]).days <= 5:
             hist_entry = float(stock_closes.loc[prior_dates[-1]])
-            unit_ratio = hist_entry / eff_entry
-            if 20.0 <= unit_ratio <= 200.0:
-                eff_entry *= 100.0
-            elif 0.005 <= unit_ratio <= 0.05:
-                eff_entry *= 0.01
+            eff_entry = _align_lse_unit_100x(eff_entry, hist_entry, symbol)
         exit_ratio = exit_price / eff_entry
         if 0.005 <= exit_ratio <= 0.05 or 20.0 <= exit_ratio <= 200.0:
             return None
@@ -252,6 +262,7 @@ def _intraday_move_pct(
     *,
     today_uk: date,
     prev_close: float | None = None,
+    symbol: str = "",
 ) -> float | None:
     """Intraday move vs prior close; `prev_close` (Finnhub/T212) overrides the daily-bar baseline."""
     px = _to_float(price)
@@ -276,20 +287,30 @@ def _intraday_move_pct(
         base = _to_float(closes.iloc[idx])
     if base is None:
         return None
+    if symbol.strip().upper().endswith(".L"):
+        px = _align_lse_unit_100x(px, base, symbol)
     return (px / base - 1.0) * 100.0
 
 
-def _order_distance_pct(price: float | None, orders: list[Any]) -> float | None:
+def _order_distance_pct(
+    price: float | None,
+    orders: list[Any],
+    *,
+    symbol: str = "",
+) -> float | None:
     """Smallest absolute distance between the live price and any pending limit/stop trigger (%)."""
     px = _to_float(price)
     if px is None or not orders:
         return None
     distances: list[float] = []
     for order in orders:
+        order_sym = symbol or str(getattr(order, "yahoo_symbol", "") or "")
         for field in ("limit_price", "stop_price"):
             trigger = _to_float(getattr(order, field, None))
             if trigger is None:
                 continue
+            if order_sym.strip().upper().endswith(".L"):
+                trigger = _align_lse_unit_100x(trigger, px, order_sym)
             distances.append(abs(px - trigger) / px * 100.0)
     return min(distances) if distances else None
 
@@ -1363,20 +1384,24 @@ class TradingScheduler:
             quote = quotes.get(sym) or {}
             position = position_by_symbol.get(sym)
             # Live price precedence: Finnhub realtime -> T212 position mark -> daily-bar close.
+            bundle_px = _to_float(getattr(bundle, "current_price", None))
             price = (
                 _to_float(quote.get("current_price"))
                 or _to_float(getattr(position, "cur_price", None))
-                or _to_float(getattr(bundle, "current_price", None))
+                or bundle_px
             )
             if price is None:
                 continue
+            if sym.endswith(".L") and bundle_px is not None:
+                price = _align_lse_unit_100x(price, bundle_px, sym)
             move_pct = _intraday_move_pct(
                 histories.get(sym),
                 price,
                 today_uk=today_uk,
                 prev_close=_to_float(quote.get("prev_close")),
+                symbol=sym,
             )
-            order_dist = _order_distance_pct(price, pending_by_symbol.get(sym) or [])
+            order_dist = _order_distance_pct(price, pending_by_symbol.get(sym) or [], symbol=sym)
             hit_move = move_pct is not None and abs(move_pct) >= self.cfg.strategy.intraday_move_alert_pct
             hit_order = order_dist is not None and order_dist <= self.cfg.strategy.intraday_order_near_pct
             if hit_move or hit_order:

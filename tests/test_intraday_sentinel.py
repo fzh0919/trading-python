@@ -451,6 +451,21 @@ class TestSentinelMath(unittest.TestCase):
         self.assertIsNone(_order_distance_pct(100.0, [_order("NVDA", 0.0, "USD")]))
         self.assertIsNone(_order_distance_pct(None, orders))
 
+    def test_lse_gbp_pence_100x_unit_alignment(self) -> None:
+        # T212 position/order in GBP (£12.50) vs Yahoo .L history/live price in GBp (1250p): no -99% spike!
+        lse_hist = _history(1250.0, 1250.0)
+        move = _intraday_move_pct(lse_hist, 12.625, today_uk=date(2026, 11, 17), symbol="AZN.L")
+        self.assertIsNotNone(move)
+        assert move is not None
+        self.assertAlmostEqual(move, 1.0, places=4)
+
+        # T212 order returned in GBP (£12.40) against GBp live price (1250p) -> 0.8% proximity
+        lse_order = _order("AZN.L", 12.40, "GBP")
+        dist = _order_distance_pct(1250.0, [lse_order], symbol="AZN.L")
+        self.assertIsNotNone(dist)
+        assert dist is not None
+        self.assertAlmostEqual(dist, 0.8, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()
