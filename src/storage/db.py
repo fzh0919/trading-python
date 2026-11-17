@@ -333,6 +333,18 @@ class AdvisorDatabase:
                     fetched_at_ms INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_grounding_news_fetched ON grounding_news_cache(fetched_at_ms);
+
+                CREATE TABLE IF NOT EXISTS wallet_balances (
+                    account_label TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    available_amount REAL NOT NULL DEFAULT 0.0,
+                    reserved_amount REAL NOT NULL DEFAULT 0.0,
+                    updated_at_uk TEXT NOT NULL DEFAULT '',
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    note TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (account_label, currency)
+                );
                 """
             )
             await _ensure_columns(
@@ -380,6 +392,23 @@ class AdvisorDatabase:
                 CREATE INDEX IF NOT EXISTS idx_pick_rec_status_symbol ON pick_recommendations(outcome_status, symbol);
                 CREATE INDEX IF NOT EXISTS idx_pick_rec_symbol_created ON pick_recommendations(symbol, created_at_ms);
                 """
+            )
+            # Seed the Invest USD wallet anchor once (idempotent); API v0 cannot report per-currency cash.
+            await db.execute(
+                """
+                INSERT INTO wallet_balances (
+                    account_label, currency, available_amount, reserved_amount,
+                    updated_at_uk, updated_at_ms, source, note
+                )
+                SELECT 'Invest', 'USD', 0.0, 0.0, ?, ?, 'init', '默认 0 USD 基准，若实际持有 USD 请校准'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM wallet_balances WHERE account_label = 'Invest' AND currency = 'USD'
+                )
+                """,
+                (
+                    datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M"),
+                    int(time.time() * 1000),
+                ),
             )
             await db.commit()
 
@@ -1980,3 +2009,89 @@ class AdvisorDatabase:
             )
             await db.commit()
         return len(rows)
+
+    async def get_wallet_balances(self, account_label: str = "Invest") -> dict[str, dict[str, Any]]:
+        """Return local per-currency wallet anchors for one account keyed by upper-case currency."""
+        label = str(account_label or "Invest").strip()
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT currency, available_amount, reserved_amount, updated_at_uk, updated_at_ms, source, note
+                FROM wallet_balances
+                WHERE account_label = ?
+                """,
+                (label,),
+            )
+            rows = await cur.fetchall()
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not row or not row[0]:
+                continue
+            curr = str(row[0]).strip().upper()
+            if not curr:
+                continue
+            out[curr] = {
+                "currency": curr,
+                "available_amount": float(row[1] or 0.0),
+                "reserved_amount": float(row[2] or 0.0),
+                "updated_at_uk": str(row[3] or ""),
+                "updated_at_ms": int(row[4] or 0),
+                "source": str(row[5] or ""),
+                "note": str(row[6] or ""),
+            }
+        return out
+
+    async def upsert_wallet_balance(
+        self,
+        account_label: str,
+        currency: str,
+        available_amount: float,
+        reserved_amount: float = 0.0,
+        *,
+        source: str = "manual",
+        note: str = "",
+    ) -> None:
+        """Persist one wallet anchor; negative or non-finite amounts are clamped to 0.0."""
+        label = str(account_label or "").strip()
+        curr = str(currency or "").strip().upper()
+        if not label or not curr:
+            raise ValueError("account_label and currency are required for wallet balances")
+        avail = float(available_amount or 0.0)
+        reserved = float(reserved_amount or 0.0)
+        avail = avail if math.isfinite(avail) and avail > 0.0 else 0.0
+        reserved = reserved if math.isfinite(reserved) and reserved > 0.0 else 0.0
+        now_ms = int(time.time() * 1000)
+        now_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT INTO wallet_balances (
+                    account_label, currency, available_amount, reserved_amount,
+                    updated_at_uk, updated_at_ms, source, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_label, currency) DO UPDATE SET
+                    available_amount = excluded.available_amount,
+                    reserved_amount = excluded.reserved_amount,
+                    updated_at_uk = excluded.updated_at_uk,
+                    updated_at_ms = excluded.updated_at_ms,
+                    source = excluded.source,
+                    note = excluded.note
+                """,
+                (label, curr, avail, reserved, now_uk, now_ms, str(source or "manual"), str(note or "")),
+            )
+            await db.commit()
+
+    async def clear_manual_gbp_override(self, account_label: str = "Invest") -> int:
+        """Drop a user-reported GBP anchor so GBP reverts to TOTAL - USD auto-derivation."""
+        label = str(account_label or "Invest").strip()
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                """
+                DELETE FROM wallet_balances
+                WHERE account_label = ? AND currency = 'GBP' AND source LIKE 'manual%'
+                """,
+                (label,),
+            )
+            deleted = int(cur.rowcount or 0)
+            await db.commit()
+        return deleted

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.bot.handlers import AdvisorBot
 from src.bot.scheduler import TradingScheduler
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig, EnvSettings, UniverseSection
@@ -873,12 +874,41 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             fired_sat = await sched.check_and_run_due_jobs(sat_idle)
             self.assertEqual(fired_sat, ["weekly_quant_audit"])
             self.assertEqual(len(tg.sent), 0)  # must not spam Telegram
-            self.assertEqual(await sched.check_and_run_due_jobs(datetime(2026, 11, 14, 14, 0, tzinfo=timezone.utc)), [])
+
+            # Saturday 14:00 UK -> weekly Invest GBP+USD ledger reminder, once per ISO week
+            fired_sat_noon = await sched.check_and_run_due_jobs(datetime(2026, 11, 14, 14, 0, tzinfo=timezone.utc))
+            self.assertEqual(fired_sat_noon, ["weekly_wallet_reconcile"])
+            self.assertEqual(len(tg.sent), 1)
+            self.assertIn("双钱包对账提醒", tg.sent[-1][1])
+            self.assertIn("/usd", tg.sent[-1][1])
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 14, 15, 0, tzinfo=timezone.utc)), []
+            )
 
             latest_audit = await db.get_latest_quant_audit()
             assert latest_audit is not None
             self.assertEqual(latest_audit["audit_date"], "2026-11-14")
             self.assertIn("ZOMB.L", latest_audit["summary_text"])
+
+
+class TestWalletCommandParsing(unittest.TestCase):
+    """Phase 3/5: /wallet & /usd argument validation before any DB write."""
+
+    def test_usd_and_wallet_argument_validation(self) -> None:
+        parse = AdvisorBot._parse_wallet_args
+        self.assertEqual(parse("/usd", ["600"]), ("", {"USD": (600.0, 0.0)}))
+        self.assertEqual(parse("/usd", ["600", "25"]), ("", {"USD": (600.0, 25.0)}))
+        self.assertEqual(parse("/wallet", ["gbp", "1500"]), ("", {"GBP": (1500.0, 0.0)}))
+        self.assertEqual(
+            parse("/wallet", ["gbp", "1500", "usd", "600"]),
+            ("", {"GBP": (1500.0, 0.0), "USD": (600.0, 0.0)}),
+        )
+        self.assertEqual(parse("/wallet", []), ("", {}))
+        self.assertEqual(parse("/usd", []), ("", {}))
+        self.assertIn("缺少金额", parse("/wallet", ["gbp"])[0])
+        self.assertIn("格式不正确", parse("/wallet", ["usd", "abc"])[0])
+        self.assertIn("负数", parse("/usd", ["-1"])[0])
+        self.assertIn("用法", parse("/wallet", ["foo"])[0])
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from src.data_providers.analytics import (
     normalize_issuer_root,
 )
 from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
-from src.data_providers.t212_client import PendingOrderItem, PortfolioData, PositionItem
+from src.data_providers.t212_client import AccountSnapshot, PendingOrderItem, PortfolioData, PositionItem
 
 
 class HoldingEvaluation(BaseModel):
@@ -70,13 +70,65 @@ def _is_uk_listing(yahoo_symbol: str, inst_currency: str) -> bool:
     return yahoo_symbol.endswith(".L") or inst_currency.upper() in {"GBP", "GBX"}
 
 
+def wallet_friction_context(wallet: AccountSnapshot | None) -> tuple[bool, float, float]:
+    """Return (dual_wallet_enabled, usd_available, gbp_available) for deterministic friction logic.
+
+    When the GBP wallet is unknown (rate not yet injected), fall back to the API
+    ``available_to_trade`` figure so we never overstate USD->GBP conversion costs.
+    """
+    if wallet is None or not getattr(wallet, "multi_currency_enabled", False):
+        return False, 0.0, 0.0
+    usd_avail = max(0.0, float(getattr(wallet, "usd_available_to_trade", 0.0) or 0.0))
+    gbp_raw = getattr(wallet, "gbp_wallet_available", None)
+    gbp_avail = (
+        max(0.0, float(gbp_raw))
+        if gbp_raw is not None
+        else max(0.0, float(getattr(wallet, "available_to_trade", 0.0) or 0.0))
+    )
+    return True, usd_avail, gbp_avail
+
+
+def _wallet_cash_basis_pct(
+    pos: PositionItem,
+    strategy: StrategySection,
+    wallet: AccountSnapshot | None = None,
+) -> float:
+    """Cash-interest hurdle basis: 3.4% when spending an existing USD balance, else 4.0% GBP."""
+    gbp_basis = float(strategy.cash_interest_rate_pct)
+    if pos.account.upper() != "INVEST":
+        return gbp_basis
+    enabled, usd_avail, gbp_avail = wallet_friction_context(wallet)
+    if not enabled:
+        return gbp_basis
+    usd_basis = float(getattr(strategy, "usd_cash_interest_rate_pct", 3.4))
+    if _is_uk_listing(pos.yahoo_symbol, pos.inst_currency):
+        return usd_basis if gbp_avail <= 0.01 else gbp_basis
+    if pos.inst_currency.upper() == "EUR":
+        return gbp_basis
+    return usd_basis if usd_avail > 0.01 else gbp_basis
+
+
 def _round_trip_friction_pct(
     pos: PositionItem,
     bundle: TickerMarketBundle | None,
     strategy: StrategySection,
+    wallet: AccountSnapshot | None = None,
 ) -> float:
+    """Round-trip friction for the target position, asymmetric for the Invest dual wallet."""
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     is_uk = _is_uk_listing(pos.yahoo_symbol, pos.inst_currency)
+    is_invest = pos.account.upper() == "INVEST"
+    enabled, usd_avail, gbp_avail = wallet_friction_context(wallet) if is_invest else (False, 0.0, 0.0)
+
+    if is_invest and enabled:
+        fx = float(strategy.fx_fee_pct)
+        if is_uk:
+            stamp = 0.0 if is_etf else float(strategy.uk_stamp_duty_pct)
+            return stamp + (0.0 if gbp_avail > 0.01 else fx)
+        if pos.inst_currency.upper() == "EUR":
+            return fx * 2.0
+        return 0.0 if usd_avail > 0.01 else fx
+
     if is_uk and is_etf:
         return 0.0
     if is_uk:
@@ -84,9 +136,35 @@ def _round_trip_friction_pct(
     return float(strategy.fx_fee_pct) * 2.0
 
 
-def _friction_hint(pos: PositionItem, bundle: TickerMarketBundle | None, strategy: StrategySection) -> str:
+def _friction_hint(
+    pos: PositionItem,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    wallet: AccountSnapshot | None = None,
+) -> str:
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     is_uk = _is_uk_listing(pos.yahoo_symbol, pos.inst_currency)
+    enabled, usd_avail, gbp_avail = (
+        wallet_friction_context(wallet) if pos.account.upper() == "INVEST" else (False, 0.0, 0.0)
+    )
+    fx = float(strategy.fx_fee_pct)
+    if enabled:
+        if is_uk and is_etf:
+            if gbp_avail > 0.01:
+                return "InvestLSE英镑ETF(GBP充足:0%换汇/0%印花税)"
+            return f"InvestLSE英镑ETF(GBP不足需USD换回+{fx:.2f}%换汇)"
+        if is_uk:
+            if gbp_avail > 0.01:
+                return f"Invest英股(GBP充足:0%换汇,买入{strategy.uk_stamp_duty_pct:.1f}%印花税)"
+            return (
+                f"Invest英股(GBP不足需USD换回+{fx:.2f}%换汇,"
+                f"买入{strategy.uk_stamp_duty_pct:.1f}%印花税)"
+            )
+        if pos.inst_currency.upper() == "EUR":
+            return f"Invest欧股({fx * 2:.2f}%往返换汇,暂不开EUR钱包)"
+        if usd_avail > 0.01:
+            return f"Invest美股(可用USD免换汇/新换单边{fx:.2f}%)"
+        return f"Invest美股(USD不足需GBP换汇+{fx:.2f}%单边)"
     if is_uk and is_etf:
         return "LSE英镑ETF(0%换汇/0%印花税)"
     if is_uk:
@@ -182,6 +260,7 @@ def evaluate_holding(
     pending_orders: list[PendingOrderItem] | None = None,
     account_total_value: float | None = None,
     total_portfolio_value: float | None = None,
+    wallet: AccountSnapshot | None = None,
 ) -> HoldingEvaluation:
     """Evaluate an existing position deterministically for Add / Trim / Stop / Hold."""
     reasons: list[str] = []
@@ -455,13 +534,14 @@ def evaluate_holding(
             ):
                 reasons.append("CYQ筹码支撑结构良好")
 
-    # 4% cash hurdle + round-trip friction gate
+    # Cash hurdle + round-trip friction gate (dual-wallet aware for Invest)
     upside_pct = _compute_analyst_upside_pct(bundle)
     if upside_pct is not None:
-        hurdle_pct = float(strategy.cash_interest_rate_pct) + _round_trip_friction_pct(pos, bundle, strategy)
+        cash_basis_pct = _wallet_cash_basis_pct(pos, strategy, wallet)
+        hurdle_pct = cash_basis_pct + _round_trip_friction_pct(pos, bundle, strategy, wallet)
         if upside_pct < hurdle_pct:
             reasons.append(
-                f"一致目标价空间仅{upside_pct:+.1f}%(低于{strategy.cash_interest_rate_pct:.1f}%现金+摩擦门槛{hurdle_pct:.1f}%)"
+                f"一致目标价空间仅{upside_pct:+.1f}%(低于{cash_basis_pct:.1f}%现金+摩擦门槛{hurdle_pct:.1f}%)"
             )
             if add_score > 0:
                 add_score = max(0, add_score - 1)
@@ -494,7 +574,7 @@ def evaluate_holding(
         return_pct=pos.return_pct,
         action_bias=bias,
         reasons=reasons,
-        friction_note=_friction_hint(pos, bundle, strategy),
+        friction_note=_friction_hint(pos, bundle, strategy, wallet),
         native_return_pct=round(native_ret, 2) if native_ret is not None else None,
         effective_stop_pct=effective_stop,
         pending_buy_weight_pct=round(pending_buy_weight_pct, 2),
@@ -545,6 +625,7 @@ def evaluate_portfolio(
             pending_orders=all_pending,
             account_total_value=account_totals.get(pos.account.upper()),
             total_portfolio_value=total_all,
+            wallet=data.invest,
         )
         for pos in data.all_positions()
     ]
@@ -593,7 +674,8 @@ def build_disagreement_matrix(
         )
         native_ret = _native_return_pct(pos)
         upside_pct = _compute_analyst_upside_pct(bundle)
-        hurdle_pct = float(strategy.cash_interest_rate_pct) + _round_trip_friction_pct(pos, bundle, strategy)
+        cash_basis_pct = _wallet_cash_basis_pct(pos, strategy, data.invest)
+        hurdle_pct = cash_basis_pct + _round_trip_friction_pct(pos, bundle, strategy, data.invest)
 
         bull_points: list[str] = []
         bear_points: list[str] = []

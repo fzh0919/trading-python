@@ -1,12 +1,12 @@
-# Trading 212 × Gemini AI 私人量化投顾 (v5.2.0)
+# Trading 212 × Gemini AI 私人量化投顾 (v5.2.1)
 
-面向英国个人投资者（Trading 212 **Stocks ISA** + **Invest** 双账户，仅保留 `GBP` 现金、标的按本地货币报价）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling、零公网端口暴露、Docker 容器化部署于本地 Intel N95）。
+面向英国个人投资者（Trading 212 **Stocks ISA** 纯 `GBP` + **Invest** `GBP`/`USD` 双钱包，标的按本地货币报价）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling、零公网端口暴露、Docker 容器化部署于本地 Intel N95）。
 
 ---
 
 ## 1. 核心能力与技术特点
 
-* **双币种与真实摩擦核算**：严格隔离 `GBP` 钱包结算与 `USD`/`EUR`/`GBp`/`GBP` 标的本地报价；将 `~4.0%` 闲置现金利息（含未成交挂单占用资金）、`0.15%` 单边换汇磨损及 `0.50%` 英国个股印花税纳入全部收益评估。
+* **双账户币种隔离与对称摩擦核算**：严格隔离 `GBP` 总账口径、`Invest` 本地 `GBP+USD` 双钱包锚点（`/wallet` / `/usd` 对账）与 `USD`/`EUR`/`GBp`/`GBP` 标的本地报价；将 `4.0%` GBP / `3.4%` USD 闲置现金利息（含未成交挂单占用资金）、跨币种 `0.15%` 单边换汇磨损（Invest 同币种复用免换汇）及 `0.50%` 英国个股印花税纳入全部收益评估。
 * **本地 Python 0-Token 量化底座**：在请求大模型前，本地完成 `2y` SQLite 日线缓存、MA/RSI14/ATR14/ADX14/周线共振、CYQ 筹码分布、移动止盈/除息防假破位、去大盘 Beta 相关性、PSD 收缩协方差前 3 波动风险贡献源与 95% 单日 CVaR、挂单触价率精算、Finnhub 深度情报、FRED 利率/信用利差、四维双轨选股漏斗（Minervini Stage 2 / VCP / VPVR / 150 只多市场海选），以及多空冲突矩阵（`Disagreement Matrix`）和后置确定性风控护栏（`RiskOverride`）。
 * **以 `/report` 为基石的跨指令复用与复盘闭环**：每日 `07:30 UK` 生成 `/report` 全景晨报与风控红线并落库 `AnalysisContextPack`，供同周期 `/us` 盘前哨兵（含 `yfinance 15m` 盘前跳空检测）、`/pick` 雷达与日常单聊 0-Token 复用；盘后自动结算 `T+5`/`T+10`/`T+20` Alpha 与 `MFE/MAE` 极值并生成微反思记忆，周末闲时离线体检选股池与阈值。
 

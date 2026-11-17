@@ -343,10 +343,10 @@ class GeminiClient:
             if self.fallback_model and self.fallback_model != primary_model:
                 fb_think = "LOW" if (use_google_search and "flash-lite" not in self.fallback_model.lower()) else self.fallback_thinking_level
                 raw_chain.append((self.fallback_model, fb_think))
-            elif "argon" in (primary_model or "").lower():
+            elif "argon" in (primary_model or "").lower() or "carbon" in (primary_model or "").lower():
                 raw_chain.append(("gemini-4-hydrogen", "HIGH"))
             elif "flash-lite" not in (primary_model or "").lower():
-                # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon
+                # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon/Carbon
                 raw_chain.append(("gemini-3.5-flash-lite", "LOW"))
             elif use_google_search:
                 raw_chain.append(("gemini-4-hydrogen", "LOW"))

@@ -335,8 +335,11 @@ class TestForcedGroundingSchedulerHealthAndKeyboard(unittest.IsolatedAsyncioTest
 
             bot = AdvisorBot(cfg, t212, md, _BoomLLM(), db, tg, ops_notifier=ops, scheduler=sched)
 
-            # Left "/" menu keeps only the 6 core commands; ops commands live in /help
-            self.assertEqual([c["command"] for c in BOT_COMMANDS], ["pos", "report", "pick", "us", "stats", "help"])
+            # Left "/" menu keeps the 8 core commands; ops commands live in /help
+            self.assertEqual(
+                [c["command"] for c in BOT_COMMANDS],
+                ["pos", "wallet", "usd", "report", "pick", "us", "stats", "help"],
+            )
 
             # /help splits core vs ops commands and removes persistent bottom keyboard
             await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/help"}}, wait=True)

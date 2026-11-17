@@ -22,7 +22,12 @@ class ReportActionItem(BaseModel):
     symbol: str = Field(description="现有持仓标的代码，若今日持仓观望无调仓可写 CASH（挂单撤改勿放此处）")
     action: str = Field(description="仅限持仓动作：ADD / TRIM / STOP / HOLD（撤改挂单只放 pending_order_audits，禁止重复放此处）")
     price_zone: str = Field(description="建议触发价位或区间，如 '355-358 USD' 或 '4500 GBp'")
-    reason: str = Field(description="一句话核心依据（不超过35字）")
+    reason: str = Field(
+        description=(
+            "一句话核心依据（不超过35字）；Invest 调仓须标明资金路径，"
+            "如「USD钱包免换汇」或「GBP不足需USD换回+0.15%」"
+        )
+    )
 
 
 class PendingOrderAuditItem(BaseModel):
@@ -30,7 +35,12 @@ class PendingOrderAuditItem(BaseModel):
     symbol: str = Field(description="挂单标的代码")
     verdict: Literal["KEEP", "MODIFY", "CANCEL"] = Field(description="KEEP（保留）| MODIFY（调低/改价）| CANCEL（建议撤单）")
     order_summary: str = Field(description="极简挂单方向与价位，如 'BUY 1250 GBp' 或 'STOP 93.80 USD'")
-    reason: str = Field(description="结合现价、均线、目标价及印花税/换汇成本给出的一句话审计结论（不超过38字）")
+    reason: str = Field(
+        description=(
+            "结合现价、均线、目标价及印花税/换汇成本给出的一句话审计结论（不超过38字）；"
+            "Invest 按实际资金来源计（同币种钱包 0% / 跨币种单边 0.15%）"
+        )
+    )
 
 
 class FlaggedPositionItem(BaseModel):
@@ -113,7 +123,12 @@ class PickActionItem(BaseModel):
     account: str = Field(description="ISA 或 Invest")
     symbol: str = Field(description="标的代码，如 VWRP.L、SHEL.L、TSM")
     action: Literal["BUY", "ADD", "TRIM", "SWAP"] = Field(description="BUY / ADD / TRIM / SWAP")
-    thesis: str = Field(description="交易逻辑与催化，含扣费与4%利息对比优势（不超过55字）")
+    thesis: str = Field(
+        description=(
+            "交易逻辑与催化，含扣费与对应币种现金利息对比（不超过55字）；"
+            "Invest 动作用须标明资金路径，如「用 USD 钱包免换汇」或「GBP 不足需 USD 换回含 0.15% 损耗」"
+        )
+    )
     entry_zone: str = Field(description="建议买入或加减仓价位区间与建议金额")
     stop_condition: str = Field(description="硬止损位或证伪条件")
     target_window: str = Field(description="目标位或观察周期")

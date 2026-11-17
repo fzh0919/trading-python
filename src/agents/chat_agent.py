@@ -9,7 +9,7 @@ import unicodedata
 from typing import TYPE_CHECKING, Any
 
 from src.agents.llm_client import LLMBackend
-from src.agents.prompts import build_agent_system_instruction
+from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.schemas import trim_text_at_line_boundary
 from src.agents.tools import MarketToolkit
 from src.config import AppConfig
@@ -528,8 +528,10 @@ async def format_positions_instant(cfg: AppConfig, t212: T212Client) -> str:
 
     trade_ctx = build_trade_context(portfolio, max_recent_lines=5, max_summary_lines=6)
     lines = [
-        f"💼 T212 双账户实时快照（{portfolio.fetched_at_uk} UK | 闲置现金利息 {cfg.strategy.cash_interest_rate_pct:.1f}%）",
+        f"💼 T212 双账户实时快照（{portfolio.fetched_at_uk} UK | 现金利息 ISA/Invest GBP "
+        f"{cfg.strategy.cash_interest_rate_pct:.1f}% · Invest USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}%）",
         f"合计总净值: GBP {portfolio.total_combined_value:,.2f} | 合计现金: GBP {portfolio.total_combined_cash:,.2f}",
+        build_wallet_context_text(portfolio, cfg.strategy, compact=True),
         "",
         "【Stocks ISA（长线稳健仓）】",
         format_account_overview(portfolio.isa),
@@ -749,6 +751,7 @@ async def answer_user_chat(
         f"当前英国时间 {sched.uk_date} ({get_uk_weekday_label()}{calendar_inline})，"
         f"美股状态：{sched.phase}（常规开盘 {sched.open_time_uk} UK，收盘 {sched.close_time_uk} UK）。\n\n"
         + (f"{premarket_tail}\n\n" if premarket_tail else "")
+        + f"{build_wallet_context_text(portfolio, cfg.strategy, compact=True)}\n\n"
         + f"【ISA 账户】\n{format_account_overview(portfolio.isa)}\n{isa_pos_text}\n\n"
         f"【Invest 账户】\n{format_account_overview(portfolio.invest)}\n{invest_pos_text}\n\n"
         f"【当前挂单与近7日成交】\n{trade_ctx['pending_orders_text']}\n{trade_ctx['recent_trades_text']}\n\n"

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from src.agents.report_agent import _compute_portfolio_diff_text
 from src.agents.schemas import (
     FlaggedPositionItem,
     MorningReportDecision,
@@ -34,6 +35,7 @@ from src.config import AppConfig, EnvSettings, UniverseSection
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    HistoricalTransactionItem,
     PendingOrderItem,
     PortfolioData,
     PositionItem,
@@ -280,11 +282,56 @@ def _sample_portfolio() -> PortfolioData:
             total_cash=1000.0,
             available_to_trade=1000.0,
             cash_ratio_pct=20.0,
+            multi_currency_enabled=True,
+            usd_cash_total=400.0,
+            usd_available_to_trade=400.0,
+            usd_reserved_cash=0.0,
+            gbp_wallet_total=686.27,
+            gbp_wallet_available=686.27,
+            gbp_wallet_reserved=0.0,
+            wallet_source="derived_from_total",
+            wallet_updated_at_uk="2026-11-14 08:00",
+            gbp_usd_rate=1.275,
+            cash_interest_rate_pct=4.0,
+            usd_cash_interest_rate_pct=3.4,
         ),
+        gbp_usd_rate=1.275,
     )
 
 
 class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
+    def test_portfolio_diff_attributes_cash_flows_by_currency(self) -> None:
+        prev = _sample_portfolio()
+        now_ms = prev.fetched_at_ms + 86_400_000
+        current = prev.model_copy(deep=True)
+        current.fetched_at_ms = now_ms
+        current.invest.recent_transactions = [
+            HistoricalTransactionItem(
+                id="x1",
+                account="Invest",
+                tx_type="DEPOSIT",
+                amount=500.0,
+                currency="GBP",
+                date_time="2026-11-15T09:00:00Z",
+                date_time_ms=now_ms - 1000,
+                uk_time_str="2026-11-15 09:00",
+            ),
+            HistoricalTransactionItem(
+                id="x2",
+                account="Invest",
+                tx_type="INTEREST_ON_FREE_CASH",
+                amount=3.4,
+                currency="USD",
+                date_time="2026-11-15T09:05:00Z",
+                date_time_ms=now_ms,
+                uk_time_str="2026-11-15 09:05",
+            ),
+        ]
+        text = _compute_portfolio_diff_text(current, prev)
+        self.assertIn("外部出入金 +500.00 GBP", text)
+        self.assertIn("现金利息 +3.40 USD", text)
+        self.assertNotIn("503.40 GBP", text)
+
     def test_telegram_chunking(self) -> None:
         long_text = ("line of text\n" * 400).strip()
         chunks = split_message_into_chunks(long_text, max_length=1000)
@@ -647,6 +694,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(llm.calls), 0)
                 self.assertIn("NVDA", tg.messages[-1])
                 self.assertIn("15,000.00", tg.messages[-1])
+                self.assertIn("GBP/USD 1.2750", tg.messages[-1])
+                self.assertIn("USD 钱包 $400.00", tg.messages[-1])
+                self.assertIn("3.4%", tg.messages[-1])
 
                 clear_grounding_cache()
                 # 3. /report runs forced grounding batches (macro + ULVR.L UK + NVDA US) + 3-step pipeline <= 1800 chars
@@ -664,8 +714,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pipeline_calls],
                     [
-                        ("report_analyst", "gemini-4-hydrogen", "MEDIUM"),
-                        ("report_auditor", "gemini-4-hydrogen", "XHIGH"),
+                        ("report_analyst", "gemini-4-hydrogen", "HIGH"),
+                        ("report_auditor", "gemini-4-carbon", "HIGH"),
                         ("report_pm", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
@@ -680,6 +730,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(c.get("system_instruction") for c in pipeline_calls))
                 self.assertTrue(all("必须直白建议撤单（CANCEL）" in c["system_instruction"] for c in pipeline_calls))
                 self.assertIn("实时 Google Search", pipeline_calls[0]["prompt"])
+                self.assertIn("现金与双钱包", pipeline_calls[0]["prompt"])
+                self.assertIn("USD 钱包 $400.00", pipeline_calls[0]["prompt"])
+                self.assertIn("Invest 资金路径", pipeline_calls[2]["prompt"])
                 report_msg = tg.messages[-1]
                 self.assertLessEqual(len(report_msg), 1800)
                 self.assertTrue(report_msg.startswith("【今日核心行动与挂单裁决】"))
@@ -706,8 +759,10 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(us_call.get("system_instruction"))
                 self.assertIn("【活动挂单裁决】", us_call["prompt"])
                 self.assertIn("【美股活动挂单】：\n（当前无未成交活动挂单）", us_call["prompt"])
+                self.assertIn("GBP/USD 1.2750", us_call["prompt"])
+                self.assertIn("USD $400.00", us_call["prompt"])
 
-                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen MEDIUM -> Hydrogen HIGH), <= 1000 chars
+                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Hydrogen HIGH), <= 1000 chars
                 calls_before = len(llm.calls)
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pick 英国ETF"}}, wait=True)
                 pick_calls = llm.calls[calls_before:]
@@ -718,12 +773,13 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pick_pipeline],
                     [
-                        ("pick_researcher", "gemini-4-hydrogen", "MEDIUM"),
+                        ("pick_researcher", "gemini-4-hydrogen", "HIGH"),
                         ("pick_critic", "gemini-4-hydrogen", "HIGH"),
                     ],
                 )
                 self.assertIn("Invest半导体占比超限", pick_pipeline[0]["prompt"])
                 self.assertIn("实时 Google Search", pick_pipeline[0]["prompt"])
+                self.assertIn("双钱包明细与资金路径", pick_pipeline[1]["prompt"])
                 self.assertTrue(
                     all("必须直白建议撤单（CANCEL）" not in c["system_instruction"] for c in pick_pipeline)
                 )

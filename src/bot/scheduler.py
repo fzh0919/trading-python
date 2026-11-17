@@ -41,6 +41,7 @@ DAILY_SETTLEMENT_START_MINUTES = 22 * 60  # 22:00 UK (after US/UK/EU close & Fri
 DAILY_SETTLEMENT_END_MINUTES = 23 * 60 + 30  # 23:30 UK catch-up cutoff
 WEEKLY_AUDIT_START_MINUTES = 10 * 60  # 10:00 UK Saturday idle window
 WEEKLY_AUDIT_END_MINUTES = 22 * 60  # 22:00 UK Saturday cutoff
+WEEKLY_WALLET_RECONCILE_START_MINUTES = 12 * 60  # 12:00 UK Saturday ledger reminder window
 
 
 def _parse_recommendation_date(rec: dict[str, Any]) -> date:
@@ -521,6 +522,59 @@ class TradingScheduler:
             f"回测样本 {bt.get('sample_count', 0)}"
         )
 
+    async def _build_weekly_wallet_reconcile_message(self, now_utc: datetime | None = None) -> str:
+        """Compose a lightweight weekly Invest GBP+USD ledger reminder (0-token, no AI calls)."""
+        dt_uk = (now_utc or datetime.now(timezone.utc)).astimezone(LONDON_TZ)
+        try:
+            portfolio = await self.t212.get_portfolio(use_cache=True)
+        except Exception as exc:
+            return f"⚠️ 钱包对账提醒生成失败：{exc}"
+        invest = getattr(portfolio, "invest", None)
+        if invest is None or not getattr(invest, "ok", False):
+            return f"⚠️ Invest 账户读取失败，本周钱包对账提醒跳过：{getattr(invest, 'error', '未知错误')}"
+
+        records: dict[str, dict[str, Any]] = {}
+        if hasattr(self.db, "get_wallet_balances"):
+            try:
+                records = await self.db.get_wallet_balances("Invest")
+            except Exception as exc:
+                logger.warning("Weekly wallet reconcile: failed loading balances: %s", exc)
+        usd = records.get("USD") or {}
+        usd_total = float(usd.get("available_amount") or 0.0) + float(usd.get("reserved_amount") or 0.0)
+        updated_uk = str(usd.get("updated_at_uk") or "")
+        updated_ms = int(usd.get("updated_at_ms") or 0)
+        age_days = (
+            max(0, int((int(dt_uk.timestamp() * 1000) - updated_ms) / 86_400_000)) if updated_ms > 0 else None
+        )
+        rate: float | None = getattr(self.t212, "gbp_usd_rate", None)
+        if rate is None and hasattr(self.market_data, "get_macro_snapshot"):
+            try:
+                macro = await self.market_data.get_macro_snapshot()
+                candidate = getattr(macro, "gbp_usd", None)
+                if candidate is not None and float(candidate) > 0:
+                    rate = float(candidate)
+            except Exception as exc:
+                logger.warning("Weekly wallet reconcile: macro fetch failed: %s", exc)
+
+        lines = ["🧾 每周 Invest 双钱包对账提醒"]
+        usd_line = f"• 本地 USD 记录: ${usd_total:,.2f}"
+        if updated_uk:
+            usd_line += f"（{updated_uk} UK"
+            usd_line += f"，{age_days} 天前）" if age_days is not None else "）"
+        lines.append(usd_line)
+        lines.append(f"• T212 实时总现金: £{float(invest.total_cash or 0.0):,.2f}")
+        if rate:
+            derived_gbp = max(0.0, float(invest.total_cash or 0.0) - usd_total / rate)
+            lines.append(f"• 推算 GBP 钱包: ≈ £{derived_gbp:,.2f}（GBP/USD {rate:.4f}）")
+        lines.append(
+            "提示：若本周有换汇、美股买卖回笼或手动换币，请回复 /usd 金额 校准；"
+            "也可 /wallet gbp 金额 单报，或 /wallet gbp x usd y 双报核对。"
+        )
+        return "\n".join(lines)
+
+    async def _run_weekly_wallet_reconcile_job(self, now_utc: datetime) -> str:
+        return await self._build_weekly_wallet_reconcile_message(now_utc=now_utc)
+
     async def _run_daily_settlement_impl(self, now_utc: datetime | None = None) -> dict[str, Any]:
         base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
         dt_uk = base.astimezone(LONDON_TZ)
@@ -960,6 +1014,20 @@ class TradingScheduler:
                         uk_now_str=uk_now_str,
                         coro=self._run_weekly_quant_audit_job(base),
                         send_to_tg=False,
+                    )
+
+            # Saturday ledger reminder window (12:00 ~ 22:00 UK): weekly Idempotent GBP+USD reconcile nudge
+            if WEEKLY_WALLET_RECONCILE_START_MINUTES <= uk_min_of_day < WEEKLY_AUDIT_END_MINUTES:
+                iso_year, iso_week, _ = dt_uk.isocalendar()
+                week_key = f"{iso_year}-W{iso_week:02d}"
+                if await self._claim_job_run("weekly_wallet_reconcile", week_key, uk_now_str):
+                    fired.append("weekly_wallet_reconcile")
+                    logger.info("Sending weekly wallet reconcile reminder (%s)", week_key)
+                    await self._execute_job(
+                        job_name="weekly_wallet_reconcile",
+                        chat_id=chat_id,
+                        uk_now_str=uk_now_str,
+                        coro=self._run_weekly_wallet_reconcile_job(base),
                     )
             return fired
 

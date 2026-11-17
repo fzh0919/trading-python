@@ -142,6 +142,20 @@ class AccountSnapshot(BaseModel):
     fallback_source: str = ""
     fallback_reason: str = ""
     snapshot_fetched_at_uk: str = ""
+    # Invest GBP+USD dual-wallet split (T212 API v0 only returns GBP-converted total cash)
+    multi_currency_enabled: bool = False
+    usd_cash_total: float = 0.0
+    usd_available_to_trade: float = 0.0
+    usd_reserved_cash: float = 0.0
+    gbp_wallet_total: float | None = None
+    gbp_wallet_available: float | None = None
+    gbp_wallet_reserved: float | None = None
+    wallet_source: str = ""
+    wallet_updated_at_uk: str = ""
+    wallet_reconcile_warning: str = ""
+    gbp_usd_rate: float | None = None
+    cash_interest_rate_pct: float = 4.0
+    usd_cash_interest_rate_pct: float = 3.4
 
 
 class PortfolioData(BaseModel):
@@ -152,6 +166,8 @@ class PortfolioData(BaseModel):
     total_combined_value: float = 0.0
     total_combined_cash: float = 0.0
     cash_interest_rate_pct: float = 4.0
+    usd_cash_interest_rate_pct: float = 3.4
+    gbp_usd_rate: float | None = None
     is_fallback: bool = False
     fallback_source: str = ""
     fallback_note: str = ""
@@ -171,6 +187,127 @@ class PortfolioData(BaseModel):
                 if o.yahoo_symbol:
                     seen.setdefault(o.yahoo_symbol, None)
         return list(seen.keys())
+
+
+_MANUAL_WALLET_SOURCES = {"manual", "manual_both", "user", "user_reported"}
+
+
+def _wallet_amount(record: dict[str, Any] | None, key: str) -> float:
+    try:
+        return float((record or {}).get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def reconcile_invest_wallets(
+    invest_snap: AccountSnapshot,
+    wallet_records: dict[str, dict[str, Any]] | None,
+    gbp_usd: float | None,
+    *,
+    mismatch_warn_gbp: float = 10.0,
+    mismatch_warn_pct: float = 2.0,
+    reconcile_warn_days: int = 7,
+    now_ms: int | None = None,
+) -> AccountSnapshot:
+    """Attach an Invest GBP+USD wallet split without touching GBP accounting totals.
+
+    Uses the locally stored USD anchor and derives GBP = API total cash - USD/GBPUSD.
+    A user-reported GBP anchor (source manual*, at least as fresh as USD) is shown verbatim
+    together with a mismatch warning when |GBP + USD/rate - API total cash| exceeds the
+    larger of ``mismatch_warn_gbp`` and ``mismatch_warn_pct`` of total cash.
+    """
+    records = {str(k).strip().upper(): (v or {}) for k, v in (wallet_records or {}).items()}
+    usd_rec = records.get("USD", {})
+    usd_avail = max(0.0, _wallet_amount(usd_rec, "available_amount"))
+    usd_reserved = max(0.0, _wallet_amount(usd_rec, "reserved_amount"))
+    usd_total = usd_avail + usd_reserved
+    usd_source = str(usd_rec.get("source") or "").strip().lower()
+    usd_updated_uk = str(usd_rec.get("updated_at_uk") or "")
+    usd_updated_ms = int(_wallet_amount(usd_rec, "updated_at_ms"))
+
+    updates: dict[str, Any] = {
+        "multi_currency_enabled": bool(invest_snap.ok),
+        "usd_cash_total": round(usd_total, 2),
+        "usd_available_to_trade": round(usd_avail, 2),
+        "usd_reserved_cash": round(usd_reserved, 2),
+        "wallet_updated_at_uk": usd_updated_uk,
+    }
+    if not invest_snap.ok:
+        return invest_snap.model_copy(update=updates)
+
+    warnings: list[str] = []
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    if reconcile_warn_days > 0 and usd_updated_ms > 0:
+        anchor_days = (now - usd_updated_ms) / 86_400_000
+        if anchor_days >= reconcile_warn_days:
+            if usd_source in {"", "init", "default"}:
+                warnings.append(
+                    f"USD 钱包仍为默认 0 USD（{usd_updated_uk or '未知时间'} 起未校准），若持有 USD 请核对"
+                )
+            else:
+                warnings.append(
+                    f"USD 钱包锚自 {usd_updated_uk or '未知时间'} 起已 {int(anchor_days)} 天未校准"
+                )
+
+    try:
+        rate = float(gbp_usd) if gbp_usd is not None else 0.0
+    except (TypeError, ValueError):
+        rate = 0.0
+    if rate <= 0.0:
+        updates.update(
+            {
+                "gbp_wallet_total": None,
+                "gbp_wallet_available": None,
+                "gbp_wallet_reserved": None,
+                "wallet_source": "pending_fx",
+                "wallet_reconcile_warning": "；".join([*warnings, "缺少 GBP/USD 汇率，GBP 钱包待折算"]),
+            }
+        )
+        return invest_snap.model_copy(update=updates)
+
+    updates["gbp_usd_rate"] = round(rate, 4)
+    gbp_rec = records.get("GBP", {})
+    gbp_source = str(gbp_rec.get("source") or "").strip().lower()
+    gbp_updated_ms = int(_wallet_amount(gbp_rec, "updated_at_ms"))
+    gbp_is_manual = gbp_source in _MANUAL_WALLET_SOURCES and gbp_updated_ms >= usd_updated_ms
+
+    if gbp_is_manual:
+        gbp_avail = max(0.0, _wallet_amount(gbp_rec, "available_amount"))
+        gbp_reserved = max(0.0, _wallet_amount(gbp_rec, "reserved_amount"))
+        gbp_total = gbp_avail + gbp_reserved
+        reported_total = gbp_total + usd_total / rate
+        diff = reported_total - invest_snap.total_cash
+        threshold = max(float(mismatch_warn_gbp), abs(invest_snap.total_cash) * float(mismatch_warn_pct) / 100.0)
+        if abs(diff) > threshold:
+            warnings.append(
+                f"双报合计 £{reported_total:,.2f} 与 API 总现金 £{invest_snap.total_cash:,.2f} "
+                f"偏差 £{diff:+,.2f}（告警阈值 £{threshold:,.2f}），请核对钱包余额"
+            )
+        updates.update(
+            {
+                "gbp_wallet_total": round(gbp_total, 2),
+                "gbp_wallet_available": round(gbp_avail, 2),
+                "gbp_wallet_reserved": round(gbp_reserved, 2),
+                "wallet_source": "manual_both",
+            }
+        )
+    else:
+        derived_total = invest_snap.total_cash - usd_total / rate
+        derived_avail = invest_snap.available_to_trade - usd_avail / rate
+        derived_reserved = invest_snap.reserved_cash - usd_reserved / rate
+        if min(derived_total, derived_avail, derived_reserved) < -0.01:
+            warnings.append("按 USD 锚推算的 GBP 钱包为负，USD 账本可能已因成交/换汇变化，请校准")
+        updates.update(
+            {
+                "gbp_wallet_total": round(max(0.0, derived_total), 2),
+                "gbp_wallet_available": round(max(0.0, derived_avail), 2),
+                "gbp_wallet_reserved": round(max(0.0, derived_reserved), 2),
+                "wallet_source": "derived_from_total",
+            }
+        )
+
+    updates["wallet_reconcile_warning"] = "；".join(warnings)
+    return invest_snap.model_copy(update=updates)
 
 
 _T212_EXCHANGE_LETTER_TO_YAHOO: dict[str, str] = {
@@ -339,6 +476,10 @@ class T212Client:
         order_history_days: int = 30,
         order_history_max_pages: int = 3,
         cash_interest_rate_pct: float = 4.0,
+        usd_cash_interest_rate_pct: float = 3.4,
+        invest_multi_currency_enabled: bool = True,
+        wallet_reconcile_warn_days: int = 7,
+        wallet_mismatch_warn_gbp: float = 10.0,
         cache_ttl_seconds: int = 120,
         transport: httpx.AsyncBaseTransport | None = None,
         ops_notifier: Any = None,
@@ -354,6 +495,10 @@ class T212Client:
         self.order_history_days = order_history_days
         self.order_history_max_pages = order_history_max_pages
         self.cash_interest_rate_pct = cash_interest_rate_pct
+        self.usd_cash_interest_rate_pct = usd_cash_interest_rate_pct
+        self.invest_multi_currency_enabled = bool(invest_multi_currency_enabled)
+        self.wallet_reconcile_warn_days = int(wallet_reconcile_warn_days)
+        self.wallet_mismatch_warn_gbp = float(wallet_mismatch_warn_gbp)
         self.cache_ttl_seconds = cache_ttl_seconds
         self._transport = transport
         self._ops = ops_notifier
@@ -365,6 +510,8 @@ class T212Client:
         self._cache: tuple[float, PortfolioData] | None = None
         self._last_good_portfolio: PortfolioData | None = None
         self._last_good_accounts: dict[str, tuple[str, int, AccountSnapshot]] = {}
+        self._wallet_records: dict[str, dict[str, Any]] = {}
+        self._gbp_usd_rate: float | None = None
         self._rate_limit_resets: dict[tuple[str, str], float] = {}
         self._instrument_map: dict[str, dict[str, Any]] = {}
 
@@ -386,6 +533,27 @@ class T212Client:
 
     def set_db(self, db: Any) -> None:
         self._db = db
+
+    def set_gbp_usd_rate(self, gbp_usd_rate: float | None) -> None:
+        """Inject the latest GBP/USD mid rate so Invest wallet splits can be derived.
+
+        The first known rate invalidates the TTL cache so the next fetch upgrades
+        USD-only wallet fields into a full GBP+USD split.
+        """
+        try:
+            rate = float(gbp_usd_rate) if gbp_usd_rate is not None else 0.0
+        except (TypeError, ValueError):
+            return
+        if rate <= 0.0:
+            return
+        if self._gbp_usd_rate is None:
+            self._cache = None
+        self._gbp_usd_rate = rate
+
+    @property
+    def gbp_usd_rate(self) -> float | None:
+        """Latest injected GBP/USD mid rate used for Invest wallet derivation."""
+        return self._gbp_usd_rate
 
     def _resolve_ticker_metadata(
         self,
@@ -1402,7 +1570,9 @@ class T212Client:
                         2,
                     )
 
-    async def get_portfolio(self, use_cache: bool = True) -> PortfolioData:
+    async def get_portfolio(self, use_cache: bool = True, gbp_usd_rate: float | None = None) -> PortfolioData:
+        if gbp_usd_rate is not None:
+            self.set_gbp_usd_rate(gbp_usd_rate)
         now = time.monotonic()
         if use_cache and self._cache is not None:
             cached_at, cached_data = self._cache
@@ -1506,6 +1676,30 @@ class T212Client:
             if invest_snap.ok and not invest_snap.is_fallback:
                 self._last_good_accounts["Invest"] = (now_uk, now_ms, invest_snap.model_copy(deep=True))
 
+            # Local GBP+USD wallet split for Invest (API v0 only exposes GBP-converted total cash).
+            if self.invest_multi_currency_enabled and invest_snap.ok:
+                wallet_records: dict[str, dict[str, Any]] = {}
+                if self._db is not None and hasattr(self._db, "get_wallet_balances"):
+                    try:
+                        wallet_records = await self._db.get_wallet_balances("Invest")
+                    except Exception as exc:
+                        logger.debug("Failed loading Invest wallet balances: %s", exc)
+                if wallet_records or self._db is not None:
+                    self._wallet_records = wallet_records
+                    invest_snap = reconcile_invest_wallets(
+                        invest_snap,
+                        wallet_records,
+                        self._gbp_usd_rate,
+                        mismatch_warn_gbp=self.wallet_mismatch_warn_gbp,
+                        reconcile_warn_days=self.wallet_reconcile_warn_days,
+                    )
+                    invest_snap = invest_snap.model_copy(
+                        update={
+                            "cash_interest_rate_pct": self.cash_interest_rate_pct,
+                            "usd_cash_interest_rate_pct": self.usd_cash_interest_rate_pct,
+                        }
+                    )
+
             data = PortfolioData(
                 fetched_at_uk=portfolio_uk,
                 fetched_at_ms=portfolio_ms,
@@ -1520,6 +1714,8 @@ class T212Client:
                     + (invest_snap.total_cash if invest_snap.ok else 0.0)
                 ),
                 cash_interest_rate_pct=self.cash_interest_rate_pct,
+                usd_cash_interest_rate_pct=self.usd_cash_interest_rate_pct,
+                gbp_usd_rate=self._gbp_usd_rate,
                 is_fallback=is_fallback,
                 fallback_source=fallback_source,
                 fallback_note=fallback_note,
@@ -1557,6 +1753,45 @@ class T212Client:
             return data
 
 
+def _format_wallet_split_line(acc: AccountSnapshot) -> str:
+    """Render the Invest GBP+USD wallet split with Python-computed amounts (no LLM arithmetic)."""
+    gbp_rate = acc.cash_interest_rate_pct
+    usd_rate = acc.usd_cash_interest_rate_pct
+    usd_equiv_str = ""
+    if acc.gbp_usd_rate and acc.gbp_usd_rate > 0:
+        usd_equiv_str = f" ≈ £{acc.usd_cash_total / acc.gbp_usd_rate:,.2f}"
+    usd_reserved_str = f", 挂单 ${acc.usd_reserved_cash:,.2f}" if acc.usd_reserved_cash > 0 else ""
+    usd_part = (
+        f"USD 钱包 ${acc.usd_cash_total:,.2f} "
+        f"(可用 ${acc.usd_available_to_trade:,.2f}{usd_reserved_str}{usd_equiv_str}, {usd_rate:.1f}%)"
+    )
+    if acc.gbp_wallet_total is None:
+        gbp_part = "GBP 钱包 ≈ 待汇率折算"
+    else:
+        gbp_reserved_str = (
+            f", 挂单 £{acc.gbp_wallet_reserved:,.2f}" if (acc.gbp_wallet_reserved or 0.0) > 0 else ""
+        )
+        gbp_part = (
+            f"GBP 钱包 ≈ £{acc.gbp_wallet_total:,.2f} "
+            f"(可用 £{acc.gbp_wallet_available or 0.0:,.2f}{gbp_reserved_str}, {gbp_rate:.1f}%)"
+        )
+    src_map = {
+        "manual_both": "手动双报",
+        "derived_from_total": "按 API 总现金推算",
+        "pending_fx": "待汇率",
+    }
+    src = src_map.get(acc.wallet_source, acc.wallet_source)
+    src_str = ""
+    if src:
+        src_str = f"，{src}"
+        if acc.wallet_updated_at_uk:
+            src_str += f" @ {acc.wallet_updated_at_uk}"
+    line = f"• 现金钱包拆解: {gbp_part} + {usd_part}{src_str}"
+    if acc.wallet_reconcile_warning:
+        line += f"\n  ⚠️ 钱包校准: {acc.wallet_reconcile_warning}"
+    return line
+
+
 def format_account_overview(acc: AccountSnapshot) -> str:
     if not acc.ok:
         return f"⚠️ {acc.account_label} 账户读取失败: {acc.error}"
@@ -1575,12 +1810,18 @@ def format_account_overview(acc: AccountSnapshot) -> str:
     lines = [
         f"• 账户总资产: {curr} {acc.total_account_value:,.2f}{fallback_head}",
         f"• 现金余额: {curr} {acc.total_cash:,.2f} (占 {acc.cash_ratio_pct:.1f}% | 可用: {acc.available_to_trade:,.2f}{reserved_str}){note_str}",
-        f"• 持仓市值: {curr} {acc.investments_value:,.2f} (投入成本: {curr} {acc.investments_cost:,.2f})",
-        (
-            f"• 累计总浮盈: {acc.unrealized_pnl:+,.2f} {curr} ({ret_pct:+.2f}%) "
-            f"[本币净盈亏 {stock_only_pnl:+,.2f} {curr} | 累计汇率影响 {acc.total_fx_impact:+,.2f} {curr}]{realized_str}"
-        ),
     ]
+    if acc.multi_currency_enabled:
+        lines.append(_format_wallet_split_line(acc))
+    lines.extend(
+        [
+            f"• 持仓市值: {curr} {acc.investments_value:,.2f} (投入成本: {curr} {acc.investments_cost:,.2f})",
+            (
+                f"• 累计总浮盈: {acc.unrealized_pnl:+,.2f} {curr} ({ret_pct:+.2f}%) "
+                f"[本币净盈亏 {stock_only_pnl:+,.2f} {curr} | 累计汇率影响 {acc.total_fx_impact:+,.2f} {curr}]{realized_str}"
+            ),
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1921,26 +2162,38 @@ def build_trade_context(
 
     cash_flow_summary_text = ""
     if all_tx or all_divs:
-        dep_sum = sum(tx.amount for tx in all_tx if tx.tx_type == "DEPOSIT")
-        wd_sum = sum(tx.amount for tx in all_tx if tx.tx_type == "WITHDRAW")
-        tr_sum = sum(tx.amount for tx in all_tx if tx.tx_type == "TRANSFER")
-        fee_sum = sum(tx.amount for tx in all_tx if tx.tx_type == "FEE")
-        int_sum = sum(tx.amount for tx in all_tx if tx.tx_type in {"INTEREST_ON_FREE_CASH", "LENDING_INTEREST"})
-        div_sum = sum(dv.amount for dv in all_divs)
+        def _sum_by_currency(items: list[Any], tx_types: set[str] | None = None) -> dict[str, float]:
+            """Aggregate amounts per currency so USD flows never inflate GBP totals."""
+            sums: dict[str, float] = {}
+            for item in items:
+                if tx_types is not None and getattr(item, "tx_type", "") not in tx_types:
+                    continue
+                ccy = str(getattr(item, "currency", "") or "GBP").strip().upper() or "GBP"
+                sums[ccy] = sums.get(ccy, 0.0) + float(getattr(item, "amount", 0.0) or 0.0)
+            return sums
+
+        def _fmt_sums(label: str, sums: dict[str, float]) -> list[str]:
+            return [
+                f"{label} {amount:+,.2f} {ccy}"
+                for ccy, amount in sums.items()
+                if abs(amount) >= 0.01
+            ]
 
         cf_parts: list[str] = []
-        if abs(dep_sum) >= 0.01:
-            cf_parts.append(f"外部入金 {dep_sum:+,.2f} GBP")
-        if abs(wd_sum) >= 0.01:
-            cf_parts.append(f"外部出金 {wd_sum:+,.2f} GBP")
-        if abs(tr_sum) >= 0.01:
-            cf_parts.append(f"账户划转 {tr_sum:+,.2f} GBP")
-        if abs(fee_sum) >= 0.01:
-            cf_parts.append(f"平台费用 {fee_sum:+,.2f} GBP")
-        if abs(div_sum) >= 0.01:
-            cf_parts.append(f"派息入账 +{div_sum:,.2f} GBP({len(all_divs)}笔)")
-        if abs(int_sum) >= 0.01:
-            cf_parts.append(f"现金利息 +{int_sum:,.2f} GBP")
+        cf_parts.extend(_fmt_sums("外部入金", _sum_by_currency(all_tx, {"DEPOSIT"})))
+        cf_parts.extend(_fmt_sums("外部出金", _sum_by_currency(all_tx, {"WITHDRAW"})))
+        cf_parts.extend(_fmt_sums("账户划转", _sum_by_currency(all_tx, {"TRANSFER"})))
+        cf_parts.extend(_fmt_sums("平台费用", _sum_by_currency(all_tx, {"FEE"})))
+        div_sums = _sum_by_currency(all_divs)
+        div_parts = [f"+{amount:,.2f} {ccy}" for ccy, amount in div_sums.items() if abs(amount) >= 0.01]
+        if div_parts:
+            cf_parts.append(f"派息入账 {' '.join(div_parts)}({len(all_divs)}笔)")
+        cf_parts.extend(
+            _fmt_sums(
+                "现金利息",
+                _sum_by_currency(all_tx, {"INTEREST_ON_FREE_CASH", "LENDING_INTEREST"}),
+            )
+        )
 
         tx_label_map = {
             "DEPOSIT": "入金",

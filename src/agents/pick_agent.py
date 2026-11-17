@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.agents.llm_client import LLMBackend
-from src.agents.prompts import build_agent_system_instruction
+from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.schemas import PickDecision, parse_or_repair_structured_json, render_pick_report
 from src.agents.tools import MarketToolkit, _format_us_deep_intel, run_forced_market_grounding
 from src.config import AppConfig
@@ -479,6 +479,12 @@ async def generate_pick_radar(
         db.get_recent_lessons(limit=5),
     )
 
+    # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
+    if getattr(macro, "gbp_usd", None):
+        set_rate = getattr(t212, "set_gbp_usd_rate", None)
+        if callable(set_rate):
+            set_rate(macro.gbp_usd)
+
     # Step 2: Load curated 150-stock active pool (if auditioned) & reuse held_histories in quant screener
     active_pool_rows: list[dict[str, Any]] = []
     if hasattr(db, "get_active_universe_pool"):
@@ -570,7 +576,8 @@ async def generate_pick_radar(
         f"双账户总净值 £{portfolio.total_combined_value:,.2f} | "
         f"总现金 £{portfolio.total_combined_cash:,.2f} (占总资产 {total_cash_pct:.1f}%) | "
         f"立即可用 £{total_available:,.2f} (ISA £{portfolio.isa.available_to_trade:,.2f} + Invest £{portfolio.invest.available_to_trade:,.2f}) | "
-        f"挂单占用(未成交前仍计息) ISA £{portfolio.isa.reserved_cash:,.2f} / Invest £{portfolio.invest.reserved_cash:,.2f}"
+        f"挂单占用(未成交前仍计息) ISA £{portfolio.isa.reserved_cash:,.2f} / Invest £{portfolio.invest.reserved_cash:,.2f}\n"
+        f"{build_wallet_context_text(portfolio, cfg.strategy, compact=True)}"
     )
 
     cand_syms = list(
@@ -730,7 +737,9 @@ async def generate_pick_radar(
         "你是独立风控官（Risk & Bear Critic）。请按四重护栏与今日 `/report` 红线严格审核投研员提案，"
         "直接输出最终结构化 JSON Decision（渲染后将限制在 1000 字内，结论置顶、废话为零）。\n\n"
         "【四重一票否决硬护栏】：\n"
-        f"1. 现金与 {cfg.strategy.cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税）：跑不赢现金利息的平庸机会直接枪毙。\n"
+        f"1. 现金与 GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 基准 + 交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税；"
+        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%，用 USD 钱包买美股比 {cfg.strategy.usd_cash_interest_rate_pct:.1f}%、"
+        f"GBP 不足 USD 换回比 {cfg.strategy.usd_cash_interest_rate_pct:.1f}%+{cfg.strategy.fx_fee_pct:.2f}%）：跑不赢对应币种现金利息的平庸机会直接枪毙。\n"
         f"2. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
         "3. 财报/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
         "4. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线与挂单/持仓裁决"
@@ -751,6 +760,7 @@ async def generate_pick_radar(
         f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
+        f"【双钱包明细与资金路径】：\n{build_wallet_context_text(portfolio, cfg.strategy)}\n"
         f"【行业暴露】：\n{exposure_text}\n\n"
         f"【投研员提案（待审）】：\n{research_output}"
     )

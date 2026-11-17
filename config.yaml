@@ -12,7 +12,7 @@ app:
 models:
   # [混合路由 + 双向灾备] 搜索与核心决策留 Gemini，日常单聊 / 平稳 /us / T+5 反思用 DeepSeek V4.1 Flash (HIGH)
   report_analyst_model: "gemini-4-hydrogen"         # /report Step 2A 机会分析
-  report_auditor_model: "gemini-4-hydrogen"         # /report Step 2B Bear 挑刺审计官 (XHIGH)
+  report_auditor_model: "gemini-4-carbon"           # /report Step 2B Bear 挑刺审计官 (旗舰推理)
   report_model: "gemini-4-hydrogen"                 # /report Step 3 PM 拍板
   us_sentinel_model: "deepseek-flash"               # /us 平稳日哨兵 (HIGH)
   us_anomaly_model: "gemini-4-hydrogen"             # /us 触发异动门控时自动切入高阶模型
@@ -27,12 +27,12 @@ models:
   report_search_model: "gemini-3.5-flash-lite"      # 早报常规 3 股批次联网搜索（0 思考高性价比）
   search_model: "gemini-3.5-flash-lite"             # 单聊 / /pick / /us 联网搜索模型
 
-  report_analyst_thinking_level: "MEDIUM"           # 初研降为 MEDIUM 省思考费，后端有 XHIGH/HIGH 把关
-  report_auditor_thinking_level: "XHIGH"            # Bear 挑刺拉满 XHIGH（比 Argon 省半价且智力更高）
+  report_analyst_thinking_level: "HIGH"             # 机会分析保持 HIGH 深度挖掘
+  report_auditor_thinking_level: "HIGH"             # Carbon Bear 挑刺审计深度
   report_thinking_level: "HIGH"                     # PM 拍板保持 HIGH
   us_thinking_level: "HIGH"                         # /us 平稳日 DeepSeek 保持 HIGH（不用 LOW）
   us_anomaly_thinking_level: "HIGH"                 # /us 异动日 Gemini 保持 HIGH
-  pick_researcher_thinking_level: "MEDIUM"          # 选股初研 MEDIUM，Stage 2 保持 HIGH
+  pick_researcher_thinking_level: "HIGH"            # 选股初研保持 HIGH 深度挖掘
   pick_thinking_level: "HIGH"
   chat_thinking_level: "HIGH"                       # 日常单聊与 T+5 反思均用 DeepSeek HIGH
   chat_deep_thinking_level: "HIGH"                  # /deep 单聊深度思考
@@ -54,9 +54,14 @@ schedule:
   weekly_radar_after_close_minutes: 30
 
 strategy:
-  cash_interest_rate_pct: 4.0       # T212 uninvested cash APY (%)
+  cash_interest_rate_pct: 4.0       # T212 uninvested GBP cash APY (%)
+  usd_cash_interest_rate_pct: 3.4   # Invest USD wallet uninvested cash APY (%)
   fx_fee_pct: 0.15                  # T212 FX fee per leg for non-GBP trades (%)
   uk_stamp_duty_pct: 0.50           # UK Stamp Duty on UK-domiciled individual stocks (ETFs = 0%)
+  # Invest GBP+USD dual-wallet ledger (API v0 cannot split cash by currency)
+  invest_multi_currency_enabled: true    # Attach local wallet split to Invest snapshots
+  wallet_reconcile_warn_days: 7          # Warn when the USD wallet anchor is older than N days
+  wallet_mismatch_warn_gbp: 10.0         # Warn when reported GBP+USD total deviates from API cash (£, also >2%)
   order_history_days: 30
   order_history_max_pages: 3
   max_daily_chat_turns: 12

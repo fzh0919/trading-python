@@ -19,19 +19,19 @@
 | :--- | :--- | :--- |
 | `config.py`, `config.yaml`, `version.py` | Pydantic 配置、`.env`、热重载自选/选股池、版本号 | `test_llm_pricing_and_usage.py` |
 | `engine/calendar_utils.py` | `US/UK/XETRA/EURONEXT` 交易日历、半日市、夏令时错位周 | `test_calendar_and_scheduler.py` |
-| `storage/db.py` | SQLite `WAL` 异步仓、周期/快照/结算/行情与搜索缓存 | `test_db_storage.py` |
+| `storage/db.py` | SQLite `WAL` 异步仓、周期/快照/结算/行情与搜索缓存、`wallet_balances` 双钱包锚点 | `test_db_storage.py` |
 | `data_providers/t212_client.py` | T212 双账户只读、限流退避、挂单量化与元/分红归档 | `test_t212_client.py` |
 | `data_providers/market_data.py` | Yahoo+Finnhub+FRED 并发聚合、`2y` 缓存、盘前 15m 跳空 | `test_market_data.py` |
 | `data_providers/analytics.py` | 复权自愈、CYQ、周线/ATR/ADX、去 Beta 相关性、CVaR | `test_analytics_and_rules.py` |
-| `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride` | `test_analytics_and_rules.py` |
-| `engine/screener.py`, `engine/universe_seeds.py`, `refresh_pool.py` | 四维双轨量化选股、150 只海选底池、VPVR/Stage2/VCP | `test_analytics_and_rules.py`, `test_universe_audition.py` |
+| `engine/portfolio_rules.py` | 持仓规则、移动止盈/除息守卫、Disagreement、`RiskOverride`、Invest 双钱包摩擦与 3.4%/4.0% 现金基准 | `test_analytics_and_rules.py` |
+| `engine/screener.py`, `engine/universe_seeds.py`, `refresh_pool.py` | 四维双轨量化选股、150 只海选底池、VPVR/Stage2/VCP、Invest 钱包摩擦加权 | `test_analytics_and_rules.py`, `test_universe_audition.py` |
 | `agents/llm_client.py` | `GeminiClient`（Gemini+DeepSeek 混合路由/双向灾备）、Thinking 钳位、工具裁剪、Search 额度预警 | `test_llm_pricing_and_usage.py` |
 | `agents/prompts.py`, `agents/schemas.py` | 投资者画像、JSON 自修复、`[🛡️风控护栏修正]` 倒金字塔渲染 | `test_db_and_end_to_end.py` |
 | `agents/tools.py` | 分域 Google 强搜（英文搜/中文出）与 `MarketToolkit` | `test_v504_ops_and_grounding.py` |
 | `agents/report_agent.py` | `/report` 三步流水线、`AnalysisContextPack`、`/us` 异动门控 | `test_db_and_end_to_end.py` |
 | `agents/pick_agent.py` | `/pick` Researcher -> Risk Critic -> Post-Screen 硬拦截落库 | `test_db_and_end_to_end.py` |
 | `agents/chat_agent.py` | `/pos` 0-Token 查仓、Implicit Cache 前缀、标的切片与 `/deep` | `test_db_and_end_to_end.py` |
-| `bot/handlers.py`, `bot/scheduler.py`, `bot/telegram_client.py` | 指令路由、`execution_lock` 互斥、自动日程、`T+5/10/20` 结算 | `test_calendar_and_scheduler.py`, `test_db_and_end_to_end.py` |
+| `bot/handlers.py`, `bot/scheduler.py`, `bot/telegram_client.py` | 指令路由、`execution_lock` 互斥、自动日程、`T+5/10/20` 结算、`/wallet`/`/usd` 双钱包校准 | `test_calendar_and_scheduler.py`, `test_db_and_end_to_end.py` |
 | `ops_notifier.py`, `healthcheck.py`, `main.py` | `ops-notify` 双态告警、心跳/只读 DB 探活、生命周期管理 | `test_v504_ops_and_grounding.py` |
 
 ## 三、开发验收命令

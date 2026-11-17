@@ -18,7 +18,7 @@ from src.agents.report_agent import generate_morning_report, generate_us_sentine
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.market_data import MarketDataService
-from src.data_providers.t212_client import T212Client
+from src.data_providers.t212_client import T212Client, reconcile_invest_wallets
 from src.engine.screener import run_universe_audition
 from src.storage.db import AdvisorDatabase
 from src.version import APP_VERSION
@@ -34,12 +34,26 @@ REMOVE_KEYBOARD_MARKUP: dict[str, Any] = {"remove_keyboard": True}
 
 BOT_COMMANDS: list[dict[str, str]] = [
     {"command": "pos", "description": "实时双账户持仓、净值与挂单"},
+    {"command": "wallet", "description": "Invest GBP+USD 双钱包对账与校准"},
+    {"command": "usd", "description": "上报 Invest USD 钱包余额（/usd 600 [25]）"},
     {"command": "report", "description": "全景深度晨报（含全市场联网检索）"},
     {"command": "pick", "description": "全市场选股雷达（可附方向，如 /pick 英股ETF）"},
     {"command": "us", "description": "美股盘前/盘中/收盘增量哨兵"},
     {"command": "stats", "description": "历史选股与调仓记录档案"},
     {"command": "help", "description": "查看核心与运维全部指令说明"},
 ]
+
+
+def _wallet_numbers(tokens: list[str]) -> list[float]:
+    """Extract numeric amounts from user tokens, tolerating , £ $ prefixes."""
+    out: list[float] = []
+    for tok in tokens:
+        cleaned = tok.replace(",", "").replace("£", "").replace("$", "").strip()
+        try:
+            out.append(float(cleaned))
+        except ValueError:
+            continue
+    return out
 
 
 def _normalize_command_text(raw_text: str) -> str:
@@ -150,6 +164,8 @@ class AdvisorBot:
             "• /pick [方向] — 全市场选股雷达（美/英/欧股 + LSE ETF 联网催化 + 风控终审）\n"
             "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报\n"
             "• /stats — 查看近期历史选股与加减仓记录档案\n"
+            "• /wallet — Invest GBP+USD 双钱包对账（实时总现金、实时汇率、推算/实报 GBP 与校准差额）\n"
+            "• /usd <金额> [挂单占用] — 上报 Invest USD 余额；/wallet gbp 1500 [usd 600] 单报或双报\n"
             "• 直接打字 — 全天单聊（自带今日晨报基线、实时查价与谷歌搜新闻工具）\n\n"
             "【运维与系统控制指令】\n"
             "• /refresh_pool — 手动触发多市场底池海选（0-Token 筛选 150 只优质个股 + LSE ETF）\n"
@@ -158,6 +174,196 @@ class AdvisorBot:
             "• /clear — 清空今日对话记忆重新开始\n"
             "• /cancel — 立即中止正在运行的耗时分析"
         )
+
+    # ---------- Invest GBP+USD wallet ledger (/wallet & /usd) ----------
+
+    @staticmethod
+    def _parse_wallet_args(head: str, args: list[str]) -> tuple[str, dict[str, tuple[float, float]]]:
+        """Parse /usd and /wallet payloads into (error_message, {currency: (available, reserved)})."""
+        if not args:
+            return "", {}
+        usage = "用法：/usd <可用金额> [挂单占用]；/wallet；/wallet gbp 1500；/wallet gbp 1500 usd 600"
+        if head == "/usd":
+            nums = _wallet_numbers(args)
+            if not nums:
+                return usage, {}
+            avail = nums[0]
+            reserved = nums[1] if len(nums) > 1 else 0.0
+            if avail < 0 or reserved < 0:
+                return "金额不能为负数。", {}
+            return "", {"USD": (avail, reserved)}
+
+        tokens = [a.lower() for a in args]
+        if not any(t in {"gbp", "usd"} for t in tokens):
+            return usage, {}
+        updates: dict[str, tuple[float, float]] = {}
+        for idx, tok in enumerate(tokens):
+            ccy = tok.upper()
+            if ccy not in {"GBP", "USD"}:
+                continue
+            if idx + 1 >= len(tokens):
+                return f"{ccy} 缺少金额，例如 /wallet gbp 1500", {}
+            nums = _wallet_numbers([args[idx + 1]])
+            if not nums:
+                return f"{ccy} 金额格式不正确：{args[idx + 1]}", {}
+            if nums[0] < 0:
+                return "金额不能为负数。", {}
+            updates[ccy] = (nums[0], 0.0)
+        if not updates:
+            return usage, {}
+        return "", updates
+
+    async def _load_wallet_snapshot(self) -> tuple[Any, dict[str, dict[str, Any]], float | None]:
+        """Load live Invest cash, local wallet anchors, and GBP/USD for ledger commands."""
+        portfolio = await self.t212.get_portfolio(use_cache=True)
+        records: dict[str, dict[str, Any]] = {}
+        if hasattr(self.db, "get_wallet_balances"):
+            try:
+                records = await self.db.get_wallet_balances("Invest")
+            except Exception as exc:
+                logger.warning("Failed loading wallet balances: %s", exc)
+        rate: float | None = None
+        if hasattr(self.market_data, "get_macro_snapshot"):
+            try:
+                macro = await self.market_data.get_macro_snapshot()
+                candidate = getattr(macro, "gbp_usd", None)
+                if candidate is not None and float(candidate) > 0:
+                    rate = float(candidate)
+                    set_rate = getattr(self.t212, "set_gbp_usd_rate", None)
+                    if callable(set_rate):
+                        set_rate(rate)
+            except Exception as exc:
+                logger.warning("Failed fetching macro for wallet ledger: %s", exc)
+        if rate is None:
+            stored = getattr(self.t212, "gbp_usd_rate", None)
+            if stored is not None and float(stored) > 0:
+                rate = float(stored)
+        return portfolio, records, rate
+
+    def _format_wallet_status(
+        self,
+        portfolio: Any,
+        records: dict[str, dict[str, Any]],
+        rate: float | None,
+        *,
+        note: str = "",
+    ) -> str:
+        """Render the Invest GBP+USD ledger with Python-computed amounts and reconcile diff."""
+        invest = portfolio.invest
+        mismatch_floor = float(self.cfg.strategy.wallet_mismatch_warn_gbp)
+        snap = reconcile_invest_wallets(
+            invest,
+            records,
+            rate,
+            mismatch_warn_gbp=mismatch_floor,
+            reconcile_warn_days=int(self.cfg.strategy.wallet_reconcile_warn_days),
+        )
+        usd_rec = records.get("USD") or {}
+        updated_ms = int(usd_rec.get("updated_at_ms") or 0)
+        age_txt = ""
+        if updated_ms > 0:
+            age_days = max(0, int((time.time() * 1000 - updated_ms) / 86_400_000))
+            age_txt = f"（{age_days} 天前）"
+
+        lines = [f"💼 Invest 双钱包对账（{portfolio.fetched_at_uk} UK）"]
+        lines.append(
+            f"• T212 总现金(GBP): £{invest.total_cash:,.2f}"
+            f"（可用 £{invest.available_to_trade:,.2f} / 挂单 £{invest.reserved_cash:,.2f}）"
+        )
+        lines.append(f"• 实时 GBP/USD: {rate:.4f}" if rate else "• 实时 GBP/USD: 暂缺（宏观快照未就绪）")
+        usd_line = (
+            f"• 本地 USD 记录: ${snap.usd_cash_total:,.2f}"
+            f"（可用 ${snap.usd_available_to_trade:,.2f} / 挂单 ${snap.usd_reserved_cash:,.2f}）"
+        )
+        if rate:
+            usd_line += f" ≈ £{snap.usd_cash_total / rate:,.2f}"
+        lines.append(usd_line)
+        if snap.wallet_updated_at_uk:
+            lines.append(f"• USD 记录更新: {snap.wallet_updated_at_uk} UK{age_txt}")
+        if snap.gbp_wallet_total is None:
+            lines.append("• GBP 钱包: 待汇率折算")
+        else:
+            src_lbl = "手动上报" if snap.wallet_source == "manual_both" else "按 API 总现金推算"
+            lines.append(
+                f"• GBP 钱包: ≈ £{snap.gbp_wallet_total:,.2f}"
+                f"（可用 £{snap.gbp_wallet_available or 0.0:,.2f}，{src_lbl}）"
+            )
+            threshold = max(mismatch_floor, abs(float(invest.total_cash)) * 0.02)
+            diff = (snap.gbp_wallet_total + snap.usd_cash_total / rate) - float(invest.total_cash)
+            lines.append(f"• 核对差额: £{diff:+,.2f}（告警阈值 £{threshold:,.2f}）")
+        if snap.wallet_reconcile_warning:
+            lines.append(f"⚠️ 校准提示: {snap.wallet_reconcile_warning}")
+        if note:
+            lines.append(note)
+        lines.append(
+            "提示：如有换汇或美股买卖回笼，回复 /usd 金额 校准；"
+            "也可 /wallet gbp 1500 或 /wallet gbp 1500 usd 600 单报/双报。"
+        )
+        return "\n".join(lines)
+
+    async def _handle_wallet_command(self, text: str) -> str:
+        """Handle /wallet and /usd as lightweight, lock-free ledger commands."""
+        parts = text.split()
+        head = parts[0].lower().split("@", 1)[0]
+        args = parts[1:]
+        err, updates = self._parse_wallet_args(head, args)
+        if err:
+            return f"⚠️ {err}"
+
+        portfolio, records, rate = await self._load_wallet_snapshot()
+        invest = getattr(portfolio, "invest", None)
+        if invest is None or not getattr(invest, "ok", False):
+            return f"⚠️ Invest 账户读取失败，暂无法对账：{getattr(invest, 'error', '未知错误')}"
+
+        note = ""
+        if updates:
+            total_cash = float(invest.total_cash or 0.0)
+            threshold = max(float(self.cfg.strategy.wallet_mismatch_warn_gbp), abs(total_cash) * 0.02)
+            usd_report = updates.get("USD")
+            usd_amount = (usd_report[0] + usd_report[1]) if usd_report is not None else None
+            if usd_amount is not None and rate:
+                usd_gbp = float(usd_amount) / rate
+                if usd_gbp > total_cash + threshold:
+                    return (
+                        f"⛔ 已阻断：USD ${usd_amount:,.2f} ÷ {rate:.4f} = £{usd_gbp:,.2f}，"
+                        f"超出 Invest 总现金 £{total_cash:,.2f}（容差 £{threshold:,.2f}）。\n"
+                        "请检查金额输入，或先 /pos 确认最新持仓快照后再报。"
+                    )
+            if usd_amount is not None and not rate:
+                note = "（汇率暂缺：已先记录 USD 余额，GBP 拆解待汇率恢复后自动补算）"
+
+            if set(updates) == {"USD"} and hasattr(self.db, "clear_manual_gbp_override"):
+                # USD-only report restores GBP = TOTAL - USD auto derivation
+                await self.db.clear_manual_gbp_override("Invest")
+
+            if set(updates) == {"GBP"}:
+                gbp_avail = updates["GBP"][0]
+                if rate:
+                    implied_usd = max(0.0, (total_cash - gbp_avail) * rate)
+                    await self.db.upsert_wallet_balance(
+                        "Invest", "USD", implied_usd, 0.0, source="manual_derived", note="由 GBP 反推"
+                    )
+                    await self.db.upsert_wallet_balance(
+                        "Invest", "GBP", gbp_avail, 0.0, source="manual", note="Telegram 单报 GBP"
+                    )
+                    note = f"（已按 GBP £{gbp_avail:,.2f} 反推 USD ≈ ${implied_usd:,.2f}）"
+                else:
+                    await self.db.upsert_wallet_balance(
+                        "Invest", "GBP", gbp_avail, 0.0, source="manual", note="Telegram 单报 GBP"
+                    )
+                    note = "（汇率暂缺：仅记录 GBP，USD 待下次双报或 /usd 校准）"
+            else:
+                # USD first, then GBP, so a dual report carries the newest GBP timestamp
+                for ccy in ("USD", "GBP"):
+                    if ccy not in updates:
+                        continue
+                    avail, reserved = updates[ccy]
+                    await self.db.upsert_wallet_balance(
+                        "Invest", ccy, avail, reserved, source="manual", note="Telegram 上报"
+                    )
+            records = await self.db.get_wallet_balances("Invest")
+
+        return self._format_wallet_status(portfolio, records, rate, note=note)
 
     async def handle_update(self, update: dict[str, Any], wait: bool = False) -> None:
         msg = update.get("message")
@@ -192,6 +398,10 @@ class AdvisorBot:
             await self._send_reply(chat_id, await self._build_stats_message())
             return
 
+        if lower.startswith("/wallet") or lower.startswith("/usd"):
+            await self._send_reply(chat_id, await self._handle_wallet_command(text))
+            return
+
         if lower.startswith("/usage"):
             summary = await self.db.get_usage_summary(days=30)
             await self._send_reply(chat_id, self._format_usage_message(summary))
@@ -211,6 +421,8 @@ class AdvisorBot:
             lower.startswith("/pos")
             or lower.startswith("/health")
             or lower.startswith("/heath")
+            or lower.startswith("/wallet")
+            or lower.startswith("/usd")
         )
 
     @staticmethod
@@ -360,6 +572,11 @@ class AdvisorBot:
             self.db.get_usage_summary(days=30),
         )
         uptime_s = _format_uptime(time.monotonic() - self._started_monotonic)
+        # Keep the T212 client's GBP/USD anchor warm for later wallet-split derivation.
+        if getattr(macro, "gbp_usd", None):
+            set_rate = getattr(self.t212, "set_gbp_usd_rate", None)
+            if callable(set_rate):
+                set_rate(macro.gbp_usd)
 
         def _acc_line(label: str, acc: Any) -> str:
             if not acc.ok:

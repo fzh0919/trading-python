@@ -29,7 +29,8 @@ from src.data_providers.market_data import (
     TickerMarketBundle,
     normalize_history_index,
 )
-from src.data_providers.t212_client import PortfolioData
+from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+from src.engine.portfolio_rules import wallet_friction_context
 
 
 class ScreenerCandidate(BaseModel):
@@ -769,6 +770,7 @@ def score_candidate(
     is_recent_traded: bool = False,
     etf_symbols: Iterable[str] | None = None,
     deep_intel: dict[str, Any] | None = None,
+    invest_wallet: AccountSnapshot | None = None,
 ) -> ScreenerCandidate:
     """Score a candidate across 4 orthogonal capped dimensions with asymmetric dual-track weights & factor attribution."""
     pros: list[str] = []
@@ -983,12 +985,40 @@ def score_candidate(
         else:
             dim3 += _linear_scale(div, 0.0, 4.0, 0.0, 2.0)
 
+    wallet_enabled, usd_avail, gbp_avail = (
+        wallet_friction_context(invest_wallet) if track != "ISA_LONG_TERM" else (False, 0.0, 0.0)
+    )
     if sym_up.endswith(".L") and is_etf:
-        dim3 += 6.0
-        pros.append("LSE英镑ETF(免换汇/免印花税)")
+        if track == "ISA_LONG_TERM" or not wallet_enabled or gbp_avail > 0.01:
+            dim3 += 6.0
+            pros.append(
+                "LSE英镑ETF(免换汇/免印花税)"
+                if track == "ISA_LONG_TERM"
+                else "LSE英镑ETF(Invest GBP充足:免换汇/免印花税)"
+            )
+        else:
+            dim3 += 2.5
+            pros.append(f"LSE英镑ETF(Invest GBP不足:USD换回+{strategy.fx_fee_pct:.2f}%换汇)")
     elif sym_up.endswith(".L"):
-        dim3 += 2.5
-        pros.append("英镑计价免换汇")
+        if track == "ISA_LONG_TERM" or not wallet_enabled or gbp_avail > 0.01:
+            dim3 += 2.5
+            pros.append("英镑计价免换汇" if track == "ISA_LONG_TERM" else "英镑计价(Invest GBP充足:免换汇)")
+        else:
+            dim3 += 1.0
+            cons.append(
+                f"英股需USD换回GBP(+{strategy.fx_fee_pct:.2f}%换汇+"
+                f"{strategy.uk_stamp_duty_pct:.1f}%印花税)"
+            )
+
+    if track != "ISA_LONG_TERM" and wallet_enabled and not sym_up.endswith(".L"):
+        is_eur = sym_up.endswith((".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".BR", ".VI", ".F"))
+        if is_eur:
+            cons.append(f"欧股需换汇+{strategy.fx_fee_pct:.2f}%单边(往返{strategy.fx_fee_pct * 2:.2f}%)")
+        elif usd_avail > 0.01:
+            dim3 += 2.0
+            pros.append("美股可用USD钱包免换汇")
+        elif gbp_avail > 0.01:
+            cons.append(f"美股USD不足需GBP换汇+{strategy.fx_fee_pct:.2f}%单边")
 
     if deep_intel and not is_etf:
         surprises = deep_intel.get("earnings_surprises") or []
@@ -1316,6 +1346,7 @@ async def run_quant_screener(
                     regime_tag=regime_tag,
                     is_recent_traded=(sym.upper() in recent_traded_set),
                     etf_symbols=etf_set,
+                    invest_wallet=portfolio.invest,
                 )
             )
 
@@ -1493,6 +1524,7 @@ async def run_quant_screener(
                     is_recent_traded=(sym.upper() in recent_traded_set),
                     etf_symbols=etf_set,
                     deep_intel=deep_intel_map.get(sym.upper()) or deep_intel_map.get(sym),
+                    invest_wallet=portfolio.invest,
                 )
             )
         calibrated = _apply_percentile_calibration(out)

@@ -735,5 +735,46 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pruned["grounding_news_cache"], 1)
 
 
+class TestWalletBalances(unittest.IsolatedAsyncioTestCase):
+    async def test_idempotent_seed_and_manual_gbp_override_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "wallet.db")
+            await db.init()
+            await db.init()
+
+            seeded = await db.get_wallet_balances("Invest")
+            self.assertIn("USD", seeded)
+            self.assertEqual(seeded["USD"]["available_amount"], 0.0)
+            self.assertEqual(seeded["USD"]["reserved_amount"], 0.0)
+            self.assertEqual(seeded["USD"]["source"], "init")
+
+            await db.upsert_wallet_balance("Invest", "usd", 1250.5, 40.25, note="手动校准")
+            records = await db.get_wallet_balances("Invest")
+            self.assertEqual(records["USD"]["available_amount"], 1250.5)
+            self.assertEqual(records["USD"]["reserved_amount"], 40.25)
+            self.assertEqual(records["USD"]["source"], "manual")
+            self.assertEqual(records["USD"]["note"], "手动校准")
+
+            # Negative / non-finite anchors must never persist as negative cash
+            await db.upsert_wallet_balance("Invest", "USD", -5.0, float("nan"))
+            clamped = (await db.get_wallet_balances("Invest"))["USD"]
+            self.assertEqual(clamped["available_amount"], 0.0)
+            self.assertEqual(clamped["reserved_amount"], 0.0)
+
+            await db.upsert_wallet_balance("Invest", "GBP", 800.0, 25.0)
+            self.assertIn("GBP", await db.get_wallet_balances("Invest"))
+            self.assertEqual(await db.clear_manual_gbp_override("Invest"), 1)
+            self.assertNotIn("GBP", await db.get_wallet_balances("Invest"))
+            self.assertIn("USD", await db.get_wallet_balances("Invest"))
+
+    async def test_clear_manual_gbp_keeps_non_manual_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "wallet2.db")
+            await db.init()
+            await db.upsert_wallet_balance("Invest", "GBP", 100.0, source="derived")
+            self.assertEqual(await db.clear_manual_gbp_override("Invest"), 0)
+            self.assertIn("GBP", await db.get_wallet_balances("Invest"))
+
+
 if __name__ == "__main__":
     unittest.main()

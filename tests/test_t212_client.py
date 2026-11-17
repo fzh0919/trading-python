@@ -17,6 +17,7 @@ import pandas as pd
 from src.data_providers.market_data import TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    HistoricalTransactionItem,
     PendingOrderItem,
     PortfolioData,
     PositionItem,
@@ -25,6 +26,7 @@ from src.data_providers.t212_client import (
     clean_t212_ticker,
     format_account_overview,
     format_positions_text,
+    reconcile_invest_wallets,
     to_yahoo_symbol,
 )
 from src.storage.db import AdvisorDatabase
@@ -1039,6 +1041,111 @@ class TestT212Client(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[远端低概率单]", p_txt)
         self.assertIn("[止损过窄易被日常波动扫出]", p_txt)
         self.assertIn("[位于90%筹码支撑带]", p_txt)
+
+
+class TestWalletSnapshotCompat(unittest.TestCase):
+    """Phase 2/5 compatibility: legacy snapshot JSON, derived split, mismatch and clamping."""
+
+    def test_legacy_snapshot_json_defaults_to_single_wallet(self) -> None:
+        payload = {
+            "fetched_at_uk": "2026-11-10 09:00",
+            "fetched_at_ms": 1762765200000,
+            "isa": {"ok": True, "account_label": "ISA", "total_cash": 100.0},
+            "invest": {"ok": True, "account_label": "Invest", "total_cash": 200.0},
+            "total_combined_value": 300.0,
+            "total_combined_cash": 300.0,
+        }
+        data = PortfolioData.model_validate(payload)
+        self.assertFalse(data.invest.multi_currency_enabled)
+        self.assertIsNone(data.gbp_usd_rate)
+        self.assertEqual(data.invest.usd_cash_total, 0.0)
+        self.assertIsNone(data.invest.gbp_wallet_total)
+
+    def test_derived_split_never_changes_gbp_totals(self) -> None:
+        snap = AccountSnapshot(ok=True, total_cash=1000.0, available_to_trade=800.0, reserved_cash=200.0)
+        updated_ms = int(time.time() * 1000)
+        records = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 50.0,
+                "updated_at_ms": updated_ms,
+                "updated_at_uk": "2026-11-17 08:00",
+                "source": "manual",
+            }
+        }
+        out = reconcile_invest_wallets(snap, records, 1.25)
+        self.assertEqual(out.usd_cash_total, 300.0)
+        self.assertEqual(out.gbp_wallet_total, 760.0)  # 1000 - 300/1.25
+        self.assertEqual(out.gbp_wallet_available, 600.0)  # 800 - 250/1.25
+        self.assertEqual(out.gbp_wallet_reserved, 160.0)  # 200 - 50/1.25
+        self.assertEqual(out.total_cash, 1000.0)
+        self.assertEqual(out.wallet_source, "derived_from_total")
+
+    def test_manual_dual_report_mismatch_and_negative_clamp(self) -> None:
+        snap = AccountSnapshot(ok=True, total_cash=1000.0, available_to_trade=1000.0, reserved_cash=0.0)
+        updated_ms = int(time.time() * 1000)
+        dual = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 0.0,
+                "updated_at_ms": updated_ms,
+                "updated_at_uk": "2026-11-17 08:00",
+                "source": "manual",
+            },
+            "GBP": {
+                "available_amount": 500.0,
+                "reserved_amount": 0.0,
+                "updated_at_ms": updated_ms + 10,
+                "updated_at_uk": "2026-11-17 08:01",
+                "source": "manual",
+            },
+        }
+        out = reconcile_invest_wallets(snap, dual, 1.25)
+        self.assertEqual(out.wallet_source, "manual_both")
+        self.assertIn("偏差", out.wallet_reconcile_warning)
+
+        overshoot = {"USD": {**dual["USD"], "available_amount": 3000.0}}
+        clamped = reconcile_invest_wallets(snap, overshoot, 1.25)
+        self.assertEqual(clamped.gbp_wallet_total, 0.0)
+        self.assertIn("负", clamped.wallet_reconcile_warning)
+
+    def test_multi_currency_trade_context_does_not_mix_currencies(self) -> None:
+        now_ms = int(time.time() * 1000)
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 09:00",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(ok=True, account_label="ISA"),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                recent_transactions=[
+                    HistoricalTransactionItem(
+                        id="t1",
+                        account="Invest",
+                        tx_type="DEPOSIT",
+                        amount=500.0,
+                        currency="GBP",
+                        date_time="2026-11-17T08:00:00Z",
+                        date_time_ms=now_ms,
+                        uk_time_str="2026-11-17 08:00",
+                    ),
+                    HistoricalTransactionItem(
+                        id="t2",
+                        account="Invest",
+                        tx_type="INTEREST_ON_FREE_CASH",
+                        amount=3.4,
+                        currency="USD",
+                        date_time="2026-11-17T08:05:00Z",
+                        date_time_ms=now_ms + 1000,
+                        uk_time_str="2026-11-17 08:05",
+                    ),
+                ],
+            ),
+        )
+        text = build_trade_context(portfolio, history_days=30)["cash_flow_summary_text"]
+        self.assertIn("外部入金 +500.00 GBP", text)
+        self.assertIn("现金利息 +3.40 USD", text)
+        self.assertNotIn("503.40 GBP", text)
 
 
 if __name__ == "__main__":

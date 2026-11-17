@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.agents.llm_client import LLMBackend
-from src.agents.prompts import build_agent_system_instruction
+from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.schemas import (
     MorningReportDecision,
     parse_or_repair_structured_json,
@@ -129,33 +129,50 @@ def _compute_portfolio_diff_text(
             f"总净值: {previous.total_combined_value:,.2f} → {current.total_combined_value:,.2f} GBP ({val_diff:+,.2f})"
         )
 
-    ext_in_out = 0.0
-    int_sum = 0.0
-    fee_sum = 0.0
-    div_sum = 0.0
+    def _add(sums: dict[str, float], ccy: str, amount: float) -> None:
+        key = str(ccy or "GBP").strip().upper() or "GBP"
+        sums[key] = sums.get(key, 0.0) + float(amount or 0.0)
+
+    ext_by_ccy: dict[str, float] = {}
+    int_by_ccy: dict[str, float] = {}
+    fee_by_ccy: dict[str, float] = {}
+    div_by_ccy: dict[str, float] = {}
     for acc in (current.isa, current.invest):
         for tx in acc.recent_transactions:
             if tx.date_time_ms >= previous.fetched_at_ms:
                 if tx.tx_type in {"DEPOSIT", "WITHDRAW"}:
-                    ext_in_out += tx.amount
+                    _add(ext_by_ccy, tx.currency, tx.amount)
                 elif tx.tx_type in {"INTEREST_ON_FREE_CASH", "LENDING_INTEREST"}:
-                    int_sum += tx.amount
+                    _add(int_by_ccy, tx.currency, tx.amount)
                 elif tx.tx_type == "FEE":
-                    fee_sum += tx.amount
+                    _add(fee_by_ccy, tx.currency, tx.amount)
         for dv in acc.recent_dividends:
             if dv.paid_on_ms >= previous.fetched_at_ms:
-                div_sum += dv.amount
+                _add(div_by_ccy, dv.currency, dv.amount)
 
-    if abs(ext_in_out) >= 0.01:
+    def _fmt_sums(sums: dict[str, float], *, plus_only: bool = False) -> str:
+        parts = [
+            (f"+{amt:,.2f} {ccy}" if plus_only else f"{amt:+,.2f} {ccy}")
+            for ccy, amt in sums.items()
+            if abs(amt) >= 0.01
+        ]
+        return "、".join(parts)
+
+    ext_txt = _fmt_sums(ext_by_ccy)
+    if ext_txt:
+        ext_gbp = ext_by_ccy.get("GBP", 0.0)
         changes.append(
-            f"区间外部出入金 {ext_in_out:+,.2f} GBP（剔除出入金后净值变动约 {val_diff - ext_in_out:+,.2f} GBP）"
+            f"区间外部出入金 {ext_txt}（按 GBP 口径剔除出入金后净值变动约 {val_diff - ext_gbp:+,.2f} GBP）"
         )
-    if abs(div_sum) >= 0.01:
-        changes.append(f"区间派息入账 +{div_sum:,.2f} GBP")
-    if abs(int_sum) >= 0.01:
-        changes.append(f"区间现金利息 +{int_sum:,.2f} GBP")
-    if abs(fee_sum) >= 0.01:
-        changes.append(f"区间平台扣费 {fee_sum:+,.2f} GBP")
+    div_txt = _fmt_sums(div_by_ccy, plus_only=True)
+    if div_txt:
+        changes.append(f"区间派息入账 {div_txt}")
+    int_txt = _fmt_sums(int_by_ccy, plus_only=True)
+    if int_txt:
+        changes.append(f"区间现金利息 {int_txt}")
+    fee_txt = _fmt_sums(fee_by_ccy)
+    if fee_txt:
+        changes.append(f"区间平台扣费 {fee_txt}")
 
     for k, cur in cur_map.items():
         if k not in prev_map:
@@ -642,6 +659,12 @@ async def generate_morning_report(
         context_pack,
     ) = fact_bundle
 
+    # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
+    if getattr(macro, "gbp_usd", None):
+        set_rate = getattr(t212, "set_gbp_usd_rate", None)
+        if callable(set_rate):
+            set_rate(macro.gbp_usd)
+
     priority_symbols: list[str] = []
     for sym in held_syms:
         b = bundles.get(sym)
@@ -731,8 +754,10 @@ async def generate_morning_report(
     if extra_alerts:
         dst_note += " | " + "；".join(extra_alerts)
 
+    wallet_text = build_wallet_context_text(portfolio, cfg.strategy)
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
+        f"{wallet_text}\n\n"
         f"=== 一、双账户状态 ===\n"
         f"【Stocks ISA】\n{format_account_overview(portfolio.isa)}\n持仓：\n{format_positions_text(portfolio.isa)}\n\n"
         f"【Invest】\n{format_account_overview(portfolio.invest)}\n持仓：\n{format_positions_text(portfolio.invest)}\n\n"
@@ -834,8 +859,7 @@ async def generate_morning_report(
         f"=== 历史决策回顾 (Memory Log) ===\n{past_lessons}\n\n"
         + calendar_block
         + f"=== 账户速览与净值变动 ===\n"
-        f"ISA 现金 {portfolio.isa.account_currency} {portfolio.isa.total_cash:,.2f} ({portfolio.isa.cash_ratio_pct:.1f}% | 可用 {portfolio.isa.available_to_trade:,.2f}) | "
-        f"Invest 现金 {portfolio.invest.account_currency} {portfolio.invest.total_cash:,.2f} ({portfolio.invest.cash_ratio_pct:.1f}%)\n"
+        f"{wallet_text}\n"
         f"净值变动：{diff_text}\n"
         f"资金流水：{cash_flow_text}\n"
         f"活动挂单：\n{trade_ctx['pending_orders_text']}\n\n"
@@ -1172,7 +1196,8 @@ async def generate_us_sentinel(
         f"{gate_block}\n\n"
         f"=== 今日 /report 全文（必须对照逐条核验）===\n{morning_baseline}\n\n"
         f"=== 今日风控红线 ===\n{veto_block}\n\n"
-        f"=== 最新美股事实与可用现金（ISA {portfolio.isa.available_to_trade:,.2f} GBP | Invest {portfolio.invest.available_to_trade:,.2f} GBP）===\n"
+        f"=== 最新美股事实与可用现金 ===\n"
+        f"{build_wallet_context_text(portfolio, cfg.strategy, compact=True)}\n"
         f"【美股活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"{fact_sheet}"
         + (f"\n\n=== 异动标的实时 Google Search 归因 ===\n{us_grounding}" if us_grounding else "")

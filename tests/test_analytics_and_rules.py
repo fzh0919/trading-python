@@ -15,8 +15,13 @@ from src.data_providers.analytics import (
     max_correlation_against_portfolio,
 )
 from src.data_providers.market_data import MarketDataService, TickerMarketBundle
-from src.data_providers.t212_client import HistoricalOrderItem, PositionItem
-from src.engine.portfolio_rules import evaluate_holding, format_evaluations_text
+from src.data_providers.t212_client import AccountSnapshot, HistoricalOrderItem, PositionItem
+from src.engine.portfolio_rules import (
+    _round_trip_friction_pct,
+    _wallet_cash_basis_pct,
+    evaluate_holding,
+    format_evaluations_text,
+)
 from src.engine.screener import (
     compute_market_breadth,
     compute_portfolio_risk_metrics,
@@ -36,6 +41,93 @@ from src.engine.screener import (
 def _make_hist(closes: list[float]) -> pd.DataFrame:
     dates = pd.date_range("2025-10-01", periods=len(closes), freq="B")
     return pd.DataFrame({"Close": closes}, index=dates)
+
+
+def _wallet_snap(*, usd: float, gbp: float) -> AccountSnapshot:
+    return AccountSnapshot(
+        ok=True,
+        account_label="Invest",
+        total_cash=2000.0,
+        available_to_trade=1500.0,
+        reserved_cash=500.0,
+        multi_currency_enabled=True,
+        usd_cash_total=usd,
+        usd_available_to_trade=usd,
+        gbp_wallet_total=gbp,
+        gbp_wallet_available=gbp,
+        gbp_wallet_reserved=0.0,
+    )
+
+
+class TestDualWalletFrictionMatrix(unittest.TestCase):
+    """ISA vs Invest asymmetric friction and cash-interest basis (Phase 4 matrix)."""
+
+    def setUp(self) -> None:
+        self.strategy = StrategySection()
+
+    def _pos(self, account: str, symbol: str, ccy: str) -> PositionItem:
+        return PositionItem(
+            account=account,
+            raw_ticker=symbol.replace(".", "_"),
+            ticker=symbol.split(".")[0],
+            yahoo_symbol=symbol,
+            name=symbol,
+            inst_currency=ccy,
+            quantity=10,
+            avg_price=100.0,
+            cur_price=101.0,
+            current_value=1010.0,
+            total_cost=1000.0,
+            pnl=10.0,
+            fx_impact=0.0,
+            return_pct=1.0,
+            weight_pct=10.0,
+        )
+
+    def test_isa_us_equity_keeps_round_trip_fx_and_gbp_basis(self) -> None:
+        pos = self._pos("ISA", "MSFT", "USD")
+        wallet = _wallet_snap(usd=600.0, gbp=1520.0)
+        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.30)
+        self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, wallet), 4.0)
+
+    def test_invest_us_equity_with_usd_wallet_is_zero_fx(self) -> None:
+        pos = self._pos("Invest", "NVDA", "USD")
+        self.assertAlmostEqual(
+            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=600.0, gbp=0.0)), 0.0
+        )
+        self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, _wallet_snap(usd=600.0, gbp=0.0)), 3.4)
+        self.assertAlmostEqual(
+            _round_trip_friction_pct(pos, None, self.strategy, _wallet_snap(usd=0.0, gbp=900.0)), 0.15
+        )
+        self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, _wallet_snap(usd=0.0, gbp=900.0)), 4.0)
+
+    def test_invest_uk_equity_and_lse_etf_follow_gbp_wallet(self) -> None:
+        uk = self._pos("Invest", "AZN.L", "GBP")
+        etf = self._pos("Invest", "VUAG.L", "GBP")
+        etf_bundle = TickerMarketBundle(symbol="VUAG.L", quote_type="ETF")
+
+        rich = _wallet_snap(usd=0.0, gbp=900.0)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, rich), 0.50)
+        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, rich), 0.0)
+        self.assertAlmostEqual(_wallet_cash_basis_pct(uk, self.strategy, rich), 4.0)
+
+        poor = _wallet_snap(usd=600.0, gbp=0.0)
+        self.assertAlmostEqual(_round_trip_friction_pct(uk, None, self.strategy, poor), 0.65)
+        self.assertAlmostEqual(_round_trip_friction_pct(etf, etf_bundle, self.strategy, poor), 0.15)
+        self.assertAlmostEqual(_wallet_cash_basis_pct(uk, self.strategy, poor), 3.4)
+
+    def test_invest_eur_equity_keeps_round_trip_and_gbp_basis(self) -> None:
+        pos = self._pos("Invest", "ASML.AS", "EUR")
+        wallet = _wallet_snap(usd=600.0, gbp=0.0)
+        self.assertAlmostEqual(_round_trip_friction_pct(pos, None, self.strategy, wallet), 0.30)
+        self.assertAlmostEqual(_wallet_cash_basis_pct(pos, self.strategy, wallet), 4.0)
+
+    def test_evaluate_holding_friction_note_reflects_funding_source(self) -> None:
+        us = self._pos("Invest", "NVDA", "USD")
+        with_usd = evaluate_holding(us, None, None, self.strategy, wallet=_wallet_snap(usd=600.0, gbp=0.0))
+        self.assertIn("可用USD免换汇", with_usd.friction_note)
+        no_usd = evaluate_holding(us, None, None, self.strategy, wallet=_wallet_snap(usd=0.0, gbp=900.0))
+        self.assertIn("USD不足需GBP换汇", no_usd.friction_note)
 
 
 class TestAnalyticsAndRules(unittest.TestCase):

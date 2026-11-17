@@ -64,7 +64,7 @@ class AppSection(BaseModel):
 class ModelsSection(BaseModel):
     # Hybrid Gemini + DeepSeek routing with cross-vendor failover
     report_analyst_model: str = "gemini-4-hydrogen"
-    report_auditor_model: str = "gemini-4-hydrogen"
+    report_auditor_model: str = "gemini-4-carbon"
     report_model: str = "gemini-4-hydrogen"
     us_sentinel_model: str = "deepseek-flash"
     us_anomaly_model: str = "gemini-4-hydrogen"
@@ -79,12 +79,12 @@ class ModelsSection(BaseModel):
     report_search_model: str = "gemini-3.5-flash-lite"
     search_model: str = "gemini-3.5-flash-lite"
 
-    report_analyst_thinking_level: ThinkingLevelLiteral = "MEDIUM"
-    report_auditor_thinking_level: ThinkingLevelLiteral = "XHIGH"
+    report_analyst_thinking_level: ThinkingLevelLiteral = "HIGH"
+    report_auditor_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_thinking_level: ThinkingLevelLiteral = "HIGH"
     us_thinking_level: ThinkingLevelLiteral = "HIGH"
     us_anomaly_thinking_level: ThinkingLevelLiteral = "HIGH"
-    pick_researcher_thinking_level: ThinkingLevelLiteral = "MEDIUM"
+    pick_researcher_thinking_level: ThinkingLevelLiteral = "HIGH"
     pick_thinking_level: ThinkingLevelLiteral = "HIGH"
     chat_thinking_level: ThinkingLevelLiteral = "HIGH"
     chat_deep_thinking_level: ThinkingLevelLiteral = "HIGH"
@@ -128,8 +128,13 @@ class ScheduleSection(BaseModel):
 
 class StrategySection(BaseModel):
     cash_interest_rate_pct: float = 4.0
+    usd_cash_interest_rate_pct: float = 3.4
     fx_fee_pct: float = 0.15
     uk_stamp_duty_pct: float = 0.50
+    # Invest GBP+USD dual-wallet ledger (T212 API v0 only reports GBP-converted total cash)
+    invest_multi_currency_enabled: bool = True
+    wallet_reconcile_warn_days: int = Field(default=7, ge=0)
+    wallet_mismatch_warn_gbp: float = Field(default=10.0, ge=0.0)
     order_history_days: int = 30
     order_history_max_pages: int = 3
     max_daily_chat_turns: int = 12
