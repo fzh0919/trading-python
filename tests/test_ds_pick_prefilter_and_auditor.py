@@ -389,6 +389,12 @@ class TestSemanticAuditor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sanitize_plain_text("**加粗** #标签 文本", 100), "加粗 标签 文本")
         self.assertEqual(len(sanitize_plain_text("x" * 50, 10)), 10)
 
+    def test_fact_baseline_keeps_full_fact_sheet(self) -> None:
+        filler = "\n".join(f"SYM{i:02d} | 现价 {100 + i}.00 USD" for i in range(400))
+        self.assertGreater(len(filler), 4000)
+        baseline = build_fact_baseline(scope="report", portfolio=_portfolio(), fact_sheet=filler)
+        self.assertIn("SYM399 | 现价 499.00 USD", baseline)
+
 
 if __name__ == "__main__":
     unittest.main()

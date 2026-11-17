@@ -88,7 +88,9 @@ def build_fact_baseline(
         lines.append("今日红线：\n" + "\n".join(f"• {g}" for g in guardrails))
     sheet = str(fact_sheet or "").strip()
     if sheet:
-        lines.append("FactSheet（唯一数值真源）：\n" + sheet[:4000])
+        # Keep the whole FactSheet: with ~20 holdings the tail prices fall beyond 4k chars and a truncated
+        # baseline makes the linter report false "hallucinated price" violations.
+        lines.append("FactSheet（唯一数值真源）：\n" + sheet[:12000])
     return "\n".join(lines)
 
 

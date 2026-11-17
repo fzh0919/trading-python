@@ -237,38 +237,60 @@ def _quote_is_verbatim(quote: str, corpus: list[str]) -> bool:
     return any(needle in _normalize_quote(item) for item in corpus)
 
 
-def _intraday_move_pct(hist: pd.DataFrame | None, price: float | None, *, today_uk: date) -> float | None:
-    """Compute today's move vs the prior close (0-token, no network)."""
-    if price is None or hist is None or hist.empty or "Close" not in hist.columns:
-        return None
-    closes = pd.to_numeric(hist["Close"], errors="coerce").dropna().astype(float)
-    if len(closes) < 2:
-        return None
+def _to_float(value: Any) -> float | None:
+    """Coerce to a finite positive float, else None (used for price / prev-close overlays)."""
     try:
-        last_bar_date = pd.Timestamp(closes.index[-1]).date()
+        num = float(value)
     except (TypeError, ValueError):
         return None
-    if last_bar_date < today_uk:
+    return num if math.isfinite(num) and num > 0 else None
+
+
+def _intraday_move_pct(
+    hist: pd.DataFrame | None,
+    price: float | None,
+    *,
+    today_uk: date,
+    prev_close: float | None = None,
+) -> float | None:
+    """Intraday move vs prior close; `prev_close` (Finnhub/T212) overrides the daily-bar baseline."""
+    px = _to_float(price)
+    if px is None:
         return None
-    prev_close = float(closes.iloc[-2])
-    if not math.isfinite(prev_close) or prev_close <= 0:
+    base = _to_float(prev_close)
+    if base is None:
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return None
+        closes = pd.to_numeric(hist["Close"], errors="coerce").dropna().astype(float)
+        if closes.empty:
+            return None
+        try:
+            last_bar_date = pd.Timestamp(closes.index[-1]).date()
+        except (TypeError, ValueError):
+            return None
+        # Guard against multi-week stale caches masquerading as "intraday".
+        if (today_uk - last_bar_date).days > 10:
+            return None
+        # A bar dated today is the running close -> the prior close is the bar before it.
+        idx = -2 if (last_bar_date >= today_uk and len(closes) >= 2) else -1
+        base = _to_float(closes.iloc[idx])
+    if base is None:
         return None
-    return (float(price) / prev_close - 1.0) * 100.0
+    return (px / base - 1.0) * 100.0
 
 
 def _order_distance_pct(price: float | None, orders: list[Any]) -> float | None:
-    """Smallest absolute distance between the live price and any pending limit order (%)."""
-    if price is None or price <= 0 or not orders:
+    """Smallest absolute distance between the live price and any pending limit/stop trigger (%)."""
+    px = _to_float(price)
+    if px is None or not orders:
         return None
     distances: list[float] = []
     for order in orders:
-        try:
-            limit_val = float(getattr(order, "limit_price", None) or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if limit_val <= 0:
-            continue
-        distances.append(abs(float(price) - limit_val) / float(price) * 100.0)
+        for field in ("limit_price", "stop_price"):
+            trigger = _to_float(getattr(order, field, None))
+            if trigger is None:
+                continue
+            distances.append(abs(px - trigger) / px * 100.0)
     return min(distances) if distances else None
 
 
@@ -1233,9 +1255,12 @@ class TradingScheduler:
         pushed: list[str] = []
         for sym, text in alerts:
             try:
-                await self.tg.send_message(chat_id, text)
+                delivered = await self.tg.send_message(chat_id, text)
             except Exception as exc:  # noqa: BLE001 - delivery failure must not break the loop
                 logger.warning("Intraday alert delivery failed for %s: %s", sym, exc)
+                continue
+            if delivered is False:
+                logger.warning("Intraday alert for %s was not delivered; keeping today's dedupe slot free.", sym)
                 continue
             # Mark only after a successful push so a quiet DS verdict never burns the daily dedupe slot.
             await self._mark_job_locked(
@@ -1310,32 +1335,56 @@ class TradingScheduler:
             logger.warning("Intraday sentinel bundle fetch failed: %s", exc)
             return []
 
+        # Finnhub fast US quote overlay: `include_info=False` bundles only carry the daily-close, which
+        # can be 15+ minutes stale (h_cache TTL) or entirely missing right after the US open.
+        quotes: dict[str, dict[str, Any]] = {}
+        us_open_symbols = [s for s in open_symbols if infer_market_from_symbol(s) == "US"]
+        if us_open_symbols:
+            quote_results = await asyncio.gather(
+                *(self.market_data.get_us_realtime_quote(s) for s in us_open_symbols),
+                return_exceptions=True,
+            )
+            for sym, result in zip(us_open_symbols, quote_results):
+                if isinstance(result, dict):
+                    quotes[sym] = result
+                elif isinstance(result, Exception):
+                    logger.debug("Intraday realtime quote overlay failed for %s: %s", sym, result)
+
+        position_by_symbol = {
+            str(getattr(pos, "yahoo_symbol", "") or "").strip().upper(): pos
+            for pos in portfolio.all_positions()
+            if str(getattr(pos, "yahoo_symbol", "") or "").strip()
+        }
+
         today_uk = dt_uk.date()
         triggered: list[tuple[float, str, float, float, float | None, str]] = []
         for sym in open_symbols:
             bundle = bundles.get(sym)
-            price: float | None = None
-            if bundle is not None and bundle.current_price is not None:
-                try:
-                    price = float(bundle.current_price)
-                except (TypeError, ValueError):
-                    price = None
-            if price is None or price <= 0:
+            quote = quotes.get(sym) or {}
+            position = position_by_symbol.get(sym)
+            # Live price precedence: Finnhub realtime -> T212 position mark -> daily-bar close.
+            price = (
+                _to_float(quote.get("current_price"))
+                or _to_float(getattr(position, "cur_price", None))
+                or _to_float(getattr(bundle, "current_price", None))
+            )
+            if price is None:
                 continue
-            move_pct = _intraday_move_pct(histories.get(sym), price, today_uk=today_uk)
+            move_pct = _intraday_move_pct(
+                histories.get(sym),
+                price,
+                today_uk=today_uk,
+                prev_close=_to_float(quote.get("prev_close")),
+            )
             order_dist = _order_distance_pct(price, pending_by_symbol.get(sym) or [])
             hit_move = move_pct is not None and abs(move_pct) >= self.cfg.strategy.intraday_move_alert_pct
             hit_order = order_dist is not None and order_dist <= self.cfg.strategy.intraday_order_near_pct
             if hit_move or hit_order:
+                currency = str(
+                    getattr(bundle, "currency", "") or getattr(position, "inst_currency", "") or ""
+                )
                 triggered.append(
-                    (
-                        abs(move_pct or 0.0),
-                        sym,
-                        price,
-                        float(move_pct or 0.0),
-                        order_dist,
-                        str(bundle.currency or ""),
-                    )
+                    (abs(move_pct or 0.0), sym, price, float(move_pct or 0.0), order_dist, currency)
                 )
 
         triggered.sort(key=lambda item: item[0], reverse=True)

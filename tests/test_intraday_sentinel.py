@@ -47,12 +47,16 @@ class _NoKeyLLM:
 
 
 class _StubTg(TelegramClient):
-    def __init__(self) -> None:
+    def __init__(self, fail: bool = False) -> None:
         super().__init__(bot_token="stub")
         self.sent: list[tuple[str, str]] = []
+        self.fail = fail
 
-    async def send_message(self, chat_id: str | int, text: str) -> None:
+    async def send_message(self, chat_id: str | int, text: str) -> bool:
+        if self.fail:
+            return False
         self.sent.append((str(chat_id), text))
+        return True
 
 
 class _StubT212(T212Client):
@@ -65,14 +69,20 @@ class _StubT212(T212Client):
 
 
 class _StubMarketData(MarketDataService):
-    def __init__(self, histories: dict, bundles: dict) -> None:
+    def __init__(self, histories: dict, bundles: dict, quotes: dict | None = None) -> None:
         super().__init__()
         self._histories = histories
         self._bundles = bundles
+        self._quotes = quotes or {}
         self.calls: list[list[str]] = []
+        self.quote_calls: list[str] = []
 
     async def get_histories(self, symbols: list[str], period: str = "1y") -> dict:
         return {s: self._histories[s] for s in symbols if s in self._histories}
+
+    async def get_us_realtime_quote(self, symbol: str) -> dict | None:
+        self.quote_calls.append(symbol)
+        return self._quotes.get(symbol)
 
     async def get_bundles(
         self,
@@ -179,9 +189,10 @@ class _SentinelTestCase(unittest.IsolatedAsyncioTestCase):
         orders: list[PendingOrderItem] | None = None,
         bundles: dict | None = None,
         histories: dict | None = None,
+        quotes: dict | None = None,
         llm=None,
     ) -> tuple[TradingScheduler, _StubMarketData, _StubTg, object]:
-        md = _StubMarketData(histories or {}, bundles or {})
+        md = _StubMarketData(histories or {}, bundles or {}, quotes)
         tg = _StubTg()
         llm = llm or _DsStubLLM()
         sched = TradingScheduler(self.cfg, _StubT212(_portfolio(positions, orders)), md, llm, self.db, tg)
@@ -341,23 +352,101 @@ class TestIntradaySentinel(_SentinelTestCase):
         self.assertEqual(tg.sent, [])
 
 
+    async def test_realtime_quote_overlays_stale_daily_bar(self) -> None:
+        """Finnhub live price + prev_close must drive the move even when the daily bar is yesterday's."""
+        stale_hist = pd.DataFrame(
+            {"Close": [98.0, 100.0]},
+            index=pd.date_range("2026-11-13", periods=2, freq="B"),  # last bar = Mon 16 (yesterday)
+        )
+        llm = _DsStubLLM('{"should_push": true, "alert_text": "NVDA 实时 +4.00%，放量突破早报压力位。"}')
+        sched, md, tg, _ = self._build(
+            positions=[_position("NVDA", "USD", 100.0)],
+            bundles={"NVDA": _bundle("NVDA", 100.0, "USD")},
+            histories={"NVDA": stale_hist},
+            quotes={"NVDA": {"symbol": "NVDA", "current_price": 104.0, "prev_close": 100.0}},
+            llm=llm,
+        )
+        fired = await sched.check_and_run_due_jobs(NOW)
+        self.assertIn("intraday_sentinel", fired)
+        self.assertEqual(md.quote_calls, ["NVDA"])
+        self.assertEqual(len(tg.sent), 1)
+        prompt = next(c["prompt"] for c in llm.calls if c["usage_label"] == "intraday_alert")
+        self.assertIn("104.00", prompt)
+        self.assertIn("+4.00%", prompt)
+
+    async def test_stop_price_counts_as_order_proximity(self) -> None:
+        llm = _DsStubLLM('{"should_push": true, "alert_text": "现价逼近止损触发价，建议确认风控计划。"}')
+        stop_order = _order("VWRP.L", 120.0, "GBP")  # limit far away
+        stop_order.stop_price = 100.8  # stop within 0.8%
+        sched, _, tg, _ = self._build(
+            positions=[],
+            orders=[stop_order],
+            bundles={"VWRP.L": _bundle("VWRP.L", 100.0, "GBP")},
+            histories={"VWRP.L": _history(100.0, 100.0)},
+            llm=llm,
+        )
+        await sched.check_and_run_due_jobs(NOW)
+        self.assertEqual(len(tg.sent), 1)
+        self.assertIn("盘中异动 | VWRP.L", tg.sent[0][1])
+
+    async def test_failed_delivery_does_not_burn_dedupe_slot(self) -> None:
+        llm = _DsStubLLM('{"should_push": true, "alert_text": "盘中放量下跌，建议复核早报止损位。"}')
+        md = _StubMarketData(
+            {"NVDA": _history(100.0, 96.0)},
+            {"NVDA": _bundle("NVDA", 96.0, "USD")},
+        )
+        tg = _StubTg(fail=True)
+        sched = TradingScheduler(
+            self.cfg,
+            _StubT212(_portfolio([_position("NVDA", "USD", 96.0)])),
+            md,
+            llm,
+            self.db,
+            tg,
+        )
+        fired = await sched.check_and_run_due_jobs(NOW)
+        self.assertEqual(fired, [])
+        self.assertFalse(await self.db.has_scheduler_job_fired("intraday_alert:NVDA", UK_DATE))
+
+        # Next scan window retries instead of being silently suppressed for the whole day.
+        tg.fail = False
+        await sched.check_and_run_due_jobs(datetime(2026, 11, 17, 15, 31, tzinfo=timezone.utc))
+        self.assertEqual(len(tg.sent), 1)
+        self.assertTrue(await self.db.has_scheduler_job_fired("intraday_alert:NVDA", UK_DATE))
+
+
 class TestSentinelMath(unittest.TestCase):
-    def test_move_pct_requires_today_bar(self) -> None:
+    def test_move_pct_uses_yesterday_bar_when_live_price_given(self) -> None:
         fresh = _history(100.0, 104.0)
         self.assertAlmostEqual(
             _intraday_move_pct(fresh, 104.0, today_uk=date(2026, 11, 17)), 4.0, places=6
         )
         stale = pd.DataFrame(
-            {"Close": [100.0, 101.0]},
-            index=pd.date_range("2026-11-10", periods=2, freq="B"),
+            {"Close": [98.0, 100.0]},
+            index=pd.date_range("2026-11-13", periods=2, freq="B"),  # last bar = Mon 16 (yesterday)
         )
-        self.assertIsNone(_intraday_move_pct(stale, 105.0, today_uk=date(2026, 11, 17)))
+        self.assertAlmostEqual(
+            _intraday_move_pct(stale, 103.0, today_uk=date(2026, 11, 17)), 3.0, places=6
+        )
+        # Explicit Finnhub prev_close always wins over the daily-bar baseline.
+        self.assertAlmostEqual(
+            _intraday_move_pct(stale, 104.0, today_uk=date(2026, 11, 17), prev_close=100.0),
+            4.0,
+            places=6,
+        )
         self.assertIsNone(_intraday_move_pct(None, 105.0, today_uk=date(2026, 11, 17)))
         self.assertIsNone(_intraday_move_pct(fresh, None, today_uk=date(2026, 11, 17)))
+        ancient = pd.DataFrame(
+            {"Close": [100.0]}, index=pd.date_range("2026-10-01", periods=1, freq="B")
+        )
+        self.assertIsNone(_intraday_move_pct(ancient, 105.0, today_uk=date(2026, 11, 17)))
 
-    def test_order_distance_pct(self) -> None:
-        orders = [_order("NVDA", 101.0, "USD"), _order("NVDA", 99.0, "USD")]
+    def test_order_distance_pct_includes_stop_price(self) -> None:
+        orders = [_order("NVDA", 120.0, "USD")]
+        orders[0].stop_price = 99.0
         self.assertAlmostEqual(_order_distance_pct(100.0, orders), 1.0, places=6)
+        far_limit = [_order("NVDA", 101.0, "USD"), _order("NVDA", 99.0, "USD")]
+        self.assertAlmostEqual(_order_distance_pct(100.0, far_limit), 1.0, places=6)
         self.assertIsNone(_order_distance_pct(100.0, []))
         self.assertIsNone(_order_distance_pct(100.0, [_order("NVDA", 0.0, "USD")]))
         self.assertIsNone(_order_distance_pct(None, orders))
