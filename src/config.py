@@ -172,6 +172,11 @@ class StrategySection(BaseModel):
     user_preference_memory_enabled: bool = True
     preference_ttl_days: int = Field(default=14, ge=1, le=90)
     preference_max_notes_per_day: int = Field(default=3, ge=1, le=5)
+    # Intraday event-driven sentinel (0-token scan; DeepSeek only decides whether to push)
+    intraday_sentinel_enabled: bool = True
+    intraday_poll_minutes: int = Field(default=30, ge=10, le=120)
+    intraday_move_alert_pct: float = Field(default=3.5, gt=0.0)
+    intraday_order_near_pct: float = Field(default=1.5, gt=0.0)
 
 
 class UniverseSection(BaseModel):

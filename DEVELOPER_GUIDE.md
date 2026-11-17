@@ -32,6 +32,8 @@
 | **`/us` 美股增量哨兵（分级门控）** | `us_sentinel_model` / `us_anomaly_model` | 平稳 `deepseek-flash` (`HIGH`) / 异动 `Hydrogen` (`HIGH`) | 本地 Anomaly Gate：平稳免工具核对；异动切 Gemini+搜+工具深挖 | **平稳 `<=450` / 异动 `<=600` 字** |
 | **日常自由单聊 / `/deep`** | `chat_model` / `chat_deep_model` | 日常 `deepseek-flash` (`HIGH`) / `/deep` `Hydrogen` (`HIGH`) | 本地切片 + 静态前缀缓存 + 按需工具（`<=2` 轮，`/deep <=4`），双厂互备 | **Prompt `<=500` 字（`/deep` `1000~1200`）** |
 | **盘后 T+5 复盘微反思** | `chat_model` | `deepseek-flash` (`HIGH`) *(备援 Hydrogen MEDIUM)* | 本地算完 T+5 Alpha 后生成 `2~4` 句（`<80 tokens`）教训 | 存入 SQLite 记忆列 |
+| **DeepSeek 侧车（筛选/质检/周报/记忆）** | `ds_helper_model` / `ds_helper_thinking_level` | `deepseek-flash` (`HIGH`)，单次 `ds_helper_timeout_seconds=20s` | `ds_pick_prefilter_enabled`（ID 名单）/ `ds_semantic_audit_enabled`（只读质检）/ 周六诊断 / 偏好抽取；缺 `DEEPSEEK_API_KEY` 时 **0 调用**，绝不回落 Gemini | 名单 JSON / `violations` / `<=450` 字诊断 / 带原话锚点笔记 |
+| **盘中异动哨兵** | 复用 `chat_model` 与 `search_model` | 扫描 0-Token；仅触发标的做 1v1 联网 + DS (`HIGH`) 判推送 | `intraday_sentinel_enabled`，工作日 `08:00~21:00 UK` 每 `30` 分钟、`execution_lock` 被占则跳过 | Telegram `<=250` 字纯文本（仅 `should_push=true`） |
 
 ---
 
@@ -49,6 +51,7 @@
 10. `grounding_news_cache(cache_key PK, scope, symbol, summary_text, updated_at_ms)`：Google Search 联网摘要缓存（默认 `3h` TTL）。
 11. `t212_instruments_metadata(ticker PK, yahoo_symbol, isin, currency_code, short_name, inst_type, extended_hours, working_schedule_id, isa_eligible, invest_eligible, updated_at_ms)`：T212 标的元数据与可买性（永久保留）。
 12. `t212_dividend_archive(id PK, account, ticker, yahoo_symbol, amount_gbp, gross_per_share, paid_on, paid_on_ms)`：T212 历史实收英镑股息归档（永久保留）。
-13. `quant_health_audits(audit_date PK, created_at_uk, summary_text, payload_json)`：周末离线候选池与阈值体检档案。
+13. `quant_health_audits(audit_date PK, created_at_uk, summary_text, payload_json, ai_diagnosis)`：周末离线候选池与阈值体检档案 + DeepSeek 周度诊断（`<=450` 字，老库经 `_ensure_columns` 幂等补列）。
 14. `fundamentals_cache` / `active_universe_pool` / `index_constituents_cache`：多市场 150 只精锐个股底池海选持久化与 21 天基本面缓存。
 15. `wallet_balances(account_label, currency, available_amount, reserved_amount, updated_at_uk, updated_at_ms, source, note, PK(account_label, currency))`：Invest `GBP+USD` 双钱包本地校准锚点（默认种入 `USD=0.0`）。
+16. `user_preference_notes(id, source_cycle_date, quote_text, rule_summary, expires_on_uk, created_at_ms)`：带**用户原话锚点**与 TTL 的长期偏好记忆（默认 14 天过期，每日 ≤3 条，`quote_text` 必须是原始发言的逐字子串）。

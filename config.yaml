@@ -105,6 +105,12 @@ strategy:
   preference_ttl_days: 14
   preference_max_notes_per_day: 3
 
+  # 盘中主动盯盘哨兵（0-Token 扫描；仅异动才联网 + DS 决定是否推送）
+  intraday_sentinel_enabled: true
+  intraday_poll_minutes: 30
+  intraday_move_alert_pct: 3.5
+  intraday_order_near_pct: 1.5
+
 # Optional priority symbols (Yahoo Finance symbols, e.g. ["TSM", "AZN.L", "ASML.AS"])
 watchlist: []
 

@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from src.agents.ds_sidecar import call_ds_json, ds_helper_available, sanitize_plain_text
 from src.agents.llm_client import LLMBackend
 from src.agents.prompts import build_agent_system_instruction, build_wallet_context_text
 from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
@@ -1258,3 +1259,84 @@ async def generate_us_sentinel(
             memo = trim_text_at_line_boundary(memo, us_max_chars)
         await db.append_premarket_note(memo)
     return memo
+
+
+async def generate_intraday_alert(
+    cfg: AppConfig,
+    market_data: MarketDataService,
+    llm: LLMBackend,
+    db: AdvisorDatabase,
+    *,
+    symbol: str,
+    current_price: float,
+    move_pct: float,
+    order_dist_pct: float | None = None,
+    pending_order_text: str = "",
+    currency: str = "",
+    ops_notifier: OpsNotifier | None = None,
+) -> str | None:
+    """Event-driven intraday alert: 1-symbol grounding + DeepSeek push/no-push decision (<=250 chars)."""
+    if not ds_helper_available(llm, cfg):
+        return None
+    sym = str(symbol or "").strip().upper()
+    if not sym or current_price <= 0:
+        return None
+
+    try:
+        (morning_text, _), guardrails = await asyncio.gather(
+            db.get_morning_context(include_premarket=True),
+            db.get_daily_guardrails(),
+        )
+    except Exception as exc:  # noqa: BLE001 - intraday alerting must never break the scheduler
+        logger.warning("Intraday alert context load failed for %s: %s", sym, exc)
+        return None
+
+    grounding = ""
+    try:
+        grounding = await run_forced_market_grounding(
+            llm=llm,
+            search_model=cfg.models.search_model,
+            scope="intraday",
+            symbols=[sym],
+            ttl_seconds=cfg.app.market_data_ttl_seconds,
+            ops_notifier=ops_notifier,
+            db=db,
+            persist_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Intraday grounding failed for %s: %s", sym, exc)
+
+    morning_slice = trim_text_at_line_boundary(str(morning_text or ""), 1200)
+    veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（无）"
+    distance_text = "N/A" if order_dist_pct is None else f"{order_dist_pct:.2f}%"
+    numeric = (
+        "【Python 实时数值（唯一真源，禁止改写）】\n"
+        f"{sym} 现价 {current_price:.2f} {currency or ''} | 日内涨跌 {move_pct:+.2f}% | "
+        f"距最近挂单价 {distance_text}\n"
+        f"活动挂单：{pending_order_text or '无'}"
+    )
+    prompt = (
+        f"{numeric}\n\n【今日 /report 原文节选】\n{morning_slice or '（今日尚未生成 /report）'}\n\n"
+        f"【今日红线】\n{veto_block}\n\n"
+        + (f"【盘中联网快讯】\n{grounding}\n\n" if grounding else "")
+        + "请判断这次异动是否值得立即打断用户：只在具备可执行意义（趋势破坏、催化确认或与今日红线直接相关）时推送；"
+        "正常波动、已被早报覆盖或与红线无关时返回 should_push=false。"
+    )
+    payload = await call_ds_json(
+        cfg,
+        llm,
+        prompt=prompt,
+        system_instruction=(
+            "你是盘中异动播报员（只读）。只输出严格 JSON："
+            '{"should_push": true/false, "alert_text": "<=250字纯文本"}。'
+            "alert_text 必须只使用【Python 实时数值】中的现价/涨跌幅/挂单距离，禁止编造任何新数字，"
+            "禁止 Markdown # 与 **；should_push=false 时 alert_text 可为空。"
+        ),
+        usage_label="intraday_alert",
+    )
+    if not payload or payload.get("should_push") is not True:
+        return None
+    text = sanitize_plain_text(str(payload.get("alert_text") or ""), 250)
+    if len(text) < 10:
+        return None
+    return f"⚡️ 盘中异动 | {sym}\n{text}"

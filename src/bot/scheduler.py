@@ -6,7 +6,7 @@ import asyncio
 import logging
 import math
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Awaitable
 from zoneinfo import ZoneInfo
 
@@ -15,7 +15,11 @@ import pandas as pd
 from src.agents.ds_sidecar import call_ds_json, ds_helper_available, sanitize_plain_text
 from src.agents.llm_client import LLMBackend
 from src.agents.pick_agent import generate_pick_radar
-from src.agents.report_agent import generate_morning_report, generate_us_sentinel
+from src.agents.report_agent import (
+    generate_intraday_alert,
+    generate_morning_report,
+    generate_us_sentinel,
+)
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.analytics import _normalize_adjusted_ohlcv, resolve_market_benchmark
@@ -26,7 +30,9 @@ from src.engine.calendar_utils import (
     get_us_market_schedule_uk,
     has_market_closed_on_date,
     infer_market_from_symbol,
+    is_eu_market_holiday,
     is_london_weekday,
+    is_uk_bank_holiday,
 )
 from src.engine.screener import run_offline_universe_and_threshold_audit, run_universe_audition
 from src.storage.db import AdvisorDatabase
@@ -42,6 +48,8 @@ DAILY_SETTLEMENT_START_MINUTES = 22 * 60  # 22:00 UK (after US/UK/EU close & Fri
 DAILY_SETTLEMENT_END_MINUTES = 23 * 60 + 30  # 23:30 UK catch-up cutoff
 WEEKLY_AUDIT_START_MINUTES = 10 * 60  # 10:00 UK Saturday idle window
 WEEKLY_AUDIT_END_MINUTES = 22 * 60  # 22:00 UK Saturday cutoff
+INTRADAY_SENTINEL_START_MINUTES = 8 * 60  # 08:00 UK (LSE open)
+INTRADAY_SENTINEL_END_MINUTES = 21 * 60  # 21:00 UK (US close)
 WEEKLY_WALLET_RECONCILE_START_MINUTES = 12 * 60  # 12:00 UK Saturday ledger reminder window
 
 
@@ -229,6 +237,54 @@ def _quote_is_verbatim(quote: str, corpus: list[str]) -> bool:
     return any(needle in _normalize_quote(item) for item in corpus)
 
 
+def _intraday_move_pct(hist: pd.DataFrame | None, price: float | None, *, today_uk: date) -> float | None:
+    """Compute today's move vs the prior close (0-token, no network)."""
+    if price is None or hist is None or hist.empty or "Close" not in hist.columns:
+        return None
+    closes = pd.to_numeric(hist["Close"], errors="coerce").dropna().astype(float)
+    if len(closes) < 2:
+        return None
+    try:
+        last_bar_date = pd.Timestamp(closes.index[-1]).date()
+    except (TypeError, ValueError):
+        return None
+    if last_bar_date < today_uk:
+        return None
+    prev_close = float(closes.iloc[-2])
+    if not math.isfinite(prev_close) or prev_close <= 0:
+        return None
+    return (float(price) / prev_close - 1.0) * 100.0
+
+
+def _order_distance_pct(price: float | None, orders: list[Any]) -> float | None:
+    """Smallest absolute distance between the live price and any pending limit order (%)."""
+    if price is None or price <= 0 or not orders:
+        return None
+    distances: list[float] = []
+    for order in orders:
+        try:
+            limit_val = float(getattr(order, "limit_price", None) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if limit_val <= 0:
+            continue
+        distances.append(abs(float(price) - limit_val) / float(price) * 100.0)
+    return min(distances) if distances else None
+
+
+def _format_pending_orders(orders: list[Any]) -> str:
+    """Compact plain-text rendering of a symbol's live pending orders."""
+    lines: list[str] = []
+    for order in orders[:3]:
+        side = str(getattr(order, "side", "") or "").strip()
+        quantity = getattr(order, "quantity", None)
+        limit_price = getattr(order, "limit_price", None)
+        currency = str(getattr(order, "currency", "") or "").strip()
+        account = str(getattr(order, "account", "") or "").strip()
+        lines.append(f"{account} {side} {quantity} @ {limit_price} {currency}".strip())
+    return "; ".join(lines)
+
+
 class TradingScheduler:
     """Deterministic minute-tick scheduler with per-job isolation and Telegram ops alerting."""
 
@@ -258,6 +314,7 @@ class TradingScheduler:
         self._morning_failures: dict[str, dict[str, Any]] = {}
         self._morning_missed_notified: set[str] = set()
         self.last_job_runs: dict[str, dict[str, str]] = {}
+        self._last_intraday_scan_utc: datetime | None = None
 
     async def _is_job_locked(self, job_name: str, uk_date: str) -> bool:
         if self._fired_dates.get(job_name) == uk_date:
@@ -1141,6 +1198,176 @@ class TradingScheduler:
             f"元数据 {summary['instruments_synced']} 条 | 分红 {summary['dividends_archived']} 条"
         )
 
+    def _intraday_scan_due(self, now_utc: datetime) -> bool:
+        """Throttle the 0-token intraday scan to `intraday_poll_minutes`."""
+        last = self._last_intraday_scan_utc
+        if last is None:
+            return True
+        interval = timedelta(minutes=max(1, int(self.cfg.strategy.intraday_poll_minutes)))
+        try:
+            return (now_utc - last) >= interval
+        except TypeError:
+            return True
+
+    async def _run_intraday_sentinel_job(
+        self,
+        now_utc: datetime,
+        *,
+        chat_id: str,
+        uk_date: str,
+    ) -> list[str]:
+        """Run one intraday scan under the execution lock; returns symbols that were actually pushed."""
+        async with self.execution_lock:
+            prev_job = self.current_job_name
+            self.current_job_name = "intraday_sentinel"
+            self._last_intraday_scan_utc = now_utc
+            try:
+                alerts = await self._run_intraday_sentinel_impl(now_utc, uk_date=uk_date)
+            except Exception:
+                logger.exception("Intraday sentinel scan crashed; skipping this round")
+                alerts = []
+            finally:
+                if self.current_job_name == "intraday_sentinel":
+                    self.current_job_name = prev_job
+
+        pushed: list[str] = []
+        for sym, text in alerts:
+            try:
+                await self.tg.send_message(chat_id, text)
+            except Exception as exc:  # noqa: BLE001 - delivery failure must not break the loop
+                logger.warning("Intraday alert delivery failed for %s: %s", sym, exc)
+                continue
+            # Mark only after a successful push so a quiet DS verdict never burns the daily dedupe slot.
+            await self._mark_job_locked(
+                f"intraday_alert:{sym}",
+                uk_date,
+                now_utc.astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M"),
+            )
+            pushed.append(sym)
+        if pushed:
+            self.last_job_runs["intraday_sentinel"] = {
+                "status": "OK",
+                "uk_time": now_utc.astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M"),
+                "detail": ",".join(pushed)[:120],
+            }
+        return pushed
+
+    async def _run_intraday_sentinel_impl(
+        self,
+        now_utc: datetime,
+        *,
+        uk_date: str,
+    ) -> list[tuple[str, str]]:
+        """0-token scan of open-market holdings/orders; only triggered symbols go to grounding + DS."""
+        base = now_utc.astimezone(timezone.utc)
+        dt_uk = base.astimezone(LONDON_TZ)
+        try:
+            portfolio = await self.t212.get_portfolio(use_cache=True)
+        except Exception as exc:
+            logger.warning("Intraday sentinel portfolio fetch failed: %s", exc)
+            return []
+        if not portfolio.isa.ok and not portfolio.invest.ok:
+            return []
+
+        pending_by_symbol: dict[str, list[Any]] = {}
+        for account in (portfolio.isa, portfolio.invest):
+            for order in getattr(account, "pending_orders", None) or []:
+                sym = str(getattr(order, "yahoo_symbol", "") or "").strip().upper()
+                if sym:
+                    pending_by_symbol.setdefault(sym, []).append(order)
+
+        held_symbols = {
+            str(getattr(pos, "yahoo_symbol", "") or "").strip().upper()
+            for pos in portfolio.all_positions()
+            if str(getattr(pos, "yahoo_symbol", "") or "").strip()
+        }
+        candidates = sorted(held_symbols | set(pending_by_symbol))
+        if not candidates:
+            return []
+
+        us_sched = get_us_market_schedule_uk(base)
+        london_window = dt_uk.weekday() < 5 and time(8, 0) <= dt_uk.time() < time(16, 30)
+        uk_holiday = is_uk_bank_holiday(base)
+        eu_holiday = is_eu_market_holiday(base)
+        market_open = {
+            "US": us_sched.phase == "OPEN",
+            "UK": london_window and not uk_holiday,
+            "XETRA": london_window and not eu_holiday,
+            "EURONEXT": london_window and not eu_holiday,
+        }
+        open_symbols = [s for s in candidates if market_open.get(infer_market_from_symbol(s), False)]
+        if not open_symbols:
+            return []
+
+        try:
+            histories, bundles = await self.market_data.get_bundles(
+                open_symbols,
+                include_news=False,
+                include_earnings=False,
+                include_info=False,
+            )
+        except Exception as exc:
+            logger.warning("Intraday sentinel bundle fetch failed: %s", exc)
+            return []
+
+        today_uk = dt_uk.date()
+        triggered: list[tuple[float, str, float, float, float | None, str]] = []
+        for sym in open_symbols:
+            bundle = bundles.get(sym)
+            price: float | None = None
+            if bundle is not None and bundle.current_price is not None:
+                try:
+                    price = float(bundle.current_price)
+                except (TypeError, ValueError):
+                    price = None
+            if price is None or price <= 0:
+                continue
+            move_pct = _intraday_move_pct(histories.get(sym), price, today_uk=today_uk)
+            order_dist = _order_distance_pct(price, pending_by_symbol.get(sym) or [])
+            hit_move = move_pct is not None and abs(move_pct) >= self.cfg.strategy.intraday_move_alert_pct
+            hit_order = order_dist is not None and order_dist <= self.cfg.strategy.intraday_order_near_pct
+            if hit_move or hit_order:
+                triggered.append(
+                    (
+                        abs(move_pct or 0.0),
+                        sym,
+                        price,
+                        float(move_pct or 0.0),
+                        order_dist,
+                        str(bundle.currency or ""),
+                    )
+                )
+
+        triggered.sort(key=lambda item: item[0], reverse=True)
+        max_alerts = 2
+        alerts: list[tuple[str, str]] = []
+        for _, sym, price, move_pct, order_dist, currency in triggered:
+            if len(alerts) >= max_alerts:
+                logger.info("Intraday sentinel capped at %d alerts for this round", max_alerts)
+                break
+            if await self._is_job_locked(f"intraday_alert:{sym}", uk_date):
+                continue
+            try:
+                text = await generate_intraday_alert(
+                    self.cfg,
+                    self.market_data,
+                    self.llm,
+                    self.db,
+                    symbol=sym,
+                    current_price=price,
+                    move_pct=move_pct,
+                    order_dist_pct=order_dist,
+                    pending_order_text=_format_pending_orders(pending_by_symbol.get(sym) or []),
+                    currency=currency,
+                    ops_notifier=self.ops,
+                )
+            except Exception as exc:  # noqa: BLE001 - one symbol must never break the scan
+                logger.warning("Intraday alert generation failed for %s: %s", sym, exc)
+                text = None
+            if text:
+                alerts.append((sym, text))
+        return alerts
+
     async def check_and_run_due_jobs(self, now_utc: datetime | None = None) -> list[str]:
         """Evaluate prewarm, morning catch-up, premarket sentinel, weekly radar, Saturday quant audit, and post-close settlement."""
         base = now_utc or datetime.now(timezone.utc)
@@ -1344,6 +1571,17 @@ class TradingScheduler:
                     coro=self._run_daily_settlement_job(base),
                     send_to_tg=False,
                 )
+
+        # 5. Intraday event-driven sentinel (08:00~21:00 UK; 0-token scan, never queues behind user commands)
+        if (
+            self.cfg.strategy.intraday_sentinel_enabled
+            and INTRADAY_SENTINEL_START_MINUTES <= uk_min_of_day < INTRADAY_SENTINEL_END_MINUTES
+            and not self.execution_lock.locked()
+            and self._intraday_scan_due(base)
+        ):
+            pushed = await self._run_intraday_sentinel_job(base, chat_id=chat_id, uk_date=uk_date)
+            if pushed:
+                fired.append("intraday_sentinel")
 
         return fired
 
