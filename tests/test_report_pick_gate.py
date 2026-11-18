@@ -26,8 +26,9 @@ import numpy as np
 import pandas as pd
 
 from src.agents.pick_agent import _apply_gate_channel_constraints, _format_gate_constraint_block
-from src.agents.report_agent import _build_report_recommendations, _enrich_gate_candidate_bundles
+from src.agents.report_agent import _build_report_recommendations, _enrich_gate_candidate_bundles, _validate_core_deployment
 from src.agents.schemas import (
+    CoreDeploymentItem,
     MorningReportDecision,
     PickActionItem,
     PickDecision,
@@ -1823,13 +1824,45 @@ class TestV550PostAuditHardening(unittest.TestCase):
             histories={"SPY": _spy_neutral_hist()},
             macro=_neutral_macro(),
             universe_etf_symbols=[
-                "VWRP.L", "VWRL.L", "VUAG.L", "SWDA.L",
+                "VWRP.L", "VWRL.L", "VUAG.L", "SWDA.L", "ISF.L", "VERG.L",
                 "IUKD.L", "VHYL.L", "SMGB.L", "INRG.L", "IITU.L", "IGLT.L", "SGLN.L", "CNX1.L",
             ],
         )
         self.assertEqual(
-            gate["etf_set"], ["SWDA.L", "VUAG.L", "VWRL.L", "VWRP.L"]
+            gate["etf_set"], ["ISF.L", "SWDA.L", "VERG.L", "VUAG.L", "VWRL.L", "VWRP.L"]
         )
+
+    def test_core_diversifiers_count_toward_target_and_soft_preference(self) -> None:
+        # Default snapshot: VWRP+VUAG only -> core <60% and 0% diversifier => soft preference.
+        gate = _run_snapshot_gate()
+        self.assertTrue(gate["isa"]["prefer_core_diversifier"])
+        self.assertIn("FTSE100/欧洲", gate["isa"]["reason"])
+
+        # FTSE100 + Europe broad-base now count toward the 60% core target.
+        portfolio = _real_snapshot_portfolio()
+        portfolio.isa.positions = [
+            _pos(
+                "ISA", "ISF", "ISF.L", value=20000.0, qty=200.0, avg=100.0, cur=100.0,
+                return_pct=0.0, weight_pct=34.9, ccy="GBP",
+            ),
+            _pos(
+                "ISA", "VERG", "VERG.L", value=15000.0, qty=150.0, avg=100.0, cur=100.0,
+                return_pct=0.0, weight_pct=26.2, ccy="GBP",
+            ),
+        ]
+        portfolio.isa.pending_orders = []
+        gate = evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=StrategySection(),
+            bundles={},
+            histories={"SPY": _spy_neutral_hist()},
+            macro=_neutral_macro(),
+            universe_etf_symbols=["VWRP.L", "VUAG.L", "ISF.L", "VERG.L"],
+        )
+        self.assertGreaterEqual(gate["isa"]["core_etf_pct"], 60.0)
+        self.assertGreaterEqual(gate["isa"]["core_diversifier_pct"], 60.0)
+        self.assertFalse(gate["isa"]["prefer_core_diversifier"])
+        self.assertFalse(gate["triggers"]["B"]["isa_core_dca"])
 
     def test_vix_30_does_not_override_core_etf_buy_in_guardrail(self) -> None:
         strat = StrategySection(pick_rr_guard_mode="off", trade_cadence_guard_mode="off")
@@ -1972,6 +2005,155 @@ class TestV550GateCandidateBundles(unittest.IsolatedAsyncioTestCase):
             None,
         )
         self.assertEqual(hits, [])
+
+
+class TestV551CoreDeployment(unittest.TestCase):
+    """v5.5.1: /report can originate un-held core/diversifier ETF BUYs, guarded."""
+
+    @staticmethod
+    def _decision_with_core(symbol: str = "VERG.L", account: str = "ISA", amount: str = "£2,000"):
+        return MorningReportDecision(
+            headline="核心宽基分散部署",
+            top_actions=[
+                ReportActionItem(account="ISA", symbol="CASH", action="HOLD", price_zone="", reason="保留现金")
+            ],
+            core_deployment=[
+                CoreDeploymentItem(
+                    account=account,
+                    symbol=symbol,
+                    price_zone="35.0-35.4 GBP",
+                    size_hint=amount,
+                    reason="分散美股科技",
+                )
+            ],
+            macro_and_cash="现金充足。",
+            account_diagnosis="ISA 核心宽基不足。",
+            hold_summary="其余持有",
+            trade_review="无",
+        )
+
+    def _cfg(self) -> AppConfig:
+        return AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            strategy=StrategySection(deployment_gate_mode="advise"),
+        )
+
+    def test_core_deployment_renders_and_enters_ledger(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        bundles = {
+            "VERG.L": TickerMarketBundle(
+                symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.2
+            )
+        }
+        decision = self._decision_with_core()
+        filtered, notes = _validate_core_deployment(
+            decision,
+            portfolio,
+            self._cfg(),
+            {"etf_set": ["VWRP.L", "VUAG.L", "ISF.L", "VERG.L"], "isa": {"etf_open": True}},
+            bundles,
+        )
+        self.assertEqual(notes, [])
+        self.assertEqual([d.symbol for d in filtered.core_deployment], ["VERG.L"])
+        text = render_morning_report(filtered, max_chars=1800)
+        self.assertIn("【核心宽基部署】", text)
+        self.assertIn("BUY VERG.L", text)
+        self.assertLessEqual(len(text), 1800)
+        recs = _build_report_recommendations(filtered, portfolio, bundles, self._cfg())
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["symbol"], "VERG.L")
+        self.assertEqual(recs[0]["action"], "BUY")
+        self.assertEqual(recs[0]["source"], "report")
+        self.assertEqual(recs[0]["fill_status"], "ASSUMED")
+
+    def test_core_deployment_rejects_non_core_invest_held_and_tiny_tickets(self) -> None:
+        portfolio = _real_snapshot_portfolio()  # holds VWRP.L
+        bundles = {
+            "VERG.L": TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.2),
+            "IUKD.L": TickerMarketBundle(symbol="IUKD.L", quote_type="ETF", currency="GBP", current_price=7.0),
+            "VWRP.L": TickerMarketBundle(symbol="VWRP.L", quote_type="ETF", currency="GBP", current_price=114.0),
+        }
+        gate = {"etf_set": ["VWRP.L", "VUAG.L", "ISF.L", "VERG.L"], "isa": {"etf_open": True}}
+        cfg = self._cfg()
+
+        non_core, notes = _validate_core_deployment(
+            self._decision_with_core(symbol="IUKD.L"), portfolio, cfg, gate, bundles
+        )
+        self.assertEqual(non_core.core_deployment, [])
+        self.assertTrue(any("不属于核心/分散宽基集合" in n for n in notes))
+
+        held, notes = _validate_core_deployment(
+            self._decision_with_core(symbol="VWRP.L"), portfolio, cfg, gate, bundles
+        )
+        self.assertEqual(held.core_deployment, [])
+        self.assertTrue(any("已持仓请用 top_actions ADD" in n for n in notes))
+
+        invest, notes = _validate_core_deployment(
+            self._decision_with_core(symbol="VERG.L", account="Invest"), portfolio, cfg, gate, bundles
+        )
+        self.assertEqual(invest.core_deployment, [])
+        self.assertTrue(any("仅限 ISA" in n for n in notes))
+
+        tiny, notes = _validate_core_deployment(
+            self._decision_with_core(symbol="VERG.L", amount="£100"), portfolio, cfg, gate, bundles
+        )
+        self.assertEqual(tiny.core_deployment, [])
+        self.assertTrue(any("低于 ISA ETF 最小建仓额" in n for n in notes))
+
+        closed, notes = _validate_core_deployment(
+            self._decision_with_core(symbol="VERG.L"),
+            portfolio,
+            cfg,
+            {"etf_set": ["VERG.L"], "isa": {"etf_open": False}},
+            bundles,
+        )
+        self.assertEqual(closed.core_deployment, [])
+        self.assertTrue(any("宽基通道关闭" in n for n in notes))
+
+    def test_invest_accumulating_core_blocked_but_distributing_and_isa_allowed(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {
+            "isa": {"etf_open": True, "equity_open": True},
+            "invest": {
+                "status": "RUN", "mode": "targeted", "slots_cap": 2, "slots_used": 0,
+                "daily_cap": 1, "today_new_equity_entries": 0,
+            },
+            "etf_set": ["VWRP.L", "VERG.L"],
+        }
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="VWRP.L", action="BUY", thesis="累积型核心宽基",
+                    entry_zone="114", stop_condition="105", target_window="140", entry_price=114.0,
+                ),
+                PickActionItem(
+                    account="Invest", symbol="VERG.L", action="BUY", thesis="派息型欧洲宽基",
+                    entry_zone="35", stop_condition="32", target_window="42", entry_price=35.0,
+                ),
+                PickActionItem(
+                    account="ISA", symbol="VWRP.L", action="BUY", thesis="ISA 累积型核心宽基",
+                    entry_zone="114", stop_condition="105", target_window="140", entry_price=114.0,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        kept = [a.symbol for a in hardened.selected_actions]
+        self.assertEqual(kept, ["VERG.L", "VWRP.L"])
+        self.assertTrue(any("累积型" in n for n in notes))
+
+        # The same un-held core ETF can be originated by /report for ISA.
+        cfg = self._cfg()
+        filtered, core_notes = _validate_core_deployment(
+            self._decision_with_core(),
+            portfolio,
+            cfg,
+            gate,
+            {"VERG.L": TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.0)},
+        )
+        self.assertEqual(core_notes, [])
+        self.assertEqual(len(filtered.core_deployment), 1)
 
 
 if __name__ == "__main__":

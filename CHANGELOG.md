@@ -2,6 +2,16 @@
 
 > 仅维护当前活跃版本（`v5.2.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.1.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.1`（2026-11-18）
+
+核心宽基从「全球 + 标普500」扩展为「全球/标普核心 + FTSE100/欧洲核心分散器」，让 ISA 的 60% 目标不再只能靠 VWRP 完成；`/report` 新增未持仓核心宽基的正式部署通道，`/pick` 对 DCA 宽基豁免 R:R 硬拦。
+
+1. **核心宽基范围（`src/engine/deployment_gate.py`, `src/engine/portfolio_rules.py`）**：`_CORE_ETF_INDEX_FAMILIES` 与 `_CORE_WIDE_BASE_FAMILIES` 新增 `FTSE 100 (英国富时100)` 与 `Europe Equity (欧洲宽基)`。`ISF.L / VUKE.L / VERG.L / VEUR.L` 等真正宽基现在计入 ISA 60% 核心目标、享受核心通道与 VIX 豁免；`CNX1/EQGB`（纳指）、`IUKD/VHYL`（高息）、`IGLT/VGOV`（国债）、`SGLN`（商品）、`INRG/IITU/HEAL`（主题）仍保持降级，不虚增核心占比。新增 `core_diversifier_pct`、`core_diversifier_share_of_core_pct` 与软偏好 `prefer_core_diversifier`（核心分散器占核心 <33% 且核心未达标时，门控/Prompt 优先提示 FTSE100/欧洲宽基，**不是硬科技上限**，避免被迫买低增长价值陷阱）。
+2. **`/report` 未持仓核心宽基部署（`src/agents/schemas.py`, `src/agents/report_agent.py`）**：`MorningReportDecision` 新增 `core_deployment`（0~2 条，仅 ISA，BUY，`price_zone`/`size_hint`/`reason`）；`top_actions` 仍只做存量 ADD/TRIM/STOP/HOLD，现有契约不破坏。`/report` 会一次性补拉未持仓核心/分散宽基的轻量行情与均线上下文（`include_news=False`，零额外 LLM 调用），PM 可推荐 `ISF.L/VERG.L` 等分散美股科技；确定性护栏只允许门控核心集合、禁止已持仓/挂单重复、最多 2 条、低于 `min_isa_etf_order_gbp` 拦截、`etf_open=false` 时清空。新增条目写入 T+N ledger（`source=report`、`fill_status=ASSUMED`）并纳入 5 日同向去重。
+3. **`/pick` DCA 宽基放行（`src/engine/portfolio_rules.py`, `src/agents/pick_agent.py`）**：核心/分散宽基的 BUY/ADD 豁免 `RR_UNVERIFIED` / `RR_BELOW_FLOOR`（结构性 DCA 不适用 2:1），除息窗口降为 `[⚠️纪律提醒]` 提示；仍保留 VIX 豁免、频率零 Quota、跨账户双持豁免。应税 Invest 新增硬拦：禁止买入累积型核心宽基（`VWRP/VUAG/SWDA/CSP1` 等，防离岸 ERI 报税摩擦），仅允许派息型 `VWRL/VUSA/ISF/VUKE/VERG/VEUR` 等。
+4. **门控与 Prompt 协同**：`format_deployment_gate_banner()` 在软偏好下将「归拢 VWRP」改为「归拢 ISF/VERG 等低科技宽基」；`_format_gate_constraint_block()` 与 `/report` Bull/PM Prompt 同步提示「核心不足且科技偏高时优先 FTSE100/欧洲宽基，趋势破位/追高不硬凑」；`core_etf_context` 作为只读候选块注入 Bull/Bear/PM 与语义质检事实底座。
+5. **离线单测**：新增 `TestV551CoreDeployment`（渲染/入账/非核心/Invest/已持仓/低于最小额/etf_open 关闭拦截、Invest 累积型 vs 派息型）、核心分散器计入 60% 与软偏好、`/pick` 核心 ETF 豁免 R:R 与除息降级；全量回归 **404/404 全绿**，`scripts/audit_egress.py` RESULT: CLEAN。
+
 ### `v5.5.0`（2026-11-18）
 
 风控闭环加固与记账纠偏（[`docs/plans/2026-11-17-PLAN_HARDENING_POST_AUDIT.md`](./docs/plans/2026-11-17-PLAN_HARDENING_POST_AUDIT.md)）：把「模型自觉」收紧为「Python 硬拦」，同时解开危机期核心宽基抄底与 `DEFEND` 退出的两个死锁，并摆正 T+N 与 TWR 的记账符号。

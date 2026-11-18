@@ -3045,6 +3045,42 @@ class TestV534PickBuyGuards(unittest.TestCase):
         self.assertIsNone(_shares_from_gbp(1000.0, 114.0, "", "VWRP.L"))
         self.assertEqual(_shares_from_gbp(1000.0, 114.0, "GBP", "VWRP.L"), 8)
 
+    def test_core_diversifier_etf_skips_rr_hard_guard_and_ex_div_is_advisory(self) -> None:
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        payload = dict(
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+            deployment_gate={"etf_set": ["VERG.L", "ISF.L", "VWRP.L"]},
+        )
+        # Core diversifier DCA: no numeric stop/target must NOT trigger RR_UNVERIFIED.
+        verg = TickerMarketBundle(
+            symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.0,
+            dividend_yield_pct=3.2, ex_dividend_date="2026-11-20", days_to_ex_dividend=2,
+        )
+        res = apply_risk_override_guardrail(
+            self._pick(symbol="VERG.L", account="ISA", entry=35.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={"VERG.L": verg},
+            **payload,
+        )
+        self.assertFalse(res.applied)
+        self.assertEqual(len(res.decision.selected_actions), 1)
+        self.assertTrue(any("距除息仅2天" in n for n in res.notes))
+
+        # Themed ETF remains a tactical trade: missing R:R is still a hard block.
+        iukd = TickerMarketBundle(
+            symbol="IUKD.L", quote_type="ETF", currency="GBP", current_price=7.0
+        )
+        blocked = apply_risk_override_guardrail(
+            self._pick(symbol="IUKD.L", account="ISA", entry=7.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={"IUKD.L": iukd},
+            **payload,
+        )
+        self.assertTrue(blocked.applied)
+        self.assertEqual(blocked.overrides[0].trigger_type, "RR_UNVERIFIED")
+
     def test_guard_off_is_silent(self) -> None:
         from src.engine.portfolio_rules import apply_risk_override_guardrail
 

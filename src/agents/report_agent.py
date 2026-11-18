@@ -36,6 +36,7 @@ from src.data_providers.analytics import (
     compute_technical_snapshot,
     compute_window_return_pct,
     format_technical_line,
+    normalize_issuer_root,
     resolve_market_benchmark,
 )
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
@@ -53,8 +54,10 @@ from src.engine.calendar_utils import (
     is_uk_bank_holiday,
 )
 from src.engine.deployment_gate import (
+    core_etf_universe_symbols,
     evaluate_deployment_gate,
     format_deployment_gate_banner,
+    is_core_diversifier_symbol,
     reconcile_pm_pick_gate,
 )
 from src.engine.portfolio_rules import (
@@ -1186,7 +1189,194 @@ def _build_report_recommendations(
                 "fill_status": "ASSUMED",
             }
         )
+    # v5.5.1: un-held core/diversifier ETF BUYs are a separate structured field.
+    for dep in getattr(decision, "core_deployment", []) or []:
+        sym = str(getattr(dep, "symbol", "") or "").strip().upper()
+        if not sym or sym == "CASH" or not account_ok["ISA"]:
+            continue
+        bundle = bundles.get(sym) or bundles.get(sym.split(".")[0])
+        price = None
+        if bundle is not None and bundle.current_price is not None and float(bundle.current_price) > 0:
+            price = float(bundle.current_price)
+        if price is None or price <= 0:
+            continue
+        out.append(
+            {
+                "account": str(getattr(dep, "account", "ISA") or "ISA").strip().upper(),
+                "symbol": sym,
+                "action": "BUY",
+                "entry_price": round(price, 4),
+                "thesis": f"核心宽基部署 | {getattr(dep, 'reason', '')} | {getattr(dep, 'price_zone', '')}"[:300],
+                "horizon_days": max(1, int(cfg.strategy.settlement_holding_days)),
+                "benchmark_symbol": resolve_market_benchmark(sym)[0],
+                "source": "report",
+                "fill_status": "ASSUMED",
+            }
+        )
     return out
+
+
+async def _fetch_core_etf_candidates(
+    market_data: MarketDataService,
+    cfg: AppConfig,
+    bundles: dict[str, TickerMarketBundle],
+    histories: dict[str, pd.DataFrame],
+) -> list[str]:
+    """Ensure the report has quotes/trends for the un-held core/diversifier ETF universe.
+
+    One lightweight batch (news off), merged in place. Never fatal: PM can still use
+    held data if the ETF quote batch fails.
+    """
+    core_syms = core_etf_universe_symbols(
+        cfg.strategy,
+        list(getattr(cfg.universe, "etf_symbols", None) or []),
+        bundles,
+    )
+    missing = [s for s in core_syms if s not in bundles]
+    if not missing or not callable(getattr(market_data, "get_bundles", None)):
+        return core_syms
+    try:
+        fetched = await market_data.get_bundles(
+            missing, include_news=False, include_earnings=True
+        )
+        fetched_hist = fetched[0] if isinstance(fetched, tuple) else {}
+        fetched_bundles = fetched[1] if isinstance(fetched, tuple) else fetched
+        if isinstance(fetched_hist, dict):
+            histories.update({k: v for k, v in fetched_hist.items() if v is not None})
+        if isinstance(fetched_bundles, dict):
+            bundles.update({k: v for k, v in fetched_bundles.items() if v is not None})
+    except Exception as exc:
+        logger.debug("Report core ETF candidate fetch skipped: %s", exc)
+    return core_syms
+
+
+def _format_core_etf_candidate_block(
+    core_syms: list[str],
+    bundles: dict[str, TickerMarketBundle],
+    histories: dict[str, pd.DataFrame],
+    held_syms: set[str],
+    *,
+    max_rows: int = 8,
+) -> str:
+    """Compact un-held core/diversifier ETF candidates for the Bull/Bear/PM prompts."""
+    rows: list[str] = []
+    for sym in core_syms:
+        sym_up = sym.strip().upper()
+        if not sym_up or sym_up in held_syms:
+            continue
+        bundle = bundles.get(sym) or bundles.get(sym_up)
+        if bundle is None or not bundle.current_price or float(bundle.current_price) <= 0:
+            continue
+        snap = None
+        try:
+            snap = compute_technical_snapshot(sym_up, histories.get(sym_up), bundle=bundle)
+        except Exception:
+            snap = None
+        tag = "分散器(低科技)" if is_core_diversifier_symbol(sym_up, bundles) else "美股权重核心"
+        parts = [f"• {sym_up} {float(bundle.current_price):g} {bundle.currency or ''}".rstrip()]
+        if snap is not None and snap.dist_ma50_pct is not None:
+            parts.append(f"距MA50 {float(snap.dist_ma50_pct):+.1f}%")
+        if snap is not None and snap.drawdown_52w_pct is not None:
+            parts.append(f"距52w高 {float(snap.drawdown_52w_pct):+.1f}%")
+        parts.append(tag)
+        rows.append(" | ".join(parts))
+        if len(rows) >= max(0, int(max_rows)):
+            break
+    if not rows:
+        return ""
+    return (
+        "【核心宽基候选（未持仓，0-Token 量化；优先低科技分散美股）】\n"
+        + "\n".join(rows)
+    )
+
+
+def _validate_core_deployment(
+    decision: MorningReportDecision,
+    portfolio: PortfolioData,
+    cfg: AppConfig,
+    gate_dict: dict[str, Any] | None,
+    bundles: dict[str, TickerMarketBundle],
+) -> tuple[MorningReportDecision, list[str]]:
+    """Deterministic filter for /report un-held core/diversifier ETF BUYs.
+
+    Only ISA, only the gate's core ETF set, never a name already held, at most 2
+    tickets, and never below the ISA ETF minimum order. This is the safety rail that
+    lets the report originate a new core sleeve without becoming a stock-picking tool.
+    """
+    if not decision.core_deployment:
+        return decision, []
+    notes: list[str] = []
+    if not isinstance(gate_dict, dict) or not gate_dict.get("etf_set"):
+        return decision.model_copy(update={"core_deployment": []}), [
+            "[🛡️风控护栏修正] core_deployment 已清空：组合门控未运行或缺少核心宽基集合"
+        ]
+    isa_gate = gate_dict.get("isa") if isinstance(gate_dict.get("isa"), dict) else {}
+    if isa_gate.get("etf_open") is False:
+        return decision.model_copy(update={"core_deployment": []}), [
+            "[🛡️风控护栏修正] core_deployment 已清空：ISA 宽基通道关闭（退潮期未达深跌阶梯）"
+        ]
+    allowed = {str(s).strip().upper() for s in gate_dict.get("etf_set") or [] if str(s).strip()}
+    allowed_roots = {normalize_issuer_root(s) for s in allowed}
+    held_isa: set[str] = set()
+    for pos in portfolio.isa.positions:
+        sym = str(pos.yahoo_symbol or "").strip().upper()
+        if sym:
+            held_isa.add(sym)
+            held_isa.add(sym.split(".")[0])
+    for order in portfolio.isa.pending_orders:
+        if str(order.side or "").strip().upper() != "BUY":
+            continue
+        sym = str(order.yahoo_symbol or "").strip().upper()
+        if sym:
+            held_isa.add(sym)
+            held_isa.add(sym.split(".")[0])
+    min_order = float(getattr(cfg.strategy, "min_isa_etf_order_gbp", 400.0) or 400.0)
+    kept: list[Any] = []
+    seen: set[str] = set()
+    for item in decision.core_deployment:
+        sym = str(item.symbol or "").strip().upper()
+        base = sym.split(".")[0]
+        acct = str(item.account or "ISA").strip().upper()
+        if len(kept) >= 2:
+            notes.append(f"[🛡️风控护栏修正] {sym}(BUY→拦截): core_deployment 单次最多 2 条")
+            continue
+        if acct != "ISA":
+            notes.append(f"[🛡️风控护栏修正] [{acct}] {sym}(BUY→拦截): 核心宽基新建仓仅限 ISA")
+            continue
+        if not sym or sym in held_isa or base in held_isa:
+            notes.append(f"[🛡️风控护栏修正] {sym or '空代码'}(BUY→拦截): 已持仓请用 top_actions ADD")
+            continue
+        if sym not in allowed and normalize_issuer_root(sym) not in allowed_roots:
+            notes.append(
+                f"[🛡️风控护栏修正] {sym}(BUY→拦截): 不属于核心/分散宽基集合"
+                "（仅 VWRP/VUAG/SWDA/CSP1/ISF/VERG 等）"
+            )
+            continue
+        if sym in seen:
+            notes.append(f"[🛡️风控护栏修正] {sym}(BUY→拦截): core_deployment 重复标的")
+            continue
+        bundle = bundles.get(sym) or bundles.get(sym.split(".")[0])
+        price = float(bundle.current_price) if (bundle is not None and bundle.current_price) else 0.0
+        if price <= 0:
+            notes.append(f"[🛡️风控护栏修正] {sym}(BUY→拦截): 缺少实时行情，无法核对价位")
+            continue
+        amount_match = re.search(r"£\s*([\d,]+(?:\.\d+)?)", str(item.size_hint or ""))
+        if amount_match:
+            try:
+                amount = float(amount_match.group(1).replace(",", ""))
+            except ValueError:
+                amount = 0.0
+            if 0 < amount < min_order:
+                notes.append(
+                    f"[🛡️风控护栏修正] {sym}(BUY→拦截): £{amount:,.0f}"
+                    f" 低于 ISA ETF 最小建仓额 £{min_order:,.0f}"
+                )
+                continue
+        seen.add(sym)
+        kept.append(item)
+    if len(kept) == len(decision.core_deployment) and not notes:
+        return decision, []
+    return decision.model_copy(update={"core_deployment": kept}), notes
 
 
 async def _enrich_gate_candidate_bundles(
@@ -1267,8 +1457,16 @@ async def generate_morning_report(
         context_pack,
     ) = fact_bundle
 
-    # ---------- v5.4.0 deployment gate data pre-fetch (0 LLM calls, offline-tolerant) ----------
+    # v5.5.1: quotes/trends for the un-held core/diversifier ETF universe, so /report
+    # can originate a new core sleeve (ISF/VERG etc.) without becoming a stock picker.
     gate_mode = str(getattr(cfg.strategy, "deployment_gate_mode", "off") or "off").strip().lower()
+    core_etf_syms = (
+        await _fetch_core_etf_candidates(market_data, cfg, bundles, histories)
+        if gate_mode != "off"
+        else []
+    )
+
+    # ---------- v5.4.0 deployment gate data pre-fetch (0 LLM calls, offline-tolerant) ----------
     gate_histories: dict[str, pd.DataFrame] = {}
     gate_candidates: list[dict[str, Any]] = []
     prev_gate_states: list[dict[str, Any]] = []
@@ -1450,6 +1648,15 @@ async def generate_morning_report(
         dst_note += " | " + "；".join(extra_alerts)
 
     wallet_text = build_wallet_context_text(portfolio, cfg.strategy)
+    core_held_syms = {s.strip().upper() for s in held_syms}
+    core_held_syms |= {
+        str(o.yahoo_symbol or "").strip().upper()
+        for o in portfolio.all_pending_orders()
+        if str(o.side or "").strip().upper() == "BUY"
+    }
+    core_etf_context = _format_core_etf_candidate_block(
+        core_etf_syms, bundles, histories, core_held_syms
+    )
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
         f"{wallet_text}\n\n"
@@ -1464,6 +1671,7 @@ async def generate_morning_report(
         f"【近{cfg.strategy.order_history_days}天行为统计】\n{trade_ctx['trade_summary_30d_text']}\n\n"
         f"【交易频率与冷却（Python 计算）】{trade_ctx['trade_behavior_text']}\n\n"
         f"=== 二、量化事实底座 ===\n{fact_sheet}"
+        + (f"\n\n{core_etf_context}" if core_etf_context else "")
         + (f"\n\n=== 三、实时 Google Search 全市场（英/欧/美/ETF/宏观）深度新闻 ===\n{grounding_brief}" if grounding_brief else "")
     )
 
@@ -1485,7 +1693,8 @@ async def generate_morning_report(
         "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
         "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
         f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}% 且核心宽基未达标，"
-        "给出核心宽基分批归拢价位与金额；Invest 机动仓严格遵循右侧猎物门控，"
+        "给出核心宽基分批归拢价位与金额；若穿透科技暴露偏高，优先评估 FTSE100/欧洲宽基（ISF.L/VERG.L）"
+        "分散美股科技，而非机械只加 VWRP；Invest 机动仓严格遵循右侧猎物门控，"
         "无 R:R≥2:1 强信号时明确维持持币待命，严禁因现金占比高而勉强凑单；\n"
         "5. 近 7 日财报事件应对预案。\n"
         "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与 Step 1 全市场 Google Search 摘要已涵盖全部持仓及挂单的量价、CYQ、目标价、财报日、深度情报与最新新闻，"
@@ -1547,6 +1756,9 @@ async def generate_morning_report(
         "严格去重与排版准则（违反将导致重要信息被截断）：\n"
         "• 对【本地多空证据冲突对照】中列出的标的，必须正面裁决采纳 Bull 还是 Bear 依据，严禁和稀泥。\n"
         "• `top_actions`【只放现有持仓的 ADD/TRIM/STOP/HOLD】（1~3条）；所有活动挂单的撤改留在 `pending_order_audits`，严禁把 CANCEL_ORDER/MODIFY_ORDER 重复写进 `top_actions`！\n"
+        "• `core_deployment`【只放未持有的核心/分散宽基 ETF 新买入】（0~2条，仅 ISA，BUY）："
+        "仅当 ISA 核心宽基未达标且现金充足时给出；优先 FTSE100/欧洲宽基（ISF.L/VERG.L 等）分散美股科技，"
+        "趋势破位/追高/无健康回踩或核心已达标时留空数组，严禁硬凑；已持仓标的只能写进 top_actions ADD。\n"
         "• `size_hint` 必填数量口径：TRIM 写减仓比例（如 30%、1/3）或英镑金额（如 £2,300），ADD 写加仓金额或比例，STOP 写「全出」，HOLD/CASH 留空；严禁写股数（由 Python 按持仓确定性换算）。\n"
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
@@ -1577,7 +1789,8 @@ async def generate_morning_report(
         f"资金流水：{cash_flow_text}\n"
         f"活动挂单：\n{trade_ctx['pending_orders_text']}\n\n"
         f"=== 本地多空证据冲突对照 (Bull vs Bear Disagreement Matrix) ===\n{disagreement_text}\n\n"
-        f"=== 机会分析师报告 (Bull) ===\n{analyst_notes}\n\n"
+        + (f"{core_etf_context}\n\n" if core_etf_context else "")
+        + f"=== 机会分析师报告 (Bull) ===\n{analyst_notes}\n\n"
         f"=== 独立风控审计官挑刺与挂单审计 (Bear) ===\n{auditor_notes}"
         + debate_pm_block
     )
@@ -1686,11 +1899,25 @@ async def generate_morning_report(
             if gate_mode == "advise":
                 gate_banner = str(gate_dict.get("banner") or "")
 
+        # v5.5.1: deterministic rail for un-held core/diversifier ETF BUYs.
+        resolved_decision, core_dep_notes = _validate_core_deployment(
+            resolved_decision, portfolio, cfg, gate_dict, bundles
+        )
+        if core_dep_notes or override_res.decision is not resolved_decision:
+            override_res = override_res.model_copy(
+                update={
+                    "decision": resolved_decision,
+                    "applied": bool(override_res.applied or core_dep_notes),
+                    "notes": [*override_res.notes, *core_dep_notes],
+                }
+            )
+
         context_pack["debate"] = debate.payload
         context_pack["report_decision"] = {
             "headline": resolved_decision.headline,
             "top_actions": [a.model_dump() for a in resolved_decision.top_actions],
             "pending_order_audits": [a.model_dump() for a in resolved_decision.pending_order_audits],
+            "core_deployment": [a.model_dump() for a in resolved_decision.core_deployment],
             "daily_vetoes": list(resolved_decision.daily_vetoes),
         }
         final_report = holiday_banner + render_morning_report(
@@ -1785,7 +2012,7 @@ async def generate_morning_report(
                 evals=evals,
                 trade_ctx=trade_ctx,
                 guardrails=guardrails,
-                fact_sheet=fact_sheet,
+                fact_sheet=fact_sheet + (f"\n\n{core_etf_context}" if core_etf_context else ""),
             ),
             rendered_text=final_report,
             strategy=cfg.strategy,

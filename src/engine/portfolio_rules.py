@@ -25,9 +25,13 @@ DEFAULT_VIX_DANGER_THRESHOLD: float = 28.0
 
 # v5.5.0: only genuine broad-base vehicles keep the crisis-time BUY exemption. Themed,
 # dividend, bond and commodity ETFs follow the same VIX freeze as single-name equities.
+# v5.5.1: FTSE 100 / Europe broad-base ETFs are core *diversifiers* (they dilute US tech)
+# and therefore also keep the VIX exemption and the ISA/ Invest core channel treatment.
 _CORE_WIDE_BASE_FAMILIES = {
     "Global All-World/Developed (全球宽基)",
     "S&P 500 (美股标普500)",
+    "FTSE 100 (英国富时100)",
+    "Europe Equity (欧洲宽基)",
 }
 
 
@@ -1722,6 +1726,15 @@ def apply_risk_override_guardrail(
                     if (portfolio is not None and acct_up == "INVEST")
                     else None
                 )
+                pick_core_etf = bool(
+                    sym_up in core_etf_syms
+                    or base in core_etf_syms
+                    or normalize_issuer_root(sym_up)
+                    in {normalize_issuer_root(s) for s in core_etf_syms}
+                )
+                if not pick_core_etf:
+                    family = infer_etf_index_family(sym_up, b)
+                    pick_core_etf = family in _CORE_WIDE_BASE_FAMILIES
                 ex_window = int(getattr(strat, "ex_div_entry_guard_days", 3) or 0)
                 ex_days = int(b.days_to_ex_dividend) if (b and b.days_to_ex_dividend is not None) else None
                 if ex_days is not None and ex_window > 0 and 0 < ex_days <= ex_window:
@@ -1730,24 +1743,27 @@ def apply_risk_override_guardrail(
                         f"除权低开≈{_ex_div_yield_hint(b)}；"
                         "ISA 股息免税可抢息，Invest 应税须按股息税后净额核 R:R"
                     )
-                    if guard_mode == "hard":
+                    if guard_mode == "hard" and not pick_core_etf:
                         return "EX_DIV_WINDOW", ex_msg
                     advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {ex_msg}"
                     if advisory not in cadence_advisories:
                         cadence_advisories.append(advisory)
 
                 if item is not None:
-                    rr_info = _resolve_pick_rr(
-                        item,
-                        b,
-                        strat,
-                        symbol=sym_up,
-                        account=acct_up,
-                        wallet=wallet,
-                    )
-                    rr = rr_info.get("rr")
-                    min_rr = float(getattr(strat, "min_rr_ratio", 2.0) or 2.0)
-                    if rr is None:
+                    # Core wide-base / diversifier DCA is a structural allocation, not a
+                    # tactical R:R trade: the 2:1 floor and numeric stop/target do not apply.
+                    if pick_core_etf:
+                        rr_info = None
+                    else:
+                        rr_info = _resolve_pick_rr(
+                            item,
+                            b,
+                            strat,
+                            symbol=sym_up,
+                            account=acct_up,
+                            wallet=wallet,
+                        )
+                    if rr_info is None and not pick_core_etf:
                         rr_msg = (
                             "Python 无法复核 R:R（stop_price / target_price 未给出有效数字）；"
                             "hard 模式要求先给出数值止损与目标价"
@@ -1757,18 +1773,31 @@ def apply_risk_override_guardrail(
                         advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
                         if advisory not in cadence_advisories:
                             cadence_advisories.append(advisory)
-                    elif float(rr) < min_rr:
-                        rr_msg = (
-                            f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 门槛；"
-                            f"目标空间{float(rr_info['upside_pct'] or 0.0):+.1f}% "
-                            f"扣摩擦{float(rr_info['friction_pct'] or 0.0):.2f}% "
-                            f"vs 止损{float(rr_info['risk_pct'] or 0.0):.1f}%)"
-                        )
-                        if guard_mode == "hard":
-                            return "RR_BELOW_FLOOR", rr_msg
-                        advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
-                        if advisory not in cadence_advisories:
-                            cadence_advisories.append(advisory)
+                    elif rr_info is not None:
+                        rr = rr_info.get("rr")
+                        min_rr = float(getattr(strat, "min_rr_ratio", 2.0) or 2.0)
+                        if rr is None:
+                            rr_msg = (
+                                "Python 无法复核 R:R（stop_price / target_price 未给出有效数字）；"
+                                "hard 模式要求先给出数值止损与目标价"
+                            )
+                            if guard_mode == "hard":
+                                return "RR_UNVERIFIED", rr_msg
+                            advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
+                            if advisory not in cadence_advisories:
+                                cadence_advisories.append(advisory)
+                        elif float(rr) < min_rr:
+                            rr_msg = (
+                                f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 门槛；"
+                                f"目标空间{float(rr_info['upside_pct'] or 0.0):+.1f}% "
+                                f"扣摩擦{float(rr_info['friction_pct'] or 0.0):.2f}% "
+                                f"vs 止损{float(rr_info['risk_pct'] or 0.0):.1f}%)"
+                            )
+                            if guard_mode == "hard":
+                                return "RR_BELOW_FLOOR", rr_msg
+                            advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
+                            if advisory not in cadence_advisories:
+                                cadence_advisories.append(advisory)
 
             if macro_high_risk and macro_vix is not None:
                 core_etf_buy = bool(

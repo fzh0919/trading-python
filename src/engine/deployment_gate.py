@@ -181,13 +181,23 @@ def _native_risk_to_gbp(native_amount: float, pos: PositionItem) -> float:
     return 0.0
 
 
-# Only true broad-base global/S&P trackers keep the core-ETF privilege. Themed,
-# high-dividend, bond and commodity ETFs are demoted to other_etf_gbp so they can
-# never inflate core_etf_pct nor use the core wide-base channel exemption.
+# Only true broad-base vehicles keep the core-ETF privilege. Global/S&P 500 are the
+# US-heavy core; FTSE 100 and Europe are accepted as *core diversifiers* so the ISA
+# 60% target can be met without mechanically increasing US tech exposure. Themed,
+# high-dividend, bond and commodity ETFs stay demoted to other_etf_gbp.
 _CORE_ETF_INDEX_FAMILIES = {
     "Global All-World/Developed (全球宽基)",
     "S&P 500 (美股标普500)",
+    "FTSE 100 (英国富时100)",
+    "Europe Equity (欧洲宽基)",
 }
+_CORE_DIVERSIFIER_FAMILIES = {
+    "FTSE 100 (英国富时100)",
+    "Europe Equity (欧洲宽基)",
+}
+# Soft target: once at least ~1/3 of the ISA core sleeve is in FTSE100/Europe,
+# stop nudging towards diversifiers. This is a preference, never a hard block.
+_CORE_DIVERSIFIER_SOFT_SHARE_PCT = 33.0
 
 
 def _build_etf_set(
@@ -219,6 +229,27 @@ def _is_etf_symbol(symbol: str, etf_set: set[str], bundles: dict[str, TickerMark
         return True
     b = (bundles or {}).get(sym)
     return bool(b is not None and str(getattr(b, "quote_type", "") or "").upper() == "ETF")
+
+
+def is_core_diversifier_symbol(
+    symbol: str,
+    bundles: dict[str, TickerMarketBundle] | None = None,
+) -> bool:
+    """True for broad-base FTSE 100 / Europe ETFs that diversify the US-heavy core."""
+    sym = _sym_up(symbol)
+    if not sym:
+        return False
+    bundle = (bundles or {}).get(sym) or (bundles or {}).get(symbol)
+    return infer_etf_index_family(sym, bundle) in _CORE_DIVERSIFIER_FAMILIES
+
+
+def core_etf_universe_symbols(
+    strategy: StrategySection,
+    universe_etf_symbols: list[str] | None,
+    bundles: dict[str, TickerMarketBundle] | None = None,
+) -> list[str]:
+    """Sorted core wide-base universe (global/S&P + FTSE100/Europe diversifiers)."""
+    return sorted(_build_etf_set(strategy, universe_etf_symbols, bundles))
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +469,7 @@ def compute_account_ledgers(
     isa_val = _account_value_gbp(isa)
     isa_ok = bool(isa.ok and not isa.is_fallback and isa_val > 0)
     core_etf_gbp = 0.0
+    core_diversifier_gbp = 0.0
     other_etf_gbp = 0.0
     satellite_gbp = 0.0
     held_equity_syms: list[str] = []
@@ -446,7 +478,9 @@ def compute_account_ledgers(
     for pos in isa.positions:
         sym = _sym_up(pos.yahoo_symbol)
         if sym in etf_set:
-            core_etf_gbp += float(pos.current_value)  # benchmark + universe ETF list = core wide base
+            core_etf_gbp += float(pos.current_value)  # benchmark + core universe = core wide base
+            if is_core_diversifier_symbol(sym, bundles):
+                core_diversifier_gbp += float(pos.current_value)
         elif _is_etf_symbol(sym, etf_set, bundles):
             other_etf_gbp += float(pos.current_value)  # ETF but not core (e.g. short-bond IBTA)
         else:
@@ -458,6 +492,14 @@ def compute_account_ledgers(
     isa_pending_core = [o for o in by_class[PENDING_CORE_ETF_BUY] if o.account.strip().upper() == "ISA"]
     isa_pending_equity = [o for o in by_class[PENDING_NEW_EQUITY_BUY] if o.account.strip().upper() == "ISA"]
     core_pending_gbp = _pending_buy_gbp(isa_pending_core, pos_by_sym)
+    core_diversifier_pending_gbp = _pending_buy_gbp(
+        [
+            o
+            for o in isa_pending_core
+            if is_core_diversifier_symbol(_sym_up(o.yahoo_symbol), bundles)
+        ],
+        pos_by_sym,
+    )
     equity_pending_gbp = _pending_buy_gbp(isa_pending_equity, pos_by_sym)
 
     def _pct(gbp: float) -> float:
@@ -475,6 +517,18 @@ def compute_account_ledgers(
         committed_satellite_pct >= float(strategy.isa_satellite_max_total_pct)
         or committed_satellite_count >= int(strategy.isa_satellite_max_count)
     )
+    committed_core_gbp = core_etf_gbp + core_pending_gbp
+    committed_diversifier_gbp = core_diversifier_gbp + core_diversifier_pending_gbp
+    diversifier_share_pct = (
+        _round2(committed_diversifier_gbp / committed_core_gbp * 100.0)
+        if committed_core_gbp > 0
+        else 0.0
+    )
+    prefer_core_diversifier = bool(
+        isa_ok
+        and committed_core_gbp / isa_val * 100.0 < float(strategy.isa_core_etf_target_pct)
+        and diversifier_share_pct < _CORE_DIVERSIFIER_SOFT_SHARE_PCT
+    )
     isa_ledger = {
         "ok": isa_ok,
         "total_account_value_gbp": _round2(isa_val),
@@ -484,8 +538,11 @@ def compute_account_ledgers(
         "total_cash_pct": _pct(isa.total_cash),
         "deployable_pct": _pct(isa.available_to_trade),  # already net of reserved BUY cash!
         "core_etf_pct": _pct(core_etf_gbp),
+        "core_diversifier_pct": _pct(committed_diversifier_gbp),
+        "core_diversifier_share_of_core_pct": diversifier_share_pct,
+        "prefer_core_diversifier": prefer_core_diversifier,
         "other_etf_pct": _pct(other_etf_gbp),
-        "committed_core_etf_pct": _pct(core_etf_gbp + core_pending_gbp),
+        "committed_core_etf_pct": _pct(committed_core_gbp),
         "satellite_equity_pct": _pct(satellite_gbp),
         "committed_satellite_pct": committed_satellite_pct,
         "committed_satellite_count": committed_satellite_count,
@@ -1035,7 +1092,13 @@ def scan_triggers_and_decide(
             isa_reason = f"外部净入金 £{inflow['per_account_net_gbp']['ISA']:,.0f} 达标，引导分批配置核心宽基"
         elif b_dca:
             isa_status, isa_mode = "RUN", "dca"
-            isa_reason = f"ISA 可用现金 {isa['deployable_pct']:.1f}%>上沿且宽基仅 {isa['committed_core_etf_pct']:.0f}%（含挂单），分批归拢 VWRP"
+            if isa.get("prefer_core_diversifier"):
+                isa_reason = (
+                    f"ISA 可用现金 {isa['deployable_pct']:.1f}%>上沿且宽基仅 {isa['committed_core_etf_pct']:.0f}%（含挂单），"
+                    "优先用 FTSE100/欧洲宽基分散美股科技，勿只加 VWRP"
+                )
+            else:
+                isa_reason = f"ISA 可用现金 {isa['deployable_pct']:.1f}%>上沿且宽基仅 {isa['committed_core_etf_pct']:.0f}%（含挂单），分批归拢 VWRP"
         elif ladder_hit is not None:
             isa_status, isa_mode = "RUN", "ladder"
             isa_reason = f"核心宽基距52周高点回撤首次触及 -{float(ladder_hit):.0f}% 阶梯"
@@ -1327,8 +1390,9 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
         if pending_eq:
             parts.append(f"审撤{pending_eq}买单")
         avail = float(isa.get("available_to_trade_gbp") or 0.0)
+        core_label = "ISF/VERG等低科技宽基" if isa.get("prefer_core_diversifier") else "VWRP"
         if avail >= 1000:
-            parts.append(f"{_gpb_k(avail)}归拢VWRP")
+            parts.append(f"{_gpb_k(avail)}归拢{core_label}")
         parts.append(f"Invest槽位{used}/{cap}({unfin}未脱险,{fin}已锁保本)静待解锁")
         line2 = "→ " + "，".join(parts)
         return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
@@ -1338,7 +1402,8 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
         core_pct = float(isa.get("committed_core_etf_pct") or 0.0)
         mode = str(isa.get("mode") or "dca")
         line1 = f"组合门控：ISA RUN·{mode} / Invest {invest_status}｜ISA可用 {d_pct:.1f}%（宽基{core_pct:.0f}%）"
-        line2 = "→ 闲置现金分批归拢 VWRP；Invest 无右侧猎物不催买（现金吃息仅作等待保底）"
+        core_label = "ISF/VERG等低科技宽基" if isa.get("prefer_core_diversifier") else "VWRP"
+        line2 = f"→ 闲置现金分批归拢 {core_label}；Invest 无右侧猎物不催买（现金吃息仅作等待保底）"
         return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
 
     line1 = f"组合门控：ISA {isa_status} / Invest {invest_status}｜市场 {regime}"

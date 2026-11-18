@@ -55,6 +55,19 @@ LONDON_TZ = ZoneInfo("Europe/London")
 
 _GUARDRAIL_TAG = "[🛡️风控护栏修正]"
 
+# v5.5.1: taxable Invest must never buy accumulating core ETFs (offshore ERI reporting
+# friction); only distributing share classes are allowed there.
+_DISTRIBUTING_CORE_ETFS = {
+    "VWRL", "VWRL.L",
+    "VUSA", "VUSA.L",
+    "ISF", "ISF.L",
+    "VUKE", "VUKE.L",
+    "VERG", "VERG.L",
+    "VEUR", "VEUR.L",
+    "IMEU", "IMEU.L",
+    "CUKX", "CUKX.L",
+}
+
 
 def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
     """Render the deterministic deployment-gate constraints for Researcher/Critic prompts."""
@@ -71,6 +84,11 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
         lines.append("• ISA 个股通道关闭（退潮期或结构饱和）：严禁推荐 ISA 新开个股。")
     if isa_g.get("etf_open") is False:
         lines.append("• ISA 宽基通道关闭（退潮期未达深跌采集阶梯）：严禁推荐 ISA 新开宽基 ETF。")
+    if isa_g.get("prefer_core_diversifier"):
+        lines.append(
+            "• ISA 核心宽基不足且美股科技权重偏高：优先用 FTSE100/欧洲宽基（ISF.L/VERG.L 等）"
+            "分散区域与科技集中度，勿机械只加 VWRP；趋势破位/追高时不得硬凑。"
+        )
     lines.append(
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
@@ -163,6 +181,13 @@ def _apply_gate_channel_constraints(
             # Themed / dividend / bond ETFs are NOT core wide-base vehicles: in Invest they
             # must obey the same slot, daily-cap and regime channel as single-name equities.
             is_core_etf = bool(is_etf and (sym in etf_set or base in etf_set))
+            if acct == "INVEST" and is_core_etf and sym not in _DISTRIBUTING_CORE_ETFS and base not in _DISTRIBUTING_CORE_ETFS:
+                notes.append(
+                    f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                    "应税 Invest 禁止买入累积型核心宽基（离岸 ERI 报税摩擦），"
+                    "仅可买派息型 VWRL.L/ISF.L/VERG.L"
+                )
+                continue
             # PM veto is a hard stop for all new positions (kept as a defence-in-depth
             # check even though generate_pick_radar already returns early).
             if pm_g.get("allow") is False:

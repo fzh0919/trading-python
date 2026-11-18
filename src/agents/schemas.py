@@ -38,6 +38,17 @@ class ReportActionItem(BaseModel):
     )
 
 
+class CoreDeploymentItem(BaseModel):
+    """v5.5.1: an un-held core/diversifier wide-base ETF BUY proposed by /report."""
+
+    account: str = Field(default="ISA", description="仅限 ISA（应税 Invest 仅允许派息型核心宽基，且不在本字段新建仓）")
+    symbol: str = Field(description="未持有的核心/分散宽基 ETF 代码，如 ISF.L、VERG.L、VWRL.L")
+    action: Literal["BUY"] = Field(default="BUY", description="固定为 BUY")
+    price_zone: str = Field(description="建议买入价位/区间，如 '35.2-35.6 GBP'")
+    size_hint: str = Field(description="建议金额（如 '£2,000'）或占 ISA 比例（如 '3%'）；必填")
+    reason: str = Field(description="一句话依据：分散美股科技/区域配置或核心宽基未达标（不超过35字）")
+
+
 class PendingOrderAuditItem(BaseModel):
     account: str = Field(description="ISA 或 Invest")
     symbol: str = Field(description="挂单标的代码")
@@ -103,6 +114,13 @@ class MorningReportDecision(BaseModel):
     pending_order_audits: list[PendingOrderAuditItem] = Field(
         default_factory=list,
         description="对所有未成交活动挂单逐一做出 KEEP / MODIFY / CANCEL 独立审计（没有挂单则为空数组）",
+    )
+    core_deployment: list[CoreDeploymentItem] = Field(
+        default_factory=list,
+        description=(
+            "0~2 条未持有的核心/分散宽基 ETF 新买入（仅 ISA，BUY）；"
+            "核心宽基已达标、现金不足或趋势破位时留空数组；优先低科技 FTSE100/欧洲宽基分散美股科技"
+        ),
     )
     daily_vetoes: list[str] = Field(
         default_factory=list,
@@ -465,6 +483,13 @@ def render_morning_report(
             f"{idx}. [{act.account}] {act.action} {act.symbol}{pz}{size_txt}{note_txt} — {act.reason}"
         )
 
+    if decision.core_deployment:
+        action_lines.append("【核心宽基部署】")
+        for item in decision.core_deployment[:2]:
+            action_lines.append(
+                f"• [{item.account}] BUY {item.symbol} @ {item.price_zone} · {item.size_hint} — {item.reason}"
+            )
+
     override_notes = _extract_override_notes(risk_override)
     for note in override_notes[:4]:
         action_lines.append(f"• {note}")
@@ -498,6 +523,11 @@ def render_morning_report(
             covered_syms.add(sym_up.split(".")[0])
     for aud in decision.pending_order_audits:
         sym_up = aud.symbol.strip().upper()
+        if sym_up and sym_up != "CASH":
+            covered_syms.add(sym_up)
+            covered_syms.add(sym_up.split(".")[0])
+    for dep in decision.core_deployment:
+        sym_up = dep.symbol.strip().upper()
         if sym_up and sym_up != "CASH":
             covered_syms.add(sym_up)
             covered_syms.add(sym_up.split(".")[0])
