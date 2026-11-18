@@ -1094,8 +1094,9 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertIn("[SUPPORT_VS_WEAK_TREND 合并 x2] UNH[ISA], UBER[Invest]", mixed_txt)
         self.assertEqual(mixed_txt.count("SUPPORT_VS_WEAK_TREND"), 1)
 
-        # MorningReportDecision guardrail: NVDA ADD downgraded by overweight, VWRP.L ADD downgraded by VIX>=28,
-        # while TRIM/HOLD remain untouched and caller's original object is not mutated.
+        # MorningReportDecision guardrail: NVDA ADD downgraded by overweight; core wide-base
+        # VWRP.L ADD stays exempt from MACRO_VIX after v5.5.0, while TRIM/HOLD remain untouched
+        # and the caller's original object is not mutated.
         report_dec = MorningReportDecision(
             headline="测试早报",
             top_actions=[
@@ -1118,11 +1119,11 @@ class TestAnalyticsAndRules(unittest.TestCase):
             bundle_map=bundle_map,
         )
         self.assertTrue(res_report.applied)
-        self.assertEqual(len(res_report.overrides), 2)
+        self.assertEqual(len(res_report.overrides), 1)
         self.assertEqual(report_dec.top_actions[0].action, "ADD")  # input preserved
         self.assertEqual(res_report.decision.top_actions[0].action, "HOLD")
         self.assertIn("[🛡️风控护栏修正]", res_report.decision.top_actions[0].reason)
-        self.assertEqual(res_report.decision.top_actions[1].action, "HOLD")
+        self.assertEqual(res_report.decision.top_actions[1].action, "ADD")
         self.assertEqual(res_report.decision.top_actions[2].action, "TRIM")
 
         # PickDecision guardrail: blocks daily_vetoes, high_correlation, and VIX>=28
@@ -2582,6 +2583,40 @@ class TestStage2PenetrationAndSizing(unittest.TestCase):
         self.assertAlmostEqual(isa_etf["min_order_gbp"], 400.0)
         self.assertAlmostEqual(isa_eq["min_order_gbp"], 1200.0)
 
+    def test_isa_risk_budget_scales_with_nav_and_isolated_from_invest_half_r(self) -> None:
+        from src.engine.portfolio_rules import compute_risk_based_size_gbp
+
+        strategy = StrategySection()
+        isa = compute_risk_based_size_gbp(
+            account="ISA",
+            strategy=strategy,
+            effective_stop_pct=-10.0,
+            account_total_value_gbp=57117.0,
+            risk_budget_scale=0.5,
+        )
+        # ISA uses 0.5% NAV (≈£285.59) and must ignore the Invest loss-streak 0.5R scale.
+        self.assertAlmostEqual(isa["risk_budget_gbp"], 285.59, delta=0.01)
+        self.assertAlmostEqual(isa["budget_sized_gbp"], 2855.85, delta=0.1)
+
+        invest = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-10.0,
+            account_total_value_gbp=30000.0,
+            risk_budget_scale=0.5,
+        )
+        # Invest NAV £30,000 -> £150 floor, then 0.5R pilot => £75 risk budget.
+        self.assertAlmostEqual(invest["risk_budget_gbp"], 75.0, places=2)
+        self.assertAlmostEqual(invest["budget_sized_gbp"], 750.0, places=2)
+
+        small_invest = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-12.0,
+            account_total_value_gbp=10000.0,
+        )
+        self.assertAlmostEqual(small_invest["risk_budget_gbp"], 85.0, places=2)
+
 class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
     """v5.3.2 Stage 2: frequency caps, re-buy cooldown and ISA opportunity-cost replacement."""
 
@@ -2985,6 +3020,30 @@ class TestV534PickBuyGuards(unittest.TestCase):
         self.assertIn("以损定仓上限 £500", note)
         self.assertIn("≈6股", note)
         self.assertIn("低于最小建仓额", note)
+
+    def test_gbp_pence_llm_pound_entry_rescaled_no_100x_shares(self) -> None:
+        from src.engine.portfolio_rules import _shares_from_gbp, apply_risk_override_guardrail
+
+        # LLM 用英镑口径写 25.0，实时行情是 GBp 2500 => 自动对齐到 2500，股数按 £25/股 计。
+        bundle = TickerMarketBundle(
+            symbol="SHEL.L", quote_type="EQUITY", currency="GBp", current_price=2500.0
+        )
+        res = apply_risk_override_guardrail(
+            self._pick(symbol="SHEL.L", account="ISA", entry=25.0, stop=22.5, target=35.0),
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={"SHEL.L": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        self.assertFalse(res.applied)
+        note = res.decision.selected_actions[0].risk_note
+        # £85 ÷ 止损 10% = £850 => 850 / £25 = 34 股（旧缺陷会按 £0.25 => 3,400 股）
+        self.assertIn("≈34股", note)
+        self.assertNotIn("3,400", note)
+
+        # 缺失币种时不得把 VWRP.L 等英镑报价 ETF 盲除 100。
+        self.assertIsNone(_shares_from_gbp(1000.0, 114.0, "", "VWRP.L"))
+        self.assertEqual(_shares_from_gbp(1000.0, 114.0, "GBP", "VWRP.L"), 8)
 
     def test_guard_off_is_silent(self) -> None:
         from src.engine.portfolio_rules import apply_risk_override_guardrail

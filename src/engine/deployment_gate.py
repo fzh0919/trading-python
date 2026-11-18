@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.config import StrategySection
-from src.data_providers.analytics import TechnicalSnapshot, normalize_issuer_root
+from src.data_providers.analytics import TechnicalSnapshot, infer_etf_index_family, normalize_issuer_root
 from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
@@ -168,15 +168,26 @@ def _native_risk_to_gbp(native_amount: float, pos: PositionItem) -> float:
     """Convert a native-currency risk amount into GBP using the position's own FX basis."""
     if native_amount <= 0:
         return 0.0
-    ccy = str(pos.inst_currency or "").upper()
-    if ccy == "GBP":
-        return native_amount
-    if ccy == "GBX":
+    # Keep the original casing: ``.upper()`` would turn LSE pence ("GBp"/"GBx") into "GBP"
+    # and silently inflate the heat by 100x.
+    raw_ccy = str(pos.inst_currency or "").strip()
+    if raw_ccy in {"GBp", "GBx"} or raw_ccy.upper() == "GBX":
         return native_amount / 100.0
+    if raw_ccy.upper() == "GBP":
+        return native_amount
     if pos.current_value > 0 and pos.cur_price > 0 and pos.quantity > 0:
         gbp_per_native_unit = float(pos.current_value) / (float(pos.cur_price) * float(pos.quantity))
         return native_amount * gbp_per_native_unit
     return 0.0
+
+
+# Only true broad-base global/S&P trackers keep the core-ETF privilege. Themed,
+# high-dividend, bond and commodity ETFs are demoted to other_etf_gbp so they can
+# never inflate core_etf_pct nor use the core wide-base channel exemption.
+_CORE_ETF_INDEX_FAMILIES = {
+    "Global All-World/Developed (全球宽基)",
+    "S&P 500 (美股标普500)",
+}
 
 
 def _build_etf_set(
@@ -184,14 +195,21 @@ def _build_etf_set(
     universe_etf_symbols: list[str] | None,
     bundles: dict[str, TickerMarketBundle] | None,
 ) -> set[str]:
-    """Core wide-base ETF membership = benchmark symbol + universe etf_symbols only.
+    """Core wide-base ETF membership = benchmark symbol + genuine broad-base universe ETFs.
 
-    Other ETF-type instruments (e.g. a short-bond IBTA) are excluded from the satellite
-    equity bucket via ``_is_etf_symbol`` but do NOT inflate the core wide-base percentage.
+    Other ETF-type instruments (e.g. a short-bond IBTA, a UK dividend or a thematic
+    ETF) are excluded from the satellite equity bucket via ``_is_etf_symbol`` but do
+    NOT inflate the core wide-base percentage.
     """
     etf_set = {_sym_up(strategy.benchmark_symbol)}
     for sym in universe_etf_symbols or []:
-        etf_set.add(_sym_up(sym))
+        sym_up = _sym_up(sym)
+        if not sym_up:
+            continue
+        bundle = (bundles or {}).get(sym_up) or (bundles or {}).get(sym)
+        family = infer_etf_index_family(sym_up, bundle)
+        if family in _CORE_ETF_INDEX_FAMILIES:
+            etf_set.add(sym_up)
     return etf_set
 
 
@@ -332,7 +350,16 @@ def evaluate_tactical_quota_guards(
         rows = buys_by_sym.get(_sym_up(order.yahoo_symbol)) or []
         opened_after_epoch = any(epoch_ms <= r.filled_at_ms < order.filled_at_ms for r in rows)
         if not opened_after_epoch:
-            continue  # no post-epoch BUY fill -> legacy cleanup, exempt
+            # No BUY inside the 30-day order-history window. That is only genuine legacy
+            # when the sell itself happened before the window aged past the epoch; a sell
+            # well after gate_epoch_date with no visible BUY is a post-epoch position whose
+            # opening fill simply fell out of the API history and must still count.
+            held_over_history_window = (
+                order.filled_at_ms - epoch_ms
+                >= int(strategy.order_history_days) * 86_400_000
+            )
+            if not held_over_history_window:
+                continue  # legacy cleanup, exempt
         tactical_sells.append(order)
     tactical_sells.sort(key=lambda r: r.filled_at_ms, reverse=True)
     # Count each symbol once: multiple partial trims of the same loser must not fake a streak.
@@ -494,14 +521,46 @@ def compute_account_ledgers(
         is_financed = False
         heat_gbp = 0.0
         if stop_orders:
-            raw_stop = float(stop_orders[0].stop_price or stop_orders[0].limit_price or 0.0)
-            aligned_stop = _rescale_price_pair(raw_stop, pos.avg_price)
-            if pos.avg_price > 0 and aligned_stop >= pos.avg_price * (1.0 + friction_pct / 100.0):
+            covered_qty = 0.0
+            weighted_stop_num = 0.0
+            aligned_stop = 0.0
+            for order in stop_orders:
+                if not (order.stop_price or order.limit_price):
+                    continue
+                raw_stop = float(order.stop_price or order.limit_price or 0.0)
+                aligned = _rescale_price_pair(raw_stop, pos.avg_price)
+                qty = float(order.quantity or 0.0)
+                covered_qty += qty
+                weighted_stop_num += aligned * qty
+                aligned_stop = aligned  # single protective order => itself
+            covered_qty = min(float(pos.quantity), covered_qty)
+            if covered_qty > 0:
+                aligned_stop = weighted_stop_num / max(
+                    sum(float(o.quantity or 0.0) for o in stop_orders if (o.stop_price or o.limit_price)),
+                    1e-9,
+                )
+            # Breakeven unlock requires the protective stop to cover ~all shares: a 60%
+            # stop on a 100% position still leaves 40% naked downside risk.
+            if (
+                pos.quantity > 0
+                and covered_qty >= float(pos.quantity) * 0.99
+                and pos.avg_price > 0
+                and aligned_stop >= pos.avg_price * (1.0 + friction_pct / 100.0)
+            ):
                 is_financed = True
                 heat_gbp = 0.0
             else:
-                native_risk = max(0.0, float(pos.avg_price) - aligned_stop) * float(pos.quantity)
-                heat_gbp = _native_risk_to_gbp(native_risk, pos)
+                covered_risk = max(0.0, float(pos.avg_price) - aligned_stop) * covered_qty
+                uncovered_qty = max(0.0, float(pos.quantity) - covered_qty)
+                if uncovered_qty > 0:
+                    tech = (tech_map or {}).get(pos.yahoo_symbol)
+                    stop_pct = _compute_adaptive_invest_stop_pct(tech, strategy)
+                    uncovered_risk = (
+                        float(pos.avg_price) * abs(float(stop_pct)) / 100.0 * uncovered_qty
+                    )
+                else:
+                    uncovered_risk = 0.0
+                heat_gbp = _native_risk_to_gbp(covered_risk + uncovered_risk, pos)
         else:
             tech = (tech_map or {}).get(pos.yahoo_symbol)
             stop_pct = _compute_adaptive_invest_stop_pct(tech, strategy)
@@ -673,10 +732,16 @@ def evaluate_market_regime(
     price = metrics["price"]
     ma200 = metrics["ma200"]
     mom20 = metrics["mom20_pct"]
+    # A 3-day dead-cat bounce while the index is still below MA200 must never release DEFEND.
+    # Only when MA200 is genuinely unavailable (insufficient bars) may momentum stand in.
+    trend_repaired = bool(
+        (ma200 is not None and price >= ma200)
+        or (ma200 is None and mom20 is not None and mom20 > 0)
+    )
     crisis_eased = bool(
         (vix is None or vix < float(strategy.regime_vix_exit_risk_off))
         and (hy_oas is None or hy_oas < float(strategy.regime_hy_oas_risk_off_pct))
-        and ((ma200 is not None and price >= ma200) or (mom20 is not None and mom20 > 0))
+        and trend_repaired
     )
     ease_streak = (
         (prev_ease_streak + 1)
@@ -697,7 +762,16 @@ def evaluate_market_regime(
     elif raw == "RISK_OFF" and raw_streak >= enter_days and prev_regime in {"NEUTRAL", "RISK_ON"}:
         regime = "RISK_OFF"
     elif prev_regime == "RISK_OFF":
-        regime = "NEUTRAL" if (raw != "RISK_OFF" and ease_streak >= exit_days) else "RISK_OFF"
+        # A -25% bear-market bottom that has repaired above MA200 for the full exit window
+        # must not stay locked in RISK_OFF because the stale 52w-high drawdown flag echoes.
+        flags = [str(f) for f in metrics.get("risk_off_flags") or []]
+        only_stale_drawdown = bool(raw == "RISK_OFF" and flags and all("回撤" in f for f in flags))
+        if raw != "RISK_OFF" and ease_streak >= exit_days:
+            regime = "NEUTRAL"
+        elif only_stale_drawdown and ease_streak >= exit_days:
+            regime = "NEUTRAL"
+        else:
+            regime = "RISK_OFF"
     elif prev_regime == "RISK_ON":
         regime = "RISK_ON" if raw == "RISK_ON" else "NEUTRAL"
     else:  # NEUTRAL
@@ -727,19 +801,43 @@ def _core_etf_drawdown_step(
     histories: dict[str, pd.DataFrame] | None,
     strategy: StrategySection,
 ) -> dict[str, Any]:
-    """A-trigger: benchmark 52w-high drawdown ladder (first crossing of -5/-10/-15/-20%)."""
-    sym = _sym_up(strategy.benchmark_symbol)
-    closes = _close_series((histories or {}).get(sym))
-    out: dict[str, Any] = {"symbol": sym, "hit": None, "drawdown_52w_pct": None, "first_cross": False}
-    if len(closes) < 2:
+    """A-trigger: benchmark 52w-high drawdown ladder (first crossing of -5/-10/-15/-20%).
+
+    Considers both the GBP-quoted core benchmark (VWRP.L) and the USD-native regime
+    benchmark (SPY) and triggers on the deeper side. In a sterling crisis the GBP
+    quote can mask a genuine -15% USD drawdown, leaving the ladder permanently idle.
+    """
+    primary_sym = _sym_up(strategy.benchmark_symbol)
+    out: dict[str, Any] = {
+        "symbol": primary_sym,
+        "hit": None,
+        "drawdown_52w_pct": None,
+        "drawdown_52w_pct_by_symbol": {},
+        "first_cross": False,
+    }
+    samples: list[tuple[str, pd.Series, float, float]] = []
+    for raw_sym in (
+        primary_sym,
+        _sym_up(strategy.regime_benchmark_symbol),
+    ):
+        if not raw_sym:
+            continue
+        closes = _close_series((histories or {}).get(raw_sym))
+        if len(closes) < 2:
+            continue
+        price = float(closes.iloc[-1])
+        prev_price = float(closes.iloc[-2])
+        high52 = float(closes.iloc[-252:].max()) if len(closes) >= 252 else float(closes.max())
+        if high52 <= 0:
+            continue
+        dd_now = (price / high52 - 1.0) * 100.0
+        dd_prev = (prev_price / high52 - 1.0) * 100.0
+        out["drawdown_52w_pct_by_symbol"][raw_sym] = _round2(dd_now)
+        samples.append((raw_sym, closes, dd_now, dd_prev))
+    if not samples:
         return out
-    price = float(closes.iloc[-1])
-    prev_price = float(closes.iloc[-2])
-    high52 = float(closes.iloc[-252:].max()) if len(closes) >= 252 else float(closes.max())
-    if high52 <= 0:
-        return out
-    dd_now = (price / high52 - 1.0) * 100.0
-    dd_prev = (prev_price / high52 - 1.0) * 100.0
+    chosen_sym, _closes, dd_now, dd_prev = min(samples, key=lambda row: row[2])
+    out["symbol"] = chosen_sym
     out["drawdown_52w_pct"] = _round2(dd_now)
     for step in sorted((float(s) for s in strategy.core_etf_drawdown_steps_pct), reverse=True):
         if dd_now <= -step and dd_prev > -step:
@@ -902,6 +1000,16 @@ def scan_triggers_and_decide(
     isa_extreme_low_cash = bool(
         isa["ok"] and isa["total_cash_pct"] < ISA_EXTREME_LOW_CASH_PCT
     )
+    # Persistent deep drawdown (>=-10%) during RISK_OFF must keep the core-ETF channel open
+    # even after the first-cross day has passed, otherwise a whole sideways bottom is missed.
+    persistent_deep_drawdown = bool(
+        isa["ok"]
+        and a_core.get("drawdown_52w_pct") is not None
+        and float(a_core["drawdown_52w_pct"]) <= -10.0
+        and isa["deployable_pct"] > float(strategy.isa_cash_band_high_pct)
+        and isa["committed_core_etf_pct"] < float(strategy.isa_core_etf_target_pct)
+        and len(isa["pending_core_etf_buys"]) == 0
+    )
 
     # ---------- ISA decision ----------
     if not isa["ok"]:
@@ -913,6 +1021,12 @@ def scan_triggers_and_decide(
             if ladder_hit is not None and float(ladder_hit) >= 10.0:
                 isa_status, isa_mode = "RUN", "ladder"
                 isa_reason = f"退潮期 ISA 个股通道关闭，宽基深跌{-float(ladder_hit):.0f}%阶梯逆向播种"
+            elif persistent_deep_drawdown:
+                isa_status, isa_mode = "RUN", "ladder"
+                isa_reason = (
+                    f"退潮期宽基持续深回撤{float(a_core['drawdown_52w_pct']):.1f}%"
+                    "且尚未挂出接针单，允许补挂核心宽基分批买单"
+                )
             else:
                 isa_status, isa_mode = "WAIT", "none"
                 isa_reason = "退潮期冻结新开个股，宽基未达深跌阶梯暂缓"
@@ -1032,7 +1146,8 @@ def scan_triggers_and_decide(
     # In RISK_OFF the ISA wide-base channel only opens on a valid drawdown ladder step;
     # otherwise the gate WAIT text and the actual permission would contradict each other.
     isa_etf_open = bool(
-        isa["ok"] and (regime != "RISK_OFF" or a_core.get("hit") is not None)
+        isa["ok"]
+        and (regime != "RISK_OFF" or a_core.get("hit") is not None or persistent_deep_drawdown)
     )
     isa["equity_open"] = isa_equity_open
     isa["etf_open"] = isa_etf_open

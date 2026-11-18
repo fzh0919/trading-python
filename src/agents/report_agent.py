@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -250,9 +251,9 @@ def _format_benchmark_line(
     parts.append(f"近30天 {ret_30:+.1f}%" if ret_30 is not None else "近30天 N/A")
     line = " / ".join(parts)
     if account_change_pct is not None:
+        # Never subtract a 1-day snapshot change from a 7-day benchmark return: the
+        # mismatched windows fabricate a fake "relative" alpha the PM then acts on.
         line += f"；本账户较上次快照 {account_change_pct:+.1f}%"
-        if ret_7 is not None:
-            line += f"(相对基准 {account_change_pct - ret_7:+.1f}%)"
     return line
 
 
@@ -1188,6 +1189,46 @@ def _build_report_recommendations(
     return out
 
 
+async def _enrich_gate_candidate_bundles(
+    market_data: MarketDataService,
+    pool_syms: list[str],
+    pool_snaps: dict[str, Any],
+    bundles: dict[str, TickerMarketBundle],
+    *,
+    tolerance_pct: float = 1.5,
+    max_symbols: int = 6,
+) -> dict[str, TickerMarketBundle]:
+    """Attach lightweight earnings/ex-div bundles to un-held MA50 pullback candidates.
+
+    Deployment-gate A-trigger scans un-held candidates only, so they normally have no
+    bundle; without this the 5-day earnings and ex-dividend exclusion windows are blind.
+    One batched call, news disabled (0 LLM, earnings calendar only).
+    """
+    cand_bundles: dict[str, TickerMarketBundle] = dict(bundles)
+    hit_syms = [
+        sym
+        for sym in pool_syms
+        if sym in pool_snaps
+        and getattr(pool_snaps[sym], "dist_ma50_pct", None) is not None
+        and abs(float(pool_snaps[sym].dist_ma50_pct)) <= float(tolerance_pct)
+        and sym not in bundles
+    ][: max(0, int(max_symbols))]
+    if not hit_syms or not callable(getattr(market_data, "get_bundles", None)):
+        return cand_bundles
+    try:
+        fetched = await market_data.get_bundles(
+            hit_syms, include_news=False, include_earnings=True
+        )
+        fetched_map = fetched[1] if isinstance(fetched, tuple) else fetched
+        if isinstance(fetched_map, dict):
+            for sym, bundle in fetched_map.items():
+                if bundle is not None:
+                    cand_bundles[sym] = bundle
+    except Exception as exc:
+        logger.debug("Deployment-gate candidate bundle fetch skipped: %s", exc)
+    return cand_bundles
+
+
 async def generate_morning_report(
     cfg: AppConfig,
     t212: T212Client,
@@ -1270,6 +1311,7 @@ async def generate_morning_report(
                     gate_histories = {k: v for k, v in fetched.items() if v is not None and not v.empty}
             except Exception as exc:
                 logger.debug("Deployment-gate history pre-fetch failed; continuing without A-trigger scan: %s", exc)
+        pool_snaps: dict[str, Any] = {}
         for sym in pool_syms:
             hist = gate_histories.get(sym)
             if hist is None or hist.empty:
@@ -1280,7 +1322,22 @@ async def generate_morning_report(
                 logger.debug("Deployment-gate tech snapshot failed for %s: %s", sym, exc)
                 continue
             if snap is not None:
-                gate_candidates.append({"symbol": sym, "tech": snap, "bundle": bundles.get(sym), "account": "Invest"})
+                pool_snaps[sym] = snap
+        # The 5-day earnings / ex-dividend mines only work when the un-held gate
+        # candidates carry a bundle; fetch one lightweight batch for the MA50 pullbacks.
+        cand_bundles = await _enrich_gate_candidate_bundles(
+            market_data,
+            pool_syms,
+            pool_snaps,
+            bundles,
+            tolerance_pct=float(getattr(cfg.strategy, "trigger_ma_tolerance_pct", 1.5) or 1.5),
+        )
+        for sym in pool_syms:
+            snap = pool_snaps.get(sym)
+            if snap is not None:
+                gate_candidates.append(
+                    {"symbol": sym, "tech": snap, "bundle": cand_bundles.get(sym), "account": "Invest"}
+                )
         if hasattr(db, "get_recent_context_packs"):
             try:
                 for pack in await db.get_recent_context_packs(limit=5):
@@ -1427,8 +1484,9 @@ async def generate_morning_report(
         "1. 宏观利率/汇率主线与今日整体交易气候；\n"
         "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
         "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
-        f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%（或 Invest 现金 >{cfg.strategy.invest_cash_idle_warn_pct:.0f}%）"
-        "且存在 MA200 上方健康回踩的宽基/优质标的，必须主动给出具体价位、金额（不低于最小建仓额）与分批节奏的部署提案，禁止只写“继续观望/持币吃息”；\n"
+        f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}% 且核心宽基未达标，"
+        "给出核心宽基分批归拢价位与金额；Invest 机动仓严格遵循右侧猎物门控，"
+        "无 R:R≥2:1 强信号时明确维持持币待命，严禁因现金占比高而勉强凑单；\n"
         "5. 近 7 日财报事件应对预案。\n"
         "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与 Step 1 全市场 Google Search 摘要已涵盖全部持仓及挂单的量价、CYQ、目标价、财报日、深度情报与最新新闻，"
         "严禁对已列出数据的持仓重复调用 `inspect_ticker`；仅当文中明确缺失某未入表新代码数据时才允许调用工具。",
@@ -1680,6 +1738,33 @@ async def generate_morning_report(
         )
         try:
             report_recs = _build_report_recommendations(resolved_decision, portfolio, bundles, cfg)
+            if report_recs:
+                # 5-day same (account, symbol, action) dedupe: repeating "TRIM X" every
+                # morning would flood the T+20 ledger with 10 highly-correlated records.
+                try:
+                    recent = await db.get_recent_recommendations(limit=200)
+                    cutoff_ms = int(time.time() * 1000) - 5 * 86_400_000
+                    recent_keys = {
+                        (
+                            str(r.get("account") or "").strip().upper(),
+                            str(r.get("symbol") or "").strip().upper(),
+                            str(r.get("action") or "").strip().upper(),
+                        )
+                        for r in recent
+                        if int(r.get("created_at_ms") or 0) >= cutoff_ms
+                    }
+                    report_recs = [
+                        rec
+                        for rec in report_recs
+                        if (
+                            str(rec.get("account") or "").strip().upper(),
+                            str(rec.get("symbol") or "").strip().upper(),
+                            str(rec.get("action") or "").strip().upper(),
+                        )
+                        not in recent_keys
+                    ]
+                except Exception as exc:
+                    logger.debug("report recommendation 5d dedupe lookup skipped: %s", exc)
             if report_recs:
                 await db.log_recommendations(
                     report_recs,

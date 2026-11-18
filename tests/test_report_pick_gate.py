@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from src.agents.pick_agent import _apply_gate_channel_constraints, _format_gate_constraint_block
-from src.agents.report_agent import _build_report_recommendations
+from src.agents.report_agent import _build_report_recommendations, _enrich_gate_candidate_bundles
 from src.agents.schemas import (
     MorningReportDecision,
     PickActionItem,
@@ -48,6 +48,7 @@ from src.engine.deployment_gate import (
     PENDING_CORE_ETF_BUY,
     PENDING_NEW_EQUITY_BUY,
     PENDING_PROTECTIVE_SELL_STOP,
+    _scan_a_equity_candidates,
     classify_pending_orders,
     evaluate_deployment_gate,
     evaluate_market_regime,
@@ -1727,6 +1728,250 @@ class TestReportSizeHint(unittest.TestCase):
         )
         rendered = render_morning_report(dec, max_chars=1800)
         self.assertIn("HOLD CASH — 观望", rendered)
+
+
+class TestV550PostAuditHardening(unittest.TestCase):
+    """v5.5.0 Phase 1: financed coverage, Invest WAIT none, pseudo-core ETF demotion."""
+
+    def test_financed_unlock_requires_full_share_coverage(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        portfolio.invest.positions = [
+            _pos(
+                "Invest", "AMZN", "AMZN", value=2500.0, qty=10.0, avg=238.42,
+                cur=250.0, return_pct=4.9, weight_pct=17.6,
+            )
+        ]
+        portfolio.invest.pending_orders = [
+            PendingOrderItem(
+                id="p-amzn-stop-partial", account="Invest", raw_ticker="AMZN_US_EQ",
+                ticker="AMZN", yahoo_symbol="AMZN", name="Amazon", side="SELL",
+                order_type="STOP", quantity=6.0, value=0.0, limit_price=None,
+                stop_price=250.0, currency="USD", time_in_force="GTC",
+            )
+        ]
+        gate = _run_snapshot_gate(portfolio)
+        invest = gate["invest"]
+        self.assertNotIn("AMZN", invest["financed_positions"])
+        self.assertIn("AMZN", invest["unfinanced_positions"])
+        self.assertEqual(invest["slots_used"], 1)
+        self.assertGreater(float(invest["heat_gbp_total"]), 0.0)
+
+    def test_invest_wait_mode_none_blocks_pick_equity_buy(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {
+            "isa": {"etf_open": True, "equity_open": True},
+            "invest": {"status": "WAIT", "mode": "none", "reason": "无右侧猎物"},
+            "etf_set": ["VWRP.L"],
+        }
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="AXON", action="BUY", thesis="想买新个股",
+                    entry_zone="300", stop_condition="285", target_window="340",
+                    entry_price=300.0,
+                ),
+                PickActionItem(
+                    account="Invest", symbol="IUKD.L", action="BUY", thesis="想买高息主题ETF",
+                    entry_zone="7", stop_condition="6.5", target_window="8",
+                    entry_price=7.0,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(all("Invest WAIT/none" in n for n in notes))
+
+    def test_one_pick_run_cannot_outrun_invest_slot_and_daily_caps(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {
+            "isa": {"etf_open": True, "equity_open": True},
+            "invest": {
+                "status": "RUN", "mode": "targeted", "slots_cap": 1, "slots_used": 0,
+                "daily_cap": 1, "today_new_equity_entries": 0,
+            },
+            "etf_set": ["VWRP.L"],
+        }
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="PANW", action="BUY", thesis="第一笔",
+                    entry_zone="300", stop_condition="285", target_window="340",
+                    entry_price=300.0,
+                ),
+                PickActionItem(
+                    account="Invest", symbol="AXON", action="BUY", thesis="第二笔",
+                    entry_zone="500", stop_condition="470", target_window="580",
+                    entry_price=500.0,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual([a.symbol for a in hardened.selected_actions], ["PANW"])
+        self.assertTrue(any("额度已用尽" in n for n in notes))
+
+    def test_themed_and_dividend_etfs_lose_core_privilege(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=StrategySection(),
+            bundles={},
+            histories={"SPY": _spy_neutral_hist()},
+            macro=_neutral_macro(),
+            universe_etf_symbols=[
+                "VWRP.L", "VWRL.L", "VUAG.L", "SWDA.L",
+                "IUKD.L", "VHYL.L", "SMGB.L", "INRG.L", "IITU.L", "IGLT.L", "SGLN.L", "CNX1.L",
+            ],
+        )
+        self.assertEqual(
+            gate["etf_set"], ["SWDA.L", "VUAG.L", "VWRL.L", "VWRP.L"]
+        )
+
+    def test_vix_30_does_not_override_core_etf_buy_in_guardrail(self) -> None:
+        strat = StrategySection(pick_rr_guard_mode="off", trade_cadence_guard_mode="off")
+        payload = dict(
+            strategy=strat,
+            bundle_map={
+                "VWRP.L": TickerMarketBundle(symbol="VWRP.L", quote_type="ETF", currency="GBP", current_price=114.0),
+                "IUKD.L": TickerMarketBundle(symbol="IUKD.L", quote_type="ETF", currency="GBP", current_price=7.0),
+                "MSFT": TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD", current_price=400.0),
+            },
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=30.0),
+            deployment_gate={"etf_set": ["VWRP.L"]},
+            trade_behavior={"partial": True},
+        )
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="VWRP.L", action="ADD", thesis="危机期核心宽基定投",
+                    entry_zone="114", stop_condition="105", target_window="140", entry_price=114.0,
+                ),
+                PickActionItem(
+                    account="ISA", symbol="IUKD.L", action="BUY", thesis="高息主题ETF",
+                    entry_zone="7", stop_condition="6.5", target_window="8", entry_price=7.0,
+                ),
+                PickActionItem(
+                    account="ISA", symbol="MSFT", action="BUY", thesis="个股",
+                    entry_zone="400", stop_condition="380", target_window="460", entry_price=400.0,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        res = apply_risk_override_guardrail(decision, **payload)
+        kept = [a.symbol for a in res.decision.selected_actions]
+        self.assertEqual(kept, ["VWRP.L"])
+        blocked = {o.symbol: o.trigger_type for o in res.overrides}
+        self.assertEqual(blocked.get("IUKD.L"), "MACRO_VIX")
+        self.assertEqual(blocked.get("MSFT"), "MACRO_VIX")
+
+    def test_bear_bounce_below_ma200_stays_risk_off_and_recovery_above_ma200_exits(self) -> None:
+        strat = StrategySection()
+        # Long 150 plateau -> -27% crash -> 20-day dead-cat bounce: mom20>0 but still below MA200.
+        bounce_closes = [150.0] * 300
+        bounce_closes += [round(150.0 * (1.0 - 0.015 * (k + 1)), 2) for k in range(20)]
+        trough = bounce_closes[-1]
+        bounce_closes += [round(trough * (1.0 + 0.0065 * (k + 1)), 2) for k in range(20)]
+        bounce_hist = _make_hist(bounce_closes)
+        prev = {"regime": "RISK_OFF", "raw_regime": "RISK_OFF", "raw_streak_days": 5, "ease_streak_days": 2}
+        bounce = evaluate_market_regime({"SPY": bounce_hist}, _neutral_macro(vix=21.0), strat, prev_gate_state=prev)
+        self.assertEqual(bounce["regime"], "RISK_OFF")
+        self.assertGreater(float(bounce["mom20_pct"] or 0.0), 0.0)
+        self.assertLess(float(bounce["price"]), float(bounce["ma200"]))
+        self.assertEqual(bounce["ease_streak_days"], 0)
+
+        # -25% bottom then reclaim MA200 for 3 days while the stale 52w drawdown flag remains.
+        recovery_closes = [100.0] * 300
+        recovery_closes += [round(100.0 + 2.5 * (k + 1), 2) for k in range(20)]  # spike to 150
+        recovery_closes += [round(150.0 - 1.5 * (k + 1), 2) for k in range(20)]  # crash to 120
+        recovery_closes += [120.0] * 60  # sit at -20% off the old high, above MA200
+        recovery_hist = _make_hist(recovery_closes)
+        prev = {"regime": "RISK_OFF", "raw_regime": "RISK_OFF", "raw_streak_days": 5, "ease_streak_days": 2}
+        recovery = evaluate_market_regime(
+            {"SPY": recovery_hist}, _neutral_macro(vix=21.0), strat, prev_gate_state=prev
+        )
+        self.assertEqual(recovery["regime"], "NEUTRAL")
+        self.assertEqual(recovery["ease_streak_days"], 3)
+        self.assertTrue(all("回撤" in f for f in recovery["risk_off_flags"]))
+
+    def test_persistent_drawdown_keeps_etf_ladder_open_after_first_cross_day(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        portfolio.isa.pending_orders = [
+            o for o in portfolio.isa.pending_orders if o.yahoo_symbol not in {"VWRP.L", "VUAG.L"}
+        ]
+        # SPY sits at a persistent -12% off its 52w high with no first-cross today.
+        closes = [round(100.0 + i * 1.0, 2) for i in range(250)]
+        peak = max(closes)
+        closes += [round(peak * 0.88, 2)] * 6
+        spy = _make_hist(closes)
+        gate = evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=StrategySection(),
+            bundles={},
+            histories={"SPY": spy},
+            macro=_neutral_macro(vix=30.0),
+            universe_etf_symbols=["VWRP.L", "VUAG.L"],
+        )
+        self.assertEqual(gate["regime"], "RISK_OFF")
+        self.assertIsNone(gate["triggers"]["A"]["core_etf_step"]["hit"])
+        self.assertEqual(gate["isa"]["status"], "RUN")
+        self.assertEqual(gate["isa"]["mode"], "ladder")
+        self.assertTrue(gate["isa"]["etf_open"])
+
+
+class TestV550GateCandidateBundles(unittest.IsolatedAsyncioTestCase):
+    """v5.5.0 Phase 3: un-held gate candidates must carry earnings/ex-div bundles."""
+
+    async def test_unheld_pullback_candidate_gets_earnings_bundle_and_is_excluded(self) -> None:
+        class _RecordingMarketData:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[str], bool, bool]] = []
+
+            async def get_bundles(self, symbols, include_news=True, include_earnings=True, **kwargs):
+                self.calls.append((list(symbols), include_news, include_earnings))
+                return {}, {
+                    s: TickerMarketBundle(
+                        symbol=s,
+                        quote_type="EQUITY",
+                        currency="USD",
+                        current_price=300.0,
+                        days_to_earnings=2,
+                    )
+                    for s in symbols
+                }
+
+        md = _RecordingMarketData()
+        snaps = {
+            "PANW": TechnicalSnapshot(
+                symbol="PANW", last_close=300.0, ma50=297.0, ma200=270.0,
+                dist_ma50_pct=1.0, rsi14=55.0, trend_regime="BULL",
+            ),
+            "MSFT": TechnicalSnapshot(
+                symbol="MSFT", last_close=400.0, ma50=380.0, ma200=350.0,
+                dist_ma50_pct=5.0, rsi14=60.0, trend_regime="BULL",
+            ),
+            "ZZZ": TechnicalSnapshot(symbol="ZZZ", last_close=10.0),
+        }
+        held_bundles = {"MSFT": TickerMarketBundle(symbol="MSFT", quote_type="EQUITY", currency="USD")}
+        out = await _enrich_gate_candidate_bundles(
+            md, ["PANW", "MSFT", "ZZZ"], snaps, held_bundles
+        )
+        # Only the un-held MA50 pullback is fetched; held names are never re-fetched.
+        self.assertEqual(md.calls, [(["PANW"], False, True)])
+        self.assertEqual(out["PANW"].days_to_earnings, 2)
+        self.assertIs(out["MSFT"], held_bundles["MSFT"])
+
+        hits = _scan_a_equity_candidates(
+            [{"symbol": "PANW", "tech": snaps["PANW"], "bundle": out["PANW"], "account": "Invest"}],
+            _real_snapshot_portfolio(),
+            StrategySection(),
+            None,
+        )
+        self.assertEqual(hits, [])
 
 
 if __name__ == "__main__":

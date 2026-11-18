@@ -29,6 +29,7 @@ from src.data_providers.analytics import (
     compute_exposure_summary,
     compute_technical_snapshot,
     max_correlation_against_portfolio,
+    normalize_issuer_root,
     resolve_market_benchmark,
 )
 from src.data_providers.market_data import MarketDataService, TickerMarketBundle
@@ -117,6 +118,25 @@ def _apply_gate_channel_constraints(
     funding_from = str(inv_g.get("funding_from") or "").strip().upper()
     etf_set = {str(s).strip().upper() for s in (gate_ctx.get("etf_set") or []) if str(s).strip()}
     buy_actions = {"BUY", "ADD", "SWAP"}
+    inv_status = str(inv_g.get("status") or "").strip().upper()
+    inv_mode = str(inv_g.get("mode") or "").strip().lower()
+
+    def _int_or_zero(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # Invest new-equity budget for this single /pick run: a ROTATE swap gets exactly one
+    # ticket, otherwise only the free risk slots (minus already-used ones) may be filled.
+    if inv_status == "ROTATE" and funding_from:
+        rem_invest_slots = 1
+    else:
+        rem_invest_slots = max(0, _int_or_zero(inv_g.get("slots_cap")) - _int_or_zero(inv_g.get("slots_used")))
+    daily_cap = _int_or_zero(inv_g.get("daily_cap"))
+    rem_daily_entries: int | None = (
+        max(0, daily_cap - _int_or_zero(inv_g.get("today_new_equity_entries"))) if daily_cap > 0 else None
+    )
 
     held_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
     pending_buy_by_acct: dict[str, set[str]] = {"ISA": set(), "INVEST": set()}
@@ -132,6 +152,7 @@ def _apply_gate_channel_constraints(
     other_acct = {"ISA": "INVEST", "INVEST": "ISA"}
     kept: list[Any] = []
     notes: list[str] = []
+    kept_new_invest: set[str] = set()
     for item in decision.selected_actions:
         act_up = str(item.action or "").strip().upper()
         sym = item.symbol.strip().upper()
@@ -139,6 +160,9 @@ def _apply_gate_channel_constraints(
         acct = item.account.strip().upper()
         if act_up in buy_actions:
             is_etf = _is_etf_action(sym, bundles, etf_set)
+            # Themed / dividend / bond ETFs are NOT core wide-base vehicles: in Invest they
+            # must obey the same slot, daily-cap and regime channel as single-name equities.
+            is_core_etf = bool(is_etf and (sym in etf_set or base in etf_set))
             # PM veto is a hard stop for all new positions (kept as a defence-in-depth
             # check even though generate_pick_radar already returns early).
             if pm_g.get("allow") is False:
@@ -148,19 +172,13 @@ def _apply_gate_channel_constraints(
                 )
                 continue
             # Account-channel hard blocks (only in advise mode, because gate_ctx is None otherwise).
-            if acct == "INVEST" and not is_etf:
-                status = str(inv_g.get("status") or "").strip().upper()
-                mode = str(inv_g.get("mode") or "").strip().lower()
-                if status == "DEFEND":
+            if acct == "INVEST" and not is_core_etf:
+                if inv_status not in {"RUN", "ROTATE"}:
                     notes.append(
                         f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
-                        "Invest DEFEND 退潮态冻结新开个股"
-                    )
-                    continue
-                if status == "WAIT" and mode in {"cooldown", "daily_cap", "slots_full"}:
-                    notes.append(
-                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
-                        f"Invest {mode} 暂停新开个股（{inv_g.get('reason') or status}）"
+                        f"Invest {inv_status or 'UNKNOWN'}"
+                        f"{('/' + inv_mode) if inv_mode else ''} 冻结新开个股/非核心 ETF"
+                        f"（{inv_g.get('reason') or inv_status or '门控未开放'}）"
                     )
                     continue
             if acct == "ISA":
@@ -179,11 +197,11 @@ def _apply_gate_channel_constraints(
             # Cross-account same-ticket dedupe applies to single-name equities only;
             # broad-base/core ETFs are intentionally allowed in both accounts.
             other = other_acct.get(acct, "")
+            other_held = held_by_acct.get(other, set()) | pending_buy_by_acct.get(other, set())
             if other and not is_etf and (
-                sym in held_by_acct.get(other, set())
-                or base in held_by_acct.get(other, set())
-                or sym in pending_buy_by_acct.get(other, set())
-                or base in pending_buy_by_acct.get(other, set())
+                sym in other_held
+                or base in other_held
+                or normalize_issuer_root(sym) in {normalize_issuer_root(s) for s in other_held}
             ):
                 note = (
                     f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
@@ -200,6 +218,32 @@ def _apply_gate_channel_constraints(
                     )
                     notes.append(note)
                     continue
+            # One /pick run must never fan out 2~3 Invest equity tickets and blow through
+            # both the risk-slot cap and the best-idea-only daily cap.
+            if acct == "INVEST" and not is_core_etf and act_up in {"BUY", "SWAP"}:
+                own_held = held_by_acct.get("INVEST", set()) | pending_buy_by_acct.get("INVEST", set())
+                if (
+                    sym not in own_held
+                    and base not in own_held
+                    and sym not in kept_new_invest
+                    and base not in kept_new_invest
+                ):
+                    if rem_invest_slots <= 0:
+                        notes.append(
+                            f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                            f"Invest 本次 /pick 在险槽位额度已用尽（剩余 {rem_invest_slots} 笔）"
+                        )
+                        continue
+                    if rem_daily_entries is not None and rem_daily_entries <= 0:
+                        notes.append(
+                            f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                            "Invest 单日新开个股额度已用尽（Best Idea Only）"
+                        )
+                        continue
+                    rem_invest_slots -= 1
+                    if rem_daily_entries is not None:
+                        rem_daily_entries -= 1
+                    kept_new_invest.update({sym, base})
         kept.append(item)
 
     if not notes:
@@ -667,22 +711,19 @@ async def _post_screen_validate_decision(
     )
     # v5.4.0: gate-linked sizing — after a loss-streak cooldown the recovery pilot runs at
     # half risk (0.5R ≈ £42.5) so the suggested share count scales automatically.
+    # v5.5.0: the scale is passed per-ticket and applied to Invest only — it must never
+    # halve an ISA risk budget (ISA also gets the 0.5% NAV floor inside the sizer).
     gate_mode = str(getattr(cfg.strategy, "deployment_gate_mode", "advise") or "advise").strip().lower()
     gate_ctx = deployment_gate if (isinstance(deployment_gate, dict) and gate_mode == "advise") else None
-    sizing_strategy = cfg.strategy
+    risk_budget_scale = 1.0
     if gate_ctx is not None:
         inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
-        scale = float(inv_g.get("risk_budget_scale") or 1.0)
-        if 0.0 < scale < 1.0:
-            base_budget = float(getattr(cfg.strategy, "invest_risk_budget_gbp", 85.0) or 85.0)
-            sizing_strategy = cfg.strategy.model_copy(
-                update={"invest_risk_budget_gbp": base_budget * scale}
-            )
+        risk_budget_scale = float(inv_g.get("risk_budget_scale") or 1.0)
     override_res = apply_risk_override_guardrail(
         hydrated_decision,
         portfolio=portfolio,
         macro=macro,
-        strategy=sizing_strategy,
+        strategy=cfg.strategy,
         bundle_map=all_bundles,
         evals=evals,
         high_correlation_symbols=high_corr_syms,
@@ -690,6 +731,7 @@ async def _post_screen_validate_decision(
         report_actions=report_actions,
         trade_behavior=trade_behavior,
         deployment_gate=gate_ctx,
+        risk_budget_scale=risk_budget_scale,
     )
     resolved_decision = (
         override_res.decision
@@ -1106,8 +1148,10 @@ async def generate_pick_radar(
         "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
         "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
         "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
-        f"若无个股达到 R:R≥2:1，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%（或 Invest 现金 >{cfg.strategy.invest_cash_idle_warn_pct:.0f}%），"
-        f"应优先输出低摩擦宽基 ETF（如 VWRP.L / VUAG.L）的分批定投方案：写明具体价位、单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}）与节奏；"
+        f"若无个股达到 R:R≥2:1，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%，"
+        f"应优先输出低摩擦核心宽基 ETF（如 VWRP.L / VUAG.L）的分批定投方案：写明具体价位、单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}）与节奏；"
+        "ISA 闲钱优先归拢 VWRP.L；Invest 若门控未开或无 R:R≥2:1 右侧个股，直接令 selected_actions 为空数组 []"
+        "（如需在应税 Invest 配置长期底仓仅可提示派息型 VWRL.L，严禁混买累积型 VWRP.L 造成离岸 ERI 报税摩擦）；"
         "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无 R:R≥2:1 标的，现金待命 + 下一次部署触发条件”，"
         f"严禁默认写“现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
         cfg.strategy,
@@ -1171,9 +1215,8 @@ async def generate_pick_radar(
             deployment_gate=gate_ctx,
         )
     else:
-        logger.warning("Pick Critic structured parse fell back to plain text.")
-        final_text = resolved_critic_raw.strip()[:1000]
-        parsed_picks = []
+        logger.warning("Pick Critic structured parse failed; refusing to emit unguarded raw text.")
+        return "⚠️ /pick 风控终审结构化解析失败，已拦截未经护栏核验的原始输出，请稍后重试 /pick。"
 
     if not final_text.startswith("⚠️"):
         await db.save_pick_radar(focus_query, research_output, final_text, now_uk)

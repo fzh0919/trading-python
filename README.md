@@ -1,4 +1,4 @@
-# Trading 212 × Gemini AI 私人量化投顾 (v5.4.0)
+# Trading 212 × Gemini AI 私人量化投顾 (v5.5.0)
 
 面向英国个人投资者（Trading 212 **Stocks ISA** 纯 `GBP` 核心-卫星仓 + **Invest** `GBP`/`USD` 双钱包右侧机动仓，标的按本地货币报价）的 7×24 全天候私人量化投顾与风控审计系统（只读 API、Telegram Long Polling、零公网端口暴露、Docker 容器化部署于本地 Intel N95）。
 
@@ -8,8 +8,8 @@
 
 * **双账户币种隔离与对称摩擦核算**：严格隔离 `GBP` 总账口径、`Invest` 本地 `GBP+USD` 双钱包锚点（`/wallet` / `/usd` 对账）与 `USD`/`EUR`/`GBp`/`GBP` 标的本地报价；将 `4.0%` GBP / `3.4%` USD 闲置现金利息（含未成交挂单占用资金）、跨币种 `0.15%` 单边换汇磨损（Invest 同币种复用免换汇）、买卖价差及 `0.50%` 英国个股印花税纳入全部 R:R 与摩擦评估。
 * **本地 Python 0-Token 量化底座与 CIO 组合门控（`v5.4.0`）**：在请求大模型前，本地完成 `2y` SQLite 日线缓存、MA/RSI14/ATR14/ADX14/周线共振、CYQ 筹码分布、移动止盈/除息防假破位、去大盘 Beta 相关性、PSD 收缩协方差前 3 波动源与 95% 单日 CVaR、TWR 绩效归因（`/perf`）、四维双轨选股漏斗，以及多空冲突矩阵（`Disagreement Matrix`）、后置确定性风控护栏（`RiskOverride`）与 **CIO 组合门控（`deployment_gate`）**——硬拦截 PM 否决、DEFEND/冷静期/单日上限/满槽、ISA 退潮期个股与未达阶梯宽基、ISA 个股卫星 ≤30%·≤8只与跨双账户单票 12%；ISA 核心宽基 ≥60% 作为 DCA 目标（现金超上沿才分批归拢，不强制卖出卫星）；Invest 在险槽位以盈解锁，美元原币种 `SPY` 防死锁市场状态机。
-* **以 `/report` 为基石的跨指令复用与复盘闭环**：每日 `07:30 UK` 生成 `/report` 全景晨报与风控红线并落库 `AnalysisContextPack`（含当日 `deployment_gate`），供同周期 `/us` 盘前哨兵、`/pick` 雷达与日常单聊 0-Token 复用；`/pick` 对缺失当日基线/ContextPack 一律拒绝，绝不拿上一交易日旧红线冒充今日裁决；盘后 `21:40 UK` 自动补采 NAV 净值锚点（结算时再兜底补写一次），`22:00~23:30 UK` 自动结算 `T+5`/`T+10`/`T+20` Alpha 与 `MFE/MAE` 极值并生成微反思记忆——**BUY/ADD 记多头收益，TRIM/STOP/SWAP 记避损收益；未触价的 BUY/ADD 标记 `NOT_FILLED` 并排除出胜率**，`/report` 的 ADD/TRIM/STOP 也进入同一 T+N ledger；周末闲时离线体检选股池与阈值。
-* **DeepSeek V4.1 Flash 只读侧车（防「传话筒效应」）**：`/pick` 宽漏斗（每轨 15 只）由 DS 仅做**候选 ID 筛选**、`/report` 与 `/pick` 渲染后做**只读语义质检**（幻觉价位/挂单计息/内部驳回外泄/红线冲突，只告警不拦截）、盘中哨兵做异动与挂单成交回执推送、周六输出 `<=450` 字**独立策略诊断周报**、每日结算末尾从原始对话抽取**带用户原话锚点 + TTL** 的长期偏好；DS 故障或缺 key 时一律确定性静默降级（0 调用）。
+* **以 `/report` 为基石的跨指令复用与复盘闭环**：每日 `07:30 UK` 生成 `/report` 全景晨报与风控红线并落库 `AnalysisContextPack`（含当日 `deployment_gate`），供同周期 `/us` 盘前哨兵、`/pick` 雷达与日常单聊 0-Token 复用；`/pick` 对缺失当日基线/ContextPack 一律拒绝，绝不拿上一交易日旧红线冒充今日裁决；盘后 `21:40 UK` 自动补采 NAV 净值锚点（结算时再兜底补写一次），`22:00~23:30 UK` 自动结算 `T+5`/`T+10`/`T+20` Alpha 与 `MFE/MAE` 极值并生成微反思记忆——**BUY/ADD/SWAP 记多头收益，TRIM/STOP 记避损收益；未触价的 BUY/ADD 标记 `NOT_FILLED` 并排除出胜率**，`/report` 的 ADD/TRIM/STOP 也进入同一 T+N ledger；周末闲时离线体检选股池与阈值。
+* **DeepSeek V4.1 Flash 只读侧车（防「传话筒效应」）**：`/pick` 宽漏斗（每轨 15 只）由 DS 仅做**候选 ID 筛选**、`/report` 与 `/pick` 渲染后做**只读语义质检**（幻觉价位/挂单计息/内部驳回外泄/红线冲突，只告警不拦截）、盘中哨兵做异动与挂单成交回执推送、周六输出 `<=450` 字**独立策略诊断周报**、每日结算末尾从原始对话抽取**带用户原话锚点 + TTL** 的长期偏好（`user_preference_memory_enabled`，v5.5.0 默认关闭）；DS 故障或缺 key 时一律确定性静默降级（0 调用）。
 
 ---
 
@@ -55,7 +55,7 @@ trading-python/
 * `/pos` / `/wallet` / `/usd <金额>`：0-Token 实时仓位、挂单与 Invest `GBP+USD` 双钱包对账校准
 * `/perf`：0-Token 组合绩效看板（TWR 时间加权收益、最大回撤、Alpha/Beta/IR、分币种胜率、HHI 集中度、信号 t 值）
 * `/report`：核心全景晨报（宏观 + CIO 组合门控 + 双账户 + 全市场联网扫描 + 逐仓/挂单审计，`<=1800` 字；PM 结构化失败时返回 `⚠️` 且不写入当日基线）
-* `/pick [方向]`：四维量化初筛 + 联网催化 + 投研/风控双审 + 组合门控硬拦截（PM 否决/账户通道/ISA 饱和/单票 12%/跨账户去重）+ R:R 可配置硬拦截（`pick_rr_guard_mode=hard` 时生效，默认 advisory；`<=1000` 字）
+* `/pick [方向]`：四维量化初筛 + 联网催化 + 投研/风控双审 + 组合门控硬拦截（PM 否决/账户通道/ISA 饱和/单票 12%/跨账户去重）+ R:R 硬拦截（`pick_rr_guard_mode=hard` 为 v5.5.0 默认；`<=1000` 字）
 * `/us`：美股盘前/盘中/收盘增量简报（平稳 `<=450` / 异动 `<=600` 字）
 * `/stats`：历史推荐 `T+5/10/20` 方向感知胜率与 Alpha 轨迹、`MFE/MAE`、未成交样本、复盘教训与周末体检看板
 * `/refresh_pool` / `/health` / `/usage` / `/clear` / `/cancel`：手动刷新海选池 / 全链路健康体检 / Token 与 Search 额度 / 清空单聊记忆 / 中止分析

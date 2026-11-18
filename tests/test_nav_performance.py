@@ -104,16 +104,48 @@ class TestNavRowAndPerformance(unittest.TestCase):
             recent_transactions=[
                 _tx(50.0, "DEPOSIT"),
                 _tx(10.0, "WITHDRAW"),
-                _tx(5.0, "FEE"),
-                _tx(999.0, "DEPOSIT", ccy="USD"),      # ignored: NAV series is GBP-only
+                _tx(5.0, "FEE"),                    # internal drag: never an external flow
+                _tx(12.0, "INTEREST_ON_FREE_CASH"),  # internal investment return
+                _tx(999.0, "DEPOSIT", ccy="USD"),      # no FX rate -> cannot convert safely
                 _tx(999.0, "DEPOSIT", day="2026-11-16"),  # ignored: not today
             ],
         )
         row = build_nav_row(_portfolio(total=1000.0, cash=400.0, isa=isa))
         self.assertEqual(row["uk_date"], "2026-11-17")
-        self.assertAlmostEqual(row["net_flow_gbp"], 35.0, places=2)
+        self.assertAlmostEqual(row["net_flow_gbp"], 40.0, places=2)
         self.assertAlmostEqual(row["invested_gbp"], 600.0, places=2)
         self.assertEqual(row["cash_rate_pct"], 4.0)
+
+    def test_usd_external_deposit_is_converted_to_gbp(self) -> None:
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            total_account_value=600.0,
+            recent_transactions=[_tx(125.0, "DEPOSIT", ccy="USD")],
+        )
+        portfolio = _portfolio(total=1000.0, cash=400.0, isa=isa)
+        portfolio.gbp_usd_rate = 1.25
+        row = build_nav_row(portfolio)
+        self.assertAlmostEqual(row["net_flow_gbp"], 100.0, places=2)
+
+    def test_cash_interest_counts_as_twr_return_not_external_deposit(self) -> None:
+        interest_row = build_nav_row(
+            _portfolio(
+                cash=1000.0,
+                isa=AccountSnapshot(
+                    ok=True,
+                    account_label="ISA",
+                    total_account_value=600.0,
+                    recent_transactions=[_tx(4.0, "INTEREST_ON_FREE_CASH")],
+                ),
+            )
+        )
+        self.assertAlmostEqual(interest_row["net_flow_gbp"], 0.0, places=2)
+        perf = compute_portfolio_performance(
+            _nav_rows([("2026-11-16", 1000.0, 0.0), ("2026-11-17", 1004.0, 0.0)])
+        )
+        self.assertTrue(perf["ok"])
+        self.assertAlmostEqual(perf["total_return_pct"], 0.4, places=2)
 
     def test_twr_excludes_deposit_from_return(self) -> None:
         rows = _nav_rows(

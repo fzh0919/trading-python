@@ -188,16 +188,31 @@ def _align_entry_price_gbp_guard(
 
 
 def _trade_direction(action: str) -> int:
-    """+1 for long entries (BUY/ADD), -1 for risk-reducing actions (TRIM/STOP/SELL/SWAP)."""
-    return -1 if str(action or "").strip().upper() in {"TRIM", "STOP", "SELL", "SWAP"} else 1
+    """+1 for long entries (BUY/ADD/SWAP), -1 for risk-reducing actions (TRIM/STOP/SELL).
+
+    /pick SWAP is a rotation *into* a new long position, so its return direction is +1.
+    """
+    return -1 if str(action or "").strip().upper() in {"TRIM", "STOP", "SELL"} else 1
 
 
 def _direction_adjusted_return_pct(action: str, entry: float, exit_price: float) -> float:
-    """Long return for BUY/ADD; avoided-loss return for TRIM/STOP/SWAP."""
+    """Long return for BUY/ADD/SWAP; avoided-loss return for TRIM/STOP/SELL."""
     if entry <= 0:
         return 0.0
     raw = ((exit_price - entry) / entry) * 100.0
     return raw * _trade_direction(action)
+
+
+def _direction_adjusted_alpha_pct(action: str, entry: float, exit_price: float, bench_ret_pct: float) -> float:
+    """Benchmark excess with the direction applied to the whole spread, not just the stock leg.
+
+    Long: ``stock_ret - bench_ret``. Risk-reducing: ``bench_ret - stock_ret`` so that
+    cutting a stock that then falls -3% while the benchmark rises +5% scores +8%.
+    """
+    if entry <= 0:
+        return 0.0
+    unadjusted_stock_ret = ((exit_price - entry) / entry) * 100.0
+    return (unadjusted_stock_ret - float(bench_ret_pct)) * _trade_direction(action)
 
 
 def _entry_fill_status(
@@ -208,12 +223,15 @@ def _entry_fill_status(
     eff_entry: float,
     *,
     tolerance_pct: float = 0.0,
+    exclude_rec_date: bool = False,
 ) -> str:
     """Daily-bar approximation of whether a BUY/ADD entry was actually touched.
 
     We cannot know the exact order type from the ledger, so a BUY/ADD is treated as
     NOT_FILLED when the low never traded at/below the reference entry. TRIM/STOP are
     assumed executable at the reference price (they are risk-reducing actions).
+    When the recommendation was generated after that session's close, its own day's
+    low is already history and must be excluded (``exclude_rec_date=True``).
     """
     act = str(action or "").strip().upper()
     if act not in {"BUY", "ADD"}:
@@ -221,7 +239,10 @@ def _entry_fill_status(
     if ohlc.empty or eff_entry <= 0 or "Low" not in ohlc.columns:
         return "UNKNOWN"
     dates = ohlc.index
-    window = ohlc[(dates >= rec_date) & (dates <= target_date)]
+    if exclude_rec_date:
+        window = ohlc[(dates > rec_date) & (dates <= target_date)]
+    else:
+        window = ohlc[(dates >= rec_date) & (dates <= target_date)]
     if window.empty:
         return "UNKNOWN"
     lows = pd.to_numeric(window["Low"], errors="coerce").dropna()
@@ -1362,10 +1383,26 @@ class TradingScheduler:
 
                 action = str(rec.get("action") or "BUY").strip().upper()
                 direction = _trade_direction(action)
+                # A recommendation generated after that session closed (e.g. Friday 21:30
+                # /pick) cannot have been filled at the same day's low; start next session.
+                exclude_rec_date = False
+                rec_ms = int(rec.get("created_at_ms") or 0)
+                if rec_ms > 0:
+                    rec_dt_utc = datetime.fromtimestamp(rec_ms / 1000.0, tz=timezone.utc)
+                    exclude_rec_date = has_market_closed_on_date(
+                        rec_date, market=market, now_utc=rec_dt_utc
+                    )
                 fill_status = (
                     "ASSUMED"
                     if str(rec.get("source") or "").strip().lower() == "report"
-                    else _entry_fill_status(action, stock_ohlc, rec_date, target_date, eff_entry)
+                    else _entry_fill_status(
+                        action,
+                        stock_ohlc,
+                        rec_date,
+                        target_date,
+                        eff_entry,
+                        exclude_rec_date=exclude_rec_date,
+                    )
                 )
                 if fill_status == "NOT_FILLED":
                     saved = await self.db.settle_recommendation(
@@ -1382,14 +1419,16 @@ class TradingScheduler:
                         not_filled += 1
                     continue
 
-                raw_return_pct = _direction_adjusted_return_pct(action, eff_entry, exit_price)
+                unadjusted_stock_ret = ((exit_price - eff_entry) / eff_entry) * 100.0
+                raw_return_pct = unadjusted_stock_ret * direction
                 bench_res = _compute_benchmark_return_pct(bench_candidates, _get_closes, rec_date, exit_date)
                 if bench_res is None:
                     logger.warning("Benchmark history unavailable for settling %s (%s -> %s)", symbol, rec_date, exit_date)
                     failed += 1
                     continue
                 chosen_bench, bench_ret_pct = bench_res
-                alpha_pct = raw_return_pct - bench_ret_pct
+                # direction=-1 => benchmark outperformance of an avoided loser is positive alpha.
+                alpha_pct = _direction_adjusted_alpha_pct(action, eff_entry, exit_price, bench_ret_pct)
                 mfe_pct, mae_pct = _compute_mfe_mae_pct(
                     stock_ohlc, rec_date, exit_date, eff_entry, direction=direction
                 )
@@ -1460,7 +1499,7 @@ class TradingScheduler:
                     if bench_res is None:
                         continue
                     _, b_ret = bench_res
-                    alpha_val = raw_ret - b_ret
+                    alpha_val = _direction_adjusted_alpha_pct(action, eff_entry, ex_price, b_ret)
                     if horizon_label == "t10":
                         t10_ret = round(raw_ret, 2)
                         t10_alpha = round(alpha_val, 2)

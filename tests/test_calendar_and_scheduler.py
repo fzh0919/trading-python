@@ -14,6 +14,7 @@ from src.bot.handlers import AdvisorBot
 from src.bot.scheduler import (
     TradingScheduler,
     _compute_mfe_mae_pct,
+    _direction_adjusted_alpha_pct,
     _direction_adjusted_return_pct,
     _entry_fill_status,
     _trade_direction,
@@ -489,8 +490,8 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             await db.log_recommendations(
                 [
                     {
-                        "created_at_uk": "2026-11-06 21:30",
-                        "created_at_ms": base_ms,
+                        "created_at_uk": "2026-11-06 15:00",
+                        "created_at_ms": base_ms - 23_400_000,  # pre-US-close, so same-day fill is valid
                         "account": "Invest",
                         "symbol": "NVDA",
                         "action": "BUY",
@@ -921,10 +922,20 @@ class TestDirectionAwareSettlement(unittest.TestCase):
     def test_trade_direction_and_adjusted_return(self) -> None:
         self.assertEqual(_trade_direction("BUY"), 1)
         self.assertEqual(_trade_direction("ADD"), 1)
+        self.assertEqual(_trade_direction("SWAP"), 1)
         self.assertEqual(_trade_direction("TRIM"), -1)
         self.assertEqual(_trade_direction("STOP"), -1)
         self.assertAlmostEqual(_direction_adjusted_return_pct("TRIM", 100.0, 90.0), 10.0)
         self.assertAlmostEqual(_direction_adjusted_return_pct("BUY", 100.0, 110.0), 10.0)
+        self.assertAlmostEqual(_direction_adjusted_return_pct("SWAP", 100.0, 110.0), 10.0)
+
+    def test_swap_is_long_and_stop_alpha_sign_matches_direction(self) -> None:
+        # Avoided loss: stopped stock -3% while the benchmark +5% => +8% benchmark excess.
+        self.assertAlmostEqual(_direction_adjusted_alpha_pct("STOP", 100.0, 97.0, 5.0), 8.0)
+        # Bad cut: defensive stock only -1% while benchmark -10% => -9% excess.
+        self.assertAlmostEqual(_direction_adjusted_alpha_pct("TRIM", 100.0, 99.0, -10.0), -9.0)
+        # Long maths is unchanged.
+        self.assertAlmostEqual(_direction_adjusted_alpha_pct("BUY", 100.0, 110.0, 5.0), 5.0)
 
     def test_fill_status_requires_price_touch_for_buys(self) -> None:
         idx = [date(2026, 11, 6), date(2026, 11, 9)]
@@ -943,6 +954,29 @@ class TestDirectionAwareSettlement(unittest.TestCase):
         self.assertEqual(
             _entry_fill_status("TRIM", ohlc, date(2026, 11, 6), date(2026, 11, 9), 100.0),
             "ASSUMED",
+        )
+        # A post-close recommendation must not use its own session's low: day-2 low 106
+        # never touches 105 => NOT_FILLED once the rec date is excluded.
+        self.assertEqual(
+            _entry_fill_status(
+                "BUY", ohlc, date(2026, 11, 6), date(2026, 11, 9), 105.5, exclude_rec_date=True
+            ),
+            "NOT_FILLED",
+        )
+        # Friday 22:30 UTC: the US session has closed, so rec-date exclusion must engage.
+        self.assertTrue(
+            has_market_closed_on_date(
+                date(2026, 11, 6),
+                market="US",
+                now_utc=datetime(2026, 11, 6, 22, 30, tzinfo=timezone.utc),
+            )
+        )
+        self.assertFalse(
+            has_market_closed_on_date(
+                date(2026, 11, 6),
+                market="US",
+                now_utc=datetime(2026, 11, 6, 14, 0, tzinfo=timezone.utc),
+            )
         )
 
     def test_mfe_mae_flip_for_trim(self) -> None:

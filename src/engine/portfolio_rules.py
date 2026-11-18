@@ -13,6 +13,7 @@ from src.data_providers.analytics import (
     _ETF_TECH_PENETRATION_PCT,
     TechnicalSnapshot,
     compute_drawdown_since_date,
+    infer_etf_index_family,
     normalize_issuer_root,
 )
 from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
@@ -21,6 +22,13 @@ from src.data_providers.t212_client import AccountSnapshot, PendingOrderItem, Po
 # v5.4.0: single-source VIX danger threshold shared by apply_risk_override_guardrail
 # and the deterministic deployment gate (src/engine/deployment_gate.py).
 DEFAULT_VIX_DANGER_THRESHOLD: float = 28.0
+
+# v5.5.0: only genuine broad-base vehicles keep the crisis-time BUY exemption. Themed,
+# dividend, bond and commodity ETFs follow the same VIX freeze as single-name equities.
+_CORE_WIDE_BASE_FAMILIES = {
+    "Global All-World/Developed (全球宽基)",
+    "S&P 500 (美股标普500)",
+}
 
 
 class HoldingEvaluation(BaseModel):
@@ -79,6 +87,39 @@ class RiskOverrideResult(BaseModel):
 
 def _is_uk_listing(yahoo_symbol: str, inst_currency: str) -> bool:
     return yahoo_symbol.endswith(".L") or inst_currency.upper() in {"GBP", "GBX"}
+
+
+def _us_sell_settled_in_gbp(wallet: AccountSnapshot | None) -> bool:
+    """True when a recent US SELL was auto-converted back into the GBP wallet.
+
+    T212 auto-converts USD sale proceeds to GBP unless the multi-currency USD wallet
+    is actually funded. That means the next US buy must convert GBP->USD *again*, so a
+    single-side FX estimate would silently understate round-trip friction.
+    """
+    for order in getattr(wallet, "recent_orders", None) or []:
+        if str(getattr(order, "side", "") or "").strip().upper() != "SELL":
+            continue
+        sym = str(getattr(order, "yahoo_symbol", "") or "").strip().upper()
+        ccy = str(getattr(order, "inst_currency", "") or "").strip().upper()
+        if not sym or sym.endswith(".L") or ccy not in {"USD", ""}:
+            continue
+        if str(getattr(order, "wallet_currency", "") or "").strip().upper() == "GBP":
+            return True
+    return False
+
+
+def _usd_retention_active(
+    wallet: AccountSnapshot | None,
+    usd_avail: float,
+    *,
+    min_usd: float,
+) -> bool:
+    """USD balance is only genuinely retained when it can fund a whole ticket."""
+    if usd_avail < float(min_usd):
+        return False
+    if _us_sell_settled_in_gbp(wallet) and float(getattr(wallet, "usd_cash_total", 0.0) or 0.0) <= 0.01:
+        return False
+    return True
 
 
 def wallet_friction_context(wallet: AccountSnapshot | None) -> tuple[bool, float, float]:
@@ -146,7 +187,14 @@ def _round_trip_friction_pct(
             return stamp + (0.0 if gbp_avail > 0.01 else fx) + spread
         if pos.inst_currency.upper() == "EUR":
             return fx * 2.0 + spread
-        return (0.0 if usd_avail > 0.01 else fx) + spread
+        usd_retained = _usd_retention_active(
+            wallet, usd_avail, min_usd=max(100.0, float(pos.current_value or 0.0) * 0.5)
+        )
+        if not usd_retained and float(getattr(wallet, "usd_cash_total", 0.0) or 0.0) <= 0.01:
+            if _us_sell_settled_in_gbp(wallet):
+                # No real USD retention + proceeds auto-converted => GBP->USD->GBP round trip.
+                return fx * 2.0 + spread
+        return (0.0 if usd_retained else fx) + spread
 
     if is_uk and is_etf:
         return spread
@@ -217,6 +265,7 @@ def compute_risk_based_size_gbp(
     is_etf: bool = False,
     account_total_value_gbp: float | None = None,
     existing_position_value_gbp: float = 0.0,
+    risk_budget_scale: float = 1.0,
 ) -> dict[str, Any]:
     """Risk-based ticket size: risk budget / |stop %|, capped by remaining single-name headroom.
 
@@ -232,7 +281,15 @@ def compute_risk_based_size_gbp(
         min_order = float(strategy.min_isa_etf_order_gbp if is_etf else strategy.min_isa_equity_order_gbp)
         cap_pct = float(strategy.max_isa_single_weight_pct)
 
-    risk_budget = float(strategy.invest_risk_budget_gbp)
+    base_budget = float(strategy.invest_risk_budget_gbp)
+    nav_gbp = float(account_total_value_gbp) if account_total_value_gbp is not None else 0.0
+    if is_invest:
+        # 0.5% NAV lifetime self-calibrating budget; the loss-streak 0.5R pilot scale
+        # applies to Invest only and must never shrink an ISA ticket.
+        nav_scaled = nav_gbp * 0.005 if nav_gbp > 0 else 0.0
+        risk_budget = max(base_budget, nav_scaled) * max(0.0, float(risk_budget_scale))
+    else:
+        risk_budget = max(base_budget, nav_gbp * 0.005) if nav_gbp > 0 else base_budget
     stop_pct = (
         abs(float(effective_stop_pct))
         if (effective_stop_pct is not None and float(effective_stop_pct) < 0)
@@ -380,7 +437,13 @@ def _estimate_entry_friction_pct(
             return stamp + (0.0 if gbp_avail > 0.01 else fx) + spread
         if inst_ccy == "EUR":
             return fx * 2.0 + spread
-        return (0.0 if usd_avail > 0.01 else fx) + spread
+        usd_retained = _usd_retention_active(
+            wallet, usd_avail, min_usd=float(strategy.min_invest_order_gbp)
+        )
+        if not usd_retained and float(getattr(wallet, "usd_cash_total", 0.0) or 0.0) <= 0.01:
+            if _us_sell_settled_in_gbp(wallet):
+                return fx * 2.0 + spread
+        return (0.0 if usd_retained else fx) + spread
     if is_uk and is_etf:
         return spread
     if is_uk:
@@ -426,6 +489,12 @@ def _resolve_pick_rr(
         entry = float(bundle.current_price)
     if entry <= 0:
         return out
+    # Align the LLM-supplied entry with the live quote currency before any R:R maths.
+    if bundle is not None and bundle.current_price and float(bundle.current_price) > 0:
+        rescaled_entry = _rescale_price_pair(entry, float(bundle.current_price))
+        if rescaled_entry != entry:
+            out["price_rescaled"] = True
+            entry = rescaled_entry
 
     stop = float(getattr(item, "stop_price", 0.0) or 0.0)
     target = float(getattr(item, "target_price", 0.0) or 0.0)
@@ -494,9 +563,9 @@ def _shares_from_gbp(
         price_gbp = price_local
     elif upper == "USD" and gbp_usd_rate and float(gbp_usd_rate) > 0:
         price_gbp = price_local / float(gbp_usd_rate)
-    elif not raw_ccy and symbol.upper().endswith(".L"):
-        price_gbp = price_local / 100.0
     else:
+        # Missing currency must return None: blindly dividing a .L symbol by 100 would
+        # turn a GBP-denominated ETF quote (VWRP.L ≈ £114) into £1.14.
         return None
     if price_gbp <= 0:
         return None
@@ -594,8 +663,10 @@ def _build_pick_size_note(
     *,
     account: str,
     account_total_value_gbp: float | None = None,
+    existing_position_value_gbp: float = 0.0,
     gbp_usd_rate: float | None = None,
     wallet: AccountSnapshot | None = None,
+    risk_budget_scale: float = 1.0,
 ) -> str:
     """Deterministic risk-based sizing hint: risk budget / stop distance, capped by single-name headroom."""
     symbol = str(getattr(item, "symbol", "") or "")
@@ -611,7 +682,8 @@ def _build_pick_size_note(
         effective_stop_pct=-abs(float(risk_pct)),
         is_etf=bool(bundle and bundle.quote_type.upper() == "ETF"),
         account_total_value_gbp=account_total_value_gbp,
-        existing_position_value_gbp=0.0,
+        existing_position_value_gbp=float(existing_position_value_gbp or 0.0),
+        risk_budget_scale=float(risk_budget_scale or 1.0),
     )
     suggested = sizing.get("suggested_gbp")
     if not suggested or float(suggested) <= 0:
@@ -1419,6 +1491,7 @@ def apply_risk_override_guardrail(
     trade_behavior: dict[str, Any] | None = None,
     vix_danger_threshold: float = DEFAULT_VIX_DANGER_THRESHOLD,
     deployment_gate: dict[str, Any] | None = None,
+    risk_budget_scale: float = 1.0,
 ) -> RiskOverrideResult:
     """Apply deterministic post-LLM risk override guardrails to MorningReportDecision or PickDecision."""
     if decision is None:
@@ -1478,10 +1551,12 @@ def apply_risk_override_guardrail(
 
     # Index bundles case-insensitively and by base symbol; also seed known UCITS ETF roots
     etf_roots.update(normalize_issuer_root(s) for s in _ETF_TECH_PENETRATION_PCT)
+    core_etf_syms: set[str] = {str(strat.benchmark_symbol).strip().upper()}
     if isinstance(deployment_gate, dict):
         for etf_sym in deployment_gate.get("etf_set") or []:
             if etf_sym:
                 etf_roots.add(normalize_issuer_root(str(etf_sym)))
+                core_etf_syms.add(str(etf_sym).strip().upper())
     bundle_lookup: dict[str, TickerMarketBundle] = {}
     for sym, b in bmap.items():
         bundle_lookup[sym.upper()] = b
@@ -1696,7 +1771,20 @@ def apply_risk_override_guardrail(
                             cadence_advisories.append(advisory)
 
             if macro_high_risk and macro_vix is not None:
-                return "MACRO_VIX", f"VIX={macro_vix:.1f}(≥{vix_danger_threshold:.0f}高危阈值)，暂停主动买入/加仓"
+                core_etf_buy = bool(
+                    sym_up in core_etf_syms
+                    or base in core_etf_syms
+                    or normalize_issuer_root(sym_up)
+                    in {normalize_issuer_root(s) for s in core_etf_syms}
+                )
+                if not core_etf_buy:
+                    family = infer_etf_index_family(sym_up, b)
+                    core_etf_buy = family in _CORE_WIDE_BASE_FAMILIES
+                if not core_etf_buy:
+                    return (
+                        "MACRO_VIX",
+                        f"VIX={macro_vix:.1f}(≥{vix_danger_threshold:.0f}高危阈值)，暂停个股主动买入/加仓",
+                    )
 
         return None
 
@@ -1766,14 +1854,27 @@ def apply_risk_override_guardrail(
                     acct_up = item.account.strip().upper()
                     sym_up = item.symbol.strip().upper()
                     sym_base = sym_up.split(".")[0]
+                    existing_val = 0.0
+                    if portfolio is not None:
+                        item_root = normalize_issuer_root(sym_up)
+                        for held in portfolio.all_positions():
+                            if held.account.strip().upper() != acct_up:
+                                continue
+                            held_root = normalize_issuer_root(
+                                str(getattr(held, "ticker", "") or held.yahoo_symbol)
+                            )
+                            if held_root == item_root:
+                                existing_val += float(held.current_value or 0.0)
                     size_note = _build_pick_size_note(
                         item,
                         bundle_lookup.get(sym_up) or bundle_lookup.get(sym_base),
                         strat,
                         account=item.account,
                         account_total_value_gbp=account_totals.get(acct_up),
+                        existing_position_value_gbp=existing_val,
                         gbp_usd_rate=gbp_usd_rate,
                         wallet=portfolio.invest if (portfolio is not None and acct_up == "INVEST") else None,
+                        risk_budget_scale=float(risk_budget_scale or 1.0),
                     )
                     if size_note:
                         # risk_note 是 Python 侧保留字段：模型必须返回空串，落地前由这里写入。

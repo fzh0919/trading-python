@@ -1665,9 +1665,6 @@ _EXTERNAL_FLOW_SIGNS: dict[str, float] = {
     "DEPOSIT": 1.0,
     "WITHDRAW": -1.0,
     "WITHDRAWAL": -1.0,
-    "FEE": -1.0,
-    "INTEREST_ON_FREE_CASH": 1.0,
-    "LENDING_INTEREST": 1.0,
 }
 
 
@@ -1687,9 +1684,10 @@ def build_nav_row(
 ) -> dict[str, Any]:
     """Build one lightweight daily NAV row (GBP-only scalars) for ``nav_history``.
 
-    Only DEPOSIT / WITHDRAW / FEE / INTEREST count as **external** cash flows.
-    Dividends are deliberately excluded: they already sit inside NAV, so treating
-    them as inflows would understate the time-weighted return.
+    Only genuine external cash movements (DEPOSIT / WITHDRAW) count as flows.
+    Cash interest, lending interest and platform fees are internal investment
+    P&L / drag and must stay inside the TWR numerator; dividends likewise already
+    sit inside NAV, so treating any of them as inflow would understate returns.
     """
     day = (uk_date or str(getattr(portfolio, "fetched_at_uk", "") or "").strip()[:10]).strip()[:10]
     total = float(getattr(portfolio, "total_combined_value", 0.0) or 0.0)
@@ -1701,12 +1699,18 @@ def build_nav_row(
             if _event_uk_date(tx) != day:
                 continue
             ccy = str(getattr(tx, "currency", "GBP") or "GBP").strip().upper()
-            if ccy not in ("GBP", ""):
+            amount = float(getattr(tx, "amount", 0.0) or 0.0)
+            if ccy == "USD":
+                fx = float(getattr(portfolio, "gbp_usd_rate", None) or 0.0)
+                if fx <= 0:
+                    continue  # cannot convert safely -> never fabricate a GBP flow
+                amount = amount / fx
+            elif ccy not in ("GBP", ""):
                 continue  # keep the NAV series strictly GBP-denominated
             sign = _EXTERNAL_FLOW_SIGNS.get(str(getattr(tx, "tx_type", "") or "").strip().upper())
             if sign is None:
                 continue
-            net_flow += sign * float(getattr(tx, "amount", 0.0) or 0.0)
+            net_flow += sign * amount
 
     return {
         "uk_date": day,
