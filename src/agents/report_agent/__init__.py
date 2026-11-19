@@ -39,6 +39,7 @@ from src.agents.report_agent.debate import (
     _DEBATE_NEUTRAL_SYSTEM,
     Step2DebateResult,
     _gather_named_notes,
+    _run_named_notes_sequential,
     _build_rebuttal_prompt,
     _build_rebuttal_system,
     _build_debate_digest_prompt,

@@ -2634,9 +2634,9 @@ class TestStage2PenetrationAndSizing(unittest.TestCase):
             account_total_value_gbp=30000.0,
             risk_budget_scale=0.5,
         )
-        # Invest NAV £30,000 -> £150 floor, then 0.5R pilot => £75 risk budget.
-        self.assertAlmostEqual(invest["risk_budget_gbp"], 75.0, places=2)
-        self.assertAlmostEqual(invest["budget_sized_gbp"], 750.0, places=2)
+        # Invest NAV £30,000 -> 0.75% = £225, then 0.5R pilot => £112.50 risk budget.
+        self.assertAlmostEqual(invest["risk_budget_gbp"], 112.5, places=2)
+        self.assertAlmostEqual(invest["budget_sized_gbp"], 1125.0, places=2)
 
         small_invest = compute_risk_based_size_gbp(
             account="Invest",
@@ -2645,6 +2645,34 @@ class TestStage2PenetrationAndSizing(unittest.TestCase):
             account_total_value_gbp=10000.0,
         )
         self.assertAlmostEqual(small_invest["risk_budget_gbp"], 85.0, places=2)
+
+        # v5.5.5: Invest 0.75% NAV calibration at the live ~£14k account size.
+        mid_invest = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-10.0,
+            account_total_value_gbp=14000.0,
+        )
+        self.assertAlmostEqual(mid_invest["risk_budget_gbp"], 105.0, places=2)
+        self.assertAlmostEqual(mid_invest["budget_sized_gbp"], 1050.0, places=2)
+
+        big_invest = compute_risk_based_size_gbp(
+            account="Invest",
+            strategy=strategy,
+            effective_stop_pct=-10.0,
+            account_total_value_gbp=30000.0,
+        )
+        self.assertAlmostEqual(big_invest["risk_budget_gbp"], 225.0, places=2)
+
+        # ISA must remain exactly 0.5% NAV even if Invest pct is pushed to the 3% ceiling.
+        high_pct_strategy = StrategySection(invest_risk_budget_pct=3.0)
+        isa_high = compute_risk_based_size_gbp(
+            account="ISA",
+            strategy=high_pct_strategy,
+            effective_stop_pct=-10.0,
+            account_total_value_gbp=58000.0,
+        )
+        self.assertAlmostEqual(isa_high["risk_budget_gbp"], 290.0, places=2)
 
     def test_leveraged_etp_names_never_inherit_core_index_family(self) -> None:
         from src.data_providers.analytics import infer_etf_index_family

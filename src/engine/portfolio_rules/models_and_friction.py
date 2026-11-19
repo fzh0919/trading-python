@@ -323,9 +323,10 @@ def compute_risk_based_size_gbp(
     base_budget = float(strategy.invest_risk_budget_gbp)
     nav_gbp = float(account_total_value_gbp) if account_total_value_gbp is not None else 0.0
     if is_invest:
-        # 0.5% NAV lifetime self-calibrating budget; the loss-streak 0.5R pilot scale
-        # applies to Invest only and must never shrink an ISA ticket.
-        nav_scaled = nav_gbp * 0.005 if nav_gbp > 0 else 0.0
+        # v5.5.5: Invest-only 0.75% NAV self-calibrating budget (floor £85). The ISA branch
+        # below stays exactly at 0.5% so the value track is byte-for-byte unaffected.
+        invest_pct = float(getattr(strategy, "invest_risk_budget_pct", 0.75) or 0.75) / 100.0
+        nav_scaled = nav_gbp * invest_pct if nav_gbp > 0 else 0.0
         risk_budget = max(base_budget, nav_scaled) * max(0.0, float(risk_budget_scale))
     else:
         risk_budget = max(base_budget, nav_gbp * 0.005) if nav_gbp > 0 else base_budget

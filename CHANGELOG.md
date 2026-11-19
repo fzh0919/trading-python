@@ -2,6 +2,28 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.5`（2026-11-19）
+
+稳定性加固（yfinance 401 / Finnhub 429 / DeepSeek 高峰期串行）与 Invest Portfolio Heat 门控升级（规划见 [`docs/plans/2026-11-19-5.5.5-stability-and-invest-heat-plan.md`](./docs/plans/2026-11-19-5.5.5-stability-and-invest-heat-plan.md)）。ISA 价值轨 0.5% 风险预算零影响。
+
+1. **Wave 1 — 日志告警修复**：
+   - `src/data_providers/market_data/yahoo_mixin.py`：新增 `_reset_yfinance_crumb_cache()` 防御性清理 `yf.data.YfData()` 的 crumb/cookie；`_run_yf_call_with_retry` 识别 `401 / invalid crumb / unauthorized` 并清令牌后短退避重试，保留顶级 `yf.Ticker` / `time.sleep` 的 `mock.patch` 接缝。
+   - `src/agents/schemas.py`：`render_pick_report` 将 Python 确定的护栏行从「本轮精选行动」拆到独立「【风控护栏记录】」区块，仍严格 `<=1000` 字且纯文本；`src/agents/semantic_auditor.py` 红线第 3 条明确豁免该区块，消除 `/pick` 误报「内部驳回外泄」。
+2. **Wave 2 — Finnhub 限流分流**：
+   - `src/data_providers/market_data/external_clients.py`：`FinnhubClient` 新增 `max_concurrency=2`、`min_interval_seconds`（生产 0.35s / Mock 0.0）、`earnings_cache_ttl_seconds=21600`、`retry_429_delay_seconds`；全部 GET 走 `_throttled_get`（信号量 + 最小发包间隔 + 429 解析 `Retry-After` 限幅 `[1,5]s` 重试 1 次，且锁/信号量按 event loop 懒初始化）；`calendar/earnings` 增加 6h 内存缓存与 in-flight 合并，仅 HTTP 200 写缓存（429/异常/降级不回写）。
+   - `src/data_providers/market_data/service.py`：`get_us_deep_intel_batch` 默认并发由 `4` 收敛为 `2`。
+3. **Wave 3 — `/report` Step 2 高峰期串行**：
+   - `src/config.py` / `config.yaml`：新增 `report_debate_sequential: True`；`report_step2_timeout_seconds` 660→900、`round2` 180→300、`round3` 120→210。
+   - `src/agents/report_agent/debate.py`：新增 `_run_named_notes_sequential(coro_factories, *, timeout_s, step_ceiling_s=None)` 延迟工厂串行执行（单步预算 `min(ceiling, remaining)`，预算耗尽不构造后续协程，无 `never awaited` 告警），R2/R3 默认串行、`False` 可回滚并发。
+4. **Wave 4 — Invest Portfolio Heat 主闸与 0.75% 风险预算**：
+   - `src/config.py` / `config.yaml`：新增 `invest_risk_budget_pct: 0.75`、`invest_max_heat_risk_on/neutral/risk_off_pct: 3.0/2.0/0.0`；`invest_slots_risk_on/neutral` 默认 2/1→3/2。
+   - `src/engine/portfolio_rules/models_and_friction.py`：`compute_risk_based_size_gbp` 仅 Invest 分支改用 `invest_risk_budget_pct`（保留 £85 地板与 0.5R 复出），ISA 分支严格维持原 `0.5% NAV`。
+   - `src/engine/deployment_gate/ledgers.py`：新增 `unit_risk_gbp` / `pending_heat_gbp`（未成交新开个股买单 ×1R）/ `committed_heat_gbp` / `committed_heat_pct`，保留 `heat_gbp_total` 原语义。
+   - `src/engine/deployment_gate/triggers.py`：按 regime 写入 `heat_cap_pct` / `heat_headroom_pct`，槽位满或承诺热力触顶统一进入 `ROTATE` 或 `WAIT(heat_full)`；`RISK_OFF`（DEFEND）/ 冷静期 / 单日上限优先级不变。
+   - `src/engine/deployment_gate/banner.py` / `src/agents/pick_agent.py`：RUN 横幅与 `/pick` 约束块动态展示 `unit_risk_gbp` 与承诺热力（移除硬编码 £85），`_apply_gate_channel_constraints` 增加 RUN 态热力触顶兜底拦截。
+   - `src/agents/prompts.py`：以 `max(£85, Invest净值×0.75%)` 表述单笔风险预算；钱包与核心策略提示词补充「按风险算出的美股金额超出 USD 余额时正常由 GBP 换汇补足，严禁为省换汇费缩仓」。
+   - 单测：新增/对齐 `test_market_data` / `test_ds_pick_prefilter_and_auditor` / `test_report_pick_gate` / `test_report_debate_round2` / `test_report_step2_budget` / `test_analytics_and_rules` / `test_wallet_rules_and_commands` 覆盖 401 重试、护栏拆区、429 与缓存、串行单飞、Invest £14k→£105 / £30k→£225 / ISA £58k→£290 隔离、热力触顶与承诺热力；全量 `481/481` 通过。
+
 ### `v5.5.4`（2026-11-19）
 
 核心模块结构瘦身（纯结构重构、零业务逻辑变更；规划归档见 [`docs/plans/2026-11-19-5.5.4-module-slimdown-plan.md`](./docs/plans/2026-11-19-5.5.4-module-slimdown-plan.md)）。采用**子包门面模式（Subpackage Facade）**将全部 9 个突破 2,100~2,851 行的核心文件（共 22,820 行，占 `src/` 74%）拆解为 47 个高内聚领域子模块 + 9 个兼容门面，最大子模块降至 929 行，全部外部调用方与原有 459 个单测零改动。

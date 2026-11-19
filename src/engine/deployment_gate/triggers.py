@@ -300,6 +300,17 @@ def scan_triggers_and_decide(
         "UNKNOWN": int(strategy.invest_slots_neutral),
     }.get(regime, int(strategy.invest_slots_neutral))
     invest["slots_cap"] = slots_cap
+    heat_cap_pct = {
+        "RISK_ON": float(strategy.invest_max_heat_risk_on_pct),
+        "NEUTRAL": float(strategy.invest_max_heat_neutral_pct),
+        "RISK_OFF": float(strategy.invest_max_heat_risk_off_pct),
+        "UNKNOWN": float(strategy.invest_max_heat_neutral_pct),
+    }.get(regime, float(strategy.invest_max_heat_neutral_pct))
+    committed_heat_pct = float(invest.get("committed_heat_pct") or 0.0)
+    slots_full = slots_cap > 0 and int(invest["slots_used"]) >= slots_cap
+    heat_full = heat_cap_pct > 0 and committed_heat_pct >= heat_cap_pct
+    invest["heat_cap_pct"] = _round2(heat_cap_pct)
+    invest["heat_headroom_pct"] = _round2(max(0.0, heat_cap_pct - committed_heat_pct))
 
     if not invest["ok"]:
         invest_status, invest_mode = "UNKNOWN", "none"
@@ -319,7 +330,7 @@ def scan_triggers_and_decide(
             f"今日已新开/新挂 {invest['today_new_equity_entries']} 笔个股"
             f"(上限{strategy.max_new_equity_entries_per_day})，Best Idea Only 单日止步"
         )
-    elif invest["slots_used"] >= slots_cap and slots_cap > 0:
+    elif slots_full or heat_full:
         if a_equity:
             invest_status, invest_mode = "ROTATE", "rotate"
             funding_from = ""
@@ -330,16 +341,28 @@ def scan_triggers_and_decide(
             elif invest["unfinanced_positions"]:
                 funding_from = invest["unfinanced_positions"][0]
             invest["funding_from"] = funding_from
+            limit_txt = (
+                f"承诺热力 {committed_heat_pct:.2f}%/{heat_cap_pct:.2f}%"
+                if heat_full
+                else f"在险槽位 {invest['slots_used']}/{slots_cap}"
+            )
             invest_reason = (
-                f"在险槽位 {invest['slots_used']}/{slots_cap} 已满但右侧强信号命中，"
-                f"须先腾挪 {funding_from} 等风险置换"
+                f"{limit_txt} 已满但右侧强信号命中，须先腾挪 {funding_from} 等风险置换"
             )
         else:
-            invest_status, invest_mode = "WAIT", "slots_full"
-            invest_reason = (
-                f"在险槽位 {invest['slots_used']}/{slots_cap} 已满"
-                f"({','.join(invest['unfinanced_positions']) or '无'} 未脱险)，静待推保本解锁"
-            )
+            if heat_full:
+                invest_status, invest_mode = "WAIT", "heat_full"
+                invest_reason = (
+                    f"承诺热力 {committed_heat_pct:.2f}%/{heat_cap_pct:.2f}% 已触顶"
+                    f"（在险槽位 {invest['slots_used']}/{slots_cap}），"
+                    "将持仓止损上移降热或推保本即可平滑释放空间"
+                )
+            else:
+                invest_status, invest_mode = "WAIT", "slots_full"
+                invest_reason = (
+                    f"在险槽位 {invest['slots_used']}/{slots_cap} 已满"
+                    f"({','.join(invest['unfinanced_positions']) or '无'} 未脱险)，静待推保本解锁"
+                )
     elif a_equity:
         invest_status, invest_mode = "RUN", "targeted"
         invest_reason = f"右侧猎物触发({','.join(h['symbol'] for h in a_equity)})，在险槽位 {invest['slots_used']}/{slots_cap}"

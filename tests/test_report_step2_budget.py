@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+import warnings
 
 from src.agents.llm_client import DEGRADED_LLM_MARKERS, is_degraded_llm_output
 from src.agents.report_agent import (
     STEP2_ANALYST_FALLBACK,
     STEP2_AUDITOR_FALLBACK,
     _gather_step2_notes,
+    _run_named_notes_sequential,
 )
 
 
@@ -86,3 +88,74 @@ class TestGatherStep2Notes(unittest.IsolatedAsyncioTestCase):
         analyst, auditor, degraded = await _gather_step2_notes(_fast("A"), _fast("B"), timeout_s=0)
         self.assertEqual((analyst, auditor), ("A", "B"))
         self.assertEqual(degraded, [])
+
+
+class TestSequentialNamedNotes(unittest.IsolatedAsyncioTestCase):
+    async def test_steps_run_in_order_one_at_a_time(self) -> None:
+        trace: list[str] = []
+
+        def _factory(name: str):
+            async def _run(step_budget: float) -> str:
+                trace.append(f"{name}:{step_budget:.1f}")
+                await asyncio.sleep(0)
+                return f"{name}-text"
+
+            return _run
+
+        texts, degraded = await _run_named_notes_sequential(
+            {"first": _factory("first"), "second": _factory("second")},
+            timeout_s=5.0,
+            step_ceiling_s=2.0,
+        )
+        self.assertEqual(texts, {"first": "first-text", "second": "second-text"})
+        self.assertEqual(degraded, [])
+        self.assertEqual([item.split(":")[0] for item in trace], ["first", "second"])
+        self.assertTrue(all(float(item.split(":")[1]) <= 2.0 for item in trace))
+
+    async def test_exhausted_budget_never_constructs_later_coroutine(self) -> None:
+        constructed: list[str] = []
+
+        def _slow_factory(step_budget: float):
+            constructed.append(f"slow:{step_budget:.2f}")
+
+            async def _slow() -> str:
+                await asyncio.sleep(30)
+                return "late"
+
+            return _slow()
+
+        def _later_factory(step_budget: float):
+            constructed.append(f"later:{step_budget:.2f}")
+
+            async def _later() -> str:
+                return "later"
+
+            return _later()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            texts, degraded = await _run_named_notes_sequential(
+                {"slow": _slow_factory, "later": _later_factory},
+                timeout_s=0.1,
+                step_ceiling_s=0.1,
+            )
+
+        self.assertEqual(texts, {"slow": "", "later": ""})
+        self.assertEqual(degraded, ["slow", "later"])
+        self.assertEqual(len(constructed), 1)  # only the first factory was ever invoked
+        self.assertTrue(constructed[0].startswith("slow:"))
+        self.assertFalse([w for w in caught if "never awaited" in str(w.message)])
+
+    async def test_failed_step_degrades_and_continues(self) -> None:
+        async def _boom() -> str:
+            raise RuntimeError("deepseek down")
+
+        async def _ok() -> str:
+            return "OK"
+
+        texts, degraded = await _run_named_notes_sequential(
+            {"boom": lambda _b: _boom(), "ok": lambda _b: _ok()},
+            timeout_s=2.0,
+        )
+        self.assertEqual(texts, {"boom": "", "ok": "OK"})
+        self.assertEqual(degraded, ["boom"])

@@ -90,8 +90,14 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
         heat = float(invest.get("heat_gbp_total") or 0.0)
         fin = "、".join(invest.get("financed_positions") or []) or "无"
         avail = float(invest.get("available_to_trade_gbp") or 0.0)
+        unit_risk = float(invest.get("unit_risk_gbp") or 85.0)
+        committed = float(invest.get("committed_heat_pct") or 0.0)
+        heat_cap = float(invest.get("heat_cap_pct") or 0.0)
         line1 = f"组合门控：RUN·右侧猎物｜Invest在险槽位 {used}/{cap}（{fin}已锁保本，本金在险£{heat:.0f}）｜可用{_gpb_k(avail)}"
-        line2 = "→ 已解锁右侧开仓槽位（单日限最优选1笔，风险预算£85），可运行 /pick 扫描突破龙头"
+        line2 = (
+            f"→ 单笔风险£{unit_risk:.0f}·热力{committed:.1f}%/{heat_cap:.1f}%；"
+            "已解锁右侧槽位（单日限最优选1笔），可运行 /pick 扫描突破龙头"
+        )
         return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
 
     if invest_status == "ROTATE":

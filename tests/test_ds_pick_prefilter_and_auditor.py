@@ -303,6 +303,29 @@ class TestSemanticAuditor(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不得据此判违规", llm.calls[0]["system_instruction"])
         self.assertIn("区分【事实价】与【今日建议执行价】", llm.calls[0]["prompt"])
 
+    async def test_prompt_exempts_python_guardrail_section_from_leak_rule(self) -> None:
+        cfg = _cfg()
+        llm = _DsStubLLM({"semantic_audit_pick": '{"passed": true, "violations": []}'})
+        rendered = (
+            "【本轮精选行动（四要素直给）】\n📌 本轮结论：现金待命\n\n"
+            "【风控护栏记录】\n• [🛡️风控护栏修正] [ISA] ISF.L(BUY→拦截): 现金门槛不足"
+        )
+        await audit_generated_output(
+            llm,
+            cfg=cfg,
+            scope="pick",
+            fact_baseline="【原始数字底座】",
+            rendered_text=rendered,
+            strategy=cfg.strategy,
+            headline="现金待命",
+            selected_symbols=set(),
+            known_symbols={"ISF.L"},
+        )
+        system_text = llm.calls[0]["system_instruction"]
+        self.assertIn("【风控护栏记录】", system_text)
+        self.assertIn("严禁判为违规", system_text)
+        self.assertIn("合规审计披露", system_text)
+
     async def test_pick_headline_leak_is_deterministic(self) -> None:
         cfg = _cfg()
         llm = _DsStubLLM({"semantic_audit_pick": '{"passed": true, "violations": []}'})

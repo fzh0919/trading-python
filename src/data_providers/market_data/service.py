@@ -419,7 +419,7 @@ class MarketDataService(YahooHistoryMixin):
         return intel
 
     async def get_us_deep_intel_batch(
-        self, symbols: list[str], max_concurrency: int = 4
+        self, symbols: list[str], max_concurrency: int = 2
     ) -> dict[str, dict[str, Any]]:
         """Batch-fetch Finnhub US deep intel reusing the 6h cache with bounded concurrency."""
         if not self.finnhub.enabled:

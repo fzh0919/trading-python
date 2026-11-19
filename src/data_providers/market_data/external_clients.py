@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -19,18 +21,96 @@ from src.data_providers.market_data.models_and_parsing import (
 logger = logging.getLogger("src.data_providers.market_data")
 
 class FinnhubClient:
-    """Optional free Finnhub client (60 calls/min) for US earnings, news, quotes & intel."""
+    """Optional free Finnhub client (60 calls/min) for US earnings, news, quotes & intel.
+
+    v5.5.5: every HTTP GET flows through :meth:`_throttled_get` (semaphore + min interval)
+    so concurrent `/pick` fan-out can never burst past the free-tier 60/min ceiling.
+    """
 
     BASE_URL = "https://finnhub.io/api/v1"
 
-    def __init__(self, api_key: str = "", transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str = "",
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        max_concurrency: int = 2,
+        min_interval_seconds: float | None = None,
+        earnings_cache_ttl_seconds: int = 21600,
+        retry_429_delay_seconds: float = 0.0,
+    ) -> None:
         self.api_key = api_key.strip()
         self._transport = transport
         self.last_error: str | None = None
+        self._max_concurrency = max(1, int(max_concurrency))
+        # Mock transports (offline tests) must never introduce real sleeps; production defaults
+        # to ~0.35s between dispatches -> <= 2 in flight and steady-state <= ~45 req/min.
+        if min_interval_seconds is None:
+            min_interval_seconds = 0.0 if transport is not None else 0.35
+        self._min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self._earnings_cache_ttl_seconds = max(0, int(earnings_cache_ttl_seconds))
+        self._retry_429_delay_seconds = max(0.0, float(retry_429_delay_seconds))
+        self._earnings_cache: dict[tuple[str, int], tuple[float, dict[str, tuple[str, str]]]] = {}
+        # Loop-bound primitives are initialised lazily so repeated `asyncio.run` in tests
+        # never reuses a Semaphore/Lock created on a closed event loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sem: asyncio.Semaphore | None = None
+        self._rate_lock: asyncio.Lock | None = None
+        self._last_request_ts = 0.0
+        self._calendar_locks: dict[tuple[str, int], asyncio.Lock] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.api_key)
+
+    def _ensure_loop_primitives(self) -> tuple[asyncio.Semaphore, asyncio.Lock]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - defensive, callers are always async
+            loop = None
+        if self._sem is None or self._rate_lock is None or self._loop is not loop:
+            self._loop = loop
+            self._sem = asyncio.Semaphore(self._max_concurrency)
+            self._rate_lock = asyncio.Lock()
+            self._last_request_ts = 0.0
+            self._calendar_locks = {}
+        return self._sem, self._rate_lock
+
+    def _retry_after_seconds(self, res: httpx.Response) -> float:
+        if self._min_interval_seconds <= 0.0:
+            return self._retry_429_delay_seconds
+        raw = res.headers.get("retry-after")
+        try:
+            value = float(raw) if raw is not None else 1.0
+        except (TypeError, ValueError):
+            value = 1.0
+        return min(5.0, max(1.0, value))
+
+    async def _throttled_get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict[str, Any],
+        timeout: float,
+    ) -> httpx.Response:
+        """Semaphore-bounded, min-interval-throttled GET with a single HTTP 429 retry."""
+        sem, rate_lock = self._ensure_loop_primitives()
+        async with sem:
+            async with rate_lock:
+                if self._min_interval_seconds > 0.0:
+                    wait = self._min_interval_seconds - (time.monotonic() - self._last_request_ts)
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self._last_request_ts = time.monotonic()
+            res = await client.get(url, params=params, timeout=timeout)
+        if res.status_code == 429:
+            delay = self._retry_after_seconds(res)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with sem:
+                res = await client.get(url, params=params, timeout=timeout)
+        return res
 
     async def _fetch_company_news(
         self,
@@ -45,7 +125,8 @@ class FinnhubClient:
         start = (today - timedelta(days=days)).isoformat()
         end = today.isoformat()
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/company-news",
                 params={"symbol": symbol, "from": start, "to": end, "token": self.api_key},
                 timeout=10.0,
@@ -84,36 +165,64 @@ class FinnhubClient:
         self.last_error = err
         return out
 
+    def _calendar_lock(self, key: tuple[str, int]) -> asyncio.Lock:
+        self._ensure_loop_primitives()
+        lock = self._calendar_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._calendar_locks[key] = lock
+        return lock
+
     async def _fetch_earnings_calendar(
         self, client: httpx.AsyncClient, days_ahead: int = 21
     ) -> tuple[dict[str, tuple[str, str]], str | None]:
         if not self.enabled:
             return {}, None
         today = datetime.now(timezone.utc).date()
-        end = today + timedelta(days=days_ahead)
-        try:
-            res = await client.get(
-                f"{self.BASE_URL}/calendar/earnings",
-                params={"from": today.isoformat(), "to": end.isoformat(), "token": self.api_key},
-                timeout=12.0,
-            )
-            if res.status_code != 200:
-                return {}, f"calendar/earnings HTTP {res.status_code}"
-            rows = (res.json() or {}).get("earningsCalendar") or []
-            mapping: dict[str, tuple[str, str]] = {}
-            for r in rows:
-                sym = str(r.get("symbol") or "").upper()
-                dt_str = str(r.get("date") or "")
-                if not sym or not dt_str:
-                    continue
-                eps = r.get("epsEstimate")
-                eps_note = f"EPS预期 {eps}" if eps is not None else ""
-                mapping.setdefault(sym, (dt_str, eps_note))
-            return mapping, None
-        except Exception as exc:
-            err = f"calendar/earnings {_safe_exc(exc)}"
-            logger.debug("Finnhub earnings calendar error: %s", exc)
-            return {}, err
+        cache_key = (today.isoformat(), int(days_ahead))
+        cached = self._earnings_cache.get(cache_key)
+        if (
+            cached is not None
+            and self._earnings_cache_ttl_seconds > 0
+            and (time.monotonic() - cached[0]) < self._earnings_cache_ttl_seconds
+        ):
+            return dict(cached[1]), None
+        # In-flight merge: concurrent inspect_ticker/get_bundles fan-out shares one HTTP call.
+        async with self._calendar_lock(cache_key):
+            cached = self._earnings_cache.get(cache_key)
+            if (
+                cached is not None
+                and self._earnings_cache_ttl_seconds > 0
+                and (time.monotonic() - cached[0]) < self._earnings_cache_ttl_seconds
+            ):
+                return dict(cached[1]), None
+            end = today + timedelta(days=days_ahead)
+            try:
+                res = await self._throttled_get(
+                    client,
+                    f"{self.BASE_URL}/calendar/earnings",
+                    params={"from": today.isoformat(), "to": end.isoformat(), "token": self.api_key},
+                    timeout=12.0,
+                )
+                if res.status_code != 200:
+                    # Degraded response: never poisoned into the earnings cache (iron rule #2).
+                    return {}, f"calendar/earnings HTTP {res.status_code}"
+                rows = (res.json() or {}).get("earningsCalendar") or []
+                mapping: dict[str, tuple[str, str]] = {}
+                for r in rows:
+                    sym = str(r.get("symbol") or "").upper()
+                    dt_str = str(r.get("date") or "")
+                    if not sym or not dt_str:
+                        continue
+                    eps = r.get("epsEstimate")
+                    eps_note = f"EPS预期 {eps}" if eps is not None else ""
+                    mapping.setdefault(sym, (dt_str, eps_note))
+                self._earnings_cache[cache_key] = (time.monotonic(), dict(mapping))
+                return mapping, None
+            except Exception as exc:
+                err = f"calendar/earnings {_safe_exc(exc)}"
+                logger.debug("Finnhub earnings calendar error: %s", exc)
+                return {}, err
 
     async def get_earnings_calendar(
         self, client: httpx.AsyncClient, days_ahead: int = 21
@@ -128,7 +237,8 @@ class FinnhubClient:
         if not self.enabled or not _is_us_symbol(symbol):
             return None
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/quote",
                 params={"symbol": symbol.strip().upper(), "token": self.api_key},
                 timeout=8.0,
@@ -162,7 +272,8 @@ class FinnhubClient:
         if not self.enabled or not clean_isin:
             return None
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/stock/profile2",
                 params={"isin": clean_isin, "token": self.api_key},
                 timeout=10.0,
@@ -195,7 +306,8 @@ class FinnhubClient:
         if not self.enabled or not _is_us_symbol(symbol):
             return []
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/stock/recommendation",
                 params={"symbol": symbol.strip().upper(), "token": self.api_key},
                 timeout=10.0,
@@ -229,7 +341,8 @@ class FinnhubClient:
         if not self.enabled or not _is_us_symbol(symbol):
             return []
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/stock/earnings",
                 params={"symbol": symbol.strip().upper(), "limit": limit, "token": self.api_key},
                 timeout=10.0,
@@ -263,7 +376,8 @@ class FinnhubClient:
         today = datetime.now(timezone.utc).date()
         start = (today - timedelta(days=days)).isoformat()
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/stock/insider-sentiment",
                 params={
                     "symbol": symbol.strip().upper(),
@@ -306,7 +420,8 @@ class FinnhubClient:
         if not self.enabled or not clean or not _is_us_symbol(clean):
             return None
         try:
-            res = await client.get(
+            res = await self._throttled_get(
+                client,
                 f"{self.BASE_URL}/stock/metric",
                 params={"symbol": clean, "metric": "all", "token": self.api_key},
                 timeout=10.0,

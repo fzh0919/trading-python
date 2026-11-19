@@ -195,6 +195,8 @@ class ModelsSection(BaseModel):
     report_pm_timeout_seconds: float = Field(default=300.0, ge=60.0, le=1200.0)
     # /report 第二轮辩论（DeepSeek）：R2 双向质询 + R3 中立摘要/证据核验
     report_debate_enabled: bool = True
+    # v5.5.5: run R2/R3 DeepSeek steps strictly one-by-one to survive 07:30 UK peak congestion.
+    report_debate_sequential: bool = True
     report_debate_model: str = "deepseek-flash"
     report_debate_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_debate_max_chars: int = Field(default=2400, ge=600, le=6000)
@@ -292,6 +294,12 @@ class StrategySection(BaseModel):
     min_isa_equity_order_gbp: float = Field(default=1200.0, gt=0.0)
     min_isa_etf_order_gbp: float = Field(default=400.0, gt=0.0)
     invest_risk_budget_gbp: float = Field(default=85.0, gt=0.0)
+    # v5.5.5: Invest 单笔净值风险预算（% NAV），仅作用于 Invest；ISA 价值轨仍锁定原 0.5% 零影响。
+    invest_risk_budget_pct: float = Field(default=0.75, gt=0.0, le=3.0)
+    # Invest Portfolio Heat 主闸：组合承诺热力（含未成交新开买单 1R）占 Invest 净值上限（% NAV）
+    invest_max_heat_risk_on_pct: float = Field(default=3.0, ge=0.0, le=10.0)
+    invest_max_heat_neutral_pct: float = Field(default=2.0, ge=0.0, le=10.0)
+    invest_max_heat_risk_off_pct: float = Field(default=0.0, ge=0.0, le=5.0)
     max_weekly_new_buys: int = Field(default=2, ge=0)
     max_monthly_new_buys: int = Field(default=6, ge=0)
     rebuy_cooldown_days: int = Field(default=15, ge=0)
@@ -326,8 +334,8 @@ class StrategySection(BaseModel):
     min_deploy_excess_pct: float = Field(default=3.0, ge=0.0, le=50.0)  # 超过现金上沿多少百分点触发 ISA 宽基 dca（15+3=18%）
 
     # 2) Invest 在险槽位与以盈解锁（仅核算 Invest 账户自身）
-    invest_slots_risk_on: int = Field(default=2, ge=0, le=10)  # RISK_ON 最大同时未脱险个股槽位数
-    invest_slots_neutral: int = Field(default=1, ge=0, le=10)  # NEUTRAL 最大同时未脱险个股槽位数（单侦察兵）
+    invest_slots_risk_on: int = Field(default=3, ge=0, le=10)  # RISK_ON 最大同时未脱险个股槽位数
+    invest_slots_neutral: int = Field(default=2, ge=0, le=10)  # NEUTRAL 最大同时未脱险个股槽位数
     invest_slots_risk_off: int = Field(default=0, ge=0, le=10)  # RISK_OFF 个股槽位数（0 = 冻结新开个股）
     max_new_equity_entries_per_day: int = Field(default=1, ge=1, le=10)  # 单日最多新开/新挂个股笔数（Best Idea Only）
     consecutive_loss_limit: int = Field(default=2, ge=1, le=10)  # gate_epoch_date 后近 14 天连续止损笔数阈值

@@ -498,15 +498,66 @@ class TestGateLedgerIdentityAndOrderTriage(unittest.TestCase):
 # Group 2: Invest risk slots & financed unlock
 # ===========================================================================
 class TestInvestSlotsAndFinancedUnlock(unittest.TestCase):
-    def test_neutral_full_slot_waits_despite_80pct_cash(self) -> None:
-        gate = _run_snapshot_gate()
+    def test_neutral_two_slots_allow_second_entry_when_heat_is_cool(self) -> None:
+        # v5.5.5: NEUTRAL grants 2 risk slots; CF heat (~0.8%) stays under the 2.0% heat cap.
+        gate = _run_snapshot_gate(candidates=[_up_candidate()])
         invest = gate["invest"]
         self.assertAlmostEqual(invest["cash_pct"], 79.7, places=1)
-        self.assertEqual(invest["status"], "WAIT")
-        self.assertEqual(invest["mode"], "slots_full")
-        self.assertIn("CF", invest["reason"])
+        self.assertEqual(invest["slots_cap"], 2)
+        self.assertEqual(invest["slots_used"], 1)
+        self.assertLess(invest["committed_heat_pct"], 2.0)
+        self.assertEqual(invest["status"], "RUN")
+        self.assertEqual(invest["mode"], "targeted")
         # Never a dca-style "spend the idle cash" RUN for Invest
         self.assertNotEqual(invest["mode"], "dca")
+
+    def test_neutral_heat_full_blocks_despite_free_slot(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        for pos in portfolio.invest.positions:
+            if pos.yahoo_symbol == "CF":
+                pos.quantity = 50.0
+                pos.current_value = pos.quantity * pos.cur_price
+        portfolio.invest.pending_orders = [
+            o for o in portfolio.invest.pending_orders if o.yahoo_symbol != "CF"
+        ]
+        gate = _run_snapshot_gate(portfolio)
+        invest = gate["invest"]
+        self.assertEqual(invest["slots_used"], 1)
+        self.assertEqual(invest["slots_cap"], 2)
+        self.assertGreaterEqual(invest["committed_heat_pct"], 2.0)
+        self.assertEqual(invest["heat_cap_pct"], 2.0)
+        self.assertEqual(invest["status"], "WAIT")
+        self.assertEqual(invest["mode"], "heat_full")
+        self.assertIn("承诺热力", invest["reason"])
+
+        rotated = _run_snapshot_gate(portfolio, candidates=[_up_candidate()])
+        self.assertEqual(rotated["invest"]["status"], "ROTATE")
+        self.assertEqual(rotated["invest"]["mode"], "rotate")
+        self.assertIn("承诺热力", rotated["invest"]["reason"])
+
+    def test_pending_new_equity_buy_commits_one_r_of_forward_heat(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        portfolio.invest.pending_orders.append(
+            PendingOrderItem(
+                id="p-de", account="Invest", raw_ticker="DE_US_EQ", ticker="DE", yahoo_symbol="DE",
+                name="Deere", side="BUY", order_type="LIMIT", quantity=2.0, value=800.0,
+                limit_price=400.0, currency="USD", time_in_force="GTC",
+            )
+        )
+        gate = _run_snapshot_gate(portfolio)
+        invest = gate["invest"]
+        self.assertEqual(invest["pending_new_equity_buys"], ["DE"])
+        self.assertAlmostEqual(invest["pending_heat_gbp"], invest["unit_risk_gbp"], places=2)
+        self.assertAlmostEqual(
+            invest["committed_heat_gbp"],
+            round(invest["heat_gbp_total"] + invest["pending_heat_gbp"], 2),
+            places=2,
+        )
+        self.assertGreater(invest["committed_heat_pct"], 0.8)
+        # The pending buy also consumes a slot, so 1 held + 1 pending = 2/2 -> full.
+        self.assertEqual(invest["slots_used"], 2)
+        self.assertEqual(invest["status"], "WAIT")
+        self.assertIn(invest["mode"], {"heat_full", "slots_full"})
 
     def test_raising_cf_stop_to_breakeven_releases_slot(self) -> None:
         portfolio = _real_snapshot_portfolio()
@@ -533,7 +584,10 @@ class TestInvestSlotsAndFinancedUnlock(unittest.TestCase):
         self.assertEqual(gate["pm"]["mode"], "run")
 
     def test_full_slot_with_a_candidate_rotates_not_adds(self) -> None:
-        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         invest = gate["invest"]
         self.assertEqual(invest["status"], "ROTATE")
         self.assertEqual(invest["mode"], "rotate")
@@ -562,7 +616,7 @@ class TestInvestSlotsAndFinancedUnlock(unittest.TestCase):
         self.assertEqual(invest["today_new_equity_entries"], 0)
         self.assertFalse(invest["daily_cap_reached"])
 
-    def test_risk_on_regime_grants_two_slots(self) -> None:
+    def test_risk_on_regime_grants_three_slots(self) -> None:
         prev = {"regime": "NEUTRAL", "raw_regime": "RISK_ON", "raw_streak_days": 2, "ease_streak_days": 0}
         gate = _run_snapshot_gate(
             spy_hist=_spy_risk_on_hist(),
@@ -571,8 +625,8 @@ class TestInvestSlotsAndFinancedUnlock(unittest.TestCase):
         )
         self.assertEqual(gate["regime"], "RISK_ON")
         invest = gate["invest"]
-        self.assertEqual(invest["slots_cap"], 2)
-        self.assertEqual(invest["status"], "RUN")  # 1/2 slots used, candidate present
+        self.assertEqual(invest["slots_cap"], 3)
+        self.assertEqual(invest["status"], "RUN")  # 1/3 slots used, candidate present
         self.assertEqual(invest["mode"], "targeted")
 
 
@@ -928,6 +982,8 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         invest = gate["invest"]
         self.assertEqual(invest["status"], "DEFEND")
         self.assertEqual(invest["mode"], "defend")
+        self.assertEqual(invest["heat_cap_pct"], 0.0)
+        self.assertEqual(invest["heat_headroom_pct"], 0.0)
         self.assertTrue(gate["triggers"]["D"]["risk_off_defend"])
         self.assertIn("撤除 Invest 未成交个股买单", invest.get("defend_note", ""))
         self.assertIn("ISA 低位价值买单须核查基本面", invest.get("defend_note", ""))
@@ -1041,7 +1097,10 @@ class TestPmClampBannerAndRendering(unittest.TestCase):
         self.assertIn("美联储议息夜", pm["reason"])
 
     def test_rotate_with_empty_pm_funding_keeps_deterministic_source(self) -> None:
-        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         self.assertEqual(gate["invest"]["status"], "ROTATE")
         # The deterministic engine already computed a legal funding source (CF); an
         # untouched PM funding_from falls back to it instead of falsely degrading to WAIT.
@@ -1051,13 +1110,19 @@ class TestPmClampBannerAndRendering(unittest.TestCase):
         self.assertEqual(pm["funding_from"], "CF")
 
     def test_rotate_with_illegal_funding_is_rejected(self) -> None:
-        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         pm = reconcile_pm_pick_gate(gate, {"allow": True, "funding_from": "TSLA"}, whitelist_symbols={"CF"})
         self.assertFalse(pm["allow"])
         self.assertIn("置换源", pm["reason"])
 
     def test_rotate_with_valid_funding_is_kept(self) -> None:
-        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         pm = reconcile_pm_pick_gate(gate, {"allow": True, "funding_from": "CF"}, whitelist_symbols={"CF"})
         self.assertTrue(pm["allow"])
         self.assertEqual(pm["mode"], "rotate")
@@ -1074,6 +1139,17 @@ class TestPmClampBannerAndRendering(unittest.TestCase):
         self.assertIn("21.1%", banner)
         self.assertIn("15只", banner)
         self.assertIn("42%", banner)
+
+    def test_run_banner_shows_dynamic_unit_risk_and_heat(self) -> None:
+        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        invest = gate["invest"]
+        self.assertEqual(invest["status"], "RUN")
+        banner = gate["banner"]
+        self.assertLessEqual(len(banner), 110)
+        self.assertNotIn("风险预算£85", banner)
+        self.assertIn(f"单笔风险£{invest['unit_risk_gbp']:.0f}", banner)
+        self.assertIn("热力", banner)
+        self.assertIn(f"{float(invest['committed_heat_pct']):.1f}%", banner)
 
     def test_all_state_banners_under_110_no_markdown(self) -> None:
         # RUN targeted
@@ -1274,13 +1350,80 @@ class TestReportGateIntegration(unittest.IsolatedAsyncioTestCase):
 # Group 8: /pick gate wiring
 # ===========================================================================
 class TestPickGateWiring(unittest.TestCase):
+    def test_guardrail_notes_render_in_dedicated_section_under_1000(self) -> None:
+        from src.agents.schemas import render_pick_report
+        from src.engine.portfolio_rules import RiskOverrideResult
+
+        dec = PickDecision(
+            headline="半导体回踩分批",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="TSM", action="BUY", thesis="晶圆龙头",
+                    entry_zone="180", stop_condition="165", target_window="210", entry_price=180.0,
+                )
+            ],
+            consistency_and_cash_note="ISA 现金 22%",
+        )
+        res = RiskOverrideResult(
+            decision=dec,
+            applied=True,
+            overrides=[],
+            notes=["[🛡️风控护栏修正] [ISA] ISF.L(BUY→拦截): 现金门槛不足"],
+        )
+        rendered = render_pick_report(dec, max_chars=1000, risk_override=res)
+        self.assertLessEqual(len(rendered), 1000)
+        self.assertTrue(rendered.startswith("【本轮精选行动（四要素直给）】"))
+        self.assertIn("【风控护栏记录】", rendered)
+        guard_block = rendered.split("【风控护栏记录】", 1)[1]
+        self.assertIn("[🛡️风控护栏修正]", guard_block)
+        # Guardrail rows must no longer sit inside the conclusion block before this header.
+        conclusion_block = rendered.split("【风控护栏记录】", 1)[0]
+        self.assertNotIn("[🛡️风控护栏修正]", conclusion_block)
+        self.assertNotIn("**", rendered)
+        self.assertNotIn("#", rendered)
+
     def test_gate_constraint_block_renders_saturation_and_rotate(self) -> None:
-        gate = _run_snapshot_gate(candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         block = _format_gate_constraint_block(gate)
         self.assertIn("今日组合门控约束", block)
         self.assertIn("ISA 个股卫星层已饱和", block)
         self.assertIn("ROTATE 等风险置换", block)
         self.assertIn("CF", block)
+        self.assertIn("承诺热力", block)
+        self.assertIn("单笔风险预算", block)
+
+    def test_run_gate_with_heat_exhausted_blocks_new_invest_equity(self) -> None:
+        portfolio = _real_snapshot_portfolio()
+        gate = {
+            "isa": {"equity_open": True},
+            "invest": {
+                "status": "RUN",
+                "mode": "targeted",
+                "slots_used": 1,
+                "slots_cap": 2,
+                "committed_heat_pct": 2.2,
+                "heat_cap_pct": 2.0,
+                "reason": "测试热力触顶",
+            },
+        }
+        decision = PickDecision(
+            headline="热力兜底测试",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest", symbol="PANW", action="BUY", thesis="右侧突破",
+                    entry_zone="300", stop_condition="285", target_window="340", entry_price=300.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("承诺热力", notes[0])
+        self.assertIn("上移止损", notes[0])
 
     def test_cross_account_duplicate_buy_is_intercepted(self) -> None:
         portfolio = _real_snapshot_portfolio()
@@ -1395,7 +1538,11 @@ class TestPickGateWiring(unittest.TestCase):
 
     def test_rotate_invest_buy_without_funding_in_thesis_is_intercepted(self) -> None:
         portfolio = _real_snapshot_portfolio()
-        gate = _run_snapshot_gate(portfolio, candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            portfolio,
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         decision = PickDecision(
             headline="测试",
             selected_actions=[
@@ -1413,7 +1560,11 @@ class TestPickGateWiring(unittest.TestCase):
 
     def test_rotate_invest_buy_with_funding_in_thesis_is_kept(self) -> None:
         portfolio = _real_snapshot_portfolio()
-        gate = _run_snapshot_gate(portfolio, candidates=[_up_candidate()])
+        gate = _run_snapshot_gate(
+            portfolio,
+            strategy=StrategySection(invest_slots_neutral=1),
+            candidates=[_up_candidate()],
+        )
         decision = PickDecision(
             headline="测试",
             selected_actions=[

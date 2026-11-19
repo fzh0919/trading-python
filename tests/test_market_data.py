@@ -399,6 +399,152 @@ class TestMarketDataService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bundles["AMD"].short_name, "NVIDIA Corp")
         self.assertGreaterEqual(attempts["count"], 4)
 
+    async def test_yf_401_invalid_crumb_resets_cache_and_retries(self) -> None:
+        svc = MarketDataService()
+        attempts = {"count": 0, "reset": 0}
+
+        def _flaky_call() -> str:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise Exception("HTTP Error 401: Invalid Crumb")
+            return "ok"
+
+        def _fake_reset() -> None:
+            attempts["reset"] += 1
+
+        with (
+            patch("src.data_providers.market_data.time.sleep", return_value=None),
+            patch(
+                "src.data_providers.market_data.yahoo_mixin.YahooHistoryMixin._reset_yfinance_crumb_cache",
+                side_effect=_fake_reset,
+            ) as reset_mock,
+        ):
+            out = svc._run_yf_call_with_retry(_flaky_call)
+
+        self.assertEqual(out, "ok")
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(attempts["reset"], 1)
+        reset_mock.assert_called_once()
+
+    async def test_yf_crumb_reset_helper_is_defensive_without_yf_data(self) -> None:
+        from types import SimpleNamespace
+
+        from src.data_providers.market_data.yahoo_mixin import YahooHistoryMixin
+
+        # Mocked/older yfinance may expose no `data`/`cache` attributes at all.
+        with patch("src.data_providers.market_data.yahoo_mixin.yf", SimpleNamespace()):
+            YahooHistoryMixin._reset_yfinance_crumb_cache()
+
+    async def test_finnhub_calendar_singleflight_and_6h_cache(self) -> None:
+        from src.data_providers.market_data.external_clients import FinnhubClient
+
+        calls = {"n": 0}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/calendar/earnings"):
+                calls["n"] += 1
+                return httpx.Response(
+                    200,
+                    json={"earningsCalendar": [{"symbol": "NVDA", "date": "2026-11-20", "epsEstimate": 0.81}]},
+                )
+            return httpx.Response(404)
+
+        transport = httpx.MockTransport(_handler)
+        fh = FinnhubClient(api_key="fh-test", transport=transport)
+        self.assertEqual(fh._min_interval_seconds, 0.0)
+        async with httpx.AsyncClient(transport=transport) as client:
+            results = await asyncio.gather(
+                *[fh._fetch_earnings_calendar(client, days_ahead=21) for _ in range(5)]
+            )
+            # 6h cache hit -> still zero extra HTTP calls.
+            again = await fh._fetch_earnings_calendar(client, days_ahead=21)
+
+        self.assertEqual(calls["n"], 1)
+        for mapping, err in results:
+            self.assertIsNone(err)
+            self.assertEqual(mapping["NVDA"][0], "2026-11-20")
+        self.assertEqual(again[0]["NVDA"][1], "EPS预期 0.81")
+        self.assertEqual(calls["n"], 1)
+
+    async def test_finnhub_calendar_429_is_never_cached(self) -> None:
+        from src.data_providers.market_data.external_clients import FinnhubClient
+
+        state = {"status": 429}
+        calls = {"n": 0}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if state["status"] == 429:
+                return httpx.Response(429, json={"error": "rate limit"})
+            return httpx.Response(200, json={"earningsCalendar": [{"symbol": "AMD", "date": "2026-11-25"}]})
+
+        transport = httpx.MockTransport(_handler)
+        fh = FinnhubClient(api_key="fh-test", transport=transport)
+        async with httpx.AsyncClient(transport=transport) as client:
+            mapping, err = await fh._fetch_earnings_calendar(client, days_ahead=21)
+            self.assertEqual(mapping, {})
+            self.assertIn("429", err or "")
+            self.assertEqual(fh._earnings_cache, {})
+            # Recovered 200 must fetch again (no poisoned empty cache) and then cache.
+            state["status"] = 200
+            mapping2, err2 = await fh._fetch_earnings_calendar(client, days_ahead=21)
+            self.assertIsNone(err2)
+            self.assertEqual(mapping2["AMD"][0], "2026-11-25")
+            await fh._fetch_earnings_calendar(client, days_ahead=21)
+
+        self.assertEqual(calls["n"], 3)  # 2 x 429 retry, 1 x 200; final call is cached
+        self.assertTrue(fh._earnings_cache)
+
+    async def test_finnhub_429_backoff_retries_once_then_succeeds(self) -> None:
+        from src.data_providers.market_data.external_clients import FinnhubClient
+
+        calls = {"n": 0}
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "2"}, json={"error": "rate limit"})
+            return httpx.Response(200, json={"earningsCalendar": [{"symbol": "META", "date": "2026-12-01"}]})
+
+        transport = httpx.MockTransport(_handler)
+        fh = FinnhubClient(api_key="fh-test", transport=transport)
+        async with httpx.AsyncClient(transport=transport) as client:
+            mapping, err = await fh._fetch_earnings_calendar(client, days_ahead=21)
+
+        self.assertIsNone(err)
+        self.assertEqual(mapping["META"][0], "2026-12-01")
+        self.assertEqual(calls["n"], 2)
+
+    async def test_finnhub_inflight_concurrency_is_bounded(self) -> None:
+        from src.data_providers.market_data.external_clients import FinnhubClient
+
+        class _ProbeTransport(httpx.AsyncBaseTransport):
+            def __init__(self) -> None:
+                self.active = 0
+                self.max_active = 0
+                self.calls = 0
+
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                self.calls += 1
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                await asyncio.sleep(0.01)
+                self.active -= 1
+                return httpx.Response(
+                    200,
+                    json={"c": 145.5, "d": 2.5, "dp": 1.75, "h": 146.0, "l": 143.0, "o": 144.0, "pc": 143.0},
+                )
+
+        probe = _ProbeTransport()
+        fh = FinnhubClient(api_key="fh-test", transport=probe, max_concurrency=2)
+        async with httpx.AsyncClient(transport=probe) as client:
+            quotes = await asyncio.gather(*[fh.get_quote(client, "NVDA") for _ in range(12)])
+
+        self.assertEqual(len(quotes), 12)
+        self.assertTrue(all(q and q["current_price"] == 145.5 for q in quotes))
+        self.assertEqual(probe.calls, 12)
+        self.assertLessEqual(probe.max_active, 2)
+
     async def test_fred_extended_series_finnhub_error_preservation_and_deep_intel(self) -> None:
         ops = _DummyOps()
         finnhub_calls: list[str] = []

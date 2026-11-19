@@ -119,6 +119,37 @@ class YahooHistoryMixin:
         self._prune_ordered_cache(self._bundle_cache, now, max(self.ttl_seconds * 4, 3600))
 
     @staticmethod
+    def _reset_yfinance_crumb_cache() -> None:
+        """Best-effort flush of yfinance's cached crumb/cookie after HTTP 401 Invalid Crumb.
+
+        Defensive by design: different yfinance versions expose different internals and offline
+        mocked environments may not provide `yf.data` at all, so every probe is wrapped.
+        """
+        try:
+            yf_data_mod = getattr(yf, "data", None)
+            yf_data_cls = getattr(yf_data_mod, "YfData", None) if yf_data_mod is not None else None
+            if yf_data_cls is not None:
+                try:
+                    yf_data_obj: Any = yf_data_cls()
+                except Exception:
+                    yf_data_obj = None
+                if yf_data_obj is not None:
+                    for attr in ("_crumb", "_cookie", "_cookie_str", "_cookies"):
+                        try:
+                            setattr(yf_data_obj, attr, None)
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        try:
+            yf_cache = getattr(yf, "cache", None)
+            clear_fn = getattr(yf_cache, "clear", None)
+            if callable(clear_fn):
+                clear_fn()
+        except Exception:
+            pass
+
+    @staticmethod
     def _run_yf_call_with_retry(fn: Any, *, max_retries: int = 2, base_delay: float = 0.8) -> Any:
         """Retry transient yfinance rate limits or temporary failures with fresh Ticker instantiation."""
         last_exc: Exception | None = None
@@ -134,6 +165,13 @@ class YahooHistoryMixin:
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc).lower()
+                crumb_error = any(tok in msg for tok in ("401", "invalid crumb", "unauthorized"))
+                if crumb_error:
+                    if attempt < max_retries:
+                        YahooHistoryMixin._reset_yfinance_crumb_cache()
+                        time.sleep(base_delay * (2 ** attempt))
+                        continue
+                    raise
                 transient = any(tok in msg for tok in ("429", "too many requests", "timed out", "timeout", "temporarily"))
                 if transient and attempt < max_retries:
                     time.sleep(base_delay * (2 ** attempt))

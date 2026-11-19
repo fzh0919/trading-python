@@ -67,6 +67,11 @@ def build_wallet_context_text(
             f"• Invest 资金路径: 复用同币种钱包 0% 换汇；跨币种买入（GBP→USD 买美股，"
             f"或 GBP 不足时 USD→GBP 买英股/LSE ETF）计单边 {fx:.2f}% 换汇费；卖出所得默认留存原币种钱包"
         )
+        lines.append(
+            f"• 跨钱包补足: 若按风险算出的美股建议金额大于当前 USD 钱包可用余额，"
+            f"差额正常由 GBP 钱包换汇补足（计单边 {fx:.2f}% 换汇费）；"
+            "严禁为省换汇费而人为把仓位压缩到 USD 余额以内。"
+        )
         warning = str(getattr(inv, "wallet_reconcile_warning", "") or "")
         if warning:
             lines.append(f"⚠️ 钱包校准: {warning}")
@@ -90,6 +95,7 @@ def build_investor_profile(
     min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
     min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
     risk_budget = float(getattr(strategy, "invest_risk_budget_gbp", 85.0))
+    risk_pct = float(getattr(strategy, "invest_risk_budget_pct", 0.75) or 0.75)
     isa_trigger = float(getattr(strategy, "isa_cash_deploy_trigger_pct", 15.0))
     invest_idle = float(getattr(strategy, "invest_cash_idle_warn_pct", 40.0))
     weekly_cap = int(getattr(strategy, "max_weekly_new_buys", 2))
@@ -137,7 +143,7 @@ def build_investor_profile(
         f"• 卖出分类（其余情况不下卖出结论）：① 逻辑证伪或触及硬止损；② 长期弱势机会成本置换（连续跑输 {benchmark} 且跌破长期趋势如 MA200）；"
         "③ 穿透后集中度超限的再平衡；④ ISA 另含极端估值泡沫与历史边角料归核。\n"
         f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
-        f"以损定仓——单笔最大可承受亏损约 £{risk_budget:,.0f}（仓位 ≈ £{risk_budget:,.0f} ÷ 止损百分比）；"
+        f"以损定仓——Invest 单笔最大可承受亏损 = max(£{risk_budget:,.0f} 地板, Invest 净值×{risk_pct:.2f}%)（仓位 ≈ 该风险预算 ÷ 止损百分比）；"
         f"{cadence_rule}\n"
         f"• 闲置现金与挂单计息：ISA 仅有 GBP 钱包（约 {gbp_rate:.1f}% 年化）；"
         f"Invest 为 GBP 钱包（{gbp_rate:.1f}%）+ USD 钱包（{usd_rate:.1f}%）双钱包，按各自币种计息，"
@@ -148,6 +154,8 @@ def build_investor_profile(
         f"（美股约 {spread_us:.2f}%，英股/LSE ETF 约 {spread_uk:.2f}%）；"
         "② Invest 为 GBP+USD 双钱包，复用同币种钱包 0% 换汇；跨币种买入（GBP→USD 买美股，"
         f"或 GBP 不足时 USD→GBP 买英股/LSE ETF）计单边 {strategy.fx_fee_pct:.2f}% 换汇费，卖出所得默认留存原币种钱包；"
+        "若按风险算出的美股建议金额大于当前 USD 钱包可用余额，超额部分正常由 GBP 钱包换汇补足（计单边换汇费），"
+        "严禁为省换汇费而人为把仓位压缩到 USD 余额以内；"
         "③ 理由中须写明资金路径（如「用 USD 钱包免换汇」或「GBP 不足需 USD 换回含损耗」）；"
         "④ Invest 为应税账户，低赔率频繁换仓会侵蚀净收益。"
         "\n"
@@ -160,7 +168,7 @@ def build_investor_profile(
         f"• Invest 在险槽位与以盈解锁（v5.4.0）：Invest 现金再多也绝不催买，只有右侧突破猎物才触发开仓；"
         "已挂保本止损（止损价≥成本+摩擦）的仓位占用 0 槽位并立即释放新开仓额度，未脱险仓位与未成交个股买单各占 1 槽位；"
         f"同一交易日最多新开 1 笔个股；近 {strategy.consecutive_loss_lookback_days} 天连损 {strategy.consecutive_loss_limit} 笔"
-        f"自动冷静 {strategy.consecutive_loss_cooldown_days} 个交易日，恢复首单按半仓试探（约 £{risk_budget * strategy.recovery_pilot_risk_scale:,.0f}），首单盈利推保本后恢复全额火力。"
+        f"自动冷静 {strategy.consecutive_loss_cooldown_days} 个交易日，恢复首单按半仓试探（风险预算×{float(strategy.recovery_pilot_risk_scale):.1f}），首单盈利推保本后恢复全额火力。"
         f"{audit_rule}"
     )
 

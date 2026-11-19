@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+import warnings
 from typing import Any
 
 from src.agents.report_agent import (
@@ -29,20 +30,37 @@ class _FakeToolkit:
 class _DebateLLM:
     """Records every generate() call and returns per-usage_label canned text."""
 
+    _R2R3_LABELS = {
+        "report_bull_rebuttal",
+        "report_bear_rebuttal",
+        "report_debate_digest",
+        "report_debate_factcheck",
+    }
+
     def __init__(self, responses: dict[str, Any] | None = None, *, deepseek_key: str = "dummy-ds") -> None:
         self.responses = responses or {}
         self.calls: list[dict[str, Any]] = []
         self.deepseek_api_key = deepseek_key
+        self.r23_active = 0
+        self.r23_max_active = 0
 
     async def generate(self, **kwargs: Any) -> str:
         self.calls.append(kwargs)
         label = str(kwargs.get("usage_label") or "")
-        value = self.responses.get(label)
-        if callable(value):
-            return await value(kwargs)
-        if value is not None:
-            return str(value)
-        return f"{label}-text"
+        tracked = label in self._R2R3_LABELS
+        if tracked:
+            self.r23_active += 1
+            self.r23_max_active = max(self.r23_max_active, self.r23_active)
+        try:
+            value = self.responses.get(label)
+            if callable(value):
+                return await value(kwargs)
+            if value is not None:
+                return str(value)
+            return f"{label}-text"
+        finally:
+            if tracked:
+                self.r23_active -= 1
 
 
 def _cfg(**overrides: Any) -> AppConfig:
@@ -264,9 +282,62 @@ class TestStep2Debate(unittest.IsolatedAsyncioTestCase):
         )
         loop = asyncio.get_running_loop()
         started = loop.time()
-        result = await _run(_cfg(report_step2_round2_seconds=0.1), llm)
+        result = await _run(
+            _cfg(report_step2_round2_seconds=0.1, report_debate_sequential=False), llm
+        )
         elapsed = loop.time() - started
         self.assertLess(elapsed, 2.0)
         self.assertEqual(result.digest, "")
         self.assertEqual(len(llm.calls), 4)
+        self.assertEqual(result.payload["r3"], {})
+
+    async def test_sequential_mode_keeps_one_r2_r3_call_in_flight(self) -> None:
+        llm = _DebateLLM(
+            {
+                "report_analyst": "BULL-R1",
+                "report_auditor": "BEAR-R1",
+                "report_bull_rebuttal": "BULL-R2",
+                "report_bear_rebuttal": "BEAR-R2",
+                "report_debate_digest": "DIGEST",
+                "report_debate_factcheck": "FACTCHECK",
+            }
+        )
+        result = await _run(_cfg(report_debate_sequential=True), llm)
+        self.assertEqual(llm.r23_max_active, 1)
+        self.assertEqual(result.digest, "DIGEST")
+        self.assertEqual(result.factcheck, "FACTCHECK")
+        self.assertEqual(result.degraded_roles, [])
+
+    async def test_sequential_budget_exhaustion_skips_later_step_without_unawaited_warning(self) -> None:
+        calls = {"n": 0}
+
+        async def _slow(_: dict[str, Any]) -> str:
+            calls["n"] += 1
+            await asyncio.sleep(30)
+            return "late"
+
+        llm = _DebateLLM(
+            {
+                "report_analyst": "BULL-R1",
+                "report_auditor": "BEAR-R1",
+                "report_bull_rebuttal": _slow,
+                "report_bear_rebuttal": _slow,
+            }
+        )
+        with self.assertNoLogs(level="ERROR"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                result = await _run(
+                    _cfg(report_step2_round2_seconds=0.1, report_debate_sequential=True), llm
+                )
+        self.assertFalse(
+            [w for w in caught if "never awaited" in str(w.message)],
+            [str(w.message) for w in caught],
+        )
+        # Only R1 (x2) + the first R2 step ran; the second factory was never constructed.
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(len(llm.calls), 3)
+        self.assertEqual(result.payload["r2"]["bull_rebuttal"], "")
+        self.assertIn("bull_rebuttal", result.payload["degraded"])
+        self.assertIn("bear_rebuttal", result.payload["degraded"])
         self.assertEqual(result.payload["r3"], {})

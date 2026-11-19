@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -136,6 +136,57 @@ async def _gather_named_notes(
                 text = (task.result() or "").strip()
             except Exception as exc:  # defensive: generate() already converts its own failures
                 logger.warning("Report debate %s task raised: %s", name, exc)
+        if not text or is_degraded_llm_output(text):
+            if name not in degraded:
+                degraded.append(name)
+            text = ""
+        texts[name] = text
+    return texts, degraded
+
+
+async def _run_named_notes_sequential(
+    coro_factories: dict[str, Callable[[float], Awaitable[str]]],
+    *,
+    timeout_s: float,
+    step_ceiling_s: float | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Run named steps strictly one-by-one under a shared phase budget (v5.5.5).
+
+    Lazy factories are mandatory: when an earlier step consumes the whole phase budget we must
+    never construct a coroutine that is then abandoned (that would raise
+    ``RuntimeWarning: coroutine was never awaited``). Failed/timed-out steps degrade to an empty
+    string exactly like :func:`_gather_named_notes`, without aborting the morning PM decision.
+    """
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    ceiling = float(step_ceiling_s) if step_ceiling_s is not None else float(timeout_s)
+    texts: dict[str, str] = {}
+    degraded: list[str] = []
+    for name, factory in coro_factories.items():
+        remaining = float(timeout_s) - (loop.time() - started)
+        step_budget = min(ceiling, remaining)
+        if step_budget <= 0:
+            degraded.append(name)
+            texts[name] = ""
+            continue
+        task = asyncio.ensure_future(factory(step_budget))
+        try:
+            _, pending = await asyncio.wait({task}, timeout=step_budget)
+            if pending:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                degraded.append(name)
+                texts[name] = ""
+                logger.warning(
+                    "Report debate sequential step %s exceeded %.1fs; degraded",
+                    name,
+                    step_budget,
+                )
+                continue
+            text = (task.result() or "").strip()
+        except Exception as exc:  # defensive: generate() already converts its own failures
+            logger.warning("Report debate %s task raised: %s", name, exc)
+            text = ""
         if not text or is_degraded_llm_output(text):
             if name not in degraded:
                 degraded.append(name)
@@ -335,43 +386,51 @@ async def _run_step2_debate(
     debate_round_timeout = max(30.0, r2_budget - 15.0)
     max_chars = int(cfg.models.report_debate_max_chars)
     r2_started = loop.time()
-    r2_texts, r2_degraded = await _gather_named_notes(
-        {
-            "bull_rebuttal": llm.generate(
-                model=cfg.models.report_debate_model,
-                prompt=_build_rebuttal_prompt(
-                    side="bull",
-                    own_notes=analyst_notes,
-                    opponent_notes=auditor_notes,
-                    shared_context=shared_context,
-                    max_chars=max_chars,
-                ),
-                system_instruction=_build_rebuttal_system("bull", cfg, max_chars),
-                thinking_level=cfg.models.report_debate_thinking_level,
-                temperature=0.25,
-                usage_label="report_bull_rebuttal",
-                round_timeout_seconds=debate_round_timeout,
-                max_output_tokens=cfg.models.report_debate_max_output_tokens,
+    r2_factories: dict[str, Callable[[float], Awaitable[str]]] = {
+        "bull_rebuttal": lambda step_budget: llm.generate(
+            model=cfg.models.report_debate_model,
+            prompt=_build_rebuttal_prompt(
+                side="bull",
+                own_notes=analyst_notes,
+                opponent_notes=auditor_notes,
+                shared_context=shared_context,
+                max_chars=max_chars,
             ),
-            "bear_rebuttal": llm.generate(
-                model=cfg.models.report_debate_model,
-                prompt=_build_rebuttal_prompt(
-                    side="bear",
-                    own_notes=auditor_notes,
-                    opponent_notes=analyst_notes,
-                    shared_context=shared_context,
-                    max_chars=max_chars,
-                ),
-                system_instruction=_build_rebuttal_system("bear", cfg, max_chars),
-                thinking_level=cfg.models.report_debate_thinking_level,
-                temperature=0.2,
-                usage_label="report_bear_rebuttal",
-                round_timeout_seconds=debate_round_timeout,
-                max_output_tokens=cfg.models.report_debate_max_output_tokens,
+            system_instruction=_build_rebuttal_system("bull", cfg, max_chars),
+            thinking_level=cfg.models.report_debate_thinking_level,
+            temperature=0.25,
+            usage_label="report_bull_rebuttal",
+            round_timeout_seconds=step_budget,
+            max_output_tokens=cfg.models.report_debate_max_output_tokens,
+        ),
+        "bear_rebuttal": lambda step_budget: llm.generate(
+            model=cfg.models.report_debate_model,
+            prompt=_build_rebuttal_prompt(
+                side="bear",
+                own_notes=auditor_notes,
+                opponent_notes=analyst_notes,
+                shared_context=shared_context,
+                max_chars=max_chars,
             ),
-        },
-        timeout_s=r2_budget,
-    )
+            system_instruction=_build_rebuttal_system("bear", cfg, max_chars),
+            thinking_level=cfg.models.report_debate_thinking_level,
+            temperature=0.2,
+            usage_label="report_bear_rebuttal",
+            round_timeout_seconds=step_budget,
+            max_output_tokens=cfg.models.report_debate_max_output_tokens,
+        ),
+    }
+    if bool(getattr(cfg.models, "report_debate_sequential", True)):
+        r2_texts, r2_degraded = await _run_named_notes_sequential(
+            r2_factories,
+            timeout_s=r2_budget,
+            step_ceiling_s=debate_round_timeout,
+        )
+    else:
+        r2_texts, r2_degraded = await _gather_named_notes(
+            {name: factory(debate_round_timeout) for name, factory in r2_factories.items()},
+            timeout_s=r2_budget,
+        )
     r2_texts = {name: trim_text_at_line_boundary(text, max_chars) if text else "" for name, text in r2_texts.items()}
     payload["r2"] = r2_texts
     payload["elapsed"]["r2_s"] = round(loop.time() - r2_started, 1)
@@ -390,43 +449,51 @@ async def _run_step2_debate(
     digest_chars = int(cfg.models.report_neutral_digest_max_chars)
     factcheck_chars = int(cfg.models.report_neutral_factcheck_max_chars)
     r3_started = loop.time()
-    r3_texts, r3_degraded = await _gather_named_notes(
-        {
-            "digest": llm.generate(
-                model=cfg.models.report_neutral_model,
-                prompt=_build_debate_digest_prompt(
-                    bull_notes=analyst_notes,
-                    bear_notes=auditor_notes,
-                    bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
-                    bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
-                    disagreement_text=disagreement_text,
-                    max_chars=digest_chars,
-                ),
-                system_instruction=_DEBATE_NEUTRAL_SYSTEM,
-                thinking_level=cfg.models.report_neutral_thinking_level,
-                temperature=0.1,
-                usage_label="report_debate_digest",
-                round_timeout_seconds=neutral_timeout,
-                max_output_tokens=8192,
+    r3_factories: dict[str, Callable[[float], Awaitable[str]]] = {
+        "digest": lambda step_budget: llm.generate(
+            model=cfg.models.report_neutral_model,
+            prompt=_build_debate_digest_prompt(
+                bull_notes=analyst_notes,
+                bear_notes=auditor_notes,
+                bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
+                bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
+                disagreement_text=disagreement_text,
+                max_chars=digest_chars,
             ),
-            "factcheck": llm.generate(
-                model=cfg.models.report_neutral_model,
-                prompt=_build_factcheck_prompt(
-                    fact_sheet=fact_sheet,
-                    bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
-                    bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
-                    max_chars=factcheck_chars,
-                ),
-                system_instruction=_DEBATE_NEUTRAL_SYSTEM,
-                thinking_level=cfg.models.report_neutral_thinking_level,
-                temperature=0.0,
-                usage_label="report_debate_factcheck",
-                round_timeout_seconds=neutral_timeout,
-                max_output_tokens=8192,
+            system_instruction=_DEBATE_NEUTRAL_SYSTEM,
+            thinking_level=cfg.models.report_neutral_thinking_level,
+            temperature=0.1,
+            usage_label="report_debate_digest",
+            round_timeout_seconds=step_budget,
+            max_output_tokens=8192,
+        ),
+        "factcheck": lambda step_budget: llm.generate(
+            model=cfg.models.report_neutral_model,
+            prompt=_build_factcheck_prompt(
+                fact_sheet=fact_sheet,
+                bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
+                bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
+                max_chars=factcheck_chars,
             ),
-        },
-        timeout_s=r3_budget,
-    )
+            system_instruction=_DEBATE_NEUTRAL_SYSTEM,
+            thinking_level=cfg.models.report_neutral_thinking_level,
+            temperature=0.0,
+            usage_label="report_debate_factcheck",
+            round_timeout_seconds=step_budget,
+            max_output_tokens=8192,
+        ),
+    }
+    if bool(getattr(cfg.models, "report_debate_sequential", True)):
+        r3_texts, r3_degraded = await _run_named_notes_sequential(
+            r3_factories,
+            timeout_s=r3_budget,
+            step_ceiling_s=neutral_timeout,
+        )
+    else:
+        r3_texts, r3_degraded = await _gather_named_notes(
+            {name: factory(neutral_timeout) for name, factory in r3_factories.items()},
+            timeout_s=r3_budget,
+        )
     result.digest = trim_text_at_line_boundary(r3_texts.get("digest", ""), digest_chars) if r3_texts.get("digest") else ""
     result.factcheck = (
         trim_text_at_line_boundary(r3_texts.get("factcheck", ""), factcheck_chars)

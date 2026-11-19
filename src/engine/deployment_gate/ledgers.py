@@ -457,4 +457,22 @@ def compute_account_ledgers(
         now_uk=now_uk,
     )
     invest_ledger.update(guards)
+
+    # v5.5.5: Invest Portfolio Heat main gate — every unfilled new-equity BUY commits 1R of
+    # forward heat so /pick can never re-lend the same risk budget twice.
+    invest_pct = float(getattr(strategy, "invest_risk_budget_pct", 0.75) or 0.75) / 100.0
+    unit_risk_gbp = _round2(
+        max(float(strategy.invest_risk_budget_gbp), invest_val * invest_pct)
+        * float(guards.get("risk_budget_scale") or 1.0)
+    )
+    pending_heat_gbp = _round2(len(invest_pending_new) * unit_risk_gbp)
+    committed_heat_gbp = _round2(total_heat + pending_heat_gbp)
+    invest_ledger.update(
+        {
+            "unit_risk_gbp": unit_risk_gbp,
+            "pending_heat_gbp": pending_heat_gbp,
+            "committed_heat_gbp": committed_heat_gbp,
+            "committed_heat_pct": _round2((committed_heat_gbp / invest_val) * 100.0) if invest_val > 0 else 0.0,
+        }
+    )
     return {"isa": isa_ledger, "invest": invest_ledger, "etf_set": sorted(etf_set)}

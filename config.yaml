@@ -52,14 +52,16 @@ models:
   # 真超时遵守 timeout_max_retries=0 立即切备援，不空等第二轮。
   deepseek_round_timeout_seconds: 150.0
   # /report Step 2（R1 Bull/Bear 并发 → R2 DeepSeek 交叉质询 → R3 双中立）分段预算 + 总闸
-  report_step2_timeout_seconds: 660.0
+  # v5.5.5：07:30 UK 高峰期 R2/R3 串行执行，放宽分段上限避免双路并发互相拖超时。
+  report_step2_timeout_seconds: 900.0
   report_step2_round1_seconds: 360.0
-  report_step2_round2_seconds: 180.0
-  report_step2_round3_seconds: 120.0
+  report_step2_round2_seconds: 300.0
+  report_step2_round3_seconds: 210.0
   # PM 单次调用上限：Carbon 思考慢，避免 120s 被硬切到备援
   report_pm_timeout_seconds: 300.0
   # 第二轮辩论：R2 双向质询（各 2400 字）+ R3 中立摘要/证据核验，每天固定跑
   report_debate_enabled: true
+  report_debate_sequential: true
   report_debate_model: "deepseek-flash"
   report_debate_thinking_level: "HIGH"
   report_debate_max_chars: 2400
@@ -120,7 +122,11 @@ strategy:
   min_invest_order_gbp: 700.0             # Invest 单笔最小建仓额（防碎单）
   min_isa_equity_order_gbp: 1200.0        # ISA 个股单笔最小建仓额
   min_isa_etf_order_gbp: 400.0            # ISA 宽基/主题 ETF 单笔最小建仓额
-  invest_risk_budget_gbp: 85.0            # 单笔最大可承受亏损（以损定仓）
+  invest_risk_budget_gbp: 85.0            # 单笔最大可承受亏损（以损定仓）；兼作 £85 地板
+  invest_risk_budget_pct: 0.75            # Invest 单笔净值风险比例（% NAV，仅 Invest；ISA 仍锁 0.5%）
+  invest_max_heat_risk_on_pct: 3.0        # RISK_ON 组合承诺热力上限（% Invest 净值）
+  invest_max_heat_neutral_pct: 2.0        # NEUTRAL 组合承诺热力上限（% Invest 净值）
+  invest_max_heat_risk_off_pct: 0.0       # RISK_OFF 组合承诺热力上限（0 = 冻结新开个股）
   max_weekly_new_buys: 2                  # 近 7 天新开仓笔数硬上限
   max_monthly_new_buys: 6                 # 近 30 天新开仓笔数硬上限
   rebuy_cooldown_days: 15                 # 清仓后同标的冷却天数
@@ -149,8 +155,8 @@ strategy:
   isa_cash_band_high_pct: 15.0            # ISA 常规现金上沿（%）
   min_deploy_excess_pct: 3.0              # 超过现金上沿多少百分点触发 ISA 宽基 dca（15+3=18%）
   # 2) Invest 在险槽位与以盈解锁（仅核算 Invest 账户自身）
-  invest_slots_risk_on: 2                 # RISK_ON 最大同时未脱险个股槽位数
-  invest_slots_neutral: 1                 # NEUTRAL 最大同时未脱险个股槽位数（单侦察兵）
+  invest_slots_risk_on: 3                 # RISK_ON 最大同时未脱险个股槽位数
+  invest_slots_neutral: 2                 # NEUTRAL 最大同时未脱险个股槽位数
   invest_slots_risk_off: 0                # RISK_OFF 个股槽位数（0 = 冻结新开个股）
   max_new_equity_entries_per_day: 1       # 单日最多新开/新挂个股笔数（Best Idea Only）
   consecutive_loss_limit: 2               # gate_epoch_date 后近 14 天连续止损笔数阈值

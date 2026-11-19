@@ -668,13 +668,18 @@ def render_pick_report(
             )
             if str(getattr(item, "risk_note", "") or "").strip():
                 sec1_lines.append(f"   校验：{item.risk_note.strip()}")
-    for gnote in guardrail_notes[:4]:
-        sec1_lines.append(f"• {gnote}")
     sec1 = "【本轮精选行动（四要素直给）】\n" + "\n".join(sec1_lines)
+
+    # v5.5.5: Python-determined guardrail rows live in their own audited section so the
+    # semantic linter never mistakes them for a rejected-name leak inside the conclusion block.
+    sec_guard = ""
+    if guardrail_notes:
+        guard_lines = [f"• {gnote}" for gnote in guardrail_notes[:4]]
+        sec_guard = "【风控护栏记录】\n" + "\n".join(guard_lines)
 
     sec2_lines = []
     if decision.consistency_and_cash_note:
         sec2_lines.append(f"• 基线与现金：{decision.consistency_and_cash_note}")
     sec2 = "【现金约束与风控基线】\n" + "\n".join(sec2_lines) if sec2_lines else ""
 
-    return _sanitize_plain_output(_fit_max_chars([sec1, sec2], max_chars=max_chars))
+    return _sanitize_plain_output(_fit_max_chars([sec1, sec_guard, sec2], max_chars=max_chars))

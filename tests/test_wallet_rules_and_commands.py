@@ -145,6 +145,21 @@ class TestWalletFrictionRules(unittest.TestCase):
         legacy = evaluate_holding(isa_us, None, None, self.strategy, wallet=_wallet(usd=600.0, gbp=900.0))
         self.assertIn("0.30%往返换汇", legacy.friction_note)
 
+    def test_prompt_uses_dynamic_invest_budget_and_forbids_fx_shrinking(self) -> None:
+        from src.agents.prompts import build_investor_profile, build_wallet_context_text
+
+        strategy = StrategySection()
+        profile = build_investor_profile(strategy)
+        self.assertIn("Invest 净值×0.75%", profile)
+        self.assertNotIn("单笔最大可承受亏损约 £85", profile)
+        self.assertIn("严禁为省换汇费而人为把仓位压缩到 USD 余额以内", profile)
+
+        portfolio = _portfolio()
+        portfolio.invest.multi_currency_enabled = True
+        wallet_text = build_wallet_context_text(portfolio, strategy)
+        self.assertIn("严禁为省换汇费而人为把仓位压缩到 USD 余额以内", wallet_text)
+        self.assertIn("差额正常由 GBP 钱包换汇补足", wallet_text)
+
     def test_wallet_context_falls_back_to_api_available_cash(self) -> None:
         partial = AccountSnapshot(
             ok=True,

@@ -108,6 +108,15 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
     )
+    committed_heat = float(inv_g.get("committed_heat_pct") or 0.0)
+    heat_cap = float(inv_g.get("heat_cap_pct") or 0.0)
+    unit_risk = float(inv_g.get("unit_risk_gbp") or 0.0)
+    if heat_cap > 0:
+        risk_txt = f"，当前单笔风险预算 £{unit_risk:.0f}" if unit_risk > 0 else ""
+        lines.append(
+            f"• Invest 承诺热力 {committed_heat:.1f}%/{heat_cap:.1f}%"
+            f"（含未成交新开买单 1R 承诺{risk_txt}）：触顶即须先上移止损/推保本降热。"
+        )
     if inv_g.get("status") == "ROTATE":
         lines.append(
             f"• ROTATE 等风险置换：Invest 新开仓必须先在 thesis 写明以平掉/撤掉 "
@@ -276,6 +285,16 @@ def _apply_gate_channel_constraints(
                 continue
             # Account-channel hard blocks (only in advise mode, because gate_ctx is None otherwise).
             if acct == "INVEST" and not is_core_etf:
+                if inv_status == "RUN":
+                    committed_heat = float(inv_g.get("committed_heat_pct") or 0.0)
+                    heat_cap = float(inv_g.get("heat_cap_pct") or 0.0)
+                    if heat_cap > 0 and committed_heat >= heat_cap:
+                        notes.append(
+                            f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                            f"Invest 承诺热力 {committed_heat:.2f}%/{heat_cap:.2f}% 已触顶，"
+                            "严禁新开个股，须先上移止损/推保本平滑降热"
+                        )
+                        continue
                 if inv_status not in {"RUN", "ROTATE"}:
                     notes.append(
                         f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
