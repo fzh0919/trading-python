@@ -27,9 +27,12 @@ import pandas as pd
 
 from src.agents.pick_agent import _apply_gate_channel_constraints, _format_gate_constraint_block
 from src.agents.report_agent import _build_report_recommendations, _enrich_gate_candidate_bundles, _validate_core_deployment
+from src.agents.report_agent.core_deployment import _format_core_policy_ticket_block
+from src.agents.report_agent.morning_report import _build_regime_anchor_text
 from src.agents.schemas import (
     CoreDeploymentItem,
     MorningReportDecision,
+    PendingOrderAuditItem,
     PickActionItem,
     PickDecision,
     ReportActionItem,
@@ -2669,6 +2672,140 @@ class TestV551RevisedCorePolicy(unittest.TestCase):
         self.assertEqual([a.symbol for a in hardened.selected_actions], ["VERG.L"])
         self.assertTrue(any("最多保留 1 条" in n for n in notes), notes)
 
+
+
+class TestV556Wave4ReportPolish(unittest.TestCase):
+    """v5.5.6 Wave 4: Regime truth source, GBp currency labelling, ISA section split, veto punctuation."""
+
+    def _cfg(self) -> AppConfig:
+        return AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            strategy=StrategySection(deployment_gate_mode="advise"),
+        )
+
+    def test_regime_anchor_text_is_deterministic_and_forbids_rejudging(self) -> None:
+        cfg = self._cfg()
+        gate_preview = {
+            "regime": "NEUTRAL",
+            "regime_reason": "常规回调/震荡分化",
+            "isa": {"status": "RUN", "reason": "现金充足"},
+            "invest": {"status": "WAIT", "reason": "槽位已满"},
+        }
+        anchor = _build_regime_anchor_text(cfg, gate_preview, "NEUTRAL")
+        self.assertIn("当日确定性市场状态 = NEUTRAL（常规回调/震荡分化）", anchor)
+        self.assertIn("Invest 基础净 R:R 门槛 = ≥2.0:1", anchor)
+        self.assertIn("ISA 门控 = RUN（现金充足）", anchor)
+        self.assertIn("Invest 门控 = WAIT（槽位已满）", anchor)
+        self.assertIn("不得自行改判 Regime", anchor)
+        self.assertIn("在 NEUTRAL 基础上主动收紧", anchor)
+
+        risk_on = _build_regime_anchor_text(cfg, None, "RISK_ON")
+        self.assertIn("RISK_ON 右侧领涨 ≥1.6:1", risk_on)
+        self.assertIn("未启用门控", risk_on)
+
+    def test_core_policy_ticket_block_labels_gbp_pence_with_pound_reference(self) -> None:
+        gate_preview = {
+            "isa": {
+                "core_allocation_plan": {
+                    "tickets": [
+                        {
+                            "symbol": "ISF.L",
+                            "sleeve_label": "英国宽基",
+                            "current_pct": 3.0,
+                            "target_pct": 10.0,
+                            "cap_pct": 20.0,
+                            "recommended_gbp": 1600.0,
+                            "currency": "GBp",
+                            "price": 1025.4,
+                            "ma50": 1041.1,
+                            "ma200": 1031.97,
+                            "execution_style": "MARKET",
+                        }
+                    ],
+                    "held_actions": [],
+                    "deferred_notes": [],
+                }
+            }
+        }
+        block = _format_core_policy_ticket_block(gate_preview, {}, {})
+        self.assertIn("现价 1025.4 GBp (≈£10.25)", block)
+        self.assertIn("MA50 1041.1 GBp", block)
+        self.assertIn("MA200 1031.97 GBp", block)
+
+    def test_isa_pending_audits_get_own_subheading_and_vetoes_lose_double_punctuation(self) -> None:
+        decision = MorningReportDecision(
+            headline="核心部署与挂单裁决",
+            top_actions=[],
+            pending_order_audits=[
+                PendingOrderAuditItem(
+                    account="ISA",
+                    symbol="ULVR.L",
+                    verdict="KEEP",
+                    order_summary="BUY 4900 GBp",
+                    reason="回踩埋伏有效等待",
+                )
+            ],
+            core_deployment=[
+                CoreDeploymentItem(
+                    account="ISA",
+                    symbol="VERG.L",
+                    verdict="APPROVE",
+                    price_zone="34.8-35.4 GBP",
+                    size_hint="£1,600",
+                    reason="欧洲宽基补缺口",
+                )
+            ],
+            daily_vetoes=[
+                "Invest 半导体占比超限，冻结新开芯片仓。",
+                "ULVR.L 挂单维持不撤；",
+            ],
+            macro_and_cash="现金充足。",
+            account_diagnosis="ISA 核心宽基缺口。",
+            hold_summary="其余持有",
+            trade_review="无",
+        )
+        text = render_morning_report(decision)
+        core_idx = text.index("【核心宽基部署】")
+        audit_idx = text.index("【活动挂单裁决】")
+        self.assertLess(core_idx, audit_idx)
+        self.assertLess(audit_idx, text.index("ULVR.L (BUY 4900 GBp)"))
+        self.assertEqual(text.count("【活动挂单裁决】"), 1)
+        self.assertNotIn("。；", text)
+        self.assertNotIn("；；", text)
+        self.assertIn("Invest 半导体占比超限，冻结新开芯片仓；ULVR.L 挂单维持不撤", text)
+
+
+class TestV556Wave4RegimeInjection(unittest.IsolatedAsyncioTestCase):
+    async def test_bull_and_bear_prompts_carry_python_regime_and_dynamic_rr_floor(self) -> None:
+        from tests.test_db_and_end_to_end import _FakeMarketData, _FakeT212, _RecordingLLM, _sample_portfolio
+        from src.agents.report_agent import generate_morning_report
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "wave4_regime.db")
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+                models={"enable_forced_search_grounding": False},
+                strategy=StrategySection(deployment_gate_mode="advise"),
+            )
+            md = _FakeMarketData()
+            llm = _RecordingLLM()
+            try:
+                await generate_morning_report(cfg, _FakeT212(_sample_portfolio()), md, llm, db)
+            finally:
+                await md.close()
+                await db.close()
+
+        by_label = {c.get("usage_label"): c for c in llm.calls}
+        for label in ("report_analyst", "report_auditor"):
+            call = by_label[label]
+            prompt = call["prompt"]
+            self.assertIn("Python 确定性市场状态", prompt)
+            self.assertIn("当日确定性市场状态 = ", prompt)
+            self.assertIn("Invest 基础净 R:R 门槛 = ≥", prompt)
+            self.assertIn("不得自行改判 Regime", prompt)
+            self.assertIn("ISA 门控 = ", prompt)
+        self.assertIn("无达到当日动态 R:R 门槛的强信号时明确维持持币待命", by_label["report_analyst"]["system_instruction"])
 
 
 if __name__ == "__main__":

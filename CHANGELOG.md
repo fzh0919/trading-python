@@ -2,6 +2,29 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.6`（2026-11-19）
+
+LLM 工具调用末轮强制收口、`/stats` 账本 5 日跨源去重与存量清理、盘中哨兵静默冷却与侧车思考降档（规划见 [`docs/plans/2026-11-19-5.5.6-hardening-plan.md`](./docs/plans/2026-11-19-5.5.6-hardening-plan.md)）。
+
+1. **Wave 1 — LLM 工具调用末轮强制收口**：
+   - `src/agents/llm_client.py`：Gemini `_run_model_once` 在存在函数声明工具且进入末轮（`round_idx == max_tool_rounds` 或无 `tool_executor`）时保留 `tools` 并注入 `ToolConfig(function_calling_config=FunctionCallingConfig(mode=NONE))`（不影响 `GoogleSearch` 联网搜索）；DeepSeek `_run_deepseek_once` / `_call_deepseek_single_round` 末轮同步切换 `tool_choice="none"`；若末轮仍只返回工具调用且无文本，报错明确记录 `末轮仍返回工具调用(...)且无文本`，根治 `gemini-4-hydrogen` 末轮误判空文本浪费 Token 并降级的问题。
+2. **Wave 2 — `/stats` 推荐账本 5 日跨源去重、存量清理与口径对齐**：
+   - `src/storage/db/recommendations_repo.py` & `src/storage/db/schema.py`：`log_recommendations` 新增 `dedupe_window_days` / `dedupe_cross_source` 参数在 SQLite 单写锁内完成批内 + 跨源原子去重；新增幂等方法 `dedupe_existing_pending_recommendations(window_days=5)` 并在 `AdvisorDatabase.init()` 启动时自动执行，清理存量 5 日内重复的未结算 `PENDING` 战术副本（保留最早条、绝不动已结算历史与 `core_dca`）；`get_recent_recommendations` 支持 `exclude_core_dca` / `only_core_dca`。
+   - `src/agents/pick_agent.py` & `src/agents/report_agent/morning_report.py`：战术推荐统一走 `dedupe_window_days=5, dedupe_cross_source=True`（消除早报与 `/pick` 5 分钟连写双份记录）。
+   - `src/bot/handlers.py`：`/stats` 顶部样本总览补充 `核心定投归档 N 条`；下方「最近 10 条」严格过滤 `core_dca` 与顶部战术口径对齐并补 `[早报]`/`[选股]` 来源标签；核心宽基定投拆至独立「【近期核心宽基定投归档（不计入战术胜率）】」区块（最多 3 条）。
+3. **Wave 3 — Token 用量止血**：
+   - `src/config.py` & `config.yaml`：新增 `intraday_quiet_cooldown_minutes: 150` 与 `intraday_quiet_retrigger_delta_pct: 1.5`；`ds_helper_thinking_level` 由 `"HIGH"` 降为 `"MEDIUM"`（仅作用于轻量侧车 JSON 节点，不影响主研判链路）。
+   - `src/bot/scheduler/core.py` & `src/bot/scheduler/intraday_mixin.py`：`intraday_alert` 判定 `should_push=false` 后写入内存静默冷却（不占用当日 `intraday_alert:{sym}` 推送锁；冷却期内价格再额外波动 `>=1.5%` 立即破除冷却复评），消除每 30 分钟反复空转。
+4. **Wave 4 — `/report` PM 链路真源统一、杂音清理与排版修复**（`report_thinking_level` 维持 `HIGH`，全部风控护栏开关不变）：
+   - `src/agents/report_agent/debate.py`：R3 `factcheck` 改为与 Bull/Bear 共用完整 `shared_context or fact_sheet`（双账户现金/市值、频率冷却、挂单、票据、搜索新闻），根治真数据被误标 `[无据]`；`_build_debate_digest_prompt` 删除「关键原文」复述要求，并对裁剪后的 `digest` 清理尾部孤立 Markdown/`【】` 标题行；串行预算 `remaining <= 10ms` 视为耗尽（对齐 Windows 单调时钟精度，消除 `never awaited` 前构造抖动）。
+   - `src/data_providers/t212_client/client.py` & `src/agents/report_agent/morning_report.py`：新增纯同步 `T212Client.refresh_portfolio_fx(portfolio, gbp_usd_rate)` 并复用 `reconcile_invest_wallets` 原位回填 Invest 双钱包；`/report` 拿到 `macro.gbp_usd` 后立即刷新局部 `portfolio`（Mock 无该方法时回退 `set_gbp_usd_rate`），消除冷启动「GBP/USD 暂缺 / 待汇率折算」。
+   - `src/agents/report_agent/morning_report.py`：将 Python 确定性 `Regime`、判定理由、`resolve_invest_dynamic_rr_floor` 动态 `R:R` 门槛与 ISA/Invest 门控状态前置注入 `shared_context`，硬纪律禁止 Bull/Bear/PM 自行改判 Regime；`analyst_sys` 硬编码 `R:R≥2:1` 对齐为当日动态门槛；PM Prompt 移除不可满足的「2100~2500 字」，改以 Schema 字段上限为准（渲染层控 `<=2800`），并明确 `top_actions` 优先实质调仓、全观望时仅 1 条 `CASH HOLD`（或至多 1 条重点 `HOLD`），其余裁决移入 `flagged_positions`/`hold_summary`。
+   - `src/engine/deployment_gate/core_policy.py` & `src/agents/report_agent/core_deployment.py`：核心票据新增 `currency` 字段，`_format_core_policy_ticket_block` 价格/MA50/MA200 显式带币种，`GBp` 额外附注 `(≈£x.xx)` 防 100 倍量级歧义。
+   - `src/agents/prompts.py` & `src/agents/schemas.py`：ISA 核心-卫星旧文案「统一归拢 VWRP.L」改为四桶宽基政策口径；`core_deployment` 描述对齐 `0~1 条（仅审批 Python 唯一票据）`；`render_morning_report` 在 ISA 核心部署/动作之后插入 `【活动挂单裁决】` 子标题，`daily_vetoes` 拼接前 `strip().rstrip("。；; ")` 消除 `。；` 连用。
+   - `src/data_providers/t212_client/context_formatting.py`：`build_trade_context` 顶部汇总保留 `现金利息` 总额，`merged_events` 明细过滤 `INTEREST_ON_FREE_CASH` / `LENDING_INTEREST`，避免每日小额利息挤占真实出入金/派息。
+   - `src/storage/db/portfolio_repo.py`：`get_past_decision_context(limit=5, *, exclude_cycle_date=None)` 支持过滤同日旧晨报（`/report` 重跑不再自我锚定），并对每条结论在 140 字边界优雅截断补 `…`；`generate_morning_report` 安全探测当前 `cycle_id` 并兼容不接受新参数的测试 Mock。
+   - 单测：`test_report_debate_round2` / `test_wallet_rules_and_commands` / `test_report_pick_gate` / `test_t212_client` / `test_db_storage` 新增 12 条离线用例（R3 底座统一与回退、摘要去空尾、冷启动汇率回填与 Mock 回退、Regime 真源注入、GBp 币种、ISA 挂单分区与标点、利息明细过滤、同日 Memory Log 过滤与截断）；全量 `499/499` 通过，`scripts/audit_egress.py` `RESULT: CLEAN`。
+
 ### `v5.5.5`（2026-11-19）
 
 稳定性加固（yfinance 401 / Finnhub 429 / DeepSeek 高峰期串行）与 Invest Portfolio Heat 门控升级（规划见 [`docs/plans/2026-11-19-5.5.5-stability-and-invest-heat-plan.md`](./docs/plans/2026-11-19-5.5.5-stability-and-invest-heat-plan.md)）。ISA 价值轨 0.5% 风险预算零影响。

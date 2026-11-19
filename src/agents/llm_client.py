@@ -632,8 +632,13 @@ class GeminiClient:
         max_output_tokens: int | None = None,
     ) -> tuple[str | None, str]:
         thinking_cfg, effective_level = self._build_thinking_config(model, thinking_level)
+        has_fn_tools = any(getattr(t, "function_declarations", None) for t in configured_tools)
 
-        def _make_config(t_cfg: types.ThinkingConfig | None) -> types.GenerateContentConfig:
+        def _make_config(
+            t_cfg: types.ThinkingConfig | None,
+            *,
+            disable_fn_calls: bool = False,
+        ) -> types.GenerateContentConfig:
             kwargs: dict[str, Any] = {"temperature": temperature}
             if max_output_tokens and max_output_tokens > 0:
                 kwargs["max_output_tokens"] = int(max_output_tokens)
@@ -641,6 +646,12 @@ class GeminiClient:
                 kwargs["system_instruction"] = system_instruction
             if configured_tools:
                 kwargs["tools"] = configured_tools
+                if disable_fn_calls and has_fn_tools:
+                    kwargs["tool_config"] = types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode=types.FunctionCallingConfigMode.NONE
+                        )
+                    )
             if response_schema is not None:
                 kwargs["response_mime_type"] = "application/json"
                 kwargs["response_schema"] = response_schema
@@ -662,10 +673,11 @@ class GeminiClient:
 
         try:
             for round_idx in range(max_tool_rounds + 1):
+                disable_fn_calls = bool(has_fn_tools and (tool_executor is None or round_idx == max_tool_rounds))
                 response, thinking_cfg, effective_level = await self._call_single_round(
                     model=model,
                     contents=contents,
-                    make_config=_make_config,
+                    make_config=lambda t_cfg, _dis=disable_fn_calls: _make_config(t_cfg, disable_fn_calls=_dis),
                     thinking_cfg=thinking_cfg,
                     effective_level=effective_level,
                     usage_label=usage_label,
@@ -692,9 +704,16 @@ class GeminiClient:
                     cands = getattr(response, "candidates", None) or []
                     fin_raw = getattr(cands[0], "finish_reason", None) if cands else None
                     fin_str = getattr(fin_raw, "name", None) or (str(fin_raw) if fin_raw is not None else "unknown")
-                    failure_reason = (
-                        f"模型返回空文本（finish_reason={fin_str}, out={output_tokens}, thought={thought_tokens}）"
-                    )
+                    if fn_calls:
+                        fn_names = ", ".join(str(getattr(c, "name", "") or "?") for c in fn_calls[:4])
+                        failure_reason = (
+                            f"末轮仍返回工具调用（{fn_names}）且无文本"
+                            f"（finish_reason={fin_str}, out={output_tokens}, thought={thought_tokens}）"
+                        )
+                    else:
+                        failure_reason = (
+                            f"模型返回空文本（finish_reason={fin_str}, out={output_tokens}, thought={thought_tokens}）"
+                        )
                     return None, failure_reason
 
                 if response.candidates and response.candidates[0].content:
@@ -750,6 +769,7 @@ class GeminiClient:
         model: str,
         messages: list[dict[str, Any]],
         openai_tools: list[dict[str, Any]],
+        tool_choice: str = "auto",
         response_schema: Any,
         temperature: float,
         thinking_level: str,
@@ -782,7 +802,7 @@ class GeminiClient:
                 body["temperature"] = temperature
             if openai_tools:
                 body["tools"] = openai_tools
-                body["tool_choice"] = "auto"
+                body["tool_choice"] = tool_choice
             if response_schema is not None:
                 body["response_format"] = {"type": "json_object"}
             return body
@@ -874,10 +894,16 @@ class GeminiClient:
 
         try:
             for round_idx in range(max_tool_rounds + 1):
+                ds_tool_choice = (
+                    "none"
+                    if openai_tools and (tool_executor is None or round_idx == max_tool_rounds)
+                    else "auto"
+                )
                 data, effective_level = await self._call_deepseek_single_round(
                     model=model,
                     messages=messages,
                     openai_tools=openai_tools,
+                    tool_choice=ds_tool_choice,
                     response_schema=response_schema,
                     temperature=temperature,
                     thinking_level=effective_level,
@@ -912,9 +938,19 @@ class GeminiClient:
                     if text:
                         success = True
                         return text, ""
-                    failure_reason = (
-                        f"DeepSeek 返回空文本（finish_reason={finish_reason}, out={output_tokens}, thought={thought_tokens}）"
-                    )
+                    if tool_calls:
+                        tc_names = ", ".join(
+                            str((tc.get("function") or {}).get("name") or "?")
+                            for tc in tool_calls[:4]
+                        )
+                        failure_reason = (
+                            f"DeepSeek 末轮仍返回工具调用（{tc_names}）且无文本"
+                            f"（finish_reason={finish_reason}, out={output_tokens}, thought={thought_tokens}）"
+                        )
+                    else:
+                        failure_reason = (
+                            f"DeepSeek 返回空文本（finish_reason={finish_reason}, out={output_tokens}, thought={thought_tokens}）"
+                        )
                     return None, failure_reason
 
                 assistant_entry: dict[str, Any] = {

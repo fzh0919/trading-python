@@ -319,6 +319,7 @@ def _core_symbol_trend_metrics(
         price = float(snap.last_close)
     metrics = {
         "symbol": sym,
+        "currency": (str(bundle.currency).strip() if bundle is not None and getattr(bundle, "currency", None) else None),
         "price": _round2(price) if price else None,
         "ma20": _round2(getattr(snap, "ma20", None)) if snap and snap.ma20 else None,
         "ma50": _round2(getattr(snap, "ma50", None)) if snap and snap.ma50 else None,
@@ -520,6 +521,7 @@ def compute_core_allocation_plan(
                 "recommended_gbp": _round2(recommended),
                 "daily_budget_gbp": _round2(daily_budget),
                 "execution_style": execution_style,
+                "currency": metrics.get("currency"),
                 "price": metrics.get("price"),
                 "ma20": metrics.get("ma20"),
                 "ma50": metrics.get("ma50"),

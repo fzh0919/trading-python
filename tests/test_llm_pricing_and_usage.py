@@ -1002,5 +1002,173 @@ class TestPerCallOverrides(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payloads[0]["reasoning_effort"], "high")
 
 
+class TestFinalToolRoundGuard(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_final_round_disables_function_calling_but_preserves_google_search(self) -> None:
+        client = GeminiClient(api_key="dummy-gem", max_transient_retries=0)
+        configs: list[Any] = []
+
+        async def _fake_generate_content(*, model: str, contents: Any, config: Any) -> Any:
+            configs.append(config)
+            if len(configs) <= 2:
+                return SimpleNamespace(
+                    text="",
+                    function_calls=[SimpleNamespace(name="inspect_ticker", args={"symbol": "AMT"})],
+                    candidates=[SimpleNamespace(content=SimpleNamespace(role="model", parts=[]))],
+                    usage_metadata=None,
+                )
+            return SimpleNamespace(
+                text="最终投研结论：观察 AMT。",
+                function_calls=[],
+                candidates=[],
+                usage_metadata=None,
+            )
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_generate_content))
+        )
+
+        async def _exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True, "symbol": args.get("symbol")}
+
+        fn_decl = types.FunctionDeclaration(name="inspect_ticker", description="inspect")
+        reply = await client.generate(
+            model="gemini-4-hydrogen",
+            prompt="分析候选",
+            tools=[fn_decl],
+            tool_executor=_exec,
+            max_tool_rounds=2,
+            usage_label="pick_researcher",
+        )
+        self.assertIn("观察 AMT", reply)
+        self.assertEqual(len(configs), 3)
+        # Rounds 0 and 1 keep default tool calling; round 2 (final) forces mode=NONE while retaining tools.
+        self.assertIsNone(configs[0].tool_config)
+        self.assertIsNone(configs[1].tool_config)
+        self.assertIsNotNone(configs[2].tools)
+        self.assertIsNotNone(configs[2].tool_config)
+        self.assertEqual(
+            configs[2].tool_config.function_calling_config.mode,
+            types.FunctionCallingConfigMode.NONE,
+        )
+
+        # Google Search grounding (no function declarations) must never receive FunctionCallingConfig(mode=NONE).
+        search_configs: list[Any] = []
+
+        async def _fake_search(*, model: str, contents: Any, config: Any) -> Any:
+            search_configs.append(config)
+            return SimpleNamespace(text="搜索摘要", function_calls=[], candidates=[], usage_metadata=None)
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_fake_search))
+        )
+        s_reply = await client.generate(
+            model="gemini-3.5-flash-lite",
+            prompt="search news",
+            use_google_search=True,
+            max_tool_rounds=0,
+            usage_label="search_tool",
+        )
+        self.assertEqual(s_reply, "搜索摘要")
+        self.assertIsNone(search_configs[0].tool_config)
+
+    async def test_deepseek_final_round_sets_tool_choice_none(self) -> None:
+        client = GeminiClient(api_key="", deepseek_api_key="dummy-ds", deepseek_max_retries=0)
+        payloads: list[dict[str, Any]] = []
+
+        async def _fake_post(payload: dict[str, Any]) -> dict[str, Any]:
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {"name": "inspect_ticker", "arguments": '{"symbol":"EOG"}'},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                }
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "DeepSeek 结论"}}],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 15, "total_tokens": 45},
+            }
+
+        client._post_deepseek_completion = _fake_post  # type: ignore[method-assign]
+
+        async def _exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            return {"ok": True}
+
+        fn_decl = types.FunctionDeclaration(name="inspect_ticker", description="inspect")
+        reply = await client.generate(
+            model="deepseek-flash",
+            prompt="分析 EOG",
+            tools=[fn_decl],
+            tool_executor=_exec,
+            max_tool_rounds=1,
+            usage_label="pick_researcher",
+        )
+        self.assertEqual(reply, "DeepSeek 结论")
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["tool_choice"], "auto")
+        self.assertEqual(payloads[1]["tool_choice"], "none")
+        self.assertTrue(payloads[1]["tools"])
+
+    async def test_final_round_still_returning_tool_call_reports_accurate_diagnostic(self) -> None:
+        client = GeminiClient(
+            api_key="dummy-gem",
+            deepseek_api_key="",
+            fallback_model="gemini-4-hydrogen",
+            max_transient_retries=0,
+        )
+
+        async def _always_tool_call(*, model: str, contents: Any, config: Any) -> Any:
+            return SimpleNamespace(
+                text="",
+                function_calls=[SimpleNamespace(name="search_market_news", args={"query": "AMT"})],
+                candidates=[SimpleNamespace(content=SimpleNamespace(role="model", parts=[]), finish_reason="STOP")],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=100,
+                    cached_content_token_count=0,
+                    candidates_token_count=40,
+                    thoughts_token_count=500,
+                    tool_use_prompt_token_count=0,
+                    total_token_count=640,
+                ),
+            )
+
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_always_tool_call))
+        )
+
+        async def _exec(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            return {"news": []}
+
+        fn_decl = types.FunctionDeclaration(name="search_market_news", description="search")
+        text, reason = await client._run_model_once(
+            model="gemini-4-hydrogen",
+            prompt="查 AMT",
+            system_instruction="",
+            thinking_level="HIGH",
+            configured_tools=[types.Tool(function_declarations=[fn_decl])],
+            tool_executor=_exec,
+            response_schema=None,
+            temperature=0.2,
+            max_tool_rounds=1,
+            usage_label="pick_researcher",
+        )
+        self.assertIsNone(text)
+        self.assertIn("末轮仍返回工具调用", reason)
+        self.assertIn("search_market_news", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

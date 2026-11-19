@@ -9,7 +9,13 @@ from pathlib import Path
 from src.bot.handlers import AdvisorBot
 from src.config import AppConfig, EnvSettings, StrategySection
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
-from src.data_providers.t212_client import AccountSnapshot, PortfolioData, PositionItem, T212Client
+from src.data_providers.t212_client import (
+    AccountSnapshot,
+    PortfolioData,
+    PositionItem,
+    T212Client,
+    reconcile_invest_wallets,
+)
 from src.engine.portfolio_rules import (
     _round_trip_friction_pct,
     _wallet_cash_basis_pct,
@@ -288,6 +294,111 @@ class TestWalletCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn("T212 总现金(GBP): £2,000.00", reply)
         self.assertIn("实时 GBP/USD: 1.2500", reply)
         self.assertEqual(await self.db.get_wallet_balances("Invest"), before)
+
+
+class TestColdStartReportFxRefresh(unittest.IsolatedAsyncioTestCase):
+    """v5.5.6 Wave 4: /report must backfill the in-memory Invest wallet on cold start."""
+
+    def _pending_fx_portfolio(self, now_ms: int) -> PortfolioData:
+        invest = AccountSnapshot(
+            ok=True,
+            account_label="Invest",
+            account_currency="GBP",
+            total_account_value=5000.0,
+            total_cash=2000.0,
+            available_to_trade=1500.0,
+            reserved_cash=500.0,
+        )
+        records = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 50.0,
+                "updated_at_ms": now_ms,
+                "updated_at_uk": "2026-11-19 08:00",
+                "source": "manual",
+            }
+        }
+        pending = reconcile_invest_wallets(invest, records, None)
+        return PortfolioData(
+            fetched_at_uk="2026-11-19 08:01",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_cash=1000.0, total_account_value=1000.0),
+            invest=pending,
+            total_combined_value=6000.0,
+            total_combined_cash=3000.0,
+        )
+
+    async def _run_report(self, t212, tmp_name: str) -> list[dict]:
+        from tests.test_db_and_end_to_end import _FakeMarketData, _RecordingLLM
+        from src.agents.report_agent import generate_morning_report
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / tmp_name)
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+                models={"enable_forced_search_grounding": False},
+                strategy=StrategySection(deployment_gate_mode="off"),
+            )
+            md = _FakeMarketData()
+            llm = _RecordingLLM()
+            try:
+                await generate_morning_report(cfg, t212, md, llm, db)
+            finally:
+                await md.close()
+                await db.close()
+        return llm.calls
+
+    async def test_refresh_portfolio_fx_removes_pending_fx_before_bull_prompt(self) -> None:
+        import time as _time
+
+        now_ms = int(_time.time() * 1000)
+        portfolio = self._pending_fx_portfolio(now_ms)
+        records = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 50.0,
+                "updated_at_ms": now_ms,
+                "updated_at_uk": "2026-11-19 08:00",
+                "source": "manual",
+            }
+        }
+
+        class _ColdStartT212(T212Client):
+            def __init__(self) -> None:
+                super().__init__()
+                self._wallet_records = records
+
+            async def get_portfolio(self, use_cache: bool = True, gbp_usd_rate=None) -> PortfolioData:
+                return portfolio
+
+        calls = await self._run_report(_ColdStartT212(), "cold_start_fx.db")
+        analyst = next(c for c in calls if c.get("usage_label") == "report_analyst")
+        prompt = analyst["prompt"]
+        self.assertIn("GBP/USD 1.2750", prompt)
+        self.assertIn("£1,764.71", prompt)
+        self.assertNotIn("暂缺", prompt)
+        self.assertNotIn("待汇率折算", prompt)
+
+    async def test_mock_without_refresh_method_falls_back_to_set_rate(self) -> None:
+        import time as _time
+
+        now_ms = int(_time.time() * 1000)
+        portfolio = self._pending_fx_portfolio(now_ms)
+
+        class _LegacyT212:
+            def __init__(self) -> None:
+                self.rate: float | None = None
+
+            async def get_portfolio(self, use_cache: bool = True, gbp_usd_rate=None) -> PortfolioData:
+                return portfolio
+
+            def set_gbp_usd_rate(self, gbp_usd_rate: float | None) -> None:
+                self.rate = gbp_usd_rate
+
+        legacy = _LegacyT212()
+        await self._run_report(legacy, "legacy_fx.db")
+        self.assertEqual(legacy.rate, 1.2750)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ from src.engine.portfolio_rules import (
     build_report_size_notes,
     evaluate_portfolio,
     format_evaluations_text,
+    resolve_invest_dynamic_rr_floor,
 )
 from src.storage.db import AdvisorDatabase
 
@@ -72,6 +73,62 @@ logger = logging.getLogger("src.agents.report_agent")
 def _facade_attr(name: str, default: Any) -> Any:
     facade = sys.modules.get("src.agents.report_agent")
     return getattr(facade, name, default) if facade is not None else default
+
+
+def _current_cycle_id(db: AdvisorDatabase) -> str | None:
+    """Best-effort current trading cycle id for same-day self-anchoring protection."""
+    getter = getattr(db, "_cycle_id", None)
+    if not callable(getter):
+        return None
+    try:
+        return str(getter() or "").strip() or None
+    except Exception:  # pragma: no cover - defensive only
+        return None
+
+
+async def _fetch_past_lessons(db: AdvisorDatabase, exclude_cycle_date: str | None) -> str:
+    """Load the Memory Log, tolerating mocks/stubs that do not accept the new keyword."""
+    fetch = getattr(db, "get_past_decision_context", None)
+    if not callable(fetch):
+        return ""
+    try:
+        return await fetch(limit=5, exclude_cycle_date=exclude_cycle_date)
+    except TypeError:
+        return await fetch(limit=5)
+
+
+def _build_regime_anchor_text(
+    cfg: AppConfig,
+    gate_preview: dict[str, Any] | None,
+    current_regime: str,
+) -> str:
+    """Deterministic Regime / dynamic R:R anchor prepended to the shared Bull/Bear/PM context."""
+    rr_floor, rr_tier = resolve_invest_dynamic_rr_floor(current_regime, None, cfg.strategy)
+    regime_reason = ""
+    isa_status = "未启用门控"
+    invest_status = "未启用门控"
+    if isinstance(gate_preview, dict):
+        regime_reason = str(gate_preview.get("regime_reason") or "").strip()
+        isa_g = gate_preview.get("isa") or {}
+        inv_g = gate_preview.get("invest") or {}
+        if isinstance(isa_g, dict) and isa_g.get("status"):
+            isa_status = f"{isa_g.get('status')}（{isa_g.get('reason') or '无补充理由'}）"
+        if isinstance(inv_g, dict) and inv_g.get("status"):
+            invest_status = f"{inv_g.get('status')}（{inv_g.get('reason') or '无补充理由'}）"
+    rr_note = "，RISK_ON 右侧领涨 ≥1.6:1 / 常规 ≥2.0:1" if current_regime == "RISK_ON" else ""
+    lines = [
+        "=== 〇、Python 确定性市场状态与动态 R:R 门槛（唯一基准，禁止自行改判） ===",
+        f"当日确定性市场状态 = {current_regime}（{regime_reason or '无补充理由'}）",
+        f"Invest 基础净 R:R 门槛 = ≥{rr_floor:.1f}:1（{rr_tier}{rr_note}）",
+        f"ISA 门控 = {isa_status}",
+        f"Invest 门控 = {invest_status}",
+        (
+            f"硬纪律：Bull/Bear/PM 必须以本段 Python 确定性 Regime（{current_regime}）为唯一基准，"
+            "不得自行改判 Regime；若因突发宏观/事件需更谨慎，仅可显式声明"
+            f"『在 {current_regime} 基础上主动收紧』，不得改称弱市或擅自抬高门槛。"
+        ),
+    ]
+    return "\n".join(lines)
 
 
 def _build_morning_pm_prompt(
@@ -96,7 +153,9 @@ def _build_morning_pm_prompt(
         "你是最终投资组合经理（Portfolio Manager），负责拍板权衡「机会分析师（Bull）」与「独立风控审计官（Bear）」的冲突并输出结构化今日总纲（严格遵守 JSON Schema）。\n"
         "严格去重与排版准则（违反将导致重要信息被截断）：\n"
         "• 对【本地多空证据冲突对照】中列出的标的，必须正面裁决采纳 Bull 还是 Bear 依据，严禁和稀泥。\n"
-        "• `top_actions`【只放现有持仓的 ADD/TRIM/STOP/HOLD】（1~3条）；所有活动挂单的撤改留在 `pending_order_audits`，严禁把 CANCEL_ORDER/MODIFY_ORDER 重复写进 `top_actions`！\n"
+        "• `top_actions`【只放现有持仓的 ADD/TRIM/STOP/HOLD】（1~3条）；所有活动挂单的撤改留在 `pending_order_audits`，严禁把 CANCEL_ORDER/MODIFY_ORDER 重复写进 `top_actions`！"
+        "优先放实质调仓（ADD/TRIM/STOP）；若现有持仓全部观望无调仓，仅输出 1 条 CASH HOLD（或最多 1 条重点监控 HOLD），"
+        "冲突标的的「维持观望裁决」请放入 `flagged_positions` 或 `hold_summary`，严禁用 3 条纯 HOLD 占满行动区。\n"
         "• `core_deployment`【仅对 Python 今日唯一签发的核心宽基政策票据做风控终审】（0~1条，仅 ISA，BUY）："
         "`symbol` 必须等于票据代码，`verdict` 只能填 APPROVE（按上限执行）/ SHRINK（缩减金额）/ DEFER（因重大宏观或事件暂缓）；"
         "票据为空时必须输出空数组 []，严禁自行挑选票据外的任何宽基代码（如 VUAG/IUKD）、严禁放大金额；"
@@ -105,8 +164,8 @@ def _build_morning_pm_prompt(
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
         "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=50字）。\n"
-        # [用户授权调整 v5.5.2] /report 目标篇幅调至 2100~2500 字、安全天花板 2800 字（单消息分账户排版）。
-        "• 全文必须自然完整、逻辑展开，控制在 2100~2500 字左右（绝不可超 2800 字），确保财报预警与操作复盘完整展示。"
+        # [用户授权调整 v5.5.6] 篇幅以各 Schema 字段上限为准，渲染层 Python 控制 <=2800 字。
+        "• 各字段严格遵守 JSON Schema 字数上限、逻辑清晰不缩写，严禁为凑字数重复或注水；最终渲染长度由 Python 控制在 ≤2800 字。"
         "严禁把「撤单」和「吃息」写成因果关系（如“撤X吃息待命”）：未成交限价挂单本就计息，撤单原因只能是追高/超频/盈亏比不足等交易逻辑。"
     )
     if debate_pm_block:
@@ -201,38 +260,13 @@ async def _persist_morning_report_and_audit(
             report_recs = [r for r in all_recs if str(r.get("source") or "") != "core_dca"]
             core_dca_recs = [r for r in all_recs if str(r.get("source") or "") == "core_dca"]
             if report_recs:
-                # 5-day same (account, symbol, action) dedupe: repeating "TRIM X" every
-                # morning would flood the T+20 ledger with 10 highly-correlated records.
-                try:
-                    recent = await db.get_recent_recommendations(limit=200)
-                    cutoff_ms = int(time.time() * 1000) - 5 * 86_400_000
-                    recent_keys = {
-                        (
-                            str(r.get("account") or "").strip().upper(),
-                            str(r.get("symbol") or "").strip().upper(),
-                            str(r.get("action") or "").strip().upper(),
-                        )
-                        for r in recent
-                        if int(r.get("created_at_ms") or 0) >= cutoff_ms
-                    }
-                    report_recs = [
-                        rec
-                        for rec in report_recs
-                        if (
-                            str(rec.get("account") or "").strip().upper(),
-                            str(rec.get("symbol") or "").strip().upper(),
-                            str(rec.get("action") or "").strip().upper(),
-                        )
-                        not in recent_keys
-                    ]
-                except Exception as exc:
-                    logger.debug("report recommendation 5d dedupe lookup skipped: %s", exc)
-            if report_recs:
+                # 5-day cross-source (report <-> pick) atomic dedupe inside SQLite write lock.
                 await db.log_recommendations(
                     report_recs,
                     default_horizon_days=cfg.strategy.settlement_holding_days,
                     source="report",
-                    dedupe_same_day=True,
+                    dedupe_window_days=5,
+                    dedupe_cross_source=True,
                 )
             if core_dca_recs:
                 # Strategic core DCA lives in its own ledger lane so it can never pollute
@@ -286,7 +320,7 @@ async def generate_morning_report(
 
     prev_snap, past_lessons, fact_bundle = await asyncio.gather(
         db.get_previous_snapshot(min_age_hours=4.0),
-        db.get_past_decision_context(limit=5),
+        _fetch_past_lessons(db, _current_cycle_id(db)),
         _assemble_fact_sheet_bundle(portfolio, market_data, cfg, us_only=False, db=db),
     )
     (
@@ -390,11 +424,20 @@ async def generate_morning_report(
             except Exception as exc:
                 logger.debug("Deployment-gate previous-state lookup skipped: %s", exc)
 
-    # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
+    # Feed the latest GBP/USD mid so the CURRENT in-memory portfolio and every downstream
+    # wallet / gate / shared-context view share one rate (cold-start FX backfill, no HTTP).
     if getattr(macro, "gbp_usd", None):
-        set_rate = getattr(t212, "set_gbp_usd_rate", None)
-        if callable(set_rate):
-            set_rate(macro.gbp_usd)
+        refresh_fx = getattr(t212, "refresh_portfolio_fx", None)
+        if callable(refresh_fx):
+            try:
+                portfolio = refresh_fx(portfolio, macro.gbp_usd) or portfolio
+            except Exception as exc:
+                logger.debug("In-place portfolio FX refresh skipped: %s", exc)
+                refresh_fx = None
+        if not callable(refresh_fx):
+            set_rate = getattr(t212, "set_gbp_usd_rate", None)
+            if callable(set_rate):
+                set_rate(macro.gbp_usd)
 
     priority_symbols: list[str] = []
     for sym in held_syms:
@@ -538,9 +581,11 @@ async def generate_morning_report(
         for sym_key, entry in (context_pack.get("symbols") or {}).items():
             if isinstance(entry, dict):
                 entry["evaluations"] = evals_by_sym.get(sym_key, [])
-        context_pack["regime"] = current_regime
+    context_pack["regime"] = current_regime
+    regime_anchor = _build_regime_anchor_text(cfg, gate_preview, current_regime)
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
+        f"{regime_anchor}\n\n"
         f"{wallet_text}\n\n"
         f"=== 一、双账户状态 ===\n"
         f"【Stocks ISA】\n{format_account_overview(portfolio.isa)}\n持仓：\n{format_positions_text(portfolio.isa)}\n\n"
@@ -579,7 +624,7 @@ async def generate_morning_report(
         f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}% 且核心宽基未达标，"
         "只针对【今日核心宽基政策票据】中 Python 唯一签发的代码给出价位/节奏建议，"
         "严禁自行更换代码或放大金额；票据为空时明确建议不下新单；Invest 机动仓严格遵循右侧猎物门控，"
-        "无 R:R≥2:1 强信号时明确维持持币待命，严禁因现金占比高而勉强凑单；\n"
+        "无达到当日动态 R:R 门槛的强信号时明确维持持币待命，严禁因现金占比高而勉强凑单；\n"
         "5. 近 7 日财报事件应对预案。\n"
         "切勿平铺常规正常持仓，仅点名关键标的；以上 FactSheet 与 Step 1 全市场 Google Search 摘要已涵盖全部持仓及挂单的量价、CYQ、目标价、财报日、深度情报与最新新闻，"
         "严禁对已列出数据的持仓重复调用 `inspect_ticker`；仅当文中明确缺失某未入表新代码数据时才允许调用工具。",

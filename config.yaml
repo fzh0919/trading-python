@@ -75,7 +75,7 @@ models:
 
   # [DeepSeek V4.1 Flash 侧车] 仅做 ID 筛选 / 只读语义质检 / 独立周报与盘中快报 / 带原话锚点记忆抽取
   ds_helper_model: "deepseek-flash"
-  ds_helper_thinking_level: "HIGH"
+  ds_helper_thinking_level: "MEDIUM"        # v5.5.6: 轻量 JSON 质检/初筛/开关降为 MEDIUM 控思考 Token 占比
   ds_helper_timeout_seconds: 60.0           # 单次侧车硬超时（超时静默降级回原逻辑）
   ds_pick_prefilter_enabled: true           # /pick 宽漏斗 30 只 -> 8+8 ID 初筛
   ds_semantic_audit_enabled: true           # /report 与 /pick 渲染后只读语义质检（只告警不拦截）
@@ -200,6 +200,8 @@ strategy:
   intraday_move_alert_pct: 3.5
   intraday_isa_move_alert_pct: 5.0    # ISA 价值仓日内噪音过滤阈值（Invest 仍用 3.5%）
   intraday_order_near_pct: 1.5
+  intraday_quiet_cooldown_minutes: 150      # 盘中判定 should_push=false 后的静默冷却（分钟，不占当日推送名额）
+  intraday_quiet_retrigger_delta_pct: 1.5   # 冷却期内现价再额外波动 >=1.5% 立即破除冷却复评
   intraday_fill_receipt_enabled: true   # 挂单成交回执（快照比对 + 历史成交交叉验证，0 额外 API）
 
 # Optional priority symbols (Yahoo Finance symbols, e.g. ["TSM", "AZN.L", "ASML.AS"])

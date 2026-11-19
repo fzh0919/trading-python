@@ -14,9 +14,12 @@ import httpx
 import numpy as np
 import pandas as pd
 
+from src.agents.prompts import build_wallet_context_text
+from src.config import StrategySection
 from src.data_providers.market_data import TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
+    HistoricalDividendItem,
     HistoricalOrderItem,
     HistoricalTransactionItem,
     PendingOrderItem,
@@ -1149,6 +1152,143 @@ class TestWalletSnapshotCompat(unittest.TestCase):
         self.assertIn("外部入金 +500.00 GBP", text)
         self.assertIn("现金利息 +3.40 USD", text)
         self.assertNotIn("503.40 GBP", text)
+
+    def test_interest_detail_rows_are_filtered_but_summary_kept(self) -> None:
+        """v5.5.6: the daily £1~£2 interest dribble must not crowd out real cash events."""
+        now_ms = int(time.time() * 1000)
+
+        def _tx(idx: int, tx_type: str, amount: float, when_ms: int) -> HistoricalTransactionItem:
+            return HistoricalTransactionItem(
+                id=f"tx{idx}",
+                account="Invest",
+                tx_type=tx_type,
+                amount=amount,
+                currency="GBP",
+                date_time=datetime.fromtimestamp(when_ms / 1000, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                date_time_ms=when_ms,
+                uk_time_str="2026-11-18 08:00",
+            )
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-19 09:00",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(ok=True, account_label="ISA"),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                recent_transactions=[
+                    _tx(1, "DEPOSIT", 2000.0, now_ms - 5000),
+                    _tx(2, "TRANSFER", 300.0, now_ms - 4000),
+                    _tx(3, "INTEREST_ON_FREE_CASH", 1.23, now_ms - 3000),
+                    _tx(4, "LENDING_INTEREST", 0.45, now_ms - 2000),
+                ],
+                recent_dividends=[
+                    HistoricalDividendItem(
+                        id="dv1",
+                        account="Invest",
+                        raw_ticker="ULVRl_EQ",
+                        ticker="ULVRl_EQ",
+                        yahoo_symbol="ULVR.L",
+                        name="Unilever",
+                        inst_currency="GBp",
+                        amount=12.5,
+                        currency="GBP",
+                        paid_on="2026-11-18T08:00:00Z",
+                        paid_on_ms=now_ms - 1000,
+                        uk_time_str="2026-11-18 08:00",
+                    )
+                ],
+            ),
+        )
+        text = build_trade_context(portfolio, history_days=30)["cash_flow_summary_text"]
+        header, _, detail = text.partition("\n")
+        # Summary line still carries the full interest total for macro reconciliation.
+        self.assertIn("现金利息", header)
+        self.assertIn("+1.68 GBP", header)  # 1.23 + 0.45
+        # Detail rows keep real cash events, drop the interest noise.
+        self.assertIn("入金", detail)
+        self.assertIn("划转", detail)
+        self.assertIn("派息", detail)
+        self.assertNotIn("现金利息", detail)
+        self.assertNotIn("借券利息", detail)
+
+
+class TestPortfolioFxRefresh(unittest.TestCase):
+    """v5.5.6: cold-start /report must backfill Invest wallets without another HTTP call."""
+
+    def _pending_fx_portfolio(self, now_ms: int) -> PortfolioData:
+        invest = AccountSnapshot(
+            ok=True,
+            account_label="Invest",
+            total_cash=1000.0,
+            available_to_trade=800.0,
+            reserved_cash=200.0,
+        )
+        records = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 50.0,
+                "updated_at_ms": now_ms,
+                "updated_at_uk": "2026-11-19 08:00",
+                "source": "manual",
+            }
+        }
+        invest_pending = reconcile_invest_wallets(invest, records, None)
+        return PortfolioData(
+            fetched_at_uk="2026-11-19 08:01",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_cash=100.0),
+            invest=invest_pending,
+            total_combined_value=1100.0,
+            total_combined_cash=1100.0,
+            gbp_usd_rate=None,
+        )
+
+    def test_refresh_backfills_wallets_and_clears_pending_fx(self) -> None:
+        now_ms = int(time.time() * 1000)
+        portfolio = self._pending_fx_portfolio(now_ms)
+        self.assertEqual(portfolio.invest.wallet_source, "pending_fx")
+        self.assertIsNone(portfolio.invest.gbp_wallet_total)
+        before = build_wallet_context_text(portfolio, StrategySection())
+        self.assertIn("暂缺", before)
+        self.assertIn("待汇率折算", before)
+
+        client = T212Client(isa_key="a", isa_secret="b", invest_key="c", invest_secret="d")
+        client._wallet_records = {
+            "USD": {
+                "available_amount": 250.0,
+                "reserved_amount": 50.0,
+                "updated_at_ms": now_ms,
+                "updated_at_uk": "2026-11-19 08:00",
+                "source": "manual",
+            }
+        }
+        refreshed = client.refresh_portfolio_fx(portfolio, 1.25)
+
+        self.assertEqual(refreshed.gbp_usd_rate, 1.25)
+        self.assertEqual(refreshed.invest.gbp_wallet_total, 760.0)  # 1000 - 300/1.25
+        self.assertEqual(refreshed.invest.wallet_source, "derived_from_total")
+        self.assertEqual(refreshed.invest.total_cash, 1000.0)
+        after = build_wallet_context_text(refreshed, StrategySection())
+        self.assertIn("GBP/USD 1.2500", after)
+        self.assertIn("£760.00", after)
+        self.assertNotIn("暂缺", after)
+        self.assertNotIn("待汇率折算", after)
+        # Pure in-memory re-derivation: no HTTP client was ever constructed.
+        self.assertIsNone(client._client)
+
+    def test_refresh_without_rate_or_wallet_context_returns_portfolio_untouched(self) -> None:
+        now_ms = int(time.time() * 1000)
+        portfolio = self._pending_fx_portfolio(now_ms)
+        client = T212Client(isa_key="a", isa_secret="b", invest_key="c", invest_secret="d")
+        self.assertIs(client.refresh_portfolio_fx(portfolio, None), portfolio)
+
+        client._wallet_records = {}
+        client._db = None
+        self.assertIs(client.refresh_portfolio_fx(portfolio, 1.25), portfolio)
+        self.assertEqual(client.gbp_usd_rate, 1.25)
 
 
 _NOW_MS = 1_763_000_000_000

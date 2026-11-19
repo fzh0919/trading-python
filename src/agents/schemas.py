@@ -126,8 +126,8 @@ class MorningReportDecision(BaseModel):
     core_deployment: list[CoreDeploymentItem] = Field(
         default_factory=list,
         description=(
-            "0~2 条未持有的核心/分散宽基 ETF 新买入（仅 ISA，BUY）；"
-            "核心宽基已达标、现金不足或趋势破位时留空数组；优先低科技 FTSE100/欧洲宽基分散美股科技"
+            "0~1 条（仅对 Python 今日唯一签发的核心宽基政策票据做 APPROVE/SHRINK/DEFER 终审，仅 ISA，BUY；"
+            "无票据时必须输出空数组 []；核心宽基已达标、现金不足或趋势破位时同样留空）"
         ),
     )
     daily_vetoes: list[str] = Field(
@@ -543,6 +543,8 @@ def render_morning_report(
                 f"• [{item.account}] BUY {item.symbol} @ {item.price_zone} · {item.size_hint}"
                 f"{verdict_tag} — {item.reason}"
             )
+    if audit_buckets["ISA"] and (exec_core_items or action_buckets["ISA"]):
+        isa_block.append("【活动挂单裁决】")
     for aud in audit_buckets["ISA"]:
         isa_block.append(_audit_line(aud))
 
@@ -572,9 +574,13 @@ def render_morning_report(
 
     sec1 = "【今日核心行动与挂单裁决】\n" + "\n".join(action_lines)
 
+    veto_items = [
+        str(v).strip().rstrip("。；; ") for v in decision.daily_vetoes[:4] if str(v).strip()
+    ]
+    veto_items = [v for v in veto_items if v]
     veto_str = (
-        "；".join(decision.daily_vetoes[:4])
-        if decision.daily_vetoes
+        "；".join(veto_items)
+        if veto_items
         else "相对基准 VWRP 跟踪，严守 ISA 安全边际 / Invest 动态 R:R 与最小建仓额，不追高。"
     )
     sec2 = (

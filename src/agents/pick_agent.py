@@ -1468,6 +1468,9 @@ async def generate_pick_radar(
                 await db.log_recommendations(
                     tactical_picks,
                     default_horizon_days=cfg.strategy.settlement_holding_days,
+                    source="pick",
+                    dedupe_window_days=5,
+                    dedupe_cross_source=True,
                 )
             if core_picks:
                 await db.log_recommendations(

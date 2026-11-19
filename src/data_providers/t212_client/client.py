@@ -123,6 +123,39 @@ class T212Client(T212HttpMixin):
         """Latest injected GBP/USD mid rate used for Invest wallet derivation."""
         return self._gbp_usd_rate
 
+    def refresh_portfolio_fx(self, portfolio: PortfolioData, gbp_usd_rate: float | None) -> PortfolioData:
+        """Re-apply the latest GBP/USD mid to an already-fetched in-memory portfolio.
+
+        Pure synchronous re-derivation (zero HTTP / DB calls): used by ``/report`` right after
+        the macro fetch so a cold-start portfolio fetched before the FX rate was known stops
+        showing "GBP/USD 暂缺 / GBP 钱包待汇率折算" in the very same cycle.
+        """
+        self.set_gbp_usd_rate(gbp_usd_rate)
+        rate = self._gbp_usd_rate
+        if rate is None or portfolio is None:
+            return portfolio
+        invest = getattr(portfolio, "invest", None)
+        if not (
+            self.invest_multi_currency_enabled
+            and invest is not None
+            and bool(getattr(invest, "ok", False))
+            and (self._wallet_records or self._db is not None)
+        ):
+            return portfolio
+        updated_invest = reconcile_invest_wallets(
+            invest,
+            self._wallet_records,
+            rate,
+            mismatch_warn_gbp=self.wallet_mismatch_warn_gbp,
+            reconcile_warn_days=self.wallet_reconcile_warn_days,
+        ).model_copy(
+            update={
+                "cash_interest_rate_pct": self.cash_interest_rate_pct,
+                "usd_cash_interest_rate_pct": self.usd_cash_interest_rate_pct,
+            }
+        )
+        return portfolio.model_copy(update={"invest": updated_invest, "gbp_usd_rate": rate})
+
     def _resolve_ticker_metadata(
         self,
         raw_ticker: str,

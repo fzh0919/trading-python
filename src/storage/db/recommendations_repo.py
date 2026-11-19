@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from src.storage.db.core import LONDON_TZ
+
+logger = logging.getLogger(__name__)
 
 _RECOMMENDATION_SELECT_COLS = (
     "id, created_at_uk, created_at_ms, account, symbol, action, entry_price, thesis, "
@@ -57,6 +60,8 @@ class RecommendationsRepoMixin:
         default_horizon_days: int = 5,
         source: str = "pick",
         dedupe_same_day: bool = False,
+        dedupe_window_days: int = 0,
+        dedupe_cross_source: bool = False,
     ) -> None:
         if not items:
             return
@@ -83,26 +88,90 @@ class RecommendationsRepoMixin:
             )
             for item in items
         ]
+        window_days = max(0, int(dedupe_window_days or 0))
         async with self._connect(write=True) as db:
-            if dedupe_same_day:
-                cur = await db.execute(
-                    """
-                    SELECT account, symbol, action
-                    FROM pick_recommendations
-                    WHERE source = ? AND substr(created_at_uk, 1, 10) = ?
-                    """,
-                    (default_source, now_uk[:10]),
-                )
+            if window_days > 0:
+                window_ms = window_days * 86_400_000
+                min_ts = min(int(r[1]) for r in rows_to_insert)
+                cutoff_ms = min_ts - window_ms
+                if dedupe_cross_source:
+                    cur = await db.execute(
+                        """
+                        SELECT account, symbol, action, created_at_ms
+                        FROM pick_recommendations
+                        WHERE COALESCE(source, 'pick') != 'core_dca'
+                          AND COALESCE(outcome_status, 'PENDING') != 'SKIPPED'
+                          AND created_at_ms >= ?
+                        """,
+                        (cutoff_ms,),
+                    )
+                else:
+                    cur = await db.execute(
+                        """
+                        SELECT account, symbol, action, created_at_ms
+                        FROM pick_recommendations
+                        WHERE COALESCE(source, 'pick') = ?
+                          AND COALESCE(outcome_status, 'PENDING') != 'SKIPPED'
+                          AND created_at_ms >= ?
+                        """,
+                        (default_source, cutoff_ms),
+                    )
+                existing_ts: dict[tuple[str, str, str], list[int]] = {}
+                for r in await cur.fetchall():
+                    key = (str(r[0]).strip().upper(), str(r[1]).strip().upper(), str(r[2]).strip().upper())
+                    existing_ts.setdefault(key, []).append(int(r[3] or 0))
+                filtered_rows = []
+                for row in rows_to_insert:
+                    key = (str(row[2]).strip().upper(), str(row[3]).strip().upper(), str(row[4]).strip().upper())
+                    ts = int(row[1])
+                    if any(abs(ts - prev_ts) < window_ms for prev_ts in existing_ts.get(key, ())):
+                        continue
+                    filtered_rows.append(row)
+                    existing_ts.setdefault(key, []).append(ts)
+                rows_to_insert = filtered_rows
+                if not rows_to_insert:
+                    return
+            elif dedupe_same_day:
+                dates = sorted({str(r[0])[:10] for r in rows_to_insert if str(r[0])[:10]})
+                placeholders = ",".join("?" for _ in dates) or "?"
+                date_params = dates or [now_uk[:10]]
+                if dedupe_cross_source:
+                    cur = await db.execute(
+                        f"""
+                        SELECT substr(created_at_uk, 1, 10), account, symbol, action
+                        FROM pick_recommendations
+                        WHERE COALESCE(source, 'pick') != 'core_dca'
+                          AND substr(created_at_uk, 1, 10) IN ({placeholders})
+                        """,
+                        tuple(date_params),
+                    )
+                else:
+                    cur = await db.execute(
+                        f"""
+                        SELECT substr(created_at_uk, 1, 10), account, symbol, action
+                        FROM pick_recommendations
+                        WHERE COALESCE(source, 'pick') = ?
+                          AND substr(created_at_uk, 1, 10) IN ({placeholders})
+                        """,
+                        (default_source, *date_params),
+                    )
                 existing = {
-                    (str(r[0]).strip().upper(), str(r[1]).strip().upper(), str(r[2]).strip().upper())
+                    (str(r[0]), str(r[1]).strip().upper(), str(r[2]).strip().upper(), str(r[3]).strip().upper())
                     for r in await cur.fetchall()
                 }
-                rows_to_insert = [
-                    row
-                    for row in rows_to_insert
-                    if (str(row[2]).strip().upper(), str(row[3]).strip().upper(), str(row[4]).strip().upper())
-                    not in existing
-                ]
+                filtered_rows = []
+                for row in rows_to_insert:
+                    key = (
+                        str(row[0])[:10],
+                        str(row[2]).strip().upper(),
+                        str(row[3]).strip().upper(),
+                        str(row[4]).strip().upper(),
+                    )
+                    if key in existing:
+                        continue
+                    filtered_rows.append(row)
+                    existing.add(key)
+                rows_to_insert = filtered_rows
                 if not rows_to_insert:
                     return
             await db.executemany(
@@ -117,10 +186,65 @@ class RecommendationsRepoMixin:
             )
             await db.commit()
 
-    async def get_recent_recommendations(self, limit: int = 10) -> list[dict[str, Any]]:
+    async def dedupe_existing_pending_recommendations(self, window_days: int = 5) -> int:
+        """Idempotently remove duplicate unsettled tactical copies within `window_days`, keeping the earliest row.
+
+        Settled/NOT_FILLED/SKIPPED history and `core_dca` rows are never touched.
+        """
+        window_ms = max(1, int(window_days)) * 86_400_000
+        async with self._connect(write=True) as db:
+            cur = await db.execute(
+                """
+                SELECT id, created_at_ms, account, symbol, action
+                FROM pick_recommendations
+                WHERE COALESCE(source, 'pick') != 'core_dca'
+                  AND (outcome_status IS NULL OR outcome_status = 'PENDING')
+                ORDER BY created_at_ms ASC, id ASC
+                """
+            )
+            rows = await cur.fetchall()
+            last_kept_ms: dict[tuple[str, str, str], int] = {}
+            dup_ids: list[int] = []
+            for row_id, created_at_ms, account, symbol, action in rows:
+                key = (
+                    str(account or "").strip().upper(),
+                    str(symbol or "").strip().upper(),
+                    str(action or "").strip().upper(),
+                )
+                ts = int(created_at_ms or 0)
+                if key in last_kept_ms and (ts - last_kept_ms[key]) < window_ms:
+                    dup_ids.append(int(row_id))
+                else:
+                    last_kept_ms[key] = ts
+            if dup_ids:
+                await db.executemany(
+                    "DELETE FROM pick_recommendations WHERE id = ?",
+                    [(rid,) for rid in dup_ids],
+                )
+                await db.commit()
+                logger.info(
+                    "Deduplicated %d duplicate pending tactical recommendation(s) (%dd window)",
+                    len(dup_ids),
+                    window_days,
+                )
+            return len(dup_ids)
+
+    async def get_recent_recommendations(
+        self,
+        limit: int = 10,
+        *,
+        exclude_core_dca: bool = False,
+        only_core_dca: bool = False,
+    ) -> list[dict[str, Any]]:
+        where_clause = ""
+        if only_core_dca:
+            where_clause = "WHERE COALESCE(source, 'pick') = 'core_dca' "
+        elif exclude_core_dca:
+            where_clause = "WHERE COALESCE(source, 'pick') != 'core_dca' "
         async with self._connect() as db:
             cur = await db.execute(
                 f"SELECT {_RECOMMENDATION_SELECT_COLS} FROM pick_recommendations "
+                f"{where_clause}"
                 "ORDER BY created_at_ms DESC, id DESC LIMIT ?",
                 (limit,),
             )

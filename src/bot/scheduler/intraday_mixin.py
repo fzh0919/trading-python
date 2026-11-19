@@ -554,6 +554,16 @@ class IntradaySentinelJobMixin:
             )
 
         triggered.sort(key=lambda item: item[0], reverse=True)
+        cooldown_map: dict[tuple[str, str], tuple[datetime, float]] = getattr(
+            self, "_intraday_quiet_cooldowns", {}
+        )
+        for stale_key in [k for k in cooldown_map if k[0] != uk_date]:
+            cooldown_map.pop(stale_key, None)
+        quiet_cd_mins = max(0, int(getattr(self.cfg.strategy, "intraday_quiet_cooldown_minutes", 150) or 0))
+        quiet_delta_pct = max(
+            0.0, float(getattr(self.cfg.strategy, "intraday_quiet_retrigger_delta_pct", 1.5) or 0.0)
+        )
+
         max_alerts = 2
         alerts: list[tuple[str, str]] = []
         for _, sym, price, move_pct, order_dist, currency, account_ctx, trigger_reason in triggered:
@@ -562,6 +572,18 @@ class IntradaySentinelJobMixin:
                 break
             if await self._is_job_locked(f"intraday_alert:{sym}", uk_date):
                 continue
+            cd_entry = cooldown_map.get((uk_date, sym))
+            if quiet_cd_mins > 0 and cd_entry is not None:
+                prev_ts, prev_price = cd_entry
+                within_window = (base - prev_ts) < timedelta(minutes=quiet_cd_mins)
+                extra_delta = (
+                    abs(price - prev_price) / prev_price * 100.0
+                    if prev_price > 0 and price > 0
+                    else 0.0
+                )
+                if within_window and (quiet_delta_pct <= 0.0 or extra_delta < quiet_delta_pct):
+                    continue
+            failed = False
             try:
                 text = await generate_intraday_alert(
                     self.cfg,
@@ -581,6 +603,10 @@ class IntradaySentinelJobMixin:
             except Exception as exc:  # noqa: BLE001 - one symbol must never break the scan
                 logger.warning("Intraday alert generation failed for %s: %s", sym, exc)
                 text = None
+                failed = True
             if text:
+                cooldown_map.pop((uk_date, sym), None)
                 alerts.append((sym, text))
+            elif not failed and quiet_cd_mins > 0:
+                cooldown_map[(uk_date, sym)] = (base, float(price))
         return alerts

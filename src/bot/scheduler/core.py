@@ -76,6 +76,7 @@ class TradingScheduler(SettlementJobMixin, WeeklyAuditJobMixin, IntradaySentinel
         self._morning_missed_notified: set[str] = set()
         self.last_job_runs: dict[str, dict[str, str]] = {}
         self._last_intraday_scan_utc: datetime | None = None
+        self._intraday_quiet_cooldowns: dict[tuple[str, str], tuple[datetime, float]] = {}
 
     async def _is_job_locked(self, job_name: str, uk_date: str) -> bool:
         if self._fired_dates.get(job_name) == uk_date:

@@ -483,6 +483,60 @@ class TestIntradaySentinel(_SentinelTestCase):
         self.assertEqual(len(tg.sent), 1)
         self.assertTrue(await self.db.has_scheduler_job_fired("intraday_alert:NVDA", UK_DATE))
 
+    async def test_quiet_verdict_cooldown_suppresses_repoll_until_expiry_or_extra_move(self) -> None:
+        llm = _DsStubLLM('{"should_push": false, "alert_text": ""}')
+        md = _StubMarketData(
+            {"NVDA": _history(100.0, 104.0)},
+            {"NVDA": _bundle("NVDA", 104.0, "USD")},
+        )
+        pos = _position("NVDA", "USD", 104.0, account="Invest")
+        t212 = _StubT212(_portfolio([pos]))
+        tg = _StubTg()
+        sched = TradingScheduler(self.cfg, t212, md, llm, self.db, tg)
+
+        # 1) Initial poll triggers DS -> should_push=false -> quiet cooldown starts, daily push lock untouched.
+        await sched.check_and_run_due_jobs(NOW)
+        ds_calls = [c for c in llm.calls if c.get("usage_label") == "intraday_alert"]
+        self.assertEqual(len(ds_calls), 1)
+        self.assertEqual(ds_calls[0]["thinking_level"], "MEDIUM")
+        self.assertFalse(await self.db.has_scheduler_job_fired("intraday_alert:NVDA", UK_DATE))
+
+        # 2) 35 minutes later (< 150m cooldown) with minor price drift (+0.5% < 1.5% delta): skipped (0 new DS calls).
+        pos.cur_price = 104.5
+        md._bundles["NVDA"] = _bundle("NVDA", 104.5, "USD")
+        md._histories["NVDA"] = _history(100.0, 104.5)
+        await sched.check_and_run_due_jobs(datetime(2026, 11, 17, 15, 35, tzinfo=timezone.utc))
+        ds_calls = [c for c in llm.calls if c.get("usage_label") == "intraday_alert"]
+        self.assertEqual(len(ds_calls), 1)
+
+        # 3) 70 minutes later (still < 150m cooldown), but price drops an extra >=1.5% (104.0 -> 95.0): breaks cooldown!
+        llm.reply = '{"should_push": true, "alert_text": "NVDA 盘中二次急跌破位，建议复核止损。"}'
+        pos.cur_price = 95.0
+        md._bundles["NVDA"] = _bundle("NVDA", 95.0, "USD")
+        md._histories["NVDA"] = _history(100.0, 95.0)
+        await sched.check_and_run_due_jobs(datetime(2026, 11, 17, 16, 10, tzinfo=timezone.utc))
+        ds_calls = [c for c in llm.calls if c.get("usage_label") == "intraday_alert"]
+        self.assertEqual(len(ds_calls), 2)
+        self.assertEqual(len(tg.sent), 1)
+        self.assertTrue(await self.db.has_scheduler_job_fired("intraday_alert:NVDA", UK_DATE))
+
+    async def test_quiet_verdict_cooldown_expires_after_window(self) -> None:
+        llm = _DsStubLLM('{"should_push": false, "alert_text": ""}')
+        md = _StubMarketData(
+            {"NVDA": _history(100.0, 104.0)},
+            {"NVDA": _bundle("NVDA", 104.0, "USD")},
+        )
+        t212 = _StubT212(_portfolio([_position("NVDA", "USD", 104.0, account="Invest")]))
+        tg = _StubTg()
+        sched = TradingScheduler(self.cfg, t212, md, llm, self.db, tg)
+
+        await sched.check_and_run_due_jobs(NOW)
+        self.assertEqual(len([c for c in llm.calls if c.get("usage_label") == "intraday_alert"]), 1)
+
+        # 160 minutes later (> 150m cooldown) with identical price: allowed to re-evaluate once.
+        await sched.check_and_run_due_jobs(datetime(2026, 11, 17, 17, 40, tzinfo=timezone.utc))
+        self.assertEqual(len([c for c in llm.calls if c.get("usage_label") == "intraday_alert"]), 2)
+
 
 class TestSentinelMath(unittest.TestCase):
     def test_move_pct_uses_yesterday_bar_when_live_price_given(self) -> None:

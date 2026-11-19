@@ -240,6 +240,60 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stats["settled_count"], 0)
             self.assertEqual(await db.get_pending_settlements(), [])
 
+    async def test_past_decision_context_excludes_same_cycle_and_truncates_cleanly(self) -> None:
+        """v5.5.6: same-day rerun must not self-anchor, and long conclusions never cut a bracket."""
+        long_conclusion = (
+            "A" * 100 + " | " + "B" * 30 + " (278.6" + " 继续描述剩余内容以确保超过一百四十字边界"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "memory_log.db")
+            await db.init()
+            await db.save_morning_report(
+                "yesterday body",
+                "YESTERDAY 结论：维持 HOLD",
+                cycle_date="2026-11-18",
+            )
+            await db.save_morning_report(
+                "today body",
+                "TODAY-STALE 结论：撤AMT吃息待命",
+                cycle_date="2026-11-19",
+            )
+            await db.save_morning_report(
+                "long body",
+                long_conclusion,
+                cycle_date="2026-11-17",
+            )
+            await db.log_recommendations(
+                [
+                    {
+                        "account": "ISA",
+                        "symbol": "VWRP.L",
+                        "action": "BUY",
+                        "entry_price": 118.0,
+                        "thesis": "归拢核心宽基",
+                    }
+                ],
+                source="pick",
+            )
+
+            text = await db.get_past_decision_context(limit=5, exclude_cycle_date="2026-11-19")
+            self.assertNotIn("TODAY-STALE", text)
+            self.assertIn("YESTERDAY", text)
+            self.assertIn("2026-11-17", text)
+            self.assertIn("VWRP.L", text)
+            self.assertIn("归拢核心宽基", text)
+
+            # Legacy callers keep working, and today's report is still visible without the filter.
+            with_today = await db.get_past_decision_context(limit=5)
+            self.assertIn("TODAY-STALE", with_today)
+
+            # The over-long line is cut at a clause boundary, wired with an ellipsis and no dangling "(".
+            long_line = next(line for line in text.splitlines() if "2026-11-17" in line)
+            self.assertTrue(long_line.endswith("…"), long_line)
+            self.assertNotIn("(278.6", long_line)
+            self.assertNotIn("（", long_line)
+            await db.close()
+
     async def test_recommendation_settlement_idempotency_lessons_and_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = AdvisorDatabase(Path(tmpdir) / "settlement.db")
@@ -433,6 +487,161 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row["symbol"] for row in series], ["NVDA"])
             lessons = await db.get_recent_lessons(limit=10)
             self.assertEqual([row["symbol"] for row in lessons], ["NVDA"])
+            tactical_recent = await db.get_recent_recommendations(limit=10, exclude_core_dca=True)
+            self.assertEqual([row["symbol"] for row in tactical_recent], ["NVDA"])
+            core_recent = await db.get_recent_recommendations(limit=10, only_core_dca=True)
+            self.assertEqual([row["symbol"] for row in core_recent], ["VERG.L"])
+
+    async def test_cross_source_5d_dedupe_and_startup_pending_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "dedupe.db"
+            db = AdvisorDatabase(db_path)
+            await db.init()
+            base_ms = 1_760_000_000_000
+            day_ms = 86_400_000
+
+            # 1) Report writes TRIM AMZN; 5 minutes later /pick tries the same TRIM AMZN -> blocked cross-source.
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-19 07:36",
+                        "created_at_ms": base_ms,
+                        "account": "ISA",
+                        "symbol": "AMZN",
+                        "action": "TRIM",
+                        "entry_price": 267.74,
+                        "thesis": "早报减仓",
+                    }
+                ],
+                source="report",
+                dedupe_window_days=5,
+                dedupe_cross_source=True,
+            )
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-19 07:41",
+                        "created_at_ms": base_ms + 300_000,
+                        "account": "ISA",
+                        "symbol": "AMZN",
+                        "action": "TRIM",
+                        "entry_price": 267.74,
+                        "thesis": "选股重复减仓",
+                    },
+                    {
+                        "created_at_uk": "2026-11-25 07:41",
+                        "created_at_ms": base_ms + 6 * day_ms,
+                        "account": "ISA",
+                        "symbol": "AMZN",
+                        "action": "TRIM",
+                        "entry_price": 270.0,
+                        "thesis": "超5日后再次减仓",
+                    },
+                ],
+                source="pick",
+                dedupe_window_days=5,
+                dedupe_cross_source=True,
+            )
+            # Core DCA lane is isolated and never collides with tactical dedupe.
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-19 07:42",
+                        "created_at_ms": base_ms + 360_000,
+                        "account": "ISA",
+                        "symbol": "ISF.L",
+                        "action": "BUY",
+                        "entry_price": 1025.0,
+                        "thesis": "核心定投",
+                    }
+                ],
+                source="core_dca",
+                dedupe_same_day=True,
+            )
+            tactical_rows = await db.get_recent_recommendations(limit=10, exclude_core_dca=True)
+            self.assertEqual(len(tactical_rows), 2)
+            self.assertEqual([r["thesis"] for r in tactical_rows], ["超5日后再次减仓", "早报减仓"])
+
+            # 2) Seed legacy duplicate PENDING rows (simulating pre-v5.5.6 DB) + a SETTLED row + core_dca.
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-18 17:23",
+                        "created_at_ms": base_ms - day_ms,
+                        "account": "Invest",
+                        "symbol": "CF",
+                        "action": "TRIM",
+                        "entry_price": 116.27,
+                        "thesis": "最早CF",
+                    },
+                    {
+                        "created_at_uk": "2026-11-18 17:28",
+                        "created_at_ms": base_ms - day_ms + 300_000,
+                        "account": "Invest",
+                        "symbol": "CF",
+                        "action": "TRIM",
+                        "entry_price": 116.27,
+                        "thesis": "重复CF1",
+                    },
+                    {
+                        "created_at_uk": "2026-11-19 09:00",
+                        "created_at_ms": base_ms + 100_000,
+                        "account": "Invest",
+                        "symbol": "CF",
+                        "action": "TRIM",
+                        "entry_price": 115.0,
+                        "thesis": "重复CF2",
+                    },
+                ],
+                source="pick",
+            )
+            # Also seed two SETTLED rows on same day to ensure cleanup NEVER deletes settled history.
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-10 10:00",
+                        "created_at_ms": base_ms - 9 * day_ms,
+                        "account": "Invest",
+                        "symbol": "EOG",
+                        "action": "BUY",
+                        "entry_price": 140.0,
+                        "thesis": "已结算1",
+                    },
+                    {
+                        "created_at_uk": "2026-11-10 10:05",
+                        "created_at_ms": base_ms - 9 * day_ms + 300_000,
+                        "account": "Invest",
+                        "symbol": "EOG",
+                        "action": "BUY",
+                        "entry_price": 140.5,
+                        "thesis": "已结算2",
+                    },
+                ],
+                source="pick",
+            )
+            pending_eog = [r for r in await db.get_pending_settlements(limit=50) if r["symbol"] == "EOG"]
+            self.assertEqual(len(pending_eog), 2)
+            for row in pending_eog:
+                await db.settle_recommendation(
+                    row["id"],
+                    benchmark_symbol="SPY",
+                    settled_at_uk="2026-11-18 21:15",
+                    raw_return_pct=2.0,
+                    alpha_pct=1.0,
+                )
+
+            # Re-running init() triggers idempotent startup dedupe.
+            await db.init()
+            cf_rows = [r for r in await db.get_recent_recommendations(limit=20) if r["symbol"] == "CF"]
+            self.assertEqual(len(cf_rows), 1)
+            self.assertEqual(cf_rows[0]["thesis"], "最早CF")
+            # Settled rows and core_dca are untouched.
+            eog_rows = [r for r in await db.get_recent_recommendations(limit=20) if r["symbol"] == "EOG"]
+            self.assertEqual(len(eog_rows), 2)
+            core_rows = await db.get_recent_recommendations(limit=10, only_core_dca=True)
+            self.assertEqual(len(core_rows), 1)
+            # Second call is a no-op (idempotent).
+            self.assertEqual(await db.dedupe_existing_pending_recommendations(window_days=5), 0)
 
     async def test_prune_old_records_preserves_latest_snapshot_and_recent_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -148,7 +148,7 @@ class TestDsSidecarHelpers(unittest.IsolatedAsyncioTestCase):
         parsed = await call_ds_json(cfg, llm, prompt="p", usage_label="pick_prefilter")
         self.assertEqual(parsed, {"keep_isa": []})
         self.assertEqual(llm.calls[0]["model"], "deepseek-flash")
-        self.assertEqual(llm.calls[0]["thinking_level"], "HIGH")
+        self.assertEqual(llm.calls[0]["thinking_level"], "MEDIUM")
 
 
 

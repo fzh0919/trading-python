@@ -159,7 +159,7 @@ def build_investor_profile(
         "③ 理由中须写明资金路径（如「用 USD 钱包免换汇」或「GBP 不足需 USD 换回含损耗」）；"
         "④ Invest 为应税账户，低赔率频繁换仓会侵蚀净收益。"
         "\n"
-        f"• ISA 核心-卫星结构（v5.4.0）：ISA 核心宽基目标占比 ≥{strategy.isa_core_etf_target_pct:.0f}%（统一归拢 {benchmark}），"
+        f"• ISA 核心-卫星结构（v5.5.6）：ISA 核心宽基目标占比 ≥{strategy.isa_core_etf_target_pct:.0f}%（按全球/美股/欧洲/英国四桶宽基政策配置，严禁偏离 Python 政策票据），"
         f"个股卫星硬上限 ≤{strategy.isa_satellite_max_total_pct:.0f}% 且 ≤{strategy.isa_satellite_max_count} 只"
         "（含未成交个股买单）；一旦超限即锁死 ISA 新开个股通道，只准审撤个股买单并把闲钱分批归拢核心宽基；"
         f"存量 <£{min_isa_eq:,.0f} 的历史小额散仓享老仓豁免，只在反弹接近回本/阻力窗顺势归拢，严禁低位急割。\n"

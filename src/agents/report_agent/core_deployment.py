@@ -200,6 +200,15 @@ def _format_core_policy_ticket_block(
         lines.append(header)
         for t in tickets[:1]:
             sym = str(t.get("symbol") or "").strip().upper()
+            ccy = str(t.get("currency") or getattr(bundles.get(sym), "currency", "") or "").strip()
+            is_gbpence = ccy in {"GBp", "GBX"}
+
+            def _fmt_quote(value: Any, *, gbp_ref: bool = False) -> str:
+                txt = f"{float(value):g} {ccy}".strip() if ccy else f"{float(value):g}"
+                if gbp_ref and is_gbpence:
+                    txt += f" (≈£{float(value) / 100.0:.2f})"
+                return txt
+
             parts = [
                 f"• {sym}｜子桶 {t.get('sleeve_label')} {float(t.get('current_pct') or 0.0):.1f}%→目标 "
                 f"{float(t.get('target_pct') or 0.0):.1f}%（上限 {float(t.get('cap_pct') or 0.0):.1f}%）",
@@ -207,11 +216,11 @@ def _format_core_policy_ticket_block(
             ]
             price = t.get("price")
             if price is not None:
-                parts.append(f"现价 {float(price):g}")
+                parts.append(f"现价 {_fmt_quote(price, gbp_ref=True)}")
             if t.get("ma50") is not None:
-                parts.append(f"MA50 {float(t['ma50']):g}")
+                parts.append(f"MA50 {_fmt_quote(t['ma50'])}")
             if t.get("ma200") is not None:
-                parts.append(f"MA200 {float(t['ma200']):g}")
+                parts.append(f"MA200 {_fmt_quote(t['ma200'])}")
             if t.get("drawdown_52w_pct") is not None:
                 parts.append(f"距52w高 {float(t['drawdown_52w_pct']):+.1f}%")
             if t.get("rsi14") is not None:

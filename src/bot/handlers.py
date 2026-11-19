@@ -650,19 +650,26 @@ class AdvisorBot:
             if hasattr(self.db, "get_latest_quant_audit")
             else _empty_audit()
         )
-        stats, lessons, rows, latest_audit = await asyncio.gather(
+        stats, lessons, rows, core_rows, latest_audit = await asyncio.gather(
             self.db.get_recommendation_stats(),
             self.db.get_recent_lessons(limit=3),
-            self.db.get_recent_recommendations(limit=10),
+            self.db.get_recent_recommendations(limit=10, exclude_core_dca=True),
+            self.db.get_recent_recommendations(limit=3, only_core_dca=True),
             audit_coro,
         )
-        if not rows and stats.get("total_count", 0) == 0 and not latest_audit:
+        if (
+            not rows
+            and not core_rows
+            and stats.get("total_count", 0) == 0
+            and stats.get("core_dca_count", 0) == 0
+            and not latest_audit
+        ):
             return "📭 暂无历史选股或调仓记录（运行一次 /pick 后会自动建档）。"
 
         symbols = list(
             dict.fromkeys(
                 str(r["symbol"]).strip()
-                for r in rows
+                for r in (*rows, *core_rows)
                 if r.get("symbol") and str(r["symbol"]).strip().upper() != "CASH"
             )
         )
@@ -679,12 +686,14 @@ class AdvisorBot:
                     if math.isfinite(raw_close) and raw_close > 0:
                         live_prices[sym] = raw_close
 
+        core_dca_cnt = int(stats.get("core_dca_count") or 0)
+        core_suffix = f" | 核心定投归档 {core_dca_cnt} 条" if core_dca_cnt > 0 else ""
         lines = [
             "📊 历史选股后验胜率与 Alpha 看板",
             (
                 f"• 样本总览: 共 {stats['total_count']} 条 "
                 f"(已结算 {stats['settled_count']} | 待结算 {stats['pending_count']} | "
-                f"未成交 {stats.get('not_filled_count', 0)} | 跳过 {stats['skipped_count']})"
+                f"未成交 {stats.get('not_filled_count', 0)} | 跳过 {stats['skipped_count']}){core_suffix}"
             ),
             "• 口径: BUY/ADD 为多头收益；TRIM/STOP/SWAP 为避损收益（价格跌=正确）",
         ]
@@ -755,38 +764,46 @@ class AdvisorBot:
                     f"{str(ls['reflection_lesson'])[:120]}"
                 )
 
+        def _format_rec_line(r: dict[str, Any]) -> str:
+            sym = str(r["symbol"])
+            entry = r.get("entry_price")
+            price_s = f" @ {entry}" if entry is not None else ""
+            status = str(r.get("outcome_status") or "PENDING").upper()
+            cur_p = live_prices.get(sym)
+            if status == "SETTLED":
+                raw_s = f"{r['raw_return_pct']:+.1f}%" if r.get("raw_return_pct") is not None else "N/A"
+                alpha_s = f"{r['alpha_pct']:+.1f}%" if r.get("alpha_pct") is not None else "N/A"
+                cur_s = f" | 现价 {cur_p:.2f}" if cur_p is not None else ""
+                perf_s = f" [已结算: 收益 {raw_s}, Alpha {alpha_s}{cur_s}]"
+            elif status == "NOT_FILLED":
+                perf_s = " [未触价·未成交，已排除出胜率]"
+            elif status == "SKIPPED":
+                perf_s = " [已跳过结算]"
+            elif cur_p is not None and entry is not None and float(entry) > 0:
+                move_pct, unit_mismatch = self._compute_live_move_pct(sym, float(entry), cur_p)
+                if unit_mismatch:
+                    perf_s = f" [待结算 | 现价 {cur_p:.2f} (GBp/GBP量级差异)]"
+                elif move_pct is not None:
+                    perf_s = f" [待结算 | 现价 {cur_p:.2f} ({move_pct:+.1f}%)]"
+                else:
+                    perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
+            elif cur_p is not None:
+                perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
+            else:
+                perf_s = " [待结算]"
+            src_key = str(r.get("source") or "pick").strip().lower()
+            src_tag = {"report": "早报", "pick": "选股", "core_dca": "定投"}.get(src_key, src_key or "选股")
+            return f"• [{r['created_at_uk']}] [{src_tag}] [{r['account']}] {r['action']} {sym}{price_s}{perf_s}：{r['thesis']}"
+
         if rows:
             lines.append("\n【最近 10 条 /pick 与加减仓表现】")
             for r in rows:
-                sym = str(r["symbol"])
-                entry = r.get("entry_price")
-                price_s = f" @ {entry}" if entry is not None else ""
-                status = str(r.get("outcome_status") or "PENDING").upper()
-                cur_p = live_prices.get(sym)
-                if status == "SETTLED":
-                    raw_s = f"{r['raw_return_pct']:+.1f}%" if r.get("raw_return_pct") is not None else "N/A"
-                    alpha_s = f"{r['alpha_pct']:+.1f}%" if r.get("alpha_pct") is not None else "N/A"
-                    cur_s = f" | 现价 {cur_p:.2f}" if cur_p is not None else ""
-                    perf_s = f" [已结算: 收益 {raw_s}, Alpha {alpha_s}{cur_s}]"
-                elif status == "NOT_FILLED":
-                    perf_s = " [未触价·未成交，已排除出胜率]"
-                elif status == "SKIPPED":
-                    perf_s = " [已跳过结算]"
-                elif cur_p is not None and entry is not None and float(entry) > 0:
-                    move_pct, unit_mismatch = self._compute_live_move_pct(sym, float(entry), cur_p)
-                    if unit_mismatch:
-                        perf_s = f" [待结算 | 现价 {cur_p:.2f} (GBp/GBP量级差异)]"
-                    elif move_pct is not None:
-                        perf_s = f" [待结算 | 现价 {cur_p:.2f} ({move_pct:+.1f}%)]"
-                    else:
-                        perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
-                elif cur_p is not None:
-                    perf_s = f" [待结算 | 现价 {cur_p:.2f}]"
-                else:
-                    perf_s = " [待结算]"
-                lines.append(
-                    f"• [{r['created_at_uk']}] [{r['account']}] {r['action']} {sym}{price_s}{perf_s}：{r['thesis']}"
-                )
+                lines.append(_format_rec_line(r))
+
+        if core_rows:
+            lines.append("\n【近期核心宽基定投归档（不计入战术胜率）】")
+            for r in core_rows:
+                lines.append(_format_rec_line(r))
 
         if latest_audit:
             audit_ts = str(latest_audit.get("created_at_uk") or latest_audit.get("audit_date") or "").strip()

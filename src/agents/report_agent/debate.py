@@ -164,11 +164,13 @@ async def _run_named_notes_sequential(
     degraded: list[str] = []
     for name, factory in coro_factories.items():
         remaining = float(timeout_s) - (loop.time() - started)
-        step_budget = min(ceiling, remaining)
-        if step_budget <= 0:
+        # Windows' monotonic clock is quantised (~15.6 ms); treat sub-centisecond leftovers
+        # as exhausted so we never build a coroutine that instantly degrades.
+        if remaining <= 0.01:
             degraded.append(name)
             texts[name] = ""
             continue
+        step_budget = min(ceiling, remaining)
         task = asyncio.ensure_future(factory(step_budget))
         try:
             _, pending = await asyncio.wait({task}, timeout=step_budget)
@@ -258,13 +260,31 @@ def _build_debate_digest_prompt(
         f"=== Bull 对 Bear 的质询 ===\n{bull_rebuttal}\n\n"
         f"=== Bear 对 Bull 的质询 ===\n{bear_rebuttal}\n\n"
         f"=== 本地多空证据冲突对照 ===\n{disagreement_text}\n\n"
-        "按以下四段输出（每段 ≤3 条）：\n"
+        "按以下四段输出（每段 ≤3 条，直接给索引，不要复述双方原话）：\n"
         "1. 存活的多方论点；\n"
         "2. 存活的空方论点；\n"
         "3. 已被驳倒的论点及原因；\n"
-        "4. 仍无证据、需 PM 亲自裁决的冲突。\n"
-        "最后附「关键原文」：挑分歧最大的 2 个标的，各引用双方最关键的一句原话（每句 ≤200 字）。"
+        "4. 仍无证据、需 PM 亲自裁决的冲突。"
     )
+
+
+def _strip_trailing_orphan_markdown(text: str) -> str:
+    """Drop trailing blank lines and lone Markdown/【】 headings left behind by char trimming."""
+    lines = text.splitlines()
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        is_heading = (
+            (len(stripped) > 4 and stripped.startswith("**") and stripped.endswith("**"))
+            or stripped.startswith("#")
+            or (len(stripped) >= 3 and stripped.startswith("【") and stripped.endswith("】"))
+        )
+        if not is_heading:
+            break
+        lines.pop()
+    return "\n".join(lines)
 
 
 def _build_factcheck_prompt(
@@ -470,7 +490,7 @@ async def _run_step2_debate(
         "factcheck": lambda step_budget: llm.generate(
             model=cfg.models.report_neutral_model,
             prompt=_build_factcheck_prompt(
-                fact_sheet=fact_sheet,
+                fact_sheet=shared_context or fact_sheet,
                 bull_rebuttal=r2_texts.get("bull_rebuttal", ""),
                 bear_rebuttal=r2_texts.get("bear_rebuttal", ""),
                 max_chars=factcheck_chars,
@@ -494,7 +514,11 @@ async def _run_step2_debate(
             {name: factory(neutral_timeout) for name, factory in r3_factories.items()},
             timeout_s=r3_budget,
         )
-    result.digest = trim_text_at_line_boundary(r3_texts.get("digest", ""), digest_chars) if r3_texts.get("digest") else ""
+    result.digest = (
+        _strip_trailing_orphan_markdown(trim_text_at_line_boundary(r3_texts.get("digest", ""), digest_chars))
+        if r3_texts.get("digest")
+        else ""
+    )
     result.factcheck = (
         trim_text_at_line_boundary(r3_texts.get("factcheck", ""), factcheck_chars)
         if r3_texts.get("factcheck")

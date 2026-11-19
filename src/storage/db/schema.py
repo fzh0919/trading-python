@@ -363,3 +363,5 @@ class SchemaMixin:
                 ),
             )
             await db.commit()
+        if hasattr(self, "dedupe_existing_pending_recommendations"):
+            await self.dedupe_existing_pending_recommendations(window_days=5)

@@ -1922,7 +1922,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("平均 Alpha: +1.00%", stats_msg)
                 self.assertIn("近期复盘教训", stats_msg)
                 self.assertIn("放量突破均线后胜率高", stats_msg)
-                self.assertIn("BUY MSFT @ 100.0 [待结算 | 现价", stats_msg)
+                self.assertIn("[选股] [Invest] BUY MSFT @ 100.0 [待结算 | 现价", stats_msg)
                 self.assertIn("BUY AZN.L @ 12000.0 [待结算 | 现价", stats_msg)
                 self.assertIn("GBp/GBP量级差异", stats_msg)
                 self.assertNotIn("$", stats_msg)

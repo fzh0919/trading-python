@@ -12,6 +12,24 @@ from src.data_providers.t212_client import PortfolioData
 logger = logging.getLogger("src.storage.db")
 
 
+def _truncate_decision_text(text: str, max_chars: int = 140) -> str:
+    """Trim a decision line at a clause boundary so no half-cut bracket/sentence reaches the PM."""
+    first = (text.splitlines()[0] if text else "").strip()
+    if len(first) <= max_chars:
+        return first
+    head = first[:max_chars]
+    cut = max(head.rfind(sep) for sep in (";", "；", "|"))
+    if cut >= max_chars // 3:
+        head = head[:cut]
+    else:
+        for opener, closer in (("(", ")"), ("（", "）"), ("[", "]")):
+            if head.count(opener) > head.count(closer):
+                idx = head.rfind(opener)
+                if idx > 0:
+                    head = head[:idx]
+    return head.rstrip("。；;，,、|·-— ") + "…"
+
+
 class PortfolioRepoMixin:
     async def save_snapshot(self, portfolio: PortfolioData) -> None:
         cycle_date = self._cycle_id()
@@ -373,16 +391,26 @@ class PortfolioRepoMixin:
         except Exception:
             return [], stale
 
-    async def get_past_decision_context(self, limit: int = 5) -> str:
-        """Brief prior decision log for Portfolio Manager continuity (TradingAgents Memory Log pattern)."""
+    async def get_past_decision_context(
+        self, limit: int = 5, *, exclude_cycle_date: str | None = None
+    ) -> str:
+        """Brief prior decision log for Portfolio Manager continuity (TradingAgents Memory Log pattern).
+
+        ``exclude_cycle_date`` skips the morning report of the current cycle so re-running
+        ``/report`` on the same day never anchors the PM on the stale report it is about to replace.
+        """
+        cycle_filter = str(exclude_cycle_date).strip() if exclude_cycle_date else ""
         lines: list[str] = []
         async with self._connect() as db:
-            cur = await db.execute(
-                "SELECT cycle_date, conclusion_text FROM morning_reports ORDER BY updated_at_ms DESC LIMIT 2"
+            report_sql = (
+                "SELECT cycle_date, conclusion_text FROM morning_reports "
+                + ("WHERE cycle_date != ? " if cycle_filter else "")
+                + "ORDER BY updated_at_ms DESC LIMIT 2"
             )
+            cur = await db.execute(report_sql, (cycle_filter,) if cycle_filter else ())
             for cdate, concl in await cur.fetchall():
                 if concl:
-                    lines.append(f"• [晨报 {cdate}] {str(concl).splitlines()[0][:140]}")
+                    lines.append(f"• [晨报 {cdate}] {_truncate_decision_text(str(concl))}")
             cur = await db.execute(
                 "SELECT created_at_uk, account, symbol, action, entry_price, thesis "
                 "FROM pick_recommendations ORDER BY created_at_ms DESC, id DESC LIMIT ?",

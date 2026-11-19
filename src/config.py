@@ -153,7 +153,7 @@ class ModelsSection(BaseModel):
     search_model: str = "gemini-3.5-flash-lite"
     # DeepSeek V4.1 Flash sidecar (ID filter / read-only linter / independent briefs / quoted memory)
     ds_helper_model: str = "deepseek-flash"
-    ds_helper_thinking_level: ThinkingLevelLiteral = "HIGH"
+    ds_helper_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     ds_helper_timeout_seconds: float = Field(default=60.0, ge=5.0, le=120.0)
     # v5.5.2: DeepSeek think=HIGH peak latency (07:30 UK ≈ 14:30/15:30 CN) routinely reaches
     # 70~110s; keep the read timeout and per-round wait ceiling aligned so 150s is a true hard cap.
@@ -283,6 +283,9 @@ class StrategySection(BaseModel):
     # ISA 价值仓日内噪音过滤阈值（高于 Invest 的 3.5%，避免巴菲特价值仓被日内噪声反复唤醒）
     intraday_isa_move_alert_pct: float = Field(default=5.0, gt=0.0)
     intraday_order_near_pct: float = Field(default=1.5, gt=0.0)
+    # Quiet verdict (should_push=false) cooldown to stop 30-min re-polling loops; broken if price moves >= delta%
+    intraday_quiet_cooldown_minutes: int = Field(default=150, ge=0, le=720)
+    intraday_quiet_retrigger_delta_pct: float = Field(default=1.5, gt=0.0)
     # Pending-order fill receipt: 0-token snapshot diff, cross-verified with order history
     intraday_fill_receipt_enabled: bool = True
 

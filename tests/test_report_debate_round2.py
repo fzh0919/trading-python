@@ -74,12 +74,18 @@ def _cfg(**overrides: Any) -> AppConfig:
     return cfg
 
 
-async def _run(cfg: AppConfig, llm: _DebateLLM, *, fact_sheet: str = "FACT-BASE") -> Any:
+async def _run(
+    cfg: AppConfig,
+    llm: _DebateLLM,
+    *,
+    fact_sheet: str = "FACT-BASE",
+    shared_context: str = "SHARED-CTX",
+) -> Any:
     return await _run_step2_debate(
         cfg=cfg,
         llm=llm,  # type: ignore[arg-type]
         toolkit=_FakeToolkit(),  # type: ignore[arg-type]
-        shared_context="SHARED-CTX",
+        shared_context=shared_context,
         fact_sheet=fact_sheet,
         disagreement_text="DISAGREE-MATRIX",
         analyst_sys="BULL-SYS",
@@ -127,6 +133,7 @@ class TestDebatePrompts(unittest.TestCase):
         )
         self.assertIn("≤900 字", digest)
         self.assertIn("只做索引，不做裁决", digest)
+        self.assertNotIn("关键原文", digest)
         self.assertIn("≤400 字", factcheck)
         self.assertIn("只标记、不判违规", factcheck)
 
@@ -196,6 +203,49 @@ class TestStep2Debate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["r1"]["bull"], "BULL-R1")
         self.assertEqual(payload["r2"]["bull_rebuttal"], "BULL-R2")
         self.assertEqual(payload["r3"]["digest"], "DIGEST")
+
+    async def test_r3_factcheck_uses_full_shared_context_and_digest_has_no_orphan_tail(self) -> None:
+        """v5.5.6: R3 must verify against the SAME full base as Bull/Bear (no false [无据])."""
+        shared = (
+            "SHARED-FULL-CTX\n"
+            "ISA 现金 £12,345.67｜Invest 现金 £8,765.43｜总净值 £210,000\n"
+            "近 7 天 5 笔成交；15 天冷却名单：AMT、PANW\n"
+            "活动挂单：ULVR.L BUY 4900 GBp\n"
+        )
+        llm = _DebateLLM(
+            {
+                "report_analyst": "BULL-R1",
+                "report_auditor": "BEAR-R1",
+                "report_bull_rebuttal": "BULL-R2",
+                "report_bear_rebuttal": "BEAR-R2",
+                # Digest overflows with a lone Markdown heading left by tail trimming.
+                "report_debate_digest": "1. 多方存活\n2. 空方存活\n**关键原文**",
+                "report_debate_factcheck": "未发现无据数字",
+            }
+        )
+        result = await _run(_cfg(), llm, fact_sheet="BARE-FACT-SHEET", shared_context=shared)
+        factcheck_prompt = llm.calls[5]["prompt"]
+        self.assertIn("ISA 现金 £12,345.67", factcheck_prompt)
+        self.assertIn("Invest 现金 £8,765.43", factcheck_prompt)
+        self.assertIn("15 天冷却名单：AMT、PANW", factcheck_prompt)
+        self.assertNotIn("BARE-FACT-SHEET", factcheck_prompt)
+        # The trimmed digest must not end on an orphan Markdown heading.
+        self.assertTrue(result.digest.endswith("空方存活"), result.digest)
+        self.assertNotIn("关键原文", result.digest)
+
+    async def test_r3_factcheck_falls_back_to_fact_sheet_when_shared_context_empty(self) -> None:
+        llm = _DebateLLM(
+            {
+                "report_analyst": "BULL-R1",
+                "report_auditor": "BEAR-R1",
+                "report_bull_rebuttal": "BULL-R2",
+                "report_bear_rebuttal": "BEAR-R2",
+                "report_debate_digest": "DIGEST",
+                "report_debate_factcheck": "FACTCHECK",
+            }
+        )
+        await _run(_cfg(), llm, fact_sheet="BARE-FACT-SHEET", shared_context="")
+        self.assertIn("BARE-FACT-SHEET", llm.calls[5]["prompt"])
 
     async def test_r1_degraded_skips_all_debate_rounds(self) -> None:
         llm = _DebateLLM(

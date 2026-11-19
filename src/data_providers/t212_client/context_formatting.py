@@ -634,7 +634,12 @@ def build_trade_context(
             "LENDING_INTEREST": "借券利息",
         }
         merged_events: list[tuple[int, str]] = []
+        # Top summary line keeps the full 现金利息 totals; the detail list skips the daily
+        # £1~£2 interest dribble so real deposits/withdrawals/dividends get the 6 slots.
+        interest_noise = {"INTEREST_ON_FREE_CASH", "LENDING_INTEREST"}
         for tx in all_tx:
+            if str(getattr(tx, "tx_type", "") or "") in interest_noise:
+                continue
             lbl = tx_label_map.get(tx.tx_type, tx.tx_type)
             merged_events.append(
                 (tx.date_time_ms, f"• [{tx.uk_time_str} UK | {tx.account}·{lbl}] {tx.amount:+,.2f} {tx.currency}")
