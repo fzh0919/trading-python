@@ -39,14 +39,22 @@ class ReportActionItem(BaseModel):
 
 
 class CoreDeploymentItem(BaseModel):
-    """v5.5.1: an un-held core/diversifier wide-base ETF BUY proposed by /report."""
+    """v5.5.1: PM verdict on Python's deterministic core-wide-base policy ticket."""
 
     account: str = Field(default="ISA", description="仅限 ISA（应税 Invest 仅允许派息型核心宽基，且不在本字段新建仓）")
-    symbol: str = Field(description="未持有的核心/分散宽基 ETF 代码，如 ISF.L、VERG.L、VWRL.L")
+    symbol: str = Field(description="必须等于 Python 今日签发的 policy_ticket.symbol（严禁换代码）")
+    verdict: Literal["APPROVE", "SHRINK", "DEFER"] = Field(
+        default="APPROVE",
+        description="APPROVE=按上限执行；SHRINK=缩减金额；DEFER=因重大宏观/事件暂缓（不生成买入指令）",
+    )
     action: Literal["BUY"] = Field(default="BUY", description="固定为 BUY")
+    approved_gbp: float | None = Field(
+        default=None,
+        description="PM 批准的英镑金额；DEFER 时为 0；留空则从 size_hint 提取或回退 Python 建议金额",
+    )
     price_zone: str = Field(description="建议买入价位/区间，如 '35.2-35.6 GBP'")
-    size_hint: str = Field(description="建议金额（如 '£2,000'）或占 ISA 比例（如 '3%'）；必填")
-    reason: str = Field(description="一句话依据：分散美股科技/区域配置或核心宽基未达标（不超过35字）")
+    size_hint: str = Field(description="建议金额（如 '£1,600'）；必填，且不得超过 Python 今日预算上限")
+    reason: str = Field(description="一句话批准/缩减/暂缓依据（不超过35字）")
 
 
 class PendingOrderAuditItem(BaseModel):
@@ -483,11 +491,19 @@ def render_morning_report(
             f"{idx}. [{act.account}] {act.action} {act.symbol}{pz}{size_txt}{note_txt} — {act.reason}"
         )
 
-    if decision.core_deployment:
+    exec_core_items = [
+        item
+        for item in decision.core_deployment
+        if str(getattr(item, "verdict", "APPROVE") or "APPROVE").strip().upper() in {"APPROVE", "SHRINK"}
+    ]
+    if exec_core_items:
         action_lines.append("【核心宽基部署】")
-        for item in decision.core_deployment[:2]:
+        for item in exec_core_items[:1]:
+            verdict = str(getattr(item, "verdict", "APPROVE") or "APPROVE").strip().upper()
+            verdict_tag = " · 缩减" if verdict == "SHRINK" else ""
             action_lines.append(
-                f"• [{item.account}] BUY {item.symbol} @ {item.price_zone} · {item.size_hint} — {item.reason}"
+                f"• [{item.account}] BUY {item.symbol} @ {item.price_zone} · {item.size_hint}"
+                f"{verdict_tag} — {item.reason}"
             )
 
     override_notes = _extract_override_notes(risk_override)
@@ -526,7 +542,7 @@ def render_morning_report(
         if sym_up and sym_up != "CASH":
             covered_syms.add(sym_up)
             covered_syms.add(sym_up.split(".")[0])
-    for dep in decision.core_deployment:
+    for dep in exec_core_items:
         sym_up = dep.symbol.strip().upper()
         if sym_up and sym_up != "CASH":
             covered_syms.add(sym_up)
@@ -571,11 +587,12 @@ def render_pick_report(
     *,
     risk_override: RiskOverrideResult | None = None,
 ) -> str:
-    """Render PickDecision as inverted-pyramid Telegram pick brief strictly <= max_chars."""
-    ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
-    if isinstance(ro_decision, PickDecision):
-        decision = ro_decision
+    """Render PickDecision as inverted-pyramid Telegram pick brief strictly <= max_chars.
 
+    Always renders the caller-supplied `decision` as the source of truth so post-override
+    steps (such as deployment-gate channel filtering) are never clobbered; `risk_override`
+    is used solely to surface guardrail notes.
+    """
     guardrail_notes = _extract_override_notes(risk_override)
     seen_guardrails = set(guardrail_notes)
     for rej in decision.rejected_or_frozen:

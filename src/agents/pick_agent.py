@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
@@ -25,6 +26,7 @@ from src.config import AppConfig
 if TYPE_CHECKING:
     from src.ops_notifier import OpsNotifier
 from src.data_providers.analytics import (
+    classify_etf_distribution_policy,
     compute_correlation_matrix,
     compute_exposure_summary,
     compute_technical_snapshot,
@@ -56,16 +58,17 @@ LONDON_TZ = ZoneInfo("Europe/London")
 _GUARDRAIL_TAG = "[🛡️风控护栏修正]"
 
 # v5.5.1: taxable Invest must never buy accumulating core ETFs (offshore ERI reporting
-# friction); only distributing share classes are allowed there.
+# friction); only distributing share classes are allowed there. VERG.L / CUKX.L are
+# ACCUMULATING share classes — their distributing equivalents are VERX.L / ISF.L.
 _DISTRIBUTING_CORE_ETFS = {
     "VWRL", "VWRL.L",
     "VUSA", "VUSA.L",
+    "IUSA", "IUSA.L",
     "ISF", "ISF.L",
     "VUKE", "VUKE.L",
-    "VERG", "VERG.L",
+    "VERX", "VERX.L",
     "VEUR", "VEUR.L",
     "IMEU", "IMEU.L",
-    "CUKX", "CUKX.L",
 }
 
 
@@ -77,18 +80,29 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
     if isa_g.get("isa_satellite_saturated"):
         lines.append(
             f"• ISA 个股卫星层已饱和（持仓+挂单 {isa_g.get('committed_satellite_count')}只/"
-            f"{float(isa_g.get('committed_satellite_pct') or 0.0):.1f}%）：ISA 赛道只允许宽基 ETF"
-            "（VWRP.L 等），严禁推荐新开 ISA 个股，闲钱归拢核心宽基。"
+            f"{float(isa_g.get('committed_satellite_pct') or 0.0):.1f}%）：ISA 赛道只允许宽基 ETF，"
+            "严禁推荐新开 ISA 个股；核心宽基只能按 Python 政策票据代码执行。"
         )
     if isa_g.get("equity_open") is False:
         lines.append("• ISA 个股通道关闭（退潮期或结构饱和）：严禁推荐 ISA 新开个股。")
     if isa_g.get("etf_open") is False:
         lines.append("• ISA 宽基通道关闭（退潮期未达深跌采集阶梯）：严禁推荐 ISA 新开宽基 ETF。")
     if isa_g.get("prefer_core_diversifier"):
-        lines.append(
-            "• ISA 核心宽基不足且美股科技权重偏高：优先用 FTSE100/欧洲宽基（ISF.L/VERG.L 等）"
-            "分散区域与科技集中度，勿机械只加 VWRP；趋势破位/追高时不得硬凑。"
-        )
+        plan = isa_g.get("core_allocation_plan") if isinstance(isa_g.get("core_allocation_plan"), dict) else {}
+        tickets = plan.get("tickets") or []
+        if tickets:
+            t = tickets[0]
+            lines.append(
+                f"• 今日核心宽基政策票据：{t.get('symbol')}（子桶 {t.get('sleeve_label')} "
+                f"{float(t.get('current_pct') or 0.0):.1f}%→目标 {float(t.get('target_pct') or 0.0):.1f}%），"
+                f"金额上限 £{float(t.get('recommended_gbp') or 0.0):,.0f}；"
+                "只能按该代码执行，严禁自行换代码或超额；已持有子桶走 top_actions ADD。"
+            )
+        else:
+            lines.append(
+                "• ISA 核心宽基仍有区域缺口但今日无 Python 政策票据：不得自行挑选宽基代码，"
+                "现金不足/趋势破位/已有挂单时保持等待。"
+            )
     lines.append(
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
@@ -135,6 +149,10 @@ def _apply_gate_channel_constraints(
     pm_g = gate_ctx.get("pm") if isinstance(gate_ctx.get("pm"), dict) else {}
     funding_from = str(inv_g.get("funding_from") or "").strip().upper()
     etf_set = {str(s).strip().upper() for s in (gate_ctx.get("etf_set") or []) if str(s).strip()}
+    core_policy = isa_g.get("core_policy") if isinstance(isa_g.get("core_policy"), dict) else {}
+    core_bucket_by_symbol = (
+        core_policy.get("bucket_by_symbol") if isinstance(core_policy.get("bucket_by_symbol"), dict) else {}
+    )
     buy_actions = {"BUY", "ADD", "SWAP"}
     inv_status = str(inv_g.get("status") or "").strip().upper()
     inv_mode = str(inv_g.get("mode") or "").strip().lower()
@@ -171,23 +189,82 @@ def _apply_gate_channel_constraints(
     kept: list[Any] = []
     notes: list[str] = []
     kept_new_invest: set[str] = set()
+    kept_isa_core = 0
     for item in decision.selected_actions:
         act_up = str(item.action or "").strip().upper()
         sym = item.symbol.strip().upper()
         base = sym.split(".")[0]
         acct = item.account.strip().upper()
+        is_etf = False
+        is_core_etf = False
         if act_up in buy_actions:
             is_etf = _is_etf_action(sym, bundles, etf_set)
             # Themed / dividend / bond ETFs are NOT core wide-base vehicles: in Invest they
             # must obey the same slot, daily-cap and regime channel as single-name equities.
             is_core_etf = bool(is_etf and (sym in etf_set or base in etf_set))
-            if acct == "INVEST" and is_core_etf and sym not in _DISTRIBUTING_CORE_ETFS and base not in _DISTRIBUTING_CORE_ETFS:
-                notes.append(
-                    f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
-                    "应税 Invest 禁止买入累积型核心宽基（离岸 ERI 报税摩擦），"
-                    "仅可买派息型 VWRL.L/ISF.L/VERG.L"
-                )
-                continue
+            bundle = None
+            if bundles:
+                bundle = bundles.get(sym) or bundles.get(base)
+            if acct == "INVEST" and is_etf:
+                dist_policy = classify_etf_distribution_policy(sym, bundle)
+                if is_core_etf and (
+                    dist_policy != "DIST"
+                    and sym not in _DISTRIBUTING_CORE_ETFS
+                    and base not in _DISTRIBUTING_CORE_ETFS
+                ):
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "应税 Invest 仅可买派息型核心宽基（离岸 ERI 报税摩擦），"
+                        "仅可买派息型 VWRL.L/ISF.L/VERX.L/VEUR.L；"
+                        "累计型 VWRP/VERG/CUKX 等严禁买入"
+                    )
+                    continue
+                if not is_core_etf and dist_policy == "ACC":
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "应税 Invest 禁止买入累积型 ETF（CNX1/EQGB/IITU/IBTA 等离岸 ERI 报税摩擦）"
+                    )
+                    continue
+            if acct == "INVEST" and is_core_etf:
+                if (
+                    str(gate_ctx.get("regime") or "").strip().upper() == "RISK_OFF"
+                    and isa_g.get("etf_open") is not True
+                ):
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "RISK_OFF 未达深跌阶梯，Invest 不得新建核心宽基，优先保留现金流"
+                    )
+                    continue
+                if (
+                    float(isa_g.get("deployable_pct") or 0.0) > 15.0
+                    and float(isa_g.get("committed_core_etf_pct") or 0.0)
+                    < float(core_policy.get("core_target_pct") or 60.0)
+                ):
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "免税 ISA 仍有现金与核心缺口，核心宽基优先在 ISA 部署"
+                    )
+                    continue
+            if acct == "ISA" and is_core_etf:
+                if float(isa_g.get("approved_report_core_gbp") or 0.0) > 0.0:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "今日 /report 已安排核心宽基定投，避免同日双通道重复扣减现金"
+                    )
+                    continue
+                bucket = core_bucket_by_symbol.get(sym) or core_bucket_by_symbol.get(base) or ""
+                if bucket == "US_TILT" and core_policy.get("us_tilt_buy_frozen"):
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "美股与标普500敞口已超上限，禁止继续加码标普500宽基"
+                    )
+                    continue
+                if kept_isa_core >= 1:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "单次 /pick 最多保留 1 条 ISA 核心宽基动作"
+                    )
+                    continue
             # PM veto is a hard stop for all new positions (kept as a defence-in-depth
             # check even though generate_pick_radar already returns early).
             if pm_g.get("allow") is False:
@@ -269,6 +346,8 @@ def _apply_gate_channel_constraints(
                     if rem_daily_entries is not None:
                         rem_daily_entries -= 1
                     kept_new_invest.update({sym, base})
+            if acct == "ISA" and is_core_etf:
+                kept_isa_core += 1
         kept.append(item)
 
     if not notes:
@@ -655,6 +734,61 @@ def _collect_high_correlation_symbols(
     return high_corr
 
 
+def _reconcile_pick_headline(
+    decision: PickDecision,
+    *,
+    original_actions: list[Any],
+) -> PickDecision:
+    """Keep PickDecision.headline consistent after Python guardrails intercept actions.
+
+    Prevents semantic-audit violations where the LLM-written headline still promotes
+    a ticker that was subsequently stripped from `selected_actions` by guardrails.
+    """
+    orig_syms = {
+        str(getattr(a, "symbol", "") or "").strip().upper()
+        for a in (original_actions or [])
+        if str(getattr(a, "symbol", "") or "").strip()
+        and str(getattr(a, "symbol", "") or "").strip().upper() != "CASH"
+    }
+    if not orig_syms:
+        return decision
+
+    kept_actions = list(decision.selected_actions or [])
+    kept_syms = {
+        str(getattr(a, "symbol", "") or "").strip().upper()
+        for a in kept_actions
+        if str(getattr(a, "symbol", "") or "").strip()
+        and str(getattr(a, "symbol", "") or "").strip().upper() != "CASH"
+    }
+    intercepted_syms = orig_syms - kept_syms
+    if not intercepted_syms:
+        return decision
+
+    if not kept_actions:
+        return decision.model_copy(update={"headline": "本轮建议均被风控护栏拦截，现金待命"})
+
+    headline_up = str(decision.headline or "").upper()
+    kept_bases = {s.split(".")[0] for s in kept_syms}
+    check_tokens: set[str] = set(intercepted_syms)
+    for sym in intercepted_syms:
+        base = sym.split(".")[0]
+        if base and base not in kept_bases:
+            check_tokens.add(base)
+
+    leaked = any(
+        re.search(rf"(?<![A-Z0-9]){re.escape(tok)}(?![A-Z0-9])", headline_up)
+        for tok in check_tokens
+    )
+    if not leaked:
+        return decision
+
+    parts = [f"{a.account} {a.action} {a.symbol}" for a in kept_actions[:3]]
+    rebuilt = f"风控筛后执行：{' / '.join(parts)}"
+    if len(rebuilt) > 45:
+        rebuilt = rebuilt[:44] + "…"
+    return decision.model_copy(update={"headline": rebuilt})
+
+
 async def _post_screen_validate_decision(
     decision: PickDecision,
     *,
@@ -769,23 +903,52 @@ async def _post_screen_validate_decision(
         final_decision, _gate_notes = _apply_gate_channel_constraints(
             resolved_decision, portfolio, gate_ctx, bundles=all_bundles
         )
+    final_decision = _reconcile_pick_headline(
+        final_decision,
+        original_actions=hydrated_decision.selected_actions,
+    )
     final_text = render_pick_report(
         final_decision,
         max_chars=1000,
         risk_override=override_res,
     )
-    parsed_picks = [
-        {
-            "account": item.account,
-            "symbol": item.symbol,
-            "action": item.action,
-            "entry_price": item.entry_price if item.entry_price > 0 else None,
-            "thesis": item.thesis,
-            "horizon_days": cfg.strategy.settlement_holding_days,
-            "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
+    core_etf_set = {
+        str(s).strip().upper()
+        for s in ((deployment_gate or {}).get("etf_set") or [])
+        if str(s).strip()
+    }
+
+    def _is_core_etf_symbol(symbol: str) -> bool:
+        sym_up = str(symbol or "").strip().upper()
+        return bool(
+            sym_up
+            and (
+                sym_up in core_etf_set
+                or sym_up.split(".")[0] in core_etf_set
+                or normalize_issuer_root(sym_up)
+                in {normalize_issuer_root(s) for s in core_etf_set}
+            )
+        )
+
+    parsed_picks = []
+    for item in final_decision.selected_actions:
+        is_core_dca = _is_core_etf_symbol(item.symbol) and str(item.action or "").strip().upper() in {
+            "BUY",
+            "ADD",
         }
-        for item in final_decision.selected_actions
-    ]
+        parsed_picks.append(
+            {
+                "account": item.account,
+                "symbol": item.symbol,
+                "action": item.action,
+                "entry_price": item.entry_price if item.entry_price > 0 else None,
+                "thesis": item.thesis,
+                "horizon_days": 20 if is_core_dca else cfg.strategy.settlement_holding_days,
+                "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
+                "source": "core_dca" if is_core_dca else "pick",
+                "fill_status": "ASSUMED" if is_core_dca else "",
+            }
+        )
     if llm is not None and not final_text.startswith("⚠️"):
         selected_syms = {
             item.symbol.strip().upper()
@@ -1151,7 +1314,7 @@ async def generate_pick_radar(
         "【六重护栏】：\n"
         f"1. 盈亏比与摩擦：按目标空间扣除交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税 + 买卖价差估算；"
         f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%）计算 R:R，低于 {cfg.strategy.min_rr_ratio:.1f}:1 一律否决；"
-        "R:R 必须给出可复算的数字：每条 action 必须填 `stop_price` 与 `target_price`（标的本地货币数值，禁止只写在 stop_condition / entry_zone 文本里），"
+        "R:R 必须给出可复算的数字：所有个股与非核心主题 ETF 必须填数值 `stop_price` 与 `target_price`（标的本地货币数值，禁止只写在 stop_condition / entry_zone 文本里），"
         "Python 会按 entry_price 与这两个价独立复算，并与分析师目标均值交叉校验（偏离>15% 以均值复核）；"
         f"GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 现金利息仅作等待期保底，不得作为否决理由。\n"
         "2. 穿透科技暴露：结合上下文“穿透后真实科技暴露(估算)”（ETF 隐含科技 + 直接科技个股），加仓后科技因子明显集中的须降级或改用低科技权重宽基。\n"
@@ -1174,8 +1337,10 @@ async def generate_pick_radar(
         "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
         "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
         f"若无个股达到 R:R≥2:1，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%，"
-        f"应优先输出低摩擦核心宽基 ETF（如 VWRP.L / VUAG.L）的分批定投方案：写明具体价位、单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}）与节奏；"
-        "ISA 闲钱优先归拢 VWRP.L；Invest 若门控未开或无 R:R≥2:1 右侧个股，直接令 selected_actions 为空数组 []"
+        "应优先按【今日组合门控约束】的 Python 核心政策票据做分批定投：写明该票据代码的具体价位、"
+        f"单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}，不得超过票据上限）与节奏，严禁自行换代码；"
+        "核心宽基 DCA 的 stop_price/target_price 填 `null` 即可，严禁为宽基编造虚假止损位；"
+        "Invest 若门控未开或无 R:R≥2:1 右侧个股，直接令 selected_actions 为空数组 []"
         "（如需在应税 Invest 配置长期底仓仅可提示派息型 VWRL.L，严禁混买累积型 VWRP.L 造成离岸 ERI 报税摩擦）；"
         "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无 R:R≥2:1 标的，现金待命 + 下一次部署触发条件”，"
         f"严禁默认写“现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
@@ -1246,9 +1411,19 @@ async def generate_pick_radar(
     if not final_text.startswith("⚠️"):
         await db.save_pick_radar(focus_query, research_output, final_text, now_uk)
         if parsed_picks:
-            await db.log_recommendations(
-                parsed_picks,
-                default_horizon_days=cfg.strategy.settlement_holding_days,
-            )
+            tactical_picks = [r for r in parsed_picks if r.get("source") != "core_dca"]
+            core_picks = [r for r in parsed_picks if r.get("source") == "core_dca"]
+            if tactical_picks:
+                await db.log_recommendations(
+                    tactical_picks,
+                    default_horizon_days=cfg.strategy.settlement_holding_days,
+                )
+            if core_picks:
+                await db.log_recommendations(
+                    core_picks,
+                    default_horizon_days=20,
+                    source="core_dca",
+                    dedupe_same_day=True,
+                )
 
     return final_text

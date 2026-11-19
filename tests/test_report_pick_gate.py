@@ -231,6 +231,109 @@ def _real_snapshot_portfolio() -> PortfolioData:
     )
 
 
+def _gentle_core_hist(n: int = 260, base: float = 100.0) -> pd.DataFrame:
+    """Oscillating history: price hugs MA200, mild 52w drawdown, RSI ~50 (no trend guard)."""
+    closes = [round(base + 3.0 * np.sin(i / 9.0) + i * 0.01, 4) for i in range(n)]
+    return _make_hist(closes)
+
+
+def _revised_plan_snapshot_portfolio() -> PortfolioData:
+    """Exact 2026-11-18 18:39 UK live snapshot from the revised v5.5.1 blueprint (§2.1)."""
+    satellite_vals = {
+        "GOOGL": 2067.0, "PANW": 1052.0, "CRWD": 789.0, "VST": 1200.0,
+        "TSLA": 1500.0, "AMZN": 453.0, "UBER": 400.0,
+    }
+    remaining = 19674.23 - sum(satellite_vals.values())
+    isa_equities = [
+        _pos("ISA", sym, sym, value=val, qty=10.0, avg=val / 10.0, cur=val / 10.0,
+             return_pct=0.0, weight_pct=0.0)
+        for sym, val in satellite_vals.items()
+    ]
+    isa_equities.append(
+        _pos("ISA", "MSFT", "MSFT", value=remaining, qty=10.0, avg=remaining / 10.0,
+             cur=remaining / 10.0, return_pct=0.0, weight_pct=0.0)
+    )
+    isa_positions = [
+        _pos("ISA", "VWRP", "VWRP.L", value=11654.06, qty=100.0, avg=116.5406,
+             cur=116.5406, return_pct=0.0, weight_pct=20.33, ccy="GBP"),
+        _pos("ISA", "VUAG", "VUAG.L", value=8277.57, qty=80.0, avg=85.0,
+             cur=103.4696, return_pct=21.72, weight_pct=14.44, ccy="GBP"),
+        _pos("ISA", "IBTA", "IBTA.L", value=305.94, qty=55.0, avg=5.56,
+             cur=5.5625, return_pct=2.13, weight_pct=0.53, ccy="GBP"),
+        *isa_equities,
+    ]
+    isa_pending = [
+        PendingOrderItem(
+            id="p-vwrp-1", account="ISA", raw_ticker="VWRP_LSE_ETF", ticker="VWRP",
+            yahoo_symbol="VWRP.L", name="VWRP", side="BUY", order_type="LIMIT",
+            quantity=25.0, value=3337.50, limit_price=133.50, currency="GBP",
+            time_in_force="GTC",
+        ),
+        PendingOrderItem(
+            id="p-vwrp-2", account="ISA", raw_ticker="VWRP_LSE_ETF", ticker="VWRP",
+            yahoo_symbol="VWRP.L", name="VWRP", side="BUY", order_type="LIMIT",
+            quantity=25.0, value=3405.00, limit_price=136.20, currency="GBP",
+            time_in_force="GTC",
+        ),
+    ]
+    return PortfolioData(
+        fetched_at_uk="2026-11-18 18:39",
+        fetched_at_ms=1763487540000,
+        total_combined_value=71526.78,
+        total_combined_cash=30318.57,
+        isa=AccountSnapshot(
+            ok=True, account_label="ISA", total_account_value=57330.94,
+            investments_value=39911.20, investments_cost=34000.0, unrealized_pnl=2481.23,
+            total_cash=17419.74, available_to_trade=10677.24, reserved_cash=6742.50,
+            cash_ratio_pct=30.38, positions=isa_positions, pending_orders=isa_pending,
+        ),
+        invest=AccountSnapshot(
+            ok=True, account_label="Invest", total_account_value=14195.84,
+            investments_value=1297.01, investments_cost=1192.10, unrealized_pnl=104.91,
+            total_cash=12898.83, available_to_trade=12898.83, reserved_cash=0.0,
+            cash_ratio_pct=90.86,
+            positions=[
+                _pos("Invest", "AMZN", "AMZN", value=1297.01, qty=5.0, avg=238.42,
+                     cur=259.402, return_pct=8.8, weight_pct=9.14, ccy="USD"),
+            ],
+            pending_orders=[
+                PendingOrderItem(
+                    id="p-amzn-stop", account="Invest", raw_ticker="AMZN_US_EQ", ticker="AMZN",
+                    yahoo_symbol="AMZN", name="Amazon", side="SELL", order_type="STOP",
+                    quantity=5.0, value=0.0, stop_price=243.50, currency="USD",
+                    time_in_force="GTC",
+                ),
+            ],
+        ),
+        gbp_usd_rate=1.25,
+    )
+
+
+def _run_revised_snapshot_gate() -> dict:
+    histories = {
+        "SPY": _spy_neutral_hist(),
+        "VWRP.L": _gentle_core_hist(base=116.0),
+        "VUAG.L": _gentle_core_hist(base=103.0),
+        "VERG.L": _gentle_core_hist(base=35.0),
+        "ISF.L": _gentle_core_hist(base=8.2),
+    }
+    bundles = {
+        sym: TickerMarketBundle(symbol=sym, quote_type="ETF", currency="GBP", current_price=price)
+        for sym, price in {
+            "VWRP.L": 116.54, "VUAG.L": 103.47, "VERG.L": 35.20,
+            "ISF.L": 8.20, "IBTA.L": 5.56,
+        }.items()
+    }
+    return evaluate_deployment_gate(
+        portfolio=_revised_plan_snapshot_portfolio(),
+        strategy=StrategySection(),
+        bundles=bundles,
+        histories=histories,
+        macro=_neutral_macro(),
+        universe_etf_symbols=["VWRP.L", "VUAG.L", "SWDA.L", "VERG.L", "ISF.L", "CUKX.L"],
+    )
+
+
 def _run_snapshot_gate(
     portfolio: PortfolioData | None = None,
     *,
@@ -1432,9 +1535,9 @@ class TestPickGateEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         gate = {
             "isa": {"isa_satellite_saturated": True},
-            "invest": {"risk_budget_scale": 0.5, "status": "WAIT", "funding_from": "", "slots_used": 0, "slots_cap": 1},
+            "invest": {"risk_budget_scale": 0.5, "status": "RUN", "funding_from": "", "slots_used": 0, "slots_cap": 1},
             "regime": "NEUTRAL",
-            "global_status": "WAIT",
+            "global_status": "RUN",
         }
         md = _FakeMarketData()
         try:
@@ -2063,7 +2166,8 @@ class TestV551CoreDeployment(unittest.TestCase):
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["symbol"], "VERG.L")
         self.assertEqual(recs[0]["action"], "BUY")
-        self.assertEqual(recs[0]["source"], "report")
+        self.assertEqual(recs[0]["source"], "core_dca")
+        self.assertEqual(recs[0]["horizon_days"], 20)
         self.assertEqual(recs[0]["fill_status"], "ASSUMED")
 
     def test_core_deployment_rejects_non_core_invest_held_and_tiny_tickets(self) -> None:
@@ -2113,35 +2217,44 @@ class TestV551CoreDeployment(unittest.TestCase):
     def test_invest_accumulating_core_blocked_but_distributing_and_isa_allowed(self) -> None:
         portfolio = _real_snapshot_portfolio()
         gate = {
-            "isa": {"etf_open": True, "equity_open": True},
+            "isa": {
+                "etf_open": True, "equity_open": True,
+                "deployable_pct": 5.0, "committed_core_etf_pct": 50.0,
+            },
             "invest": {
-                "status": "RUN", "mode": "targeted", "slots_cap": 2, "slots_used": 0,
-                "daily_cap": 1, "today_new_equity_entries": 0,
+                "status": "RUN", "mode": "targeted", "slots_cap": 10, "slots_used": 0,
+                "daily_cap": 10, "today_new_equity_entries": 0,
             },
             "etf_set": ["VWRP.L", "VERG.L"],
         }
+        bundles = {
+            sym: TickerMarketBundle(symbol=sym, quote_type="ETF", currency="GBP", current_price=10.0)
+            for sym in ("VWRP.L", "VERG.L", "VERX.L", "CUKX.L", "ISF.L", "VWRL.L")
+        }
+
+        def _buy(account: str, symbol: str) -> PickActionItem:
+            return PickActionItem(
+                account=account, symbol=symbol, action="BUY", thesis="测试",
+                entry_zone="10", stop_condition="9", target_window="12", entry_price=10.0,
+            )
+
         decision = PickDecision(
             headline="测试",
             selected_actions=[
-                PickActionItem(
-                    account="Invest", symbol="VWRP.L", action="BUY", thesis="累积型核心宽基",
-                    entry_zone="114", stop_condition="105", target_window="140", entry_price=114.0,
-                ),
-                PickActionItem(
-                    account="Invest", symbol="VERG.L", action="BUY", thesis="派息型欧洲宽基",
-                    entry_zone="35", stop_condition="32", target_window="42", entry_price=35.0,
-                ),
-                PickActionItem(
-                    account="ISA", symbol="VWRP.L", action="BUY", thesis="ISA 累积型核心宽基",
-                    entry_zone="114", stop_condition="105", target_window="140", entry_price=114.0,
-                ),
+                _buy("Invest", "VWRP.L"),   # accumulating -> hard block
+                _buy("Invest", "VERG.L"),   # accumulating -> hard block
+                _buy("Invest", "CUKX.L"),   # accumulating FTSE100 -> hard block
+                _buy("Invest", "VERX.L"),   # distributing Europe ex-UK -> allowed
+                _buy("Invest", "ISF.L"),    # distributing FTSE100 -> allowed
+                _buy("Invest", "VWRL.L"),   # distributing all-world -> allowed
+                _buy("ISA", "VERG.L"),      # ISA accumulating is tax-sheltered -> allowed
             ],
             consistency_and_cash_note="测试",
         )
-        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate)
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate, bundles=bundles)
         kept = [a.symbol for a in hardened.selected_actions]
-        self.assertEqual(kept, ["VERG.L", "VWRP.L"])
-        self.assertTrue(any("累积型" in n for n in notes))
+        self.assertEqual(kept, ["VERX.L", "ISF.L", "VWRL.L", "VERG.L"])
+        self.assertTrue(any("累积型" in n for n in notes) or any("派息型" in n for n in notes))
 
         # The same un-held core ETF can be originated by /report for ISA.
         cfg = self._cfg()
@@ -2154,6 +2267,199 @@ class TestV551CoreDeployment(unittest.TestCase):
         )
         self.assertEqual(core_notes, [])
         self.assertEqual(len(filtered.core_deployment), 1)
+
+
+class TestV551RevisedCorePolicy(unittest.TestCase):
+    """Revised v5.5.1: deterministic four-bucket policy ticket + PM one-way verdicts."""
+
+    def _cfg(self) -> AppConfig:
+        return AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            strategy=StrategySection(deployment_gate_mode="advise"),
+        )
+
+    def _decision_with_ticket(
+        self,
+        *,
+        symbol: str | None = None,
+        verdict: str = "APPROVE",
+        approved_gbp: float | None = None,
+        amount: str = "£1,600",
+        account: str = "ISA",
+    ) -> MorningReportDecision:
+        return MorningReportDecision(
+            headline="核心宽基政策票据审批",
+            top_actions=[
+                ReportActionItem(account="ISA", symbol="CASH", action="HOLD", price_zone="", reason="保留现金")
+            ],
+            core_deployment=[
+                CoreDeploymentItem(
+                    account=account,
+                    symbol=symbol or "VERG.L",
+                    verdict=verdict,
+                    approved_gbp=approved_gbp,
+                    price_zone="34.8-35.4 GBP",
+                    size_hint=amount,
+                    reason="欧洲宽基补缺口",
+                )
+            ],
+            macro_and_cash="现金充足。",
+            account_diagnosis="ISA 核心宽基缺口。",
+            hold_summary="其余持有",
+            trade_review="无",
+        )
+
+    def test_user_2026_11_18_snapshot_freezes_vuag_respects_vwrp_orders_and_tickets_verg_or_isf(self) -> None:
+        gate = _run_revised_snapshot_gate()
+        isa = gate["isa"]
+        policy = isa["core_policy"]
+
+        # 1) VUAG stays inside the 60% denominator; no false liquidation/breach.
+        self.assertAlmostEqual(float(isa["committed_core_etf_pct"]), 46.53, delta=0.15)
+        # 2) US tilt frozen and the two pending VWRP orders already satisfy the 32% anchor floor.
+        self.assertTrue(policy["us_tilt_buy_frozen"])
+        self.assertEqual(float(policy["anchor_gap_pct"]), 0.0)
+        self.assertGreaterEqual(float(policy["excess_us_tilt_pct"]), 10.0)
+        # 3) Only the Europe/UK gaps remain, and exactly one policy ticket is issued.
+        self.assertEqual(policy["priority"][0], "EU_DIVERSIFIER")
+        self.assertGreaterEqual(float(policy["core_total_gap_gbp"]), 7500.0)
+        self.assertLessEqual(float(policy["core_total_gap_gbp"]), 7900.0)
+        plan = isa["core_allocation_plan"]
+        self.assertEqual(len(plan["tickets"]), 1)
+        ticket = plan["tickets"][0]
+        self.assertIn(ticket["symbol"], {"VERG.L", "ISF.L"})
+        self.assertGreaterEqual(float(ticket["recommended_gbp"]), 1000.0)
+        self.assertLessEqual(float(ticket["recommended_gbp"]), 1600.0)
+        # 3b) Post-trade cash stays far above the 5% (£2,867) structural floor.
+        cash_after = float(_revised_plan_snapshot_portfolio().isa.available_to_trade) - float(
+            ticket["recommended_gbp"]
+        )
+        self.assertGreater(cash_after, 57330.94 * 0.05)
+        # 3c) The banner names the deterministic ticket instead of a vague menu.
+        self.assertLessEqual(len(gate["banner"]), 110)
+        self.assertIn(ticket["symbol"], gate["banner"])
+
+    def test_pm_swap_or_inflate_is_blocked_or_clamped_and_defer_is_not_a_buy(self) -> None:
+        portfolio = _revised_plan_snapshot_portfolio()
+        cfg = self._cfg()
+        bundles = {
+            "VERG.L": TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.20),
+            "VUAG.L": TickerMarketBundle(symbol="VUAG.L", quote_type="ETF", currency="GBP", current_price=103.47),
+            "IUKD.L": TickerMarketBundle(symbol="IUKD.L", quote_type="ETF", currency="GBP", current_price=7.0),
+        }
+
+        # PM tries to swap the Python ticket for VUAG / IUKD -> hard intercept.
+        for bad in ("VUAG.L", "IUKD.L"):
+            gate = _run_revised_snapshot_gate()
+            filtered, notes = _validate_core_deployment(
+                self._decision_with_ticket(symbol=bad), portfolio, cfg, gate, bundles
+            )
+            self.assertEqual(filtered.core_deployment, [])
+            self.assertTrue(any("严禁换代码" in n for n in notes), notes)
+
+        # PM tries to inflate £8,000 -> clamped down to ticket.recommended_gbp.
+        gate = _run_revised_snapshot_gate()
+        ticket = gate["isa"]["core_allocation_plan"]["tickets"][0]
+        filtered, notes = _validate_core_deployment(
+            self._decision_with_ticket(
+                symbol=ticket["symbol"], approved_gbp=8000.0, amount="£8,000"
+            ),
+            portfolio,
+            cfg,
+            gate,
+            bundles,
+        )
+        self.assertEqual(len(filtered.core_deployment), 1)
+        self.assertAlmostEqual(float(filtered.core_deployment[0].approved_gbp), float(ticket["recommended_gbp"]))
+        self.assertEqual(filtered.core_deployment[0].size_hint, f"£{float(ticket['recommended_gbp']):,.0f}")
+        self.assertTrue(any("钳位" in n for n in notes))
+        self.assertAlmostEqual(
+            float(gate["isa"]["approved_report_core_gbp"]), float(ticket["recommended_gbp"])
+        )
+
+        # PM DEFER -> no BUY, no T+N ledger row.
+        gate = _run_revised_snapshot_gate()
+        deferred, notes = _validate_core_deployment(
+            self._decision_with_ticket(symbol=ticket["symbol"], verdict="DEFER", approved_gbp=0.0),
+            portfolio,
+            cfg,
+            gate,
+            bundles,
+        )
+        self.assertEqual(deferred.core_deployment, [])
+        self.assertTrue(any("DEFER" in n for n in notes))
+        self.assertEqual(_build_report_recommendations(deferred, portfolio, bundles, cfg), [])
+        text = render_morning_report(deferred, max_chars=1800)
+        self.assertNotIn("BUY " + ticket["symbol"], text)
+
+    def test_approved_ticket_enters_core_dca_ledger_and_blocks_same_day_pick(self) -> None:
+        portfolio = _revised_plan_snapshot_portfolio()
+        cfg = self._cfg()
+        bundles = {
+            "VERG.L": TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=35.20),
+            "ISF.L": TickerMarketBundle(symbol="ISF.L", quote_type="ETF", currency="GBP", current_price=8.20),
+        }
+        gate = _run_revised_snapshot_gate()
+        ticket = gate["isa"]["core_allocation_plan"]["tickets"][0]
+        filtered, _notes = _validate_core_deployment(
+            self._decision_with_ticket(symbol=ticket["symbol"]), portfolio, cfg, gate, bundles
+        )
+        recs = _build_report_recommendations(filtered, portfolio, bundles, cfg)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["source"], "core_dca")
+        self.assertEqual(recs[0]["horizon_days"], 20)
+        self.assertEqual(recs[0]["fill_status"], "ASSUMED")
+
+        # Same-day /pick cannot spend the same ISA cash a second time.
+        pick = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol=ticket["symbol"], action="BUY", thesis="同日宽基",
+                    entry_zone="35", stop_condition="32", target_window="42", entry_price=35.2,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(pick, portfolio, gate, bundles=bundles)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertTrue(any("/report 已安排" in n for n in notes), notes)
+
+        # A fresh gate with no /report approval still freezes VUAG (US tilt) and caps ISA core at 1.
+        fresh = _run_revised_snapshot_gate()
+        fresh["isa"]["approved_report_core_gbp"] = 0.0
+        vuag_pick = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="VUAG.L", action="BUY", thesis="标普加码",
+                    entry_zone="103", stop_condition="95", target_window="120", entry_price=103.47,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(vuag_pick, portfolio, fresh, bundles=bundles)
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertTrue(any("标普500" in n for n in notes), notes)
+
+        two_core = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA", symbol="VERG.L", action="BUY", thesis="欧洲",
+                    entry_zone="35", stop_condition="32", target_window="42", entry_price=35.2,
+                ),
+                PickActionItem(
+                    account="ISA", symbol="ISF.L", action="BUY", thesis="英国",
+                    entry_zone="8", stop_condition="7.5", target_window="10", entry_price=8.2,
+                ),
+            ],
+            consistency_and_cash_note="测试",
+        )
+        hardened, notes = _apply_gate_channel_constraints(two_core, portfolio, fresh, bundles=bundles)
+        self.assertEqual([a.symbol for a in hardened.selected_actions], ["VERG.L"])
+        self.assertTrue(any("最多保留 1 条" in n for n in notes), notes)
+
 
 
 if __name__ == "__main__":

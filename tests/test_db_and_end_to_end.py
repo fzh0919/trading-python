@@ -716,7 +716,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     [
                         ("report_analyst", "gemini-4-hydrogen", "HIGH"),
                         ("report_auditor", "gemini-4-hydrogen", "HIGH"),
-                        ("report_pm", "gemini-4-carbon", "HIGH"),
+                        ("report_pm", "gemini-4-neon", "HIGH"),
                     ],
                 )
                 self.assertTrue(
@@ -762,7 +762,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("GBP/USD 1.2750", us_call["prompt"])
                 self.assertIn("USD $400.00", us_call["prompt"])
 
-                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Hydrogen HIGH), <= 1000 chars
+                # 5. /pick inherits /report guardrails, runs forced grounding + 2 calls (Hydrogen HIGH -> Neon MEDIUM), <= 1000 chars
                 calls_before = len(llm.calls)
                 await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/pick 英国ETF"}}, wait=True)
                 pick_calls = llm.calls[calls_before:]
@@ -774,7 +774,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     [(c["usage_label"], c["model"], c["thinking_level"]) for c in pick_pipeline],
                     [
                         ("pick_researcher", "gemini-4-hydrogen", "HIGH"),
-                        ("pick_critic", "gemini-4-hydrogen", "HIGH"),
+                        ("pick_critic", "gemini-4-neon", "MEDIUM"),
                     ],
                 )
                 self.assertIn("Invest半导体占比超限", pick_pipeline[0]["prompt"])

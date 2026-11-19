@@ -169,9 +169,9 @@ class TestStep2Debate(unittest.IsolatedAsyncioTestCase):
         for call in llm.calls[2:]:
             self.assertEqual(call["model"], "deepseek-flash")
             self.assertEqual(call["thinking_level"], "HIGH")
-        self.assertEqual(llm.calls[2]["max_output_tokens"], 4096)
-        self.assertEqual(llm.calls[4]["max_output_tokens"], 2048)
-        self.assertEqual(llm.calls[5]["max_output_tokens"], 1024)
+        self.assertEqual(llm.calls[2]["max_output_tokens"], 16384)
+        self.assertEqual(llm.calls[4]["max_output_tokens"], 8192)
+        self.assertEqual(llm.calls[5]["max_output_tokens"], 8192)
 
         # PM payload stores the transcript but only the index is exposed for injection.
         payload = result.payload

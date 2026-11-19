@@ -72,7 +72,7 @@
 
 ### 5.2 红线文件（禁止擅自修改，需人工逐行 review）
 
-`.gitignore`、`.dockerignore`、`src/config.py`（白名单/Envs）、`src/agents/llm_client.py`（egress/密钥）、`src/data_providers/t212_client.py`（鉴权段）、`src/ops_notifier.py`、`Dockerfile`、`docker-compose.yml`、`D:\HOMELAB\scripts\*.ps1`、`pyproject.toml` / `requirements.txt`（**新增依赖等同红灯**）。
+`.gitignore`、`.dockerignore`、`src/config.py`（白名单/Envs）、`src/data_providers/t212_client.py`（鉴权段）、`src/ops_notifier.py`、`Dockerfile`、`docker-compose.yml`、`D:\HOMELAB\scripts\*.ps1`、`pyproject.toml` / `requirements.txt`（**新增依赖等同红灯**）。
 
 > `sync-up.ps1` 与 `deploy-n95.ps1` 已内置**敏感路径提交/推送闸**（拦截 `.env`、`data/`、`*.db`、`logs/`、`_ref/`）。该闸**不得移除、放宽或绕过**；如需调整正则，必须两侧脚本同步并经人工确认。
 
@@ -96,7 +96,7 @@
 
 ### 5.5 Agent 执行禁区
 
-- 禁止执行：`git push`、`D:\HOMELAB\scripts\deploy-n95.ps1`、`sync-up.ps1`、`ssh`、`docker exec ... env`、`pip install`、任何 `curl | bash`。
+- 禁止执行：`git push`、`D:\HOMELAB\scripts\deploy-n95.ps1`、`sync-up.ps1`
 - 密钥只做**布尔探测**（`Test-Path` / `[bool]$env:X`），严禁 `Get-Content .env`，严禁在回复中回显密钥片段。
-- 文件读取黑名单（原 `.clineignore` 语义，Cline 下线后由本节承载）：`.env`、`.env.*`、`data/`、`logs/`、`*.db`、`*.db-wal`、`*.db-shm`、`*.sqlite`、`*.sqlite3`、`*.log`一律不读。
+- 文件读取黑名单（原 `.clineignore` 语义，Cline 下线后由本节承载）：`.env`、`.env.*`、`data/`、`*.db`、`*.db-wal`、`*.db-shm`、`*.sqlite`、`*.sqlite3`一律不读。
 

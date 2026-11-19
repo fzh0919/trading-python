@@ -2617,6 +2617,131 @@ class TestStage2PenetrationAndSizing(unittest.TestCase):
         )
         self.assertAlmostEqual(small_invest["risk_budget_gbp"], 85.0, places=2)
 
+    def test_leveraged_etp_names_never_inherit_core_index_family(self) -> None:
+        from src.data_providers.analytics import infer_etf_index_family
+
+        self.assertIsNone(
+            infer_etf_index_family(
+                "LVER", TickerMarketBundle(symbol="LVER", quote_type="ETF"),
+                name_hint="FTSE 100 3x Daily Leveraged ETP",
+            )
+        )
+        self.assertIsNone(
+            infer_etf_index_family(
+                "SHRT", TickerMarketBundle(symbol="SHRT", quote_type="ETF"),
+                name_hint="S&P 500 2x Inverse Daily",
+            )
+        )
+        # Genuine Europe ex-UK still maps to the Europe broad family.
+        self.assertEqual(infer_etf_index_family("VERX.L"), "Europe Equity (欧洲宽基)")
+        self.assertEqual(infer_etf_index_family("VUKG.L"), "FTSE 100 (英国富时100)")
+
+    def test_distribution_policy_classification_fixes_verg_cukx_tax_trap(self) -> None:
+        from src.data_providers.analytics import classify_etf_distribution_policy
+
+        self.assertEqual(classify_etf_distribution_policy("VERG.L"), "ACC")
+        self.assertEqual(classify_etf_distribution_policy("CUKX.L"), "ACC")
+        self.assertEqual(classify_etf_distribution_policy("VERX.L"), "DIST")
+        self.assertEqual(classify_etf_distribution_policy("ISF.L"), "DIST")
+        self.assertEqual(classify_etf_distribution_policy("VWRL.L"), "DIST")
+        self.assertEqual(classify_etf_distribution_policy("VWRP.L"), "ACC")
+        self.assertEqual(
+            classify_etf_distribution_policy(
+                "ZZZZ.L",
+                TickerMarketBundle(symbol="ZZZZ.L", quote_type="ETF", long_name="Example UCITS ETF (Acc)"),
+            ),
+            "ACC",
+        )
+        self.assertEqual(classify_etf_distribution_policy("ZZZY.L"), "UNKNOWN")
+
+    def test_penetration_counts_googl_panw_crwd_verg_and_flags_unmapped_etf(self) -> None:
+        from src.data_providers.analytics import estimate_penetration_tech_exposure
+        from src.data_providers.t212_client import PortfolioData
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-18 18:39",
+            fetched_at_ms=1763487540000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=20000.0,
+                positions=[
+                    self._pos("ISA", "GOOGL", "USD", 2000.0),
+                    self._pos("ISA", "PANW", "USD", 1000.0),
+                    self._pos("ISA", "CRWD", "USD", 500.0),
+                    self._pos("ISA", "VERG.L", "GBP", 2000.0),
+                    self._pos("ISA", "WEIRD.L", "GBP", 500.0),
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=20000.0,
+        )
+        bundles = {"WEIRD.L": TickerMarketBundle(symbol="WEIRD.L", quote_type="ETF", currency="GBP")}
+        res = estimate_penetration_tech_exposure(portfolio, bundles)
+        # GOOGL must normalise to GOOG instead of being silently dropped.
+        self.assertIn("GOOG", res["direct_positions"])
+        self.assertAlmostEqual(res["direct_value"], 3500.0, places=2)
+        self.assertAlmostEqual(res["etf_implied_value"], 160.0, places=2)  # 8% of VERG.L £2,000
+        self.assertAlmostEqual(res["unmapped_etf_value"], 500.0, places=2)
+
+    def test_core_policy_benchmark_comparison_vs_vwrp(self) -> None:
+        from src.data_providers.analytics import compute_core_policy_benchmark_comparison
+
+        vwrp = _make_hist([100.0 + i * 0.1 for i in range(80)])
+        verg = _make_hist([30.0 + i * 0.09 for i in range(80)])
+        isf = _make_hist([8.0 + i * 0.004 for i in range(80)])
+        vuag = _make_hist([95.0 + i * 0.11 for i in range(80)])
+        res = compute_core_policy_benchmark_comparison(
+            {"VWRP.L": vwrp, "VERG.L": verg, "ISF.L": isf, "VUAG.L": vuag}, lookback_days=60
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res["benchmark_symbol"], "VWRP.L")
+        self.assertEqual(res["lookback_days"], 60)
+        self.assertAlmostEqual(sum(res["weights_used"].values()), 100.0, places=1)
+        self.assertIn("allocation_effect_pct", res)
+        self.assertIsNotNone(res["tracking_error_pct"])
+        # Missing regional legs are re-normalised; a missing benchmark returns None.
+        only_two = compute_core_policy_benchmark_comparison(
+            {"VWRP.L": vwrp, "VERG.L": verg}, lookback_days=60
+        )
+        self.assertEqual(only_two["missing_symbols"], ["ISF.L", "VUAG.L"])
+        self.assertAlmostEqual(only_two["weights_used"]["VWRP.L"], 84.03, places=1)
+        self.assertIsNone(compute_core_policy_benchmark_comparison({"VERG.L": verg}, 60))
+
+    def test_regional_lookthrough_splits_us_uk_europe_ex_uk(self) -> None:
+        from src.data_providers.analytics import estimate_portfolio_regional_lookthrough
+        from src.data_providers.t212_client import PortfolioData
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-18 18:39",
+            fetched_at_ms=1763487540000,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=10000.0,
+                positions=[
+                    self._pos("ISA", "VWRP.L", "GBP", 4000.0),
+                    self._pos("ISA", "VERG.L", "GBP", 2000.0),
+                    self._pos("ISA", "ISF.L", "GBP", 1000.0),
+                    self._pos("ISA", "MSFT", "USD", 2000.0),
+                    self._pos("ISA", "IBTA.L", "GBP", 1000.0),
+                ],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=10000.0,
+        )
+        bundles = {
+            sym: TickerMarketBundle(symbol=sym, quote_type="ETF", currency="GBP")
+            for sym in ("VWRP.L", "VERG.L", "ISF.L", "IBTA.L")
+        }
+        res = estimate_portfolio_regional_lookthrough(portfolio, bundles)
+        self.assertAlmostEqual(res["us_value"], 4520.0, places=2)   # 4000*63% + 2000 MSFT
+        self.assertAlmostEqual(res["uk_value"], 1140.0, places=2)   # 4000*3.5% + 1000 ISF
+        self.assertAlmostEqual(res["eu_ex_uk_value"], 2500.0, places=2)  # 4000*12.5% + 2000 VERG
+        self.assertAlmostEqual(res["excluded_bond_gold_value"], 1000.0, places=2)
+        self.assertGreater(res["equity_us_share_pct"], 50.0)
+        self.assertAlmostEqual(res["isa_uk_pct"], 11.4, places=2)
+
 class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
     """v5.3.2 Stage 2: frequency caps, re-buy cooldown and ISA opportunity-cost replacement."""
 
@@ -3156,6 +3281,130 @@ class TestV534PickBuyGuards(unittest.TestCase):
             **common,
         )
         self.assertIn("今日除息", today_line)
+
+
+class TestV551CoreDcaGuard(unittest.TestCase):
+    """v5.5.1: no more blank R:R exemption — deterministic CORE_DCA_GUARD applies."""
+
+    def _portfolio(self, available_to_trade: float = 10000.0) -> PortfolioData:
+        from src.data_providers.t212_client import PortfolioData
+
+        pos = PositionItem(
+            account="ISA", raw_ticker="VWRP_LSE_ETF", ticker="VWRP", yahoo_symbol="VWRP.L",
+            name="VWRP", inst_currency="GBP", quantity=50.0, avg_price=100.0, cur_price=100.0,
+            current_value=5000.0, total_cost=5000.0, pnl=0.0, fx_impact=0.0,
+            return_pct=0.0, weight_pct=50.0,
+        )
+        return PortfolioData(
+            fetched_at_uk="2026-11-18 18:39",
+            fetched_at_ms=1763487540000,
+            isa=AccountSnapshot(
+                ok=True, account_label="ISA", total_account_value=10000.0,
+                available_to_trade=available_to_trade, positions=[pos],
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=0.0),
+            total_combined_value=10000.0,
+        )
+
+    def _decision(self, symbol: str, account: str = "ISA"):
+        from src.agents.schemas import PickActionItem, PickDecision
+
+        return PickDecision(
+            headline="核心宽基测试",
+            selected_actions=[
+                PickActionItem(
+                    account=account, symbol=symbol, action="BUY", thesis="核心 DCA",
+                    entry_zone="100", stop_condition="null", target_window="null", entry_price=100.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+
+    def _gate(self, bucket: str = "EU_DIVERSIFIER", **policy_overrides) -> dict:
+        policy = {
+            "committed_core_pct": 45.0,
+            "bucket_by_symbol": {"VERG.L": bucket, "VUAG.L": "US_TILT", "ISF.L": "UK_DIVERSIFIER"},
+            "buckets": {
+                bucket: {"committed_pct": 0.0, "cap_pct": 10.0, "target_pct": 8.0},
+            },
+            "us_tilt_buy_frozen": False,
+            "core_target_pct": 60.0,
+        }
+        policy.update(policy_overrides)
+        return {"etf_set": ["VERG.L", "VUAG.L", "ISF.L"], "isa": {"core_policy": policy}}
+
+    def _run(self, decision, gate, portfolio, bundle):
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        return apply_risk_override_guardrail(
+            decision,
+            portfolio=portfolio,
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            bundle_map={decision.selected_actions[0].symbol: bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=16.0),
+            trade_behavior={"partial": True},
+            deployment_gate=gate,
+        )
+
+    def test_us_tilt_freeze_and_sleeve_caps_block_dca(self) -> None:
+        portfolio = self._portfolio()
+        verg = TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=100.0)
+        res = self._run(self._decision("VERG.L"), self._gate(us_tilt_buy_frozen=True), portfolio, verg)
+        self.assertFalse(res.applied)  # Europe not frozen
+
+        vuag = TickerMarketBundle(symbol="VUAG.L", quote_type="ETF", currency="GBP", current_price=100.0)
+        res = self._run(
+            self._decision("VUAG.L"),
+            self._gate(bucket="GLOBAL_ANCHOR", us_tilt_buy_frozen=True),
+            portfolio,
+            vuag,
+        )
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[0].trigger_type, "ACCOUNT_OVERWEIGHT")
+        self.assertIn("标普500", res.overrides[0].reason)
+
+        # Europe sleeve already at its 10% hard cap.
+        capped_gate = self._gate()
+        capped_gate["isa"]["core_policy"]["buckets"]["EU_DIVERSIFIER"]["committed_pct"] = 10.0
+        res = self._run(self._decision("VERG.L"), capped_gate, portfolio, verg)
+        self.assertTrue(res.applied)
+        self.assertIn("硬上限", res.overrides[0].reason)
+
+    def test_isa_cash_floor_blocks_dca(self) -> None:
+        portfolio = self._portfolio(available_to_trade=700.0)  # floor 500 + 400 min order
+        verg = TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=100.0)
+        res = self._run(self._decision("VERG.L"), self._gate(), portfolio, verg)
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[0].trigger_type, "ACCOUNT_OVERWEIGHT")
+        self.assertIn("5% 结构地板", res.overrides[0].reason)
+
+    def test_breakdown_and_overheated_dca_are_blocked(self) -> None:
+        portfolio = self._portfolio()
+        verg = TickerMarketBundle(symbol="VERG.L", quote_type="ETF", currency="GBP", current_price=100.0)
+        gate = self._gate()
+        gate["isa"]["core_allocation_plan"] = {
+            "symbol_metrics": {"VERG.L": {"price": 100.0, "ma200": 120.0, "drawdown_52w_pct": -5.0, "rsi14": 50.0}}
+        }
+        res = self._run(self._decision("VERG.L"), gate, portfolio, verg)
+        self.assertTrue(res.applied)
+        self.assertIn("跌破MA200", res.overrides[0].reason)
+
+        gate = self._gate()
+        gate["isa"]["core_allocation_plan"] = {
+            "symbol_metrics": {"VERG.L": {"price": 100.0, "ma200": 95.0, "drawdown_52w_pct": -5.0, "rsi14": 75.0}}
+        }
+        res = self._run(self._decision("VERG.L"), gate, portfolio, verg)
+        self.assertTrue(res.applied)
+        self.assertIn("RSI14", res.overrides[0].reason)
+
+        # Healthy trend: R:R is exempted and the DCA guard stays silent.
+        gate = self._gate()
+        gate["isa"]["core_allocation_plan"] = {
+            "symbol_metrics": {"VERG.L": {"price": 100.0, "ma200": 95.0, "drawdown_52w_pct": -5.0, "rsi14": 55.0}}
+        }
+        res = self._run(self._decision("VERG.L"), gate, portfolio, verg)
+        self.assertFalse(res.applied)
+        self.assertEqual(len(res.decision.selected_actions), 1)
 
 
 if __name__ == "__main__":

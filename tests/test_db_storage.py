@@ -375,6 +375,65 @@ class TestDbStorageImp03(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stats["avg_raw_return_pct"], 2.25)
             self.assertEqual(stats["avg_alpha_pct"], 1.0)
 
+    async def test_core_dca_is_excluded_from_tactical_stats_and_lessons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "core_dca.db")
+            await db.init()
+            base_ms = 1_760_000_000_000
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-18 07:30",
+                        "created_at_ms": base_ms + 1000,
+                        "account": "ISA",
+                        "symbol": "NVDA",
+                        "action": "BUY",
+                        "entry_price": 180.0,
+                        "thesis": "战术选股",
+                    }
+                ],
+                source="pick",
+            )
+            await db.log_recommendations(
+                [
+                    {
+                        "created_at_uk": "2026-11-18 07:31",
+                        "created_at_ms": base_ms + 2000,
+                        "account": "ISA",
+                        "symbol": "VERG.L",
+                        "action": "BUY",
+                        "entry_price": 35.0,
+                        "thesis": "战略核心 DCA",
+                    }
+                ],
+                source="core_dca",
+                default_horizon_days=20,
+            )
+            pending = {r["symbol"]: r for r in await db.get_pending_settlements()}
+            self.assertEqual(pending["VERG.L"]["horizon_days"], 20)
+            self.assertEqual(pending["VERG.L"]["source"], "core_dca")
+            for sym, alpha in (("NVDA", 3.0), ("VERG.L", -1.0)):
+                await db.settle_recommendation(
+                    pending[sym]["id"],
+                    benchmark_symbol="SPY",
+                    settled_at_uk="2026-11-30 21:15",
+                    raw_return_pct=alpha + 1.0,
+                    alpha_pct=alpha,
+                    reflection_lesson=f"{sym} lesson",
+                )
+
+            stats = await db.get_recommendation_stats()
+            self.assertEqual(stats["total_count"], 1)
+            self.assertEqual(stats["core_dca_count"], 1)
+            self.assertEqual(stats["settled_count"], 1)
+            self.assertEqual(stats["win_rate_pct"], 100.0)
+            self.assertEqual(stats["avg_alpha_pct"], 3.0)
+
+            series = await db.get_settled_outcome_series()
+            self.assertEqual([row["symbol"] for row in series], ["NVDA"])
+            lessons = await db.get_recent_lessons(limit=10)
+            self.assertEqual([row["symbol"] for row in lessons], ["NVDA"])
+
     async def test_prune_old_records_preserves_latest_snapshot_and_recent_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = AdvisorDatabase(Path(tmpdir) / "prune.db")

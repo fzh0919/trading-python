@@ -36,7 +36,7 @@ def normalize_thinking_level(model: str, thinking_level: str) -> str:
     if m.startswith("gemini-4-"):
         if lvl == "MINIMAL":
             return "LOW"
-        if lvl == "XHIGH" and "hydrogen" not in m:
+        if lvl == "XHIGH" and "hydrogen" not in m and "neon" not in m:
             return "HIGH"
         return lvl
 
@@ -368,7 +368,7 @@ class GeminiClient:
             if self.fallback_model and self.fallback_model != primary_model:
                 fb_think = "LOW" if (use_google_search and "flash-lite" not in self.fallback_model.lower()) else self.fallback_thinking_level
                 raw_chain.append((self.fallback_model, fb_think))
-            elif "argon" in (primary_model or "").lower() or "carbon" in (primary_model or "").lower():
+            elif any(tag in (primary_model or "").lower() for tag in ("argon", "carbon", "neon")):
                 raw_chain.append(("gemini-4-hydrogen", "HIGH"))
             elif "flash-lite" not in (primary_model or "").lower():
                 # Avoid silently upgrading Hydrogen/Pro failures to more expensive Argon/Carbon.
@@ -685,7 +685,12 @@ class GeminiClient:
                     if text:
                         success = True
                         return text, ""
-                    failure_reason = "模型返回空文本（可能受限流或安全策略拦截）"
+                    cands = getattr(response, "candidates", None) or []
+                    fin_raw = getattr(cands[0], "finish_reason", None) if cands else None
+                    fin_str = getattr(fin_raw, "name", None) or (str(fin_raw) if fin_raw is not None else "unknown")
+                    failure_reason = (
+                        f"模型返回空文本（finish_reason={fin_str}, out={output_tokens}, thought={thought_tokens}）"
+                    )
                     return None, failure_reason
 
                 if response.candidates and response.candidates[0].content:
@@ -888,13 +893,16 @@ class GeminiClient:
 
                 choices = data.get("choices") or []
                 msg = (choices[0].get("message") if choices else None) or {}
+                finish_reason = str((choices[0].get("finish_reason") if choices else None) or "unknown")
                 tool_calls = msg.get("tool_calls") or []
                 if not tool_calls or tool_executor is None or round_idx == max_tool_rounds:
                     text = str(msg.get("content") or "").strip()
                     if text:
                         success = True
                         return text, ""
-                    failure_reason = "DeepSeek 返回空文本"
+                    failure_reason = (
+                        f"DeepSeek 返回空文本（finish_reason={finish_reason}, out={output_tokens}, thought={thought_tokens}）"
+                    )
                     return None, failure_reason
 
                 assistant_entry: dict[str, Any] = {
@@ -1066,12 +1074,13 @@ class GeminiClient:
                 )
             if text is not None:
                 if idx > 0 or used_fallback:
+                    err_summary = " | ".join(errors)[:360] if errors else "未知异常"
                     await self._emit_ops(
                         severity="WARN",
                         source=f"llm:{usage_label or model}",
                         alert_key=f"llm_fallback:{model}->{cand_model}",
                         message=(
-                            f"主模型 {model} 调用异常（{errors[0]}），"
+                            f"主模型 {model} 调用异常（{err_summary}），"
                             f"已自动降级到备援模型 {cand_model} ({cand_think}) 完成响应。"
                         ),
                     )

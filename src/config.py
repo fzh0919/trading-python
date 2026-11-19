@@ -138,13 +138,13 @@ class ModelsSection(BaseModel):
     # Hybrid Gemini + DeepSeek routing with cross-vendor failover
     report_analyst_model: str = "gemini-4-hydrogen"
     report_auditor_model: str = "gemini-4-hydrogen"
-    report_model: str = "gemini-4-carbon"
+    report_model: str = "gemini-4-neon"
     us_sentinel_model: str = "deepseek-flash"
     us_anomaly_model: str = "gemini-4-hydrogen"
     pick_researcher_model: str = "gemini-4-hydrogen"
-    pick_model: str = "gemini-4-hydrogen"
+    pick_model: str = "gemini-4-neon"
     chat_model: str = "deepseek-flash"
-    chat_deep_model: str = "gemini-4-hydrogen"
+    chat_deep_model: str = "gemini-4-neon"
     fallback_model: str = "gemini-4-hydrogen"
     gemini_fallback_model: str = "gemini-4-hydrogen"
     deepseek_fallback_model: str = "deepseek-flash"
@@ -154,7 +154,7 @@ class ModelsSection(BaseModel):
     # DeepSeek V4.1 Flash sidecar (ID filter / read-only linter / independent briefs / quoted memory)
     ds_helper_model: str = "deepseek-flash"
     ds_helper_thinking_level: ThinkingLevelLiteral = "HIGH"
-    ds_helper_timeout_seconds: float = Field(default=20.0, ge=5.0, le=60.0)
+    ds_helper_timeout_seconds: float = Field(default=40.0, ge=5.0, le=60.0)
     ds_pick_prefilter_enabled: bool = True
     ds_semantic_audit_enabled: bool = True
 
@@ -164,9 +164,9 @@ class ModelsSection(BaseModel):
     us_thinking_level: ThinkingLevelLiteral = "HIGH"
     us_anomaly_thinking_level: ThinkingLevelLiteral = "HIGH"
     pick_researcher_thinking_level: ThinkingLevelLiteral = "HIGH"
-    pick_thinking_level: ThinkingLevelLiteral = "HIGH"
+    pick_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     chat_thinking_level: ThinkingLevelLiteral = "HIGH"
-    chat_deep_thinking_level: ThinkingLevelLiteral = "HIGH"
+    chat_deep_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
     gemini_fallback_thinking_level: ThinkingLevelLiteral = "MEDIUM"
     deepseek_fallback_thinking_level: ThinkingLevelLiteral = "HIGH"
@@ -195,7 +195,7 @@ class ModelsSection(BaseModel):
     report_debate_model: str = "deepseek-flash"
     report_debate_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_debate_max_chars: int = Field(default=2400, ge=600, le=6000)
-    report_debate_max_output_tokens: int = Field(default=4096, ge=512, le=32768)
+    report_debate_max_output_tokens: int = Field(default=16384, ge=512, le=32768)
     report_neutral_model: str = "deepseek-flash"
     report_neutral_thinking_level: ThinkingLevelLiteral = "HIGH"
     report_neutral_digest_max_chars: int = Field(default=900, ge=300, le=3000)

@@ -13,13 +13,13 @@ models:
   # [混合路由 + 双向灾备] 搜索与核心决策留 Gemini，日常单聊 / 平稳 /us / T+5 反思用 DeepSeek V4.1 Flash (HIGH)
   report_analyst_model: "gemini-4-hydrogen"         # /report Step 2A 机会分析
   report_auditor_model: "gemini-4-hydrogen"         # /report Step 2B Bear 挑刺审计官 (HIGH)
-  report_model: "gemini-4-carbon"                   # /report Step 3 PM 拍板 (旗舰推理 HIGH)
+  report_model: "gemini-4-neon"                     # /report Step 3 PM 拍板 (金融最优性价比 HIGH)
   us_sentinel_model: "deepseek-flash"               # /us 平稳日哨兵 (HIGH)
   us_anomaly_model: "gemini-4-hydrogen"             # /us 触发异动门控时自动切入高阶模型
   pick_researcher_model: "gemini-4-hydrogen"        # /pick Stage 1 投研探测
-  pick_model: "gemini-4-hydrogen"                   # /pick Stage 2 风控官终审拍板
+  pick_model: "gemini-4-neon"                       # /pick Stage 2 风控官终审拍板 (MEDIUM)
   chat_model: "deepseek-flash"                      # Telegram 日常单聊 & 盘后 T+5 反思
-  chat_deep_model: "gemini-4-hydrogen"              # /deep 深度单聊升级模型
+  chat_deep_model: "gemini-4-neon"                  # /deep 深度单聊升级模型 (MEDIUM)
   fallback_model: "gemini-4-hydrogen"               # Gemini 节点同厂降级备援模型
   gemini_fallback_model: "gemini-4-hydrogen"        # DeepSeek 故障时切回 Gemini 备援模型
   deepseek_fallback_model: "deepseek-flash"         # Gemini 故障时跨厂商兜底模型（非搜索节点）
@@ -33,9 +33,9 @@ models:
   us_thinking_level: "HIGH"                         # /us 平稳日 DeepSeek 保持 HIGH（不用 LOW）
   us_anomaly_thinking_level: "HIGH"                 # /us 异动日 Gemini 保持 HIGH
   pick_researcher_thinking_level: "HIGH"            # 选股初研保持 HIGH 深度挖掘
-  pick_thinking_level: "HIGH"
+  pick_thinking_level: "MEDIUM"                     # Neon 终审用 MEDIUM 兼顾金融精度与成本
   chat_thinking_level: "HIGH"                       # 日常单聊与 T+5 反思均用 DeepSeek HIGH
-  chat_deep_thinking_level: "HIGH"                  # /deep 单聊深度思考
+  chat_deep_thinking_level: "MEDIUM"                # /deep 单聊 Neon MEDIUM 深度思考
   fallback_thinking_level: "HIGH"
   gemini_fallback_thinking_level: "MEDIUM"          # DeepSeek 故障切回 Hydrogen MEDIUM
   deepseek_fallback_thinking_level: "HIGH"          # Gemini 故障切入 DeepSeek HIGH
@@ -60,7 +60,7 @@ models:
   report_debate_model: "deepseek-flash"
   report_debate_thinking_level: "HIGH"
   report_debate_max_chars: 2400
-  report_debate_max_output_tokens: 4096
+  report_debate_max_output_tokens: 16384
   report_neutral_model: "deepseek-flash"
   report_neutral_thinking_level: "HIGH"
   report_neutral_digest_max_chars: 900
@@ -71,7 +71,7 @@ models:
   # [DeepSeek V4.1 Flash 侧车] 仅做 ID 筛选 / 只读语义质检 / 独立周报与盘中快报 / 带原话锚点记忆抽取
   ds_helper_model: "deepseek-flash"
   ds_helper_thinking_level: "HIGH"
-  ds_helper_timeout_seconds: 20.0           # 单次侧车硬超时（超时静默降级回原逻辑）
+  ds_helper_timeout_seconds: 40.0           # 单次侧车硬超时（超时静默降级回原逻辑）
   ds_pick_prefilter_enabled: true           # /pick 宽漏斗 30 只 -> 8+8 ID 初筛
   ds_semantic_audit_enabled: true           # /report 与 /pick 渲染后只读语义质检（只告警不拦截）
 
@@ -242,6 +242,8 @@ universe:
     - "VGOV.L"
     - "IWFQ.L"
     - "IWMO.L"
+    - "VWRL.L"
+    - "VERX.L"
 
   isa_long_term:
     # Broad & factor LSE GBP ETFs (0% FX fee, 0% UK stamp duty)

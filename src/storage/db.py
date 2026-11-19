@@ -1068,6 +1068,7 @@ class AdvisorDatabase:
             cur = await db.execute(
                 f"SELECT {_RECOMMENDATION_SELECT_COLS} FROM pick_recommendations "
                 "WHERE symbol = ? AND outcome_status = 'SETTLED' "
+                "AND COALESCE(source, 'pick') != 'core_dca' "
                 "AND reflection_lesson IS NOT NULL AND TRIM(reflection_lesson) != '' "
                 "ORDER BY created_at_ms DESC, id DESC LIMIT ?",
                 (sym, limit),
@@ -1081,6 +1082,7 @@ class AdvisorDatabase:
             cur = await db.execute(
                 f"SELECT {_RECOMMENDATION_SELECT_COLS} FROM pick_recommendations "
                 "WHERE outcome_status = 'SETTLED' "
+                "AND COALESCE(source, 'pick') != 'core_dca' "
                 "AND reflection_lesson IS NOT NULL AND TRIM(reflection_lesson) != '' "
                 "ORDER BY created_at_ms DESC, id DESC LIMIT ?",
                 (limit,),
@@ -1108,9 +1110,16 @@ class AdvisorDatabase:
                     AVG(CASE WHEN outcome_status = 'SETTLED' THEN mfe_pct END),
                     AVG(CASE WHEN outcome_status = 'SETTLED' THEN mae_pct END)
                 FROM pick_recommendations
+                WHERE COALESCE(source, 'pick') != 'core_dca'
                 """
             )
             row = await cur.fetchone()
+            core_cur = await db.execute(
+                "SELECT COUNT(*) FROM pick_recommendations "
+                "WHERE COALESCE(source, 'pick') = 'core_dca'"
+            )
+            core_row = await core_cur.fetchone()
+            core_dca_count = int(core_row[0] or 0) if core_row else 0
         if not row:
             return {
                 "total_count": 0,
@@ -1128,6 +1137,7 @@ class AdvisorDatabase:
                 "avg_t20_alpha_pct": None,
                 "avg_mfe_pct": None,
                 "avg_mae_pct": None,
+                "core_dca_count": core_dca_count,
             }
         settled = int(row[4] or 0)
         win_cnt = int(row[5] or 0)
@@ -1148,6 +1158,7 @@ class AdvisorDatabase:
             "avg_t20_alpha_pct": round(float(row[10]), 2) if row[10] is not None else None,
             "avg_mfe_pct": round(float(row[11]), 2) if row[11] is not None else None,
             "avg_mae_pct": round(float(row[12]), 2) if row[12] is not None else None,
+            "core_dca_count": core_dca_count,
         }
 
     async def get_settled_outcome_series(self, limit: int = 400) -> list[dict[str, Any]]:
@@ -1159,6 +1170,7 @@ class AdvisorDatabase:
                 SELECT symbol, created_at_uk, alpha_pct, t10_alpha_pct, t20_alpha_pct
                 FROM pick_recommendations
                 WHERE outcome_status = 'SETTLED'
+                  AND COALESCE(source, 'pick') != 'core_dca'
                 ORDER BY created_at_ms DESC, id DESC
                 LIMIT ?
                 """,

@@ -37,6 +37,9 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         self.assertEqual(normalize_thinking_level("gemini-4-carbon", "XHIGH"), "HIGH")
         self.assertEqual(normalize_thinking_level("gemini-4-hydrogen", "MINIMAL"), "LOW")
         self.assertEqual(normalize_thinking_level("gemini-4-hydrogen", "xhigh"), "XHIGH")
+        self.assertEqual(normalize_thinking_level("gemini-4-neon", "MINIMAL"), "LOW")
+        self.assertEqual(normalize_thinking_level("gemini-4-neon", "medium"), "MEDIUM")
+        self.assertEqual(normalize_thinking_level("gemini-4-neon", "xhigh"), "XHIGH")
         self.assertEqual(normalize_thinking_level("gemini-3.5-flash-lite", "MINIMAL"), "MINIMAL")
         self.assertEqual(normalize_thinking_level("gemini-4-hydrogen", "INVALID"), "")
 
@@ -46,7 +49,7 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         self.assertEqual(cfg.models.report_analyst_thinking_level, "HIGH")
         self.assertEqual(cfg.models.report_auditor_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.report_auditor_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.report_model, "gemini-4-carbon")
+        self.assertEqual(cfg.models.report_model, "gemini-4-neon")
         self.assertEqual(cfg.models.report_thinking_level, "HIGH")
         self.assertEqual(cfg.models.us_sentinel_model, "deepseek-flash")
         self.assertEqual(cfg.models.us_thinking_level, "HIGH")
@@ -54,12 +57,12 @@ class TestConfigAndThinkingNormalization(unittest.TestCase):
         self.assertEqual(cfg.models.us_anomaly_thinking_level, "HIGH")
         self.assertEqual(cfg.models.pick_researcher_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.pick_researcher_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.pick_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.pick_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.pick_model, "gemini-4-neon")
+        self.assertEqual(cfg.models.pick_thinking_level, "MEDIUM")
         self.assertEqual(cfg.models.chat_model, "deepseek-flash")
         self.assertEqual(cfg.models.chat_thinking_level, "HIGH")
-        self.assertEqual(cfg.models.chat_deep_model, "gemini-4-hydrogen")
-        self.assertEqual(cfg.models.chat_deep_thinking_level, "HIGH")
+        self.assertEqual(cfg.models.chat_deep_model, "gemini-4-neon")
+        self.assertEqual(cfg.models.chat_deep_thinking_level, "MEDIUM")
         self.assertEqual(cfg.models.fallback_model, "gemini-4-hydrogen")
         self.assertEqual(cfg.models.fallback_thinking_level, "HIGH")
         self.assertEqual(cfg.models.gemini_fallback_model, "gemini-4-hydrogen")
@@ -538,6 +541,16 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             client._candidate_chain("gemini-4-carbon", "HIGH"),
             [("gemini-4-carbon", "HIGH"), ("gemini-4-hydrogen", "HIGH")],
+        )
+        self.assertEqual(
+            client._candidate_chain("gemini-4-neon", "MEDIUM"),
+            [("gemini-4-neon", "MEDIUM"), ("gemini-4-hydrogen", "HIGH")],
+        )
+        # Even if fallback_model matches primary_model, neon still falls back to hydrogen (never flash-lite first).
+        neon_same_fb = GeminiClient(api_key="dummy-key", fallback_model="gemini-4-neon")
+        self.assertEqual(
+            neon_same_fb._candidate_chain("gemini-4-neon", "HIGH"),
+            [("gemini-4-neon", "HIGH"), ("gemini-4-hydrogen", "HIGH")],
         )
 
     def test_cross_vendor_candidate_chain_and_search_isolation(self) -> None:

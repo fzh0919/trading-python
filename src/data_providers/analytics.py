@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -1206,6 +1206,21 @@ _TECH_FACTOR_TICKERS: frozenset[str] = frozenset(
         "SMCI",
         "TSM",
         "ASML",
+        # v5.5.1: high-beta US software / cyber-security / semi-cap leaders that were
+        # silently missing from the factor bucket (PANW/CRWD/GOOGL look-through gaps).
+        "PANW",
+        "CRWD",
+        "NOW",
+        "SNOW",
+        "DDOG",
+        "NET",
+        "ANET",
+        "MRVL",
+        "KLAC",
+        "LRCX",
+        "AMAT",
+        "CDNS",
+        "SNPS",
     }
 )
 
@@ -1253,7 +1268,83 @@ _ETF_TECH_PENETRATION_PCT: dict[str, float] = {
     "ISF.L": 1.0,
     "VUKE": 1.0,
     "VUKE.L": 1.0,
+    "CUKX": 1.0,
+    "CUKX.L": 1.0,
+    "VUKG": 1.0,
+    "VUKG.L": 1.0,
+    # Europe broad (developed / ex-UK)
+    "VERG": 8.0,
+    "VERG.L": 8.0,
+    "VERX": 8.0,
+    "VERX.L": 8.0,
+    "VEUR": 8.0,
+    "VEUR.L": 8.0,
+    "VEUA": 8.0,
+    "VEUA.L": 8.0,
+    "IMEU": 8.0,
+    "IMEU.L": 8.0,
+    "SMEA": 8.0,
+    "SMEA.L": 8.0,
 }
+
+# Static APPROXIMATE regional look-through for broad UCITS ETFs (percent of ETF NAV).
+# Kept deliberately coarse: it only produces a context line and the deterministic core
+# policy gap maths never treats it as a hard risk threshold.
+_ETF_REGIONAL_LOOKTHROUGH: dict[str, dict[str, float]] = {
+    # Global all-world / developed
+    "VWRP": {"us": 63.0, "uk": 3.5, "eu_ex_uk": 12.5, "row": 21.0},
+    "VWRL": {"us": 63.0, "uk": 3.5, "eu_ex_uk": 12.5, "row": 21.0},
+    "SSAC": {"us": 63.0, "uk": 3.5, "eu_ex_uk": 12.5, "row": 21.0},
+    "FWRG": {"us": 63.0, "uk": 3.5, "eu_ex_uk": 12.5, "row": 21.0},
+    # Developed world (MSCI World)
+    "SWDA": {"us": 71.0, "uk": 3.8, "eu_ex_uk": 13.5, "row": 11.7},
+    "IWDA": {"us": 71.0, "uk": 3.8, "eu_ex_uk": 13.5, "row": 11.7},
+    # S&P 500
+    "VUAG": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "VUSA": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "CSP1": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "IUSA": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "SPXP": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "GSPX": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "SPY": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "VOO": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "IVV": {"us": 100.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0},
+    # Europe ex-UK (strictly zero UK overlap)
+    "VERG": {"us": 0.0, "uk": 0.0, "eu_ex_uk": 100.0, "row": 0.0},
+    "VERX": {"us": 0.0, "uk": 0.0, "eu_ex_uk": 100.0, "row": 0.0},
+    # Europe including UK (~22% UK exposure)
+    "VEUR": {"us": 0.0, "uk": 22.0, "eu_ex_uk": 78.0, "row": 0.0},
+    "VEUA": {"us": 0.0, "uk": 22.0, "eu_ex_uk": 78.0, "row": 0.0},
+    "IMEU": {"us": 0.0, "uk": 22.0, "eu_ex_uk": 78.0, "row": 0.0},
+    "SMEA": {"us": 0.0, "uk": 22.0, "eu_ex_uk": 78.0, "row": 0.0},
+    # FTSE 100
+    "ISF": {"us": 0.0, "uk": 100.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "VUKE": {"us": 0.0, "uk": 100.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "CUKX": {"us": 0.0, "uk": 100.0, "eu_ex_uk": 0.0, "row": 0.0},
+    "VUKG": {"us": 0.0, "uk": 100.0, "eu_ex_uk": 0.0, "row": 0.0},
+}
+
+# Bond / gold ETFs are excluded from the equity-only regional denominator.
+_NON_EQUITY_ETF_BASES: frozenset[str] = frozenset({"IGLT", "VGOV", "IBTA", "SGLN"})
+
+# v5.5.1: distribution policy whitelists (LSE share classes, with/without ``.L``).
+_KNOWN_DISTRIBUTING_ETFS: frozenset[str] = frozenset(
+    {
+        "VWRL", "VUSA", "IUSA", "ISF", "VUKE", "VERX", "VEUR", "IMEU",
+        "VHYL", "IUKD", "IGLT", "VGOV", "VFEM", "MIDD",
+    }
+)
+_KNOWN_ACCUMULATING_ETFS: frozenset[str] = frozenset(
+    {
+        "VWRP", "SWDA", "IWDA", "FWRG", "SSAC", "VUAG", "CSP1", "SPXP", "GSPX",
+        "VERG", "VEUA", "SMEA", "CUKX", "VUKG", "CNX1", "EQGB", "IBTA", "IITU",
+        "SMGB", "HEAL", "INRG", "EMIM", "WSML", "IWQU", "IWFQ", "IWMO", "VJPN", "SGLN",
+    }
+)
+_LEVERAGED_ETP_TOKENS: tuple[str, ...] = (
+    "2x", "3x", "-1x", "-2x", "-3x", "leveraged", "daily short",
+    "inverse", "ultrashort", "covered call", "incomeshares",
+)
 
 # Underlying index family mapping for duplicate/clone ETF exposure aggregation
 _ETF_INDEX_FAMILY_MAP: dict[str, str] = {
@@ -1304,13 +1395,21 @@ _ETF_INDEX_FAMILY_MAP: dict[str, str] = {
     "VUKE.L": "FTSE 100 (英国富时100)",
     "CUKX": "FTSE 100 (英国富时100)",
     "CUKX.L": "FTSE 100 (英国富时100)",
+    "VUKG": "FTSE 100 (英国富时100)",
+    "VUKG.L": "FTSE 100 (英国富时100)",
     # Europe broad trackers
     "VERG": "Europe Equity (欧洲宽基)",
     "VERG.L": "Europe Equity (欧洲宽基)",
+    "VERX": "Europe Equity (欧洲宽基)",
+    "VERX.L": "Europe Equity (欧洲宽基)",
     "VEUR": "Europe Equity (欧洲宽基)",
     "VEUR.L": "Europe Equity (欧洲宽基)",
+    "VEUA": "Europe Equity (欧洲宽基)",
+    "VEUA.L": "Europe Equity (欧洲宽基)",
     "IMEU": "Europe Equity (欧洲宽基)",
     "IMEU.L": "Europe Equity (欧洲宽基)",
+    "SMEA": "Europe Equity (欧洲宽基)",
+    "SMEA.L": "Europe Equity (欧洲宽基)",
     # UK Gilts
     "IGLT": "UK Gilts (英国国债)",
     "IGLT.L": "UK Gilts (英国国债)",
@@ -1332,13 +1431,6 @@ def infer_etf_index_family(
 ) -> str | None:
     """Identify the underlying index family of an ETF to aggregate clone ETF risk exposure."""
     sym_clean = (symbol or "").strip().upper()
-    if sym_clean in _ETF_INDEX_FAMILY_MAP:
-        return _ETF_INDEX_FAMILY_MAP[sym_clean]
-    base_clean = sym_clean.split(".")[0]
-    if base_clean in _ETF_INDEX_FAMILY_MAP:
-        return _ETF_INDEX_FAMILY_MAP[base_clean]
-
-    is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     combined_name = " ".join(
         filter(
             None,
@@ -1350,6 +1442,18 @@ def infer_etf_index_family(
         )
     ).lower()
 
+    # v5.5.1: leveraged / inverse / covered-call ETPs must never inherit the broad-base
+    # core privilege (e.g. "FTSE 100 3x Daily Leveraged" is NOT a core wide-base ETF).
+    if any(token in combined_name for token in _LEVERAGED_ETP_TOKENS):
+        return None
+
+    if sym_clean in _ETF_INDEX_FAMILY_MAP:
+        return _ETF_INDEX_FAMILY_MAP[sym_clean]
+    base_clean = sym_clean.split(".")[0]
+    if base_clean in _ETF_INDEX_FAMILY_MAP:
+        return _ETF_INDEX_FAMILY_MAP[base_clean]
+
+    is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     if not is_etf and not any(k in combined_name for k in ("ucits", "etf", "vanguard", "ishares", "invesco", "spdr")):
         return None
 
@@ -1361,9 +1465,157 @@ def infer_etf_index_family(
         return "Global All-World/Developed (全球宽基)"
     if "ftse 100" in combined_name:
         return "FTSE 100 (英国富时100)"
+    if (
+        "developed europe" in combined_name
+        or "msci europe" in combined_name
+        or "stoxx europe 600" in combined_name
+        or "europe ex uk" in combined_name
+    ):
+        return "Europe Equity (欧洲宽基)"
     if "gilt" in combined_name:
         return "UK Gilts (英国国债)"
     return None
+
+
+def classify_etf_distribution_policy(
+    symbol: str,
+    bundle: TickerMarketBundle | None = None,
+) -> Literal["ACC", "DIST", "UNKNOWN"]:
+    """Classify an ETF share class as accumulating / distributing / unknown.
+
+    Taxable Invest accounts must only buy distributing classes: accumulating offshore
+    funds trigger Excess Reportable Income (ERI) reporting friction in the UK.
+    """
+    sym_clean = (symbol or "").strip().upper()
+    base_clean = sym_clean.split(".")[0]
+    if base_clean in _KNOWN_DISTRIBUTING_ETFS or sym_clean in _KNOWN_DISTRIBUTING_ETFS:
+        return "DIST"
+    if base_clean in _KNOWN_ACCUMULATING_ETFS or sym_clean in _KNOWN_ACCUMULATING_ETFS:
+        return "ACC"
+    name = " ".join(
+        filter(
+            None,
+            [
+                str(getattr(bundle, "short_name", "") or ""),
+                str(getattr(bundle, "long_name", "") or ""),
+            ],
+        )
+    ).lower()
+    if "(acc)" in name or "accumulating" in name or " acc " in f" {name} ":
+        return "ACC"
+    if "(dist)" in name or "distributing" in name or " dist " in f" {name} ":
+        return "DIST"
+    return "UNKNOWN"
+
+
+def _regional_root(symbol: str) -> str:
+    return (symbol or "").strip().upper().split(".")[0]
+
+
+def _stock_region(symbol: str) -> str | None:
+    """Map a single-name listing suffix to a coarse region (ETF-free helper)."""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return None
+    if sym.endswith(".L"):
+        return "uk"
+    if sym.endswith((".DE", ".PA", ".AS", ".MC", ".MI", ".SW")):
+        return "eu_ex_uk"
+    if "." not in sym:
+        return "us"
+    return None
+
+
+def estimate_portfolio_regional_lookthrough(
+    portfolio: PortfolioData,
+    bundles: dict[str, TickerMarketBundle] | None = None,
+    *,
+    include_pending_core_etfs: bool = True,
+) -> dict[str, Any]:
+    """Coarse US / UK / Europe-ex-UK split of the equity book (context only)."""
+    bmap = bundles or {}
+    raw_total = portfolio.total_combined_value or (
+        portfolio.isa.total_account_value + portfolio.invest.total_account_value
+    )
+    total_all = max(float(raw_total or 0.0), 1.0)
+    isa_val = max(float(portfolio.isa.total_account_value or 0.0), 1.0)
+
+    region_values = {"us": 0.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0}
+    isa_region_values = {"us": 0.0, "uk": 0.0, "eu_ex_uk": 0.0, "row": 0.0}
+    unmapped_value = 0.0
+    excluded_value = 0.0
+
+    def _add(acct: str, sym: str, value: float) -> None:
+        nonlocal unmapped_value, excluded_value
+        base = _regional_root(sym)
+        if base in _NON_EQUITY_ETF_BASES:
+            excluded_value += value
+            return
+        b = bmap.get(sym) or bmap.get(sym.strip().upper())
+        is_etf = bool((b is not None and str(b.quote_type).upper() == "ETF"))
+        row = _ETF_REGIONAL_LOOKTHROUGH.get(base) if (is_etf or base in _ETF_REGIONAL_LOOKTHROUGH) else None
+        if row is not None:
+            for key in region_values:
+                share = float(row.get(key, 0.0)) / 100.0 * value
+                region_values[key] += share
+                if acct == "ISA":
+                    isa_region_values[key] += share
+            return
+        region = _stock_region(sym)
+        if region is None:
+            unmapped_value += value
+            return
+        region_values[region] += value
+        if acct == "ISA":
+            isa_region_values[region] += value
+
+    for pos in portfolio.all_positions():
+        if pos.current_value > 0:
+            _add(str(pos.account or "").strip().upper(), pos.yahoo_symbol or pos.ticker, float(pos.current_value))
+    if include_pending_core_etfs:
+        for order in portfolio.isa.pending_orders:
+            if str(order.side or "").strip().upper() != "BUY":
+                continue
+            base = _regional_root(order.yahoo_symbol or order.ticker)
+            if base not in _ETF_REGIONAL_LOOKTHROUGH:
+                continue
+            ccy = str(order.currency or "").strip()
+            raw_value = float(order.value or 0.0)
+            if ccy in {"GBp", "GBx", "GBX"}:
+                value = raw_value / 100.0
+            elif ccy.upper() in {"GBP", ""}:
+                value = raw_value
+            else:
+                # Non-GBP pending value cannot be converted without an FX basis; skip
+                # rather than silently mis-scaling the look-through percentages.
+                continue
+            if value > 0:
+                _add("ISA", order.yahoo_symbol or order.ticker, value)
+
+    equity_total = sum(region_values.values())
+
+    def _pct_of(value: float, denom: float) -> float:
+        return round(value / denom * 100.0, 2) if denom > 0 else 0.0
+
+    return {
+        "us_value": round(region_values["us"], 2),
+        "uk_value": round(region_values["uk"], 2),
+        "eu_ex_uk_value": round(region_values["eu_ex_uk"], 2),
+        "row_value": round(region_values["row"], 2),
+        "equity_value_gbp": round(equity_total, 2),
+        "excluded_bond_gold_value": round(excluded_value, 2),
+        "unmapped_value": round(unmapped_value, 2),
+        "us_pct_nav": _pct_of(region_values["us"], total_all),
+        "uk_pct_nav": _pct_of(region_values["uk"], total_all),
+        "eu_ex_uk_pct_nav": _pct_of(region_values["eu_ex_uk"], total_all),
+        "isa_us_pct": _pct_of(isa_region_values["us"], isa_val),
+        "isa_uk_pct": _pct_of(isa_region_values["uk"], isa_val),
+        "isa_eu_ex_uk_pct": _pct_of(isa_region_values["eu_ex_uk"], isa_val),
+        "equity_us_share_pct": _pct_of(region_values["us"], equity_total),
+        "equity_uk_share_pct": _pct_of(region_values["uk"], equity_total),
+        "equity_eu_ex_uk_share_pct": _pct_of(region_values["eu_ex_uk"], equity_total),
+        "include_pending_core_etfs": bool(include_pending_core_etfs),
+    }
 
 
 def estimate_penetration_tech_exposure(
@@ -1389,7 +1641,7 @@ def estimate_penetration_tech_exposure(
     for p in portfolio.all_positions():
         if p.current_value <= 0:
             continue
-        root = (p.ticker or "").strip().upper()
+        root = normalize_issuer_root((p.ticker or "").strip().upper())
         if root in _TECH_FACTOR_TICKERS:
             direct_val += p.current_value
             direct_by_ticker[root] = direct_by_ticker.get(root, 0.0) + p.current_value
@@ -1640,6 +1892,16 @@ def compute_exposure_summary(
             f"• 穿透后真实科技暴露(估算): ETF 隐含 £{penetration['etf_implied_value']:,.0f} + "
             f"直接科技个股 £{penetration['direct_value']:,.0f} = £{penetration['combined_value']:,.0f} "
             f"(占总资产 {penetration['combined_pct']:.1f}%；静态权重近似，非实时持仓穿透)"
+        )
+    if penetration.get("unmapped_etf_value", 0.0) > 0:
+        lines.append(
+            f"• 另有 £{penetration['unmapped_etf_value']:,.0f} ETF 未映射科技权重（未静默计入）"
+        )
+    regional = estimate_portfolio_regional_lookthrough(portfolio, bundles)
+    if regional["equity_value_gbp"] > 0:
+        lines.append(
+            f"• 权益区域穿透(估算): 美股 {regional['equity_us_share_pct']:.1f}% | "
+            f"英国 {regional['equity_uk_share_pct']:.1f}% | 欧陆(除英) {regional['equity_eu_ex_uk_share_pct']:.1f}%"
         )
     if histories:
         risk_info = compute_portfolio_cvar_and_risk_attribution(portfolio, histories)
@@ -2085,4 +2347,79 @@ def compute_concentration_metrics(portfolio: PortfolioData) -> dict[str, Any]:
         "effective_n": round(1.0 / hhi, 2) if hhi > 0 else None,
         "top1_pct": round(weights[0] * 100.0, 1),
         "top3_pct": round(sum(weights[:3]) * 100.0, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
+# v5.5.1: core-policy benchmark (regional-tilt Beta vs stock-picking Alpha)
+# ---------------------------------------------------------------------------
+_CORE_POLICY_BENCHMARK_WEIGHTS: dict[str, float] = {
+    "VWRP.L": 70.0,
+    "VERG.L": 13.3,
+    "ISF.L": 10.0,
+    "VUAG.L": 6.7,
+}
+
+
+def compute_core_policy_benchmark_comparison(
+    histories: dict[str, pd.DataFrame],
+    lookback_days: int = 60,
+) -> dict[str, Any] | None:
+    """Compare the four-bucket core policy mix against the default VWRP.L benchmark.
+
+    Returns ``allocation_effect_pct`` (policy mix return minus VWRP.L return over the
+    same window) and annualised tracking error, so the weekly / /perf review can tell
+    a deliberate UK/EU regional tilt (Beta) apart from genuine stock-picking Alpha.
+    """
+    if not isinstance(histories, dict) or not histories:
+        return None
+    bench_sym = "VWRP.L"
+    bench_hist = histories.get(bench_sym) if bench_sym in histories else histories.get("VWRP")
+    bench_closes = _extract_close_series(bench_hist, int(lookback_days) + 5)
+    if bench_closes is None or len(bench_closes) < 2:
+        return None
+
+    window = max(2, min(int(lookback_days), len(bench_closes) - 1))
+    bench_ret = float(bench_closes.iloc[-1] / float(bench_closes.iloc[-1 - window]) - 1.0)
+
+    returns_by_sym: dict[str, pd.Series] = {}
+    used_weights: dict[str, float] = {}
+    missing: list[str] = []
+    for sym, weight in _CORE_POLICY_BENCHMARK_WEIGHTS.items():
+        hist = histories.get(sym) if sym in histories else histories.get(sym.split(".")[0])
+        closes = _extract_close_series(hist, window + 5)
+        if closes is None or len(closes) < window + 1:
+            if sym != bench_sym:
+                missing.append(sym)
+            continue
+        rets = closes.pct_change().dropna().iloc[-window:]
+        if rets.empty:
+            missing.append(sym)
+            continue
+        returns_by_sym[sym] = rets.reset_index(drop=True)
+        used_weights[sym] = float(weight)
+
+    total_w = float(sum(used_weights.values()))
+    if total_w <= 0 or bench_sym not in used_weights:
+        return None
+    norm = {sym: weight / total_w for sym, weight in used_weights.items()}
+
+    min_len = min(len(series) for series in returns_by_sym.values())
+    if min_len < 2:
+        return None
+    aligned = {sym: series.iloc[-min_len:].reset_index(drop=True) for sym, series in returns_by_sym.items()}
+    policy_daily = sum(aligned[sym] * w for sym, w in norm.items())
+    bench_daily = aligned[bench_sym]
+    diff = policy_daily - bench_daily
+    policy_ret = float((1.0 + policy_daily).prod() - 1.0)
+    tracking_error = float(diff.std(ddof=1) * math.sqrt(252) * 100.0) if len(diff) > 1 else None
+    return {
+        "lookback_days": int(min_len),
+        "weights_used": {sym: round(w * 100.0, 2) for sym, w in norm.items()},
+        "missing_symbols": missing,
+        "policy_return_pct": round(policy_ret * 100.0, 2),
+        "benchmark_return_pct": round(bench_ret * 100.0, 2),
+        "allocation_effect_pct": round((policy_ret - bench_ret) * 100.0, 2),
+        "tracking_error_pct": round(tracking_error, 2) if tracking_error is not None else None,
+        "benchmark_symbol": bench_sym,
     }

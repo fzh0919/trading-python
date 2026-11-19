@@ -1615,6 +1615,91 @@ def apply_risk_override_guardrail(
     }
     cadence_advisories: list[str] = []
 
+    def _core_dca_guard(
+        sym_up: str,
+        base: str,
+        acct_up: str,
+        bundle: TickerMarketBundle | None,
+        guard_mode: str,
+    ) -> tuple[str, str] | None:
+        """v5.5.1 deterministic DCA guard replacing the old blank R:R exemption."""
+        if guard_mode != "hard":
+            return None
+        isa_gate = (
+            deployment_gate.get("isa")
+            if isinstance(deployment_gate, dict) and isinstance(deployment_gate.get("isa"), dict)
+            else {}
+        )
+        policy = isa_gate.get("core_policy") if isinstance(isa_gate.get("core_policy"), dict) else {}
+        bucket_map = policy.get("bucket_by_symbol") if isinstance(policy.get("bucket_by_symbol"), dict) else {}
+        bucket = bucket_map.get(sym_up) or bucket_map.get(base)
+        if not bucket:
+            family = infer_etf_index_family(sym_up, bundle)
+            bucket = {
+                "Global All-World/Developed (全球宽基)": "GLOBAL_ANCHOR",
+                "S&P 500 (美股标普500)": "US_TILT",
+                "Europe Equity (欧洲宽基)": "EU_DIVERSIFIER",
+                "FTSE 100 (英国富时100)": "UK_DIVERSIFIER",
+            }.get(family or "")
+        committed_core_pct = float(
+            policy.get("committed_core_pct")
+            or isa_gate.get("committed_core_etf_pct")
+            or 0.0
+        )
+        if committed_core_pct >= 65.0:
+            return "ACCOUNT_OVERWEIGHT", "ISA 核心宽基已达65%硬上限，暂停新增宽基定投"
+        buckets = policy.get("buckets") if isinstance(policy.get("buckets"), dict) else {}
+        sleeve = buckets.get(bucket) if bucket else None
+        if bucket == "US_TILT" and policy.get("us_tilt_buy_frozen"):
+            return (
+                "ACCOUNT_OVERWEIGHT",
+                "美股与标普500敞口已超上限，禁止继续加码标普500宽基",
+            )
+        if isinstance(sleeve, dict):
+            cap = float(sleeve.get("cap_pct") or 0.0)
+            pct_now = float(sleeve.get("committed_pct") or 0.0)
+            if cap > 0 and pct_now >= cap:
+                return (
+                    "ACCOUNT_OVERWEIGHT",
+                    f"该核心子桶已达 {cap:.0f}% 硬上限，暂停继续加仓",
+                )
+        if acct_up == "ISA" and portfolio is not None and portfolio.isa.total_account_value > 0:
+            isa_val = float(portfolio.isa.total_account_value)
+            floor_gbp = (
+                isa_val * float(getattr(strat, "isa_cash_band_low_pct", 5.0) or 0.0) / 100.0
+                + float(getattr(strat, "min_isa_etf_order_gbp", 400.0) or 0.0)
+            )
+            if float(portfolio.isa.available_to_trade) < floor_gbp:
+                return (
+                    "ACCOUNT_OVERWEIGHT",
+                    "ISA 可用现金逼近 5% 结构地板，暂停宽基定投",
+                )
+        if bucket in {"EU_DIVERSIFIER", "UK_DIVERSIFIER", "US_TILT"}:
+            plan = (
+                isa_gate.get("core_allocation_plan")
+                if isinstance(isa_gate.get("core_allocation_plan"), dict)
+                else {}
+            )
+            metrics_map = plan.get("symbol_metrics") if isinstance(plan.get("symbol_metrics"), dict) else {}
+            metrics = metrics_map.get(sym_up) or metrics_map.get(base) or {}
+            price = metrics.get("price")
+            ma200 = metrics.get("ma200")
+            dd52 = metrics.get("drawdown_52w_pct")
+            rsi = metrics.get("rsi14")
+            if (
+                price is not None
+                and ma200 is not None
+                and float(price) < float(ma200) * 0.95
+                and (dd52 is None or float(dd52) > -15.0)
+            ):
+                return (
+                    "ACCOUNT_OVERWEIGHT",
+                    "跌破MA200逾5%且未达-15%深跌阶梯，暂缓左侧接刀",
+                )
+            if rsi is not None and float(rsi) >= 72.0:
+                return "ACCOUNT_OVERWEIGHT", "RSI14≥72 追高，暂停宽基买入"
+        return None
+
     def _check_symbol_violation(
         account: str,
         symbol: str,
@@ -1735,6 +1820,10 @@ def apply_risk_override_guardrail(
                 if not pick_core_etf:
                     family = infer_etf_index_family(sym_up, b)
                     pick_core_etf = family in _CORE_WIDE_BASE_FAMILIES
+                if pick_core_etf:
+                    dca_breach = _core_dca_guard(sym_up, base, acct_up, b, guard_mode)
+                    if dca_breach is not None:
+                        return dca_breach
                 ex_window = int(getattr(strat, "ex_div_entry_guard_days", 3) or 0)
                 ex_days = int(b.days_to_ex_dividend) if (b and b.days_to_ex_dividend is not None) else None
                 if ex_days is not None and ex_window > 0 and 0 < ex_days <= ex_window:
