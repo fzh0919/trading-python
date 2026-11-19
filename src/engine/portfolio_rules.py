@@ -23,6 +23,45 @@ from src.data_providers.t212_client import AccountSnapshot, PendingOrderItem, Po
 # and the deterministic deployment gate (src/engine/deployment_gate.py).
 DEFAULT_VIX_DANGER_THRESHOLD: float = 28.0
 
+# --- v5.5.1 Dual-Philosophy Constants (ISA Value vs Invest Right-Side) ---
+# All of them are read through ``getattr(strategy, "<lower_name>", <CONST>)`` so the values
+# stay overridable from config.yaml later without touching src/config.py today.
+# Invest right-side dynamic R:R & noise-floor stops
+INVEST_MIN_RR_RISK_ON_LEADER: float = 1.6
+INVEST_MIN_RR_NEUTRAL: float = 2.0
+INVEST_MIN_RR_WEAK_OR_RISK_OFF: float = 2.5
+INVEST_STOP_MIN_ATR_MULT: float = 1.5
+INVEST_STOP_MIN_PCT_FLOOR: float = 4.0
+INVEST_TRAILING_DD_RISK_ON_PCT: float = -12.0
+INVEST_TRAILING_DD_NEUTRAL_PCT: float = -8.5
+INVEST_RSI_OVERBOUGHT_RISK_ON: float = 80.0
+INVEST_FORWARD_RR_EXIT_WARN: float = 0.8
+INVEST_RISK_ON_TARGET_HIGH_HAIRCUT: float = 0.90
+
+# ISA Buffett value quality & margin-of-safety gates
+ISA_VALUE_GUARD_MODE_DEFAULT: str = "hard"  # off / advisory / hard
+ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT: bool = True
+ISA_QUALITY_MIN_ROE_PCT: float = 10.0
+ISA_QUALITY_MIN_PROFIT_MARGIN_PCT: float = 5.0
+ISA_QUALITY_MAX_DEBT_TO_EQUITY: float = 180.0
+ISA_QUALITY_MAX_DEBT_TO_EQUITY_NO_CR: float = 250.0
+ISA_QUALITY_MIN_CURRENT_RATIO: float = 0.9
+ISA_QUALITY_MIN_REV_GROWTH_PCT: float = -10.0
+ISA_QUALITY_MIN_FCF_YIELD_PCT: float = -2.0
+ISA_MOS_MIN_DISCOUNT_PCT: float = 12.0
+ISA_MOS_CRISIS_DISCOUNT_PCT: float = 20.0
+ISA_MOS_MIN_ERP_PCT: float = 1.0
+ISA_MOS_CRISIS_MIN_ERP_PCT: float = 1.5
+ISA_BUBBLE_FORWARD_PE: float = 45.0
+ISA_BUBBLE_PEG_THRESHOLD: float = 2.8
+ISA_VALUE_ADD_DRAWDOWN_PCT: float = -10.0
+DEFAULT_RISK_FREE_YIELD_PCT: float = 4.2
+
+# Banks / insurers / REITs / utilities legitimately run high leverage; never punish them here.
+_LEVERAGE_EXEMPT_SECTOR_KEYWORDS: tuple[str, ...] = (
+    "financial", "bank", "insurance", "real estate", "reit", "utilities", "utility",
+)
+
 # v5.5.0: only genuine broad-base vehicles keep the crisis-time BUY exemption. Themed,
 # dividend, bond and commodity ETFs follow the same VIX freeze as single-name equities.
 # v5.5.1: FTSE 100 / Europe broad-base ETFs are core *diversifiers* (they dilute US tech)
@@ -55,6 +94,10 @@ class HoldingEvaluation(BaseModel):
     min_order_gbp: float | None = None
     # v5.4.0: ISA legacy <min_isa_equity_order_gbp crumb currently inside a rebound/pruning window
     is_crumb_prune_candidate: bool = False
+    # v5.5.1 dual-philosophy annotations (defaults keep old serialized payloads valid)
+    philosophy_tag: str = ""                 # "ISA_VALUE" | "INVEST_RIGHT_SIDE"
+    value_mos_pct: float | None = None       # ISA margin-of-safety discount (%)
+    forward_rr: float | None = None          # Invest forward R:R at current price
 
 
 class DisagreementItem(BaseModel):
@@ -76,7 +119,7 @@ class RiskOverrideRecord(BaseModel):
     symbol: str
     from_action: str
     to_action: str
-    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT | EX_DIV_WINDOW | RR_BELOW_FLOOR | RR_UNVERIFIED | FREQUENCY_CAP | REBUY_COOLDOWN | ISA_SATELLITE_SATURATED
+    trigger_type: str  # ISSUER_OVERWEIGHT | ACCOUNT_OVERWEIGHT | MACRO_VIX | EARNINGS_WINDOW | DAILY_VETO | CORRELATION_OVERLAP | REPORT_ACTION_CONFLICT | EX_DIV_WINDOW | RR_BELOW_FLOOR | RR_UNVERIFIED | FREQUENCY_CAP | REBUY_COOLDOWN | ISA_SATELLITE_SATURATED | ISA_QUALITY_FAIL | ISA_MOS_INSUFFICIENT | STOP_TOO_TIGHT
     reason: str
 
 
@@ -475,8 +518,14 @@ def _resolve_pick_rr(
     symbol: str = "",
     account: str = "",
     wallet: AccountSnapshot | None = None,
+    tech: TechnicalSnapshot | None = None,
+    regime: str = "NEUTRAL",
 ) -> dict[str, Any]:
-    """Recompute BUY-side R:R in Python from structured prices instead of trusting LLM arithmetic."""
+    """Recompute BUY-side R:R in Python from structured prices instead of trusting LLM arithmetic.
+
+    v5.5.1: accepts ``tech`` / ``regime`` so RISK_ON right-side leaders get a two-anchor target
+    ceiling and every stop is checked against an ATR noise floor (``stop_too_tight``).
+    """
     out: dict[str, Any] = {
         "entry": 0.0,
         "stop": 0.0,
@@ -487,6 +536,8 @@ def _resolve_pick_rr(
         "friction_pct": None,
         "target_replaced": False,
         "price_rescaled": False,
+        "stop_too_tight": False,
+        "min_stop_pct": None,
     }
     entry = float(getattr(item, "entry_price", 0.0) or 0.0)
     if entry <= 0 and bundle is not None and bundle.current_price and bundle.current_price > 0:
@@ -516,7 +567,34 @@ def _resolve_pick_rr(
         and bundle.target_mean_price > 0
     ):
         analyst_target = _rescale_price_pair(float(bundle.target_mean_price), entry)
-    if analyst_target > 0:
+
+    is_right_side = bool(
+        str(regime or "").upper() == "RISK_ON" and _is_right_side_leader(tech)
+    )
+    if is_right_side:
+        # v5.5.1 bull-market two-anchor ceiling: never clamp a fresh RISK_ON leader back to a
+        # stale analyst mean, but still cap LLM fantasy targets at the highest sane anchor.
+        cand_ceilings: list[float] = []
+        if analyst_target > 0:
+            cand_ceilings.append(analyst_target * (1.0 + _PICK_RR_TARGET_TOLERANCE_PCT / 100.0))
+        if bundle is not None and bundle.target_high_price and bundle.target_high_price > 0:
+            th = _rescale_price_pair(float(bundle.target_high_price), entry)
+            cand_ceilings.append(
+                th * float(getattr(strategy, "invest_risk_on_target_high_haircut", INVEST_RISK_ON_TARGET_HIGH_HAIRCUT))
+            )
+        if tech is not None and tech.atr_pct is not None and tech.atr_pct > 0:
+            cand_ceilings.append(entry * (1.0 + 4.0 * float(tech.atr_pct) / 100.0))
+        ceiling = max(cand_ceilings) if cand_ceilings else 0.0
+        if target <= 0 and analyst_target > 0:
+            target = analyst_target
+            out["target_replaced"] = True
+        if ceiling > 0 and target > ceiling:
+            target = ceiling
+            out["target_replaced"] = True
+        if analyst_target > 0 and target < analyst_target * (1.0 - _PICK_RR_TARGET_TOLERANCE_PCT / 100.0):
+            target = analyst_target
+            out["target_replaced"] = True
+    elif analyst_target > 0:
         if target <= 0:
             target = analyst_target
             out["target_replaced"] = True
@@ -544,9 +622,330 @@ def _resolve_pick_rr(
             "friction_pct": round(friction_pct, 2),
         }
     )
+    # v5.5.1 Invest stop must clear the ATR noise floor — a razor-thin stop fakes a huge R:R.
+    if risk_pct is not None and tech is not None and tech.atr_pct is not None and tech.atr_pct > 0:
+        atr_mult = float(getattr(strategy, "invest_stop_min_atr_mult", INVEST_STOP_MIN_ATR_MULT))
+        floor_pct = float(getattr(strategy, "invest_stop_min_pct_floor", INVEST_STOP_MIN_PCT_FLOOR))
+        min_stop = round(max(atr_mult * float(tech.atr_pct), floor_pct), 2)
+        out["min_stop_pct"] = min_stop
+        if risk_pct < min_stop:
+            out["stop_too_tight"] = True
     if risk_pct is not None and risk_pct > 0 and upside_pct is not None:
         out["rr"] = round((upside_pct - friction_pct) / risk_pct, 2)
     return out
+
+
+def _is_leverage_exempt_sector(bundle: TickerMarketBundle | None) -> bool:
+    """Financials / REITs / utilities run structurally high leverage — do not value-trap them."""
+    if bundle is None:
+        return False
+    text = f"{bundle.sector or ''} {bundle.industry or ''}".lower()
+    return any(kw in text for kw in _LEVERAGE_EXEMPT_SECTOR_KEYWORDS)
+
+
+def evaluate_isa_value_gate(
+    bundle: TickerMarketBundle | None,
+    tech: TechnicalSnapshot | None,
+    macro: MacroSnapshot | None,
+    strategy: StrategySection,
+    *,
+    item: Any | None = None,
+    symbol: str = "",
+    crisis_mode: bool = False,
+) -> dict[str, Any]:
+    """ISA Buffett-style gate: quality (anti value-trap) × margin of safety (valuation).
+
+    Replaces the tactical 2:1 price-stop R:R hurdle for ISA single names. A missing financial
+    snapshot can never *falsify* quality (quality_pass=True) but always fails the safety margin
+    (no valuation evidence => no buy).
+    """
+    min_roe = float(getattr(strategy, "isa_quality_min_roe_pct", ISA_QUALITY_MIN_ROE_PCT))
+    min_margin = float(
+        getattr(strategy, "isa_quality_min_profit_margin_pct", ISA_QUALITY_MIN_PROFIT_MARGIN_PCT)
+    )
+    max_de = float(getattr(strategy, "isa_quality_max_debt_to_equity", ISA_QUALITY_MAX_DEBT_TO_EQUITY))
+    max_de_no_cr = float(
+        getattr(strategy, "isa_quality_max_debt_to_equity_no_cr", ISA_QUALITY_MAX_DEBT_TO_EQUITY_NO_CR)
+    )
+    min_cr = float(getattr(strategy, "isa_quality_min_current_ratio", ISA_QUALITY_MIN_CURRENT_RATIO))
+    min_rev = float(
+        getattr(strategy, "isa_quality_min_rev_growth_pct", ISA_QUALITY_MIN_REV_GROWTH_PCT)
+    )
+    min_fcf = float(getattr(strategy, "isa_quality_min_fcf_yield_pct", ISA_QUALITY_MIN_FCF_YIELD_PCT))
+    min_mos = float(getattr(strategy, "isa_mos_min_discount_pct", ISA_MOS_MIN_DISCOUNT_PCT))
+    crisis_mos = float(getattr(strategy, "isa_mos_crisis_discount_pct", ISA_MOS_CRISIS_DISCOUNT_PCT))
+    min_erp = float(getattr(strategy, "isa_mos_min_erp_pct", ISA_MOS_MIN_ERP_PCT))
+    crisis_erp = float(getattr(strategy, "isa_mos_crisis_min_erp_pct", ISA_MOS_CRISIS_MIN_ERP_PCT))
+    bubble_pe_th = float(getattr(strategy, "isa_bubble_forward_pe", ISA_BUBBLE_FORWARD_PE))
+    bubble_peg_th = float(getattr(strategy, "isa_bubble_peg_threshold", ISA_BUBBLE_PEG_THRESHOLD))
+
+    quality_fails: list[str] = []
+    quality_pros: list[str] = []
+    mos_reasons: list[str] = []
+
+    if bundle is None:
+        return {
+            "quality_pass": True,
+            "mos_pass": False,
+            "passed": False,
+            "bubble_risk": False,
+            "crisis_mode": bool(crisis_mode),
+            "mos_pct": None,
+            "erp_pct": None,
+            "fcf_yield_pct": None,
+            "quality_fails": [],
+            "quality_pros": [],
+            "quality_note": "财务快照缺失待核",
+            "mos_reasons": ["缺少现价/估值数据，无法确认安全边际"],
+            "summary": "财务快照缺失待核 | 安全边际无法确认",
+        }
+
+    # --- Quality gate (anti value-trap) -------------------------------------------------
+    if bundle.profit_margin_pct is not None and bundle.profit_margin_pct <= 0.0:
+        quality_fails.append("净利率≤0%(亏损企业)")
+    if bundle.roe_pct is not None and bundle.roe_pct <= 0.0:
+        quality_fails.append("ROE≤0%(资本回报为负)")
+
+    if not _is_leverage_exempt_sector(bundle) and bundle.debt_to_equity is not None:
+        de = float(bundle.debt_to_equity)
+        if bundle.current_ratio is not None:
+            cr = float(bundle.current_ratio)
+            if de > max_de and cr < min_cr:
+                quality_fails.append(f"高杠杆且流动性偏紧(D/E={de:.0f}, CR={cr:.2f})")
+        elif de > max_de_no_cr:
+            quality_fails.append(f"非金融企业极高杠杆(D/E={de:.0f})")
+
+    if bundle.revenue_growth_pct is not None and bundle.revenue_growth_pct <= min_rev:
+        quality_fails.append("营收大幅萎缩(<= -10%)")
+    if bundle.fcf_yield_pct is not None and bundle.fcf_yield_pct < min_fcf:
+        quality_fails.append(f"自由现金流明显为负(FCF率={bundle.fcf_yield_pct:.1f}%)")
+
+    if bundle.roe_pct is not None and bundle.roe_pct >= min_roe:
+        quality_pros.append(f"ROE {bundle.roe_pct:.1f}%")
+    if bundle.profit_margin_pct is not None and bundle.profit_margin_pct >= min_margin:
+        quality_pros.append(f"净利率 {bundle.profit_margin_pct:.1f}%")
+    if bundle.fcf_yield_pct is not None and bundle.fcf_yield_pct >= 3.0:
+        quality_pros.append(f"FCF率 {bundle.fcf_yield_pct:.1f}%")
+
+    quality_pass = len(quality_fails) == 0
+
+    # --- Bubble risk ---------------------------------------------------------------------
+    pe = None
+    if bundle.forward_pe is not None and bundle.forward_pe > 0:
+        pe = float(bundle.forward_pe)
+    elif bundle.trailing_pe is not None and bundle.trailing_pe > 0:
+        pe = float(bundle.trailing_pe)
+    high_pe = bool(pe is not None and pe >= bubble_pe_th)
+    growth_insufficient = bool(
+        (bundle.peg_ratio is not None and bundle.peg_ratio >= bubble_peg_th)
+        or (bundle.revenue_growth_pct is not None and bundle.revenue_growth_pct < 15.0)
+        or (bundle.peg_ratio is None and bundle.revenue_growth_pct is None)
+    )
+    bubble_risk = bool(high_pe and growth_insufficient)
+
+    # --- Margin of safety ----------------------------------------------------------------
+    entry = float(getattr(item, "entry_price", 0.0) or 0.0)
+    if entry <= 0:
+        entry = float(bundle.current_price or 0.0)
+    if entry > 0 and bundle.current_price and float(bundle.current_price) > 0:
+        entry = _rescale_price_pair(entry, float(bundle.current_price))
+    friction_pct = _estimate_entry_friction_pct(
+        symbol or bundle.symbol, bundle, strategy, "ISA", None
+    )
+
+    target_mos_pct: float | None = None
+    if (
+        (bundle.analyst_count or 0) >= 3
+        and bundle.target_mean_price is not None
+        and bundle.target_mean_price > 0
+        and entry > 0
+    ):
+        ref_target = _rescale_price_pair(float(bundle.target_mean_price), entry)
+        item_target = float(getattr(item, "target_price", 0.0) or 0.0) if item is not None else 0.0
+        if item_target > 0:
+            llm_t = _rescale_price_pair(item_target, entry)
+            if llm_t <= ref_target * 1.15:
+                ref_target = min(llm_t, ref_target)
+        target_mos_pct = round(((ref_target / entry) - 1.0) * 100.0 - friction_pct, 2)
+    else:
+        item_target = float(getattr(item, "target_price", 0.0) or 0.0) if item is not None else 0.0
+        if item_target > 0 and entry > 0:
+            llm_t = _rescale_price_pair(item_target, entry)
+            target_mos_pct = round(
+                min(((llm_t / entry) - 1.0) * 100.0, 25.0) - friction_pct, 2
+            )
+
+    rf_yield = DEFAULT_RISK_FREE_YIELD_PCT
+    if macro is not None and macro.us_10y_yield is not None and macro.us_10y_yield > 0:
+        rf_yield = float(macro.us_10y_yield)
+    erp_pct: float | None = round((100.0 / pe) - rf_yield, 2) if pe is not None and pe > 0 else None
+    fcf_yield_pct = bundle.fcf_yield_pct
+    dd52 = tech.drawdown_52w_pct if tech is not None else None
+
+    if bubble_risk:
+        mos_pass = False
+        mos_reasons.append("估值处于高PE泡沫区，缺乏安全边际")
+    elif not crisis_mode:
+        cond_target = bool(target_mos_pct is not None and target_mos_pct >= min_mos)
+        cond_erp = bool(
+            erp_pct is not None
+            and erp_pct >= min_erp
+            and (target_mos_pct is None or target_mos_pct >= 6.0)
+            and (fcf_yield_pct is None or fcf_yield_pct >= 2.0)
+        )
+        cond_low_pe = bool(
+            target_mos_pct is None
+            and pe is not None
+            and pe <= 20.0
+            and (bundle.ev_ebitda is None or bundle.ev_ebitda <= 14.0)
+        )
+        mos_pass = bool(cond_target or cond_erp or cond_low_pe)
+        if not mos_pass:
+            parts = []
+            if target_mos_pct is not None:
+                parts.append(f"目标折价{target_mos_pct:+.1f}%(<{min_mos:.0f}%)")
+            else:
+                parts.append("缺分析师目标价")
+            if erp_pct is not None:
+                parts.append(f"ERP{erp_pct:+.1f}%(<{min_erp:.1f}%)")
+            mos_reasons.append("常规安全边际不足：" + "，".join(parts))
+    else:
+        deep_discount = bool(target_mos_pct is not None and target_mos_pct >= crisis_mos)
+        value_anchor = bool(
+            (erp_pct is not None and erp_pct >= crisis_erp)
+            or (fcf_yield_pct is not None and fcf_yield_pct >= 4.5)
+            or (dd52 is not None and dd52 <= -15.0)
+        )
+        mos_pass = bool(deep_discount and value_anchor)
+        if not mos_pass:
+            if not deep_discount:
+                got = f"{target_mos_pct:+.1f}%" if target_mos_pct is not None else "缺失"
+                mos_reasons.append(f"危机深折价不足(目标折价{got}<{crisis_mos:.0f}%)")
+            if not value_anchor:
+                mos_reasons.append("危机模式缺少估值/现金流/深跌支撑")
+
+    mos_bits: list[str] = []
+    if target_mos_pct is not None:
+        mos_bits.append(f"安全边际{target_mos_pct:+.1f}%")
+    if erp_pct is not None:
+        mos_bits.append(f"ERP{erp_pct:+.1f}%")
+    if fcf_yield_pct is not None:
+        mos_bits.append(f"FCF {fcf_yield_pct:.1f}%")
+    quality_bit = "质量通过" if quality_pass else "质量门未过"
+    summary = quality_bit + (" | " + " / ".join(mos_bits) if mos_bits else " | 无估值锚")
+
+    return {
+        "quality_pass": quality_pass,
+        "mos_pass": mos_pass,
+        "passed": bool(quality_pass and mos_pass),
+        "bubble_risk": bubble_risk,
+        "crisis_mode": bool(crisis_mode),
+        "mos_pct": target_mos_pct,
+        "erp_pct": erp_pct,
+        "fcf_yield_pct": fcf_yield_pct,
+        "quality_fails": quality_fails,
+        "quality_pros": quality_pros,
+        "quality_note": "；".join(quality_pros) if quality_pros else "",
+        "mos_reasons": mos_reasons,
+        "summary": summary,
+    }
+
+
+def _is_right_side_leader(tech: TechnicalSnapshot | None) -> bool:
+    """True when a name is a clean Stage-2 style leader (above MA200, BULL/PULLBACK, weekly OK)."""
+    if tech is None:
+        return False
+    above_ma200 = tech.dist_ma200_pct is not None and tech.dist_ma200_pct > 0.0
+    return bool(
+        above_ma200
+        and tech.trend_regime in {"BULL", "PULLBACK"}
+        and tech.weekly_bullish is not False
+    )
+
+
+def resolve_invest_dynamic_rr_floor(
+    regime: str | None,
+    tech: TechnicalSnapshot | None,
+    strategy: StrategySection,
+) -> tuple[float, str]:
+    """Regime × structure dynamic R:R floor for Invest (1.6 / 2.0 / 2.5)."""
+    reg = str(regime or "NEUTRAL").strip().upper()
+    base_neutral = float(
+        getattr(strategy, "invest_min_rr_neutral", None)
+        or getattr(strategy, "min_rr_ratio", INVEST_MIN_RR_NEUTRAL)
+        or INVEST_MIN_RR_NEUTRAL
+    )
+    rr_leader = float(
+        getattr(strategy, "invest_min_rr_risk_on_leader", INVEST_MIN_RR_RISK_ON_LEADER)
+    )
+    rr_weak = float(getattr(strategy, "invest_min_rr_weak_or_risk_off", INVEST_MIN_RR_WEAK_OR_RISK_OFF))
+
+    is_weak = bool(
+        reg == "RISK_OFF"
+        or (
+            tech is not None
+            and (
+                tech.trend_regime == "WEAK"
+                or (tech.dist_ma200_pct is not None and tech.dist_ma200_pct <= 0.0)
+            )
+        )
+    )
+    if is_weak:
+        return rr_weak, "弱势/防御高赔率门槛"
+    if reg == "RISK_ON" and _is_right_side_leader(tech):
+        return min(rr_leader, base_neutral), "RISK_ON右侧强结构"
+    return base_neutral, f"{reg or 'NEUTRAL'}标准门槛"
+
+
+def compute_invest_forward_rr(
+    pos: PositionItem,
+    tech: TechnicalSnapshot | None,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    *,
+    effective_stop_pct: float | None,
+    regime: str = "NEUTRAL",
+    wallet: AccountSnapshot | None = None,
+) -> float | None:
+    """Forward R:R from *today's* price to the remaining target, per unit of stop risk.
+
+    A reading below ~0.8:1 means the leftover upside no longer pays for the downside risk,
+    i.e. the position became a "鸡肋" candidate for profit-lock / ROTATE.
+    """
+    if pos.cur_price <= 0 or effective_stop_pct is None or effective_stop_pct >= 0:
+        return None
+    cur = (
+        float(bundle.current_price)
+        if (bundle is not None and bundle.current_price and bundle.current_price > 0)
+        else float(pos.cur_price)
+    )
+    if cur <= 0:
+        return None
+    if (
+        bundle is None
+        or (bundle.analyst_count or 0) < 3
+        or bundle.target_mean_price is None
+        or bundle.target_mean_price <= 0
+    ):
+        return None
+    mean_t = _rescale_price_pair(float(bundle.target_mean_price), cur)
+    target = mean_t
+    if (
+        str(regime or "").upper() == "RISK_ON"
+        and _is_right_side_leader(tech)
+        and bundle.target_high_price is not None
+        and bundle.target_high_price > 0
+    ):
+        high_t = _rescale_price_pair(float(bundle.target_high_price), cur) * float(
+            getattr(strategy, "invest_risk_on_target_high_haircut", INVEST_RISK_ON_TARGET_HIGH_HAIRCUT)
+        )
+        target = max(mean_t, high_t)
+    upside_pct = ((target / cur) - 1.0) * 100.0
+    risk_pct = abs(float(effective_stop_pct))
+    if risk_pct <= 0:
+        return None
+    friction_pct = _round_trip_friction_pct(pos, bundle, strategy, wallet) * 0.5
+    return round((upside_pct - friction_pct) / risk_pct, 2)
 
 
 def _shares_from_gbp(
@@ -671,10 +1070,53 @@ def _build_pick_size_note(
     gbp_usd_rate: float | None = None,
     wallet: AccountSnapshot | None = None,
     risk_budget_scale: float = 1.0,
+    tech: TechnicalSnapshot | None = None,
+    macro: MacroSnapshot | None = None,
+    regime: str = "NEUTRAL",
+    existing_position_weight_pct: float = 0.0,
 ) -> str:
-    """Deterministic risk-based sizing hint: risk budget / stop distance, capped by single-name headroom."""
+    """Deterministic sizing hint: risk budget / stop distance for Invest, value batching for ISA."""
+    acct_up = str(account or "").strip().upper()
     symbol = str(getattr(item, "symbol", "") or "")
-    info = _resolve_pick_rr(item, bundle, strategy, symbol=symbol, account=account, wallet=wallet)
+    is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
+    stop_hint = float(getattr(item, "stop_price", 0.0) or 0.0)
+
+    # v5.5.1 ISA value position: no tactical stop needed -> batch-in by valuation, not by ATR.
+    if acct_up == "ISA" and not is_etf and stop_hint <= 0:
+        gate = evaluate_isa_value_gate(
+            bundle,
+            tech,
+            macro,
+            strategy,
+            item=item,
+            symbol=symbol,
+            crisis_mode=str(regime or "").upper() == "RISK_OFF",
+        )
+        if not gate.get("mos_pass"):
+            return ""
+        total = float(account_total_value_gbp or 0.0)
+        if total <= 0:
+            return f"ISA价值分批建议：{gate.get('summary')}，建议分批逢低建仓"
+        cap_pct = float(getattr(strategy, "max_single_name_portfolio_pct", 12.0) or 12.0)
+        headroom = max(0.0, total * cap_pct / 100.0 - float(existing_position_value_gbp or 0.0))
+        if headroom <= 0:
+            return ""
+        step = min(headroom, max(float(strategy.min_isa_equity_order_gbp), total * 0.04))
+        return (
+            f"ISA价值分批建议 £{step:,.0f}"
+            f"（单票余量£{headroom:,.0f}，{gate.get('summary')}，建议分批逢低建仓）"
+        )
+
+    info = _resolve_pick_rr(
+        item,
+        bundle,
+        strategy,
+        symbol=symbol,
+        account=account,
+        wallet=wallet,
+        tech=tech,
+        regime=regime,
+    )
     entry = float(info.get("entry") or 0.0)
     stop = float(info.get("stop") or 0.0)
     risk_pct = info.get("risk_pct")
@@ -684,7 +1126,7 @@ def _build_pick_size_note(
         account=account,
         strategy=strategy,
         effective_stop_pct=-abs(float(risk_pct)),
-        is_etf=bool(bundle and bundle.quote_type.upper() == "ETF"),
+        is_etf=is_etf,
         account_total_value_gbp=account_total_value_gbp,
         existing_position_value_gbp=float(existing_position_value_gbp or 0.0),
         risk_budget_scale=float(risk_budget_scale or 1.0),
@@ -697,6 +1139,9 @@ def _build_pick_size_note(
         f"以损定仓上限 £{float(suggested):,.0f}"
         f"（预算£{float(sizing.get('risk_budget_gbp') or 0.0):,.0f}÷止损{float(risk_pct):.1f}%，单仓≤{cap_pct:.0f}%）"
     ]
+    if acct_up == "INVEST":
+        min_rr, tier_label = resolve_invest_dynamic_rr_floor(regime, tech, strategy)
+        parts.append(f"动态门槛{tier_label}≥{min_rr:.1f}:1")
     shares = _shares_from_gbp(
         float(suggested),
         entry,
@@ -723,8 +1168,15 @@ def evaluate_holding(
     account_total_value: float | None = None,
     total_portfolio_value: float | None = None,
     wallet: AccountSnapshot | None = None,
+    regime: str = "NEUTRAL",
+    macro: MacroSnapshot | None = None,
 ) -> HoldingEvaluation:
-    """Evaluate an existing position deterministically for Add / Trim / Stop / Hold."""
+    """Evaluate an existing position deterministically for Add / Trim / Stop / Hold.
+
+    v5.5.1 splits the philosophy: ISA = Buffett value (quality × margin of safety, no short-term
+    volatility sell signals), Invest = right-side momentum (regime-adaptive R:R, ATR noise floor,
+    forward R:R decay).
+    """
     reasons: list[str] = []
     add_score = 0
     trim_score = 0
@@ -732,6 +1184,19 @@ def evaluate_holding(
 
     is_invest = pos.account.upper() == "INVEST"
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
+    reg_up = str(regime or "NEUTRAL").strip().upper()
+    philosophy_tag = "INVEST_RIGHT_SIDE" if is_invest else "ISA_VALUE"
+    val_gate: dict[str, Any] | None = None
+    if not is_invest and not is_etf:
+        val_gate = evaluate_isa_value_gate(
+            bundle,
+            tech,
+            macro,
+            strategy,
+            symbol=pos.yahoo_symbol,
+            crisis_mode=(reg_up == "RISK_OFF"),
+        )
+    value_mos_pct = val_gate.get("mos_pct") if val_gate else None
     max_weight = strategy.max_invest_single_weight_pct if is_invest else strategy.max_isa_single_weight_pct
     earnings_soon = bool(
         bundle and bundle.days_to_earnings is not None and 0 <= bundle.days_to_earnings <= 5
@@ -835,6 +1300,15 @@ def evaluate_holding(
             )
 
     isa_deep_dd = (not is_invest) and (pos.return_pct <= strategy.isa_deep_drawdown_review_pct)
+    isa_quality_broken = bool(val_gate is not None and val_gate.get("quality_pass") is False)
+    if isa_quality_broken:
+        trim_score += 2
+        fails_txt = "；".join(val_gate.get("quality_fails") or []) or "财务质量指标恶化"
+        reasons.append(f"ISA基本面质量门预警({fails_txt})，须核查护城河是否证伪")
+    if val_gate is not None and val_gate.get("bubble_risk"):
+        # One of the 4 legitimate ISA sell/review cases: extreme valuation bubble.
+        trim_score += 2
+        reasons.append("ISA估值进入泡沫区(安全边际透支)，建议复核估值再平衡")
     if isa_deep_dd:
         trim_score += 1
         reasons.append(
@@ -860,13 +1334,23 @@ def evaluate_holding(
     if recent_dd is None and tech is not None:
         recent_dd = tech.drawdown_60d_pct if tech.drawdown_60d_pct is not None else tech.drawdown_20d_pct
 
+    # v5.5.1: trailing profit protection is an Invest (right-side) tool only. ISA value holdings
+    # are never sold on short-term volatility; they exit on quality/bubble/concentration instead.
     trailing_triggered = False
+    trailing_dd_thresh = float(strategy.trailing_drawdown_from_peak_pct)
+    if is_invest:
+        trailing_dd_thresh = (
+            float(getattr(strategy, "invest_trailing_dd_risk_on_pct", INVEST_TRAILING_DD_RISK_ON_PCT))
+            if reg_up == "RISK_ON"
+            else float(getattr(strategy, "invest_trailing_dd_neutral_pct", INVEST_TRAILING_DD_NEUTRAL_PCT))
+        )
     if (
-        pos.return_pct >= strategy.trailing_profit_activation_pct
+        is_invest
+        and pos.return_pct >= strategy.trailing_profit_activation_pct
         and recent_dd is not None
-        and recent_dd <= strategy.trailing_drawdown_from_peak_pct
+        and recent_dd <= trailing_dd_thresh
     ):
-        if ex_div_guard and recent_dd > (strategy.trailing_drawdown_from_peak_pct - ex_div_buf):
+        if ex_div_guard and recent_dd > (trailing_dd_thresh - ex_div_buf):
             reasons.append(
                 f"浮盈+{pos.return_pct:.1f}%但处于除息窗口(回撤{recent_dd:.1f}%),暂免移动止盈误触"
             )
@@ -875,7 +1359,7 @@ def evaluate_holding(
             trim_score += 2
             window_lbl = "开仓后波段高点" if pos.created_at else "近60日波段高点"
             reasons.append(
-                f"浮盈+{pos.return_pct:.1f}%后自{window_lbl}回撤{recent_dd:.1f}%(≤{strategy.trailing_drawdown_from_peak_pct:.0f}%),触发移动止盈保护警戒"
+                f"浮盈+{pos.return_pct:.1f}%后自{window_lbl}回撤{recent_dd:.1f}%(≤{trailing_dd_thresh:.1f}%),触发移动止盈保护警戒"
             )
 
     if has_pending_stop and (stop_flag or trailing_triggered):
@@ -890,14 +1374,56 @@ def evaluate_holding(
         price_hint = f"@{','.join(prices[:2])}" if prices else ""
         reasons.append(f"已有在途卖出/止损挂单保护{price_hint},请复核触发价是否充分")
 
+    holding_above_ma20 = bool(
+        tech is not None and tech.dist_ma20_pct is not None and tech.dist_ma20_pct >= 0.0
+    )
+    heavy_down_vol = bool(
+        tech is not None
+        and tech.volume_ratio_20d is not None
+        and tech.volume_ratio_20d >= 1.8
+        and tech.ret_1d_pct is not None
+        and tech.ret_1d_pct <= -2.0
+        and not ex_div_guard
+    )
+    invest_bull_ride = bool(
+        is_invest and reg_up == "RISK_ON" and holding_above_ma20 and not heavy_down_vol
+    )
+    isa_value_add = False
+
     if tech is not None:
+        rsi_ob_risk_on = float(
+            getattr(strategy, "invest_rsi_overbought_risk_on", INVEST_RSI_OVERBOUGHT_RISK_ON)
+        )
         if tech.rsi14 is not None and tech.rsi14 >= strategy.rsi_overbought_threshold:
-            trim_score += 2 if is_invest else 1
-            reasons.append(f"RSI14={tech.rsi14:.1f}(≥{strategy.rsi_overbought_threshold:.0f}超买区)")
+            if invest_bull_ride and tech.rsi14 < rsi_ob_risk_on:
+                # Let the winner run: never trim a RISK_ON leader on RSI alone.
+                reasons.append(
+                    f"RISK_ON强趋势RSI钝化(RSI14={tech.rsi14:.1f})且稳居MA20上方，"
+                    "建议上移移动止损锁利，勿急于卖飞"
+                )
+            elif invest_bull_ride and tech.rsi14 >= rsi_ob_risk_on:
+                trim_score += 1
+                reasons.append(
+                    f"RSI14={tech.rsi14:.1f}(≥{rsi_ob_risk_on:.0f}极端超买)，"
+                    "仅提示上移移动止损，需叠加破位/乖离/前瞻R:R恶化再决策"
+                )
+            elif is_invest:
+                trim_score += 2
+                reasons.append(f"RSI14={tech.rsi14:.1f}(≥{strategy.rsi_overbought_threshold:.0f}超买区)")
+            else:
+                reasons.append(
+                    f"RSI14={tech.rsi14:.1f}(≥{strategy.rsi_overbought_threshold:.0f})仅作情绪注记，"
+                    "ISA价值仓不据此卖飞好公司"
+                )
 
         if tech.dist_ma50_pct is not None and tech.dist_ma50_pct >= 18.0:
-            trim_score += 1
-            reasons.append(f"大幅正乖离MA50({tech.dist_ma50_pct:+.1f}%),短线追高风险大")
+            if is_invest:
+                trim_score += 1
+                reasons.append(f"大幅正乖离MA50({tech.dist_ma50_pct:+.1f}%),短线追高风险大")
+            else:
+                reasons.append(
+                    f"短线大幅正乖离MA50({tech.dist_ma50_pct:+.1f}%)，长线价值仓仅作注记"
+                )
 
         if (
             tech.cyq_benefit_part_pct is not None
@@ -905,8 +1431,15 @@ def evaluate_holding(
             and tech.rsi14 is not None
             and tech.rsi14 >= 70.0
         ):
-            trim_score += 1
-            reasons.append(f"CYQ获利盘达{tech.cyq_benefit_part_pct:.0f}%且RSI={tech.rsi14:.1f},短期筹码拥挤")
+            if is_invest:
+                trim_score += 1
+                reasons.append(
+                    f"CYQ获利盘达{tech.cyq_benefit_part_pct:.0f}%且RSI={tech.rsi14:.1f},短期筹码拥挤"
+                )
+            else:
+                reasons.append(
+                    f"CYQ获利盘达{tech.cyq_benefit_part_pct:.0f}%且RSI={tech.rsi14:.1f}，仅作筹码注记"
+                )
         elif (
             tech.cyq_regime == "上方套牢峰"
             and tech.cyq_benefit_part_pct is not None
@@ -914,15 +1447,17 @@ def evaluate_holding(
         ):
             reasons.append(f"CYQ上方套牢盘较重(仅{tech.cyq_benefit_part_pct:.0f}%获利),反弹留意抛压")
 
-        if (
-            tech.volume_ratio_20d is not None
-            and tech.volume_ratio_20d >= 1.8
-            and tech.ret_1d_pct is not None
-            and tech.ret_1d_pct <= -2.0
-            and not ex_div_guard
-        ):
-            trim_score += 1
-            reasons.append(f"放量下挫(量比{tech.volume_ratio_20d:.2f}, 单日{tech.ret_1d_pct:+.1f}%)")
+        if heavy_down_vol:
+            if is_invest:
+                trim_score += 1
+                reasons.append(
+                    f"放量下挫(量比{tech.volume_ratio_20d:.2f}, 单日{tech.ret_1d_pct:+.1f}%)"
+                )
+            else:
+                reasons.append(
+                    f"放量下挫(量比{tech.volume_ratio_20d:.2f}, 单日{tech.ret_1d_pct:+.1f}%)，"
+                    "长线价值仓不据此减仓，须核查基本面是否证伪"
+                )
 
         below_ma200 = tech.dist_ma200_pct is not None and tech.dist_ma200_pct <= 0.0
         mild_ex_div_dip = bool(
@@ -996,6 +1531,31 @@ def evaluate_holding(
             ):
                 reasons.append("CYQ筹码支撑结构良好")
 
+        # v5.5.1 ISA value left-side add (four locks). The old "Price > MA200" gate
+        # (`require_uptrend_for_add`) is deliberately waived for quality value names.
+        if not is_invest and not is_etf and val_gate is not None:
+            add_dd_thresh = float(
+                getattr(strategy, "isa_value_add_drawdown_pct", ISA_VALUE_ADD_DRAWDOWN_PCT)
+            )
+            dd52_ok = bool(
+                tech.drawdown_52w_pct is not None and tech.drawdown_52w_pct <= add_dd_thresh
+            )
+            cost_dd_ok = bool(pos.return_pct <= add_dd_thresh)
+            four_locks = bool(
+                (not over_weight)
+                and (not stop_flag)
+                and val_gate.get("quality_pass")
+                and val_gate.get("mos_pass")
+                and (dd52_ok or cost_dd_ok)
+            )
+            if four_locks:
+                isa_value_add = True
+                add_score = max(add_score, 2)
+                reasons.append(
+                    f"ISA价值左侧加仓候补({val_gate.get('summary')}，距高点/成本回撤达标；"
+                    "须联网确认下跌源于市场情绪而非基本面/护城河恶化后分批加仓)"
+                )
+
     # v5.4.0 ISA legacy crumb (grandfathered, < min_isa_equity_order_gbp) — only a *gentle*
     # rebound-window prune hint. Never force-liquidate in panic days or silent pullbacks.
     crumb_prune_candidate = False
@@ -1026,13 +1586,15 @@ def evaluate_holding(
     friction_pct = _round_trip_friction_pct(pos, bundle, strategy, wallet)
     cash_floor_pct = _wallet_cash_basis_pct(pos, strategy, wallet)
     rr_ratio: float | None = None
+    forward_rr: float | None = None
     if is_invest and effective_stop is not None and float(effective_stop) < 0 and upside_pct is not None:
         risk_pct = abs(float(effective_stop))
         rr_ratio = (upside_pct - friction_pct) / risk_pct if risk_pct > 0 else None
-        if rr_ratio is not None and rr_ratio < 2.0:
+        min_rr, rr_tier = resolve_invest_dynamic_rr_floor(reg_up, tech, strategy)
+        if rr_ratio is not None and rr_ratio < min_rr:
             add_score = 0
             reasons.append(
-                f"风险回报比仅{rr_ratio:.2f}:1(<2:1门槛；目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}% "
+                f"风险回报比仅{rr_ratio:.2f}:1(<{min_rr:.1f}:1 {rr_tier}；目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}% "
                 f"vs 止损{risk_pct:.1f}%，现金停车{cash_floor_pct:.1f}%仅作等待期保底)"
             )
     elif not is_invest and upside_pct is not None:
@@ -1045,6 +1607,35 @@ def evaluate_holding(
         if weak_long_trend and (upside_pct - friction_pct) <= 0.0:
             reasons.append(
                 f"长期弱势(MA200下方)+目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}%后不足,触发机会成本置换复核(不以现金利息否决)"
+            )
+
+    # v5.5.1 Invest forward R:R: leftover upside vs remaining downside risk (<0.8:1 = 鸡肋).
+    if is_invest:
+        forward_rr = compute_invest_forward_rr(
+            pos,
+            tech,
+            bundle,
+            strategy,
+            effective_stop_pct=effective_stop,
+            regime=reg_up,
+            wallet=wallet,
+        )
+        forward_rr_warn = float(
+            getattr(strategy, "invest_forward_rr_exit_warn", INVEST_FORWARD_RR_EXIT_WARN)
+        )
+        if (
+            forward_rr is not None
+            and forward_rr < forward_rr_warn
+            and not stop_flag
+            and (
+                not holding_above_ma20
+                or (tech is not None and tech.ret_20d_pct is not None and tech.ret_20d_pct <= 2.0)
+            )
+        ):
+            trim_score += 1
+            reasons.append(
+                f"前瞻R:R恶化至{forward_rr:.2f}:1(<{forward_rr_warn:.1f}:1)，剩余赔率不足，"
+                "可评估锁利或ROTATE置换高赔率标的"
             )
 
     sizing = compute_risk_based_size_gbp(
@@ -1061,7 +1652,7 @@ def evaluate_holding(
         if add_score > 0:
             add_score = min(max(0, add_score - 1), 1)
 
-    if stop_flag or over_weight or isa_deep_dd or trim_score >= 2:
+    if stop_flag or over_weight or (isa_deep_dd and not isa_value_add) or trim_score >= 2:
         add_score = 0
 
     if stop_flag:
@@ -1094,6 +1685,9 @@ def evaluate_holding(
         suggested_size_gbp=sizing["suggested_gbp"],
         min_order_gbp=sizing["min_order_gbp"],
         is_crumb_prune_candidate=crumb_prune_candidate,
+        philosophy_tag=philosophy_tag,
+        value_mos_pct=round(float(value_mos_pct), 2) if value_mos_pct is not None else None,
+        forward_rr=forward_rr,
     )
 
 
@@ -1114,6 +1708,8 @@ def evaluate_portfolio(
     strategy: StrategySection,
     *,
     histories: dict[str, pd.DataFrame] | None = None,
+    regime: str = "NEUTRAL",
+    macro: MacroSnapshot | None = None,
 ) -> list[HoldingEvaluation]:
     """Evaluate all holdings across ISA & Invest with cross-account weight & pending-order context."""
     total_all = _resolve_total_portfolio_gbp(data)
@@ -1140,6 +1736,8 @@ def evaluate_portfolio(
             account_total_value=account_totals.get(pos.account.upper()),
             total_portfolio_value=total_all,
             wallet=data.invest,
+            regime=regime,
+            macro=macro,
         )
         for pos in data.all_positions()
     ]
@@ -1496,6 +2094,7 @@ def apply_risk_override_guardrail(
     vix_danger_threshold: float = DEFAULT_VIX_DANGER_THRESHOLD,
     deployment_gate: dict[str, Any] | None = None,
     risk_budget_scale: float = 1.0,
+    tech_map: dict[str, TechnicalSnapshot] | None = None,
 ) -> RiskOverrideResult:
     """Apply deterministic post-LLM risk override guardrails to MorningReportDecision or PickDecision."""
     if decision is None:
@@ -1507,6 +2106,13 @@ def apply_risk_override_guardrail(
     macro_high_risk = macro_vix is not None and macro_vix >= vix_danger_threshold
     corr_set = {s.strip().upper() for s in (high_correlation_symbols or set()) if s and s.strip()}
     corr_bases = {s.split(".")[0] for s in corr_set}
+    regime = str((deployment_gate or {}).get("regime") or "NEUTRAL").strip().upper()
+    tech_lookup: dict[str, TechnicalSnapshot] = {}
+    for t_sym, t_snap in (tech_map or {}).items():
+        if not t_sym or t_snap is None:
+            continue
+        tech_lookup[t_sym.strip().upper()] = t_snap
+        tech_lookup.setdefault(t_sym.strip().upper().split(".")[0], t_snap)
 
     merged_vetoes = list(daily_vetoes or [])
     if hasattr(decision, "daily_vetoes") and getattr(decision, "daily_vetoes"):
@@ -1841,9 +2447,46 @@ def apply_risk_override_guardrail(
                 if item is not None:
                     # Core wide-base / diversifier DCA is a structural allocation, not a
                     # tactical R:R trade: the 2:1 floor and numeric stop/target do not apply.
+                    t_snap = tech_lookup.get(sym_up) or tech_lookup.get(base)
                     if pick_core_etf:
-                        rr_info = None
+                        pass
+                    elif acct_up == "ISA" and not is_etf:
+                        # v5.5.1 ISA branch: quality gate + margin of safety REPLACE the 2:1 R:R
+                        # hurdle entirely (a Buffett value name may legitimately carry stop_price=0).
+                        isa_value_mode = str(
+                            getattr(strat, "isa_value_guard_mode", ISA_VALUE_GUARD_MODE_DEFAULT) or ""
+                        ).strip().lower()
+                        if isa_value_mode != "off":
+                            is_crisis = bool(macro_high_risk or regime == "RISK_OFF")
+                            vg = evaluate_isa_value_gate(
+                                b,
+                                t_snap,
+                                macro,
+                                strat,
+                                item=item,
+                                symbol=sym_up,
+                                crisis_mode=is_crisis,
+                            )
+                            if not vg["quality_pass"]:
+                                vg_msg = f"ISA 质量门未通过：{'；'.join(vg['quality_fails'])}"
+                                if isa_value_mode == "hard":
+                                    return "ISA_QUALITY_FAIL", vg_msg
+                                _adv = f"[⚠️纪律提醒] [{account}] {symbol}: {vg_msg}"
+                                if _adv not in cadence_advisories:
+                                    cadence_advisories.append(_adv)
+                            elif not vg["mos_pass"]:
+                                mode_lbl = "危机深折价模式" if is_crisis else "常规模式"
+                                vg_msg = (
+                                    f"ISA 安全边际不足（{mode_lbl}）："
+                                    f"{'；'.join(vg['mos_reasons']) or '估值证据不足'}"
+                                )
+                                if isa_value_mode == "hard":
+                                    return "ISA_MOS_INSUFFICIENT", vg_msg
+                                _adv = f"[⚠️纪律提醒] [{account}] {symbol}: {vg_msg}"
+                                if _adv not in cadence_advisories:
+                                    cadence_advisories.append(_adv)
                     else:
+                        # v5.5.1 Invest branch: regime × structure dynamic R:R + ATR noise floor.
                         rr_info = _resolve_pick_rr(
                             item,
                             b,
@@ -1851,20 +2494,21 @@ def apply_risk_override_guardrail(
                             symbol=sym_up,
                             account=acct_up,
                             wallet=wallet,
+                            tech=t_snap,
+                            regime=regime,
                         )
-                    if rr_info is None and not pick_core_etf:
-                        rr_msg = (
-                            "Python 无法复核 R:R（stop_price / target_price 未给出有效数字）；"
-                            "hard 模式要求先给出数值止损与目标价"
-                        )
-                        if guard_mode == "hard":
-                            return "RR_UNVERIFIED", rr_msg
-                        advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
-                        if advisory not in cadence_advisories:
-                            cadence_advisories.append(advisory)
-                    elif rr_info is not None:
+                        if rr_info.get("stop_too_tight"):
+                            st_msg = (
+                                f"止损幅仅{float(rr_info.get('risk_pct') or 0.0):.1f}%，"
+                                f"低于ATR噪声地板{float(rr_info.get('min_stop_pct') or 0.0):.1f}%，"
+                                "禁止借窄止损虚增R:R"
+                            )
+                            if guard_mode == "hard":
+                                return "STOP_TOO_TIGHT", st_msg
+                            _adv = f"[⚠️纪律提醒] [{account}] {symbol}: {st_msg}"
+                            if _adv not in cadence_advisories:
+                                cadence_advisories.append(_adv)
                         rr = rr_info.get("rr")
-                        min_rr = float(getattr(strat, "min_rr_ratio", 2.0) or 2.0)
                         if rr is None:
                             rr_msg = (
                                 "Python 无法复核 R:R（stop_price / target_price 未给出有效数字）；"
@@ -1875,18 +2519,20 @@ def apply_risk_override_guardrail(
                             advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
                             if advisory not in cadence_advisories:
                                 cadence_advisories.append(advisory)
-                        elif float(rr) < min_rr:
-                            rr_msg = (
-                                f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 门槛；"
-                                f"目标空间{float(rr_info['upside_pct'] or 0.0):+.1f}% "
-                                f"扣摩擦{float(rr_info['friction_pct'] or 0.0):.2f}% "
-                                f"vs 止损{float(rr_info['risk_pct'] or 0.0):.1f}%)"
-                            )
-                            if guard_mode == "hard":
-                                return "RR_BELOW_FLOOR", rr_msg
-                            advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
-                            if advisory not in cadence_advisories:
-                                cadence_advisories.append(advisory)
+                        else:
+                            min_rr, tier_label = resolve_invest_dynamic_rr_floor(regime, t_snap, strat)
+                            if float(rr) < min_rr:
+                                rr_msg = (
+                                    f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 {tier_label}；"
+                                    f"目标空间{float(rr_info['upside_pct'] or 0.0):+.1f}% "
+                                    f"扣摩擦{float(rr_info['friction_pct'] or 0.0):.2f}% "
+                                    f"vs 止损{float(rr_info['risk_pct'] or 0.0):.1f}%)"
+                                )
+                                if guard_mode == "hard":
+                                    return "RR_BELOW_FLOOR", rr_msg
+                                advisory = f"[⚠️纪律提醒] [{account}] {symbol}: {rr_msg}"
+                                if advisory not in cadence_advisories:
+                                    cadence_advisories.append(advisory)
 
             if macro_high_risk and macro_vix is not None:
                 core_etf_buy = bool(
@@ -1898,10 +2544,35 @@ def apply_risk_override_guardrail(
                 if not core_etf_buy:
                     family = infer_etf_index_family(sym_up, b)
                     core_etf_buy = family in _CORE_WIDE_BASE_FAMILIES
-                if not core_etf_buy:
+                # v5.5.1: ISA deep-margin-of-safety quality value names keep a staged
+                # contrarian entry lane during a crisis; Invest stays 100% frozen.
+                isa_crisis_value_exempt = False
+                if (
+                    acct_up == "ISA"
+                    and not is_etf
+                    and b is not None
+                    and bool(
+                        getattr(
+                            strat,
+                            "isa_value_crisis_buy_enabled",
+                            ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT,
+                        )
+                    )
+                ):
+                    vg_crisis = evaluate_isa_value_gate(
+                        b,
+                        tech_lookup.get(sym_up) or tech_lookup.get(base),
+                        macro,
+                        strat,
+                        item=item,
+                        symbol=sym_up,
+                        crisis_mode=True,
+                    )
+                    isa_crisis_value_exempt = bool(vg_crisis["passed"])
+                if not core_etf_buy and not isa_crisis_value_exempt:
                     return (
                         "MACRO_VIX",
-                        f"VIX={macro_vix:.1f}(≥{vix_danger_threshold:.0f}高危阈值)，暂停个股主动买入/加仓",
+                        f"VIX={macro_vix:.1f}(≥{vix_danger_threshold:.0f}高危阈值)，暂停非深折价优质个股买入/加仓",
                     )
 
         return None
@@ -1993,6 +2664,9 @@ def apply_risk_override_guardrail(
                         gbp_usd_rate=gbp_usd_rate,
                         wallet=portfolio.invest if (portfolio is not None and acct_up == "INVEST") else None,
                         risk_budget_scale=float(risk_budget_scale or 1.0),
+                        tech=tech_lookup.get(sym_up) or tech_lookup.get(sym_base),
+                        macro=macro,
+                        regime=regime,
                     )
                     if size_note:
                         # risk_note 是 Python 侧保留字段：模型必须返回空串，落地前由这里写入。

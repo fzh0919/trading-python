@@ -763,7 +763,8 @@ class TestAnalyticsAndRules(unittest.TestCase):
         strategy = StrategySection()
 
         # 1. Post-entry trailing drawdown: peak of 150 occurs at bar 175 (within 60d window);
-        # ISA entered before the peak (bar 172 -> triggers trailing stop), Invest entered after (bar 185 -> exempt).
+        # an Invest position entered before the peak triggers the trailing stop, one entered after
+        # is exempt. v5.5.1: ISA value holdings are NOT shaken out by the same short-term drawdown.
         dates = pd.date_range("2026-01-01", periods=220, freq="B")
         closes = (
             [100.0 + i * 0.08 for i in range(170)]
@@ -795,7 +796,7 @@ class TestAnalyticsAndRules(unittest.TestCase):
             quantity=10,
             avg_price=85.0,
             cur_price=105.0,
-            current_value=820,
+            current_value=2400,
             total_cost=660,
             pnl=160,
             fx_impact=0,
@@ -803,19 +804,29 @@ class TestAnalyticsAndRules(unittest.TestCase):
             weight_pct=10.0,
             created_at=entry_date_recent,
         )
-        pos_old = pos_recent.model_copy(update={"account": "ISA", "created_at": entry_date_old})
+        pos_old_inv = pos_recent.model_copy(update={"created_at": entry_date_old})
+        pos_old_isa = pos_old_inv.model_copy(
+            update={"account": "ISA", "ticker": "KO", "yahoo_symbol": "KO", "raw_ticker": "KO_US_EQ"}
+        )
         portfolio_dual = PortfolioData(
             fetched_at_uk="2026-11-14 07:30",
             fetched_at_ms=1763105400000,
-            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=8200, positions=[pos_old]),
-            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=8200, positions=[pos_recent]),
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=24000, positions=[pos_old_isa]),
+            invest=AccountSnapshot(
+                ok=True, account_label="Invest", total_account_value=24000, positions=[pos_recent, pos_old_inv]
+            ),
         )
-        evals_dual = evaluate_portfolio(portfolio_dual, {"NVDA": tech_raw}, {}, strategy, histories={"NVDA": hist})
-        by_acct = {e.account: e for e in evals_dual}
-        self.assertNotIn("移动止盈", " ".join(by_acct["Invest"].reasons))
-        self.assertNotEqual(by_acct["Invest"].action_bias, "TRIM_ALERT")
-        self.assertIn("移动止盈", " ".join(by_acct["ISA"].reasons))
-        self.assertEqual(by_acct["ISA"].action_bias, "TRIM_ALERT")
+        evals_dual = evaluate_portfolio(
+            portfolio_dual, {"NVDA": tech_raw, "KO": tech_raw}, {}, strategy, histories={"NVDA": hist, "KO": hist}
+        )
+        invest_evals = [e for e in evals_dual if e.account == "Invest"]
+        isa_eval = next(e for e in evals_dual if e.account == "ISA")
+        # Invest entered before the peak -> trailing stop fires; entered after -> exempt.
+        self.assertTrue(any("移动止盈" in " ".join(e.reasons) for e in invest_evals))
+        self.assertTrue(any(e.action_bias == "TRIM_ALERT" for e in invest_evals))
+        # ISA value holding in the exact same drawdown must NOT be sold on volatility alone.
+        self.assertNotIn("移动止盈", " ".join(isa_eval.reasons))
+        self.assertNotEqual(isa_eval.action_bias, "TRIM_ALERT")
 
         # 2. ATR adaptive stop: high volatility (atr_pct=5.5% -> stop=-15.4%) avoids premature -12% stop;
         # low volatility (atr_pct=2.0% -> stop=-8.0%) triggers REVIEW_STOP at -9.5%.
@@ -979,7 +990,7 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertNotEqual(ev_low_upside_inv.action_bias, "ADD_CANDIDATE")
         self.assertIn("风险回报比仅", " ".join(ev_low_upside_inv.reasons))
 
-        # Crowded CYQ profit + RSI>=70 + volume spike triggers TRIM_ALERT
+        # Crowded CYQ profit + RSI>=70 + volume spike triggers TRIM_ALERT (Invest right-side rule)
         tech_crowded = TechnicalSnapshot(
             symbol="NVDA",
             last_close=150.0,
@@ -990,7 +1001,8 @@ class TestAnalyticsAndRules(unittest.TestCase):
             ret_1d_pct=-2.5,
             trend_regime="BULL",
         )
-        ev_crowded = evaluate_holding(pos_msft.model_copy(update={"weight_pct": 10.0}), tech_crowded, None, strategy)
+        pos_inv_crowded = pos_msft.model_copy(update={"account": "Invest", "weight_pct": 10.0})
+        ev_crowded = evaluate_holding(pos_inv_crowded, tech_crowded, None, strategy)
         self.assertEqual(ev_crowded.action_bias, "TRIM_ALERT")
         self.assertIn("CYQ获利盘达95%", " ".join(ev_crowded.reasons))
 
@@ -1632,7 +1644,7 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertFalse(m_down["passes"])
         cand_down = score_candidate(
             "FALL.L",
-            "ISA_LONG_TERM",
+            "INVEST_TACTICAL",
             tech_down,
             None,
             0.30,
@@ -1645,6 +1657,23 @@ class TestAnalyticsAndRules(unittest.TestCase):
         self.assertGreater(cand_down.score, 0.0)
         self.assertIn("[Phase4弱势]", cand_down.reasons)
         self.assertLess(cand_down.score, cand_vcp.score)
+
+        # v5.5.1: the ISA value track no longer hard-punishes a Phase 4 tape (value-trap guard
+        # is handled by fundamental quality metrics, not by momentum regime).
+        cand_down_isa = score_candidate(
+            "FALL.L",
+            "ISA_LONG_TERM",
+            tech_down,
+            None,
+            0.30,
+            "NVDA",
+            False,
+            False,
+            strategy,
+            hist=df_down,
+        )
+        self.assertNotIn("[Phase4弱势]", cand_down_isa.reasons)
+        self.assertGreater(cand_down_isa.score, cand_down.score)
 
     def test_imp08_v2_linear_quality_and_portfolio_marginal_risk(self) -> None:
         from src.data_providers.t212_client import AccountSnapshot, PortfolioData
@@ -2745,6 +2774,11 @@ class TestStage2PenetrationAndSizing(unittest.TestCase):
 class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
     """v5.3.2 Stage 2: frequency caps, re-buy cooldown and ISA opportunity-cost replacement."""
 
+    @staticmethod
+    def _cadence_strategy(**kwargs):
+        """v5.5.1: these cases test cadence only, so keep the ISA value gate out of the way."""
+        return StrategySection(**kwargs).model_copy(update={"isa_value_guard_mode": "off"})
+
     def _pick(self, action: str, symbol: str = "MSFT", account: str = "ISA"):
         from src.agents.schemas import PickActionItem, PickDecision
 
@@ -2776,7 +2810,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         }
         res = apply_risk_override_guardrail(
             self._pick("BUY"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertTrue(res.applied)
@@ -2785,7 +2819,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
 
         trim_res = apply_risk_override_guardrail(
             self._pick("TRIM"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertFalse(trim_res.applied)
@@ -2796,7 +2830,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         behavior = {"buys_7d": 1, "buys_30d": 6, "partial": False, "recently_closed": [], "cooldown_days": 15}
         res = apply_risk_override_guardrail(
             self._pick("ADD"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertTrue(res.applied)
@@ -2817,7 +2851,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         }
         blocked = apply_risk_override_guardrail(
             self._pick("BUY", symbol="NVDA"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertTrue(blocked.applied)
@@ -2826,7 +2860,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
 
         allowed = apply_risk_override_guardrail(
             self._pick("BUY", symbol="MSFT"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertFalse(allowed.applied)
@@ -2845,7 +2879,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         }
         res = apply_risk_override_guardrail(
             self._pick("BUY"),
-            strategy=StrategySection(trade_cadence_guard_mode="hard"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="hard"),
             trade_behavior=behavior,
         )
         self.assertFalse(res.applied)
@@ -2861,7 +2895,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
             "cooldown_days": 15,
         }
         res = apply_risk_override_guardrail(
-            self._pick("BUY"), strategy=StrategySection(), trade_behavior=behavior
+            self._pick("BUY"), strategy=self._cadence_strategy(), trade_behavior=behavior
         )
         self.assertFalse(res.applied)
         self.assertEqual(res.overrides, [])
@@ -2889,7 +2923,7 @@ class TestStage2CadenceAndOpportunityCost(unittest.TestCase):
         res = apply_risk_override_guardrail(
             self._pick("BUY"),
             # v5.3.4: 买入侧 R:R/除息护栏是独立开关，这里同时关机才能验证 cadence 的 off 语义。
-            strategy=StrategySection(trade_cadence_guard_mode="off", pick_rr_guard_mode="off"),
+            strategy=self._cadence_strategy(trade_cadence_guard_mode="off", pick_rr_guard_mode="off"),
             trade_behavior=behavior,
         )
         self.assertFalse(res.applied)

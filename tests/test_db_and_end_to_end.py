@@ -588,9 +588,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         from src.agents.report_agent import generate_us_sentinel
         from src.agents.tools import MarketToolkit
 
-        # 1) render_morning_report default ceiling is now 1800 chars (1650-char report preserved intact)
+        # 1) render_morning_report default ceiling is now 2200 chars (v5.5.1; 1950-char report preserved intact)
         medium_report = MorningReportDecision(
-            headline="1800字安全天花板验证",
+            headline="2200字安全天花板验证",
             top_actions=[ReportActionItem(account="ISA", symbol="NVDA", action="HOLD", price_zone="138", reason="趋势完整")],
             daily_vetoes=["控制半导体仓位"],
             macro_and_cash="宏观" * 180,
@@ -601,7 +601,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         rendered_default = render_morning_report(medium_report)
         self.assertGreater(len(rendered_default), 1000)
-        self.assertLessEqual(len(rendered_default), 1800)
+        self.assertLessEqual(len(rendered_default), 2200)
         self.assertIn("其余长线底仓持有", rendered_default)
 
         # 2) trim_text_at_line_boundary cleanly trims on newline without leaving dangling 【...】 or mid-clause breaks
@@ -734,7 +734,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("USD 钱包 $400.00", pipeline_calls[0]["prompt"])
                 self.assertIn("Invest 资金路径", pipeline_calls[2]["prompt"])
                 report_msg = tg.messages[-1]
-                self.assertLessEqual(len(report_msg), 1800)
+                self.assertLessEqual(len(report_msg), 2200)
                 self.assertTrue(report_msg.startswith("【今日核心行动与挂单裁决】"))
                 self.assertIn("CANCEL", report_msg)
                 guardrails = await db.get_daily_guardrails()
@@ -757,7 +757,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(us_call["thinking_level"], cfg.models.us_thinking_level)
                 self.assertIsNone(us_call.get("tools"))
                 self.assertTrue(us_call.get("system_instruction"))
-                self.assertIn("【活动挂单裁决】", us_call["prompt"])
+                self.assertIn("🏛️ ISA 价值账户", us_call["prompt"])
                 self.assertIn("【美股活动挂单】：\n（当前无未成交活动挂单）", us_call["prompt"])
                 self.assertIn("GBP/USD 1.2750", us_call["prompt"])
                 self.assertIn("USD $400.00", us_call["prompt"])
@@ -2214,7 +2214,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     clear_grounding_cache()
                     await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/report"}}, wait=True)
                     report_msg = tg.messages[-1]
-                    self.assertLessEqual(len(report_msg), 1800)
+                    self.assertLessEqual(len(report_msg), 2200)
                     self.assertIsNotNone(await db.get_context_pack(allow_fallback=False))
 
                     await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/us"}}, wait=True)
@@ -2485,8 +2485,10 @@ class TestStage3BenchmarkMandatePrompts(unittest.TestCase):
         profile = build_investor_profile(StrategySection())
         self.assertIn("VWRP.L", profile)
         self.assertIn("£85", profile)
-        self.assertIn("R:R ≥ 2:1", profile)
-        self.assertIn("卖出三分类", profile)
+        self.assertIn("RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1", profile)
+        self.assertIn("卖出分类", profile)
+        self.assertIn("巴菲特价值流派", profile)
+        self.assertIn("右侧动量战术流派", profile)
         self.assertIn("严禁把“守住现金吃息”当默认结论", profile)
         self.assertIn("一律按挂单限价核算", profile)
         self.assertNotIn("必须直白建议撤单", profile)

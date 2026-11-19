@@ -929,7 +929,8 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         self.assertEqual(invest["status"], "DEFEND")
         self.assertEqual(invest["mode"], "defend")
         self.assertTrue(gate["triggers"]["D"]["risk_off_defend"])
-        self.assertIn("撤除未成交个股买单", invest.get("defend_note", ""))
+        self.assertIn("撤除 Invest 未成交个股买单", invest.get("defend_note", ""))
+        self.assertIn("ISA 低位价值买单须核查基本面", invest.get("defend_note", ""))
 
     def test_isa_wide_base_ladder_still_sowed_during_risk_off(self) -> None:
         # VIX 30 (RISK_OFF) must NOT kill ISA core-ETF ladder seeding at the -15% step.
@@ -949,12 +950,16 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         self.assertEqual(gate["invest"]["status"], "DEFEND")
         self.assertEqual(gate["triggers"]["A"]["core_etf_step"]["hit"], 15.0)
 
-    def test_isa_equity_channel_closed_during_risk_off(self) -> None:
-        portfolio = _real_snapshot_portfolio()
-        for order in list(portfolio.isa.pending_orders):
-            if order.yahoo_symbol in {"SHEL.L", "RKT.L"}:
-                portfolio.isa.pending_orders.remove(order)
-        portfolio.isa.positions = portfolio.isa.positions[:5]  # only big 5, no saturation
+    def test_isa_crisis_value_channel_and_invest_freeze_during_risk_off(self) -> None:
+        def _trimmed_portfolio():
+            p = _real_snapshot_portfolio()
+            for order in list(p.isa.pending_orders):
+                if order.yahoo_symbol in {"SHEL.L", "RKT.L"}:
+                    p.isa.pending_orders.remove(order)
+            p.isa.positions = p.isa.positions[:5]  # only big 5, no saturation
+            return p
+
+        portfolio = _trimmed_portfolio()
         gate = evaluate_deployment_gate(
             portfolio=portfolio,
             strategy=StrategySection(),
@@ -965,11 +970,42 @@ class TestDefendAndInverseCoupling(unittest.TestCase):
         )
         isa = gate["isa"]
         self.assertFalse(isa["isa_satellite_saturated"])
-        self.assertNotEqual(isa["status"], "RUN")  # equity channel shut in RISK_OFF (no ladder hit)
-        self.assertEqual(isa["mode"], "none")
-        self.assertFalse(isa["equity_open"])
+        # v5.5.1: ISA keeps a quality + >=20% deep-discount contrarian lane open in RISK_OFF,
+        # while the wide-base ETF ladder itself still needs a valid drawdown step.
+        self.assertTrue(isa["value_crisis_mode"])
+        self.assertTrue(isa["equity_open"])
         self.assertFalse(isa["etf_open"])
+        self.assertIn("深度安全边际价值分批通道", isa["reason"])
         self.assertEqual(gate["invest"]["status"], "DEFEND")
+        self.assertEqual(gate["invest"]["slots_cap"], 0)
+
+        # Branch 2: explicitly disabling the crisis value lane re-closes the ISA equity channel.
+        off_strategy = StrategySection().model_copy(update={"isa_value_crisis_buy_enabled": False})
+        gate_off = evaluate_deployment_gate(
+            portfolio=_trimmed_portfolio(),
+            strategy=off_strategy,
+            bundles={},
+            histories={"SPY": _spy_neutral_hist()},
+            macro=_neutral_macro(vix=30.0),
+            universe_etf_symbols=["VWRP.L", "VUAG.L"],
+        )
+        self.assertFalse(gate_off["isa"]["value_crisis_mode"])
+        self.assertFalse(gate_off["isa"]["equity_open"])
+        self.assertEqual(gate_off["invest"]["status"], "DEFEND")
+
+        # Branch 3: extreme low cash (<2%) also shuts the lane.
+        portfolio_low = _trimmed_portfolio()
+        portfolio_low.isa.total_cash = 500.0
+        gate_low = evaluate_deployment_gate(
+            portfolio=portfolio_low,
+            strategy=StrategySection(),
+            bundles={},
+            histories={"SPY": _spy_neutral_hist()},
+            macro=_neutral_macro(vix=30.0),
+            universe_etf_symbols=["VWRP.L", "VUAG.L"],
+        )
+        self.assertFalse(gate_low["isa"]["equity_open"])
+        self.assertEqual(gate_low["invest"]["status"], "DEFEND")
 
     def test_isa_extreme_low_cash_triggers_defence_note(self) -> None:
         portfolio = _real_snapshot_portfolio()
@@ -1719,7 +1755,9 @@ class TestPostAuditRegressions(unittest.IsolatedAsyncioTestCase):
         portfolio = _sample_portfolio()
         cfg = AppConfig(
             env=EnvSettings(_env_file=None, telegram_chat_id="999"),
-            strategy=StrategySection(deployment_gate_mode="log", overlap_correlation_threshold=1.0),
+            strategy=StrategySection(
+                deployment_gate_mode="log", overlap_correlation_threshold=1.0
+            ).model_copy(update={"isa_value_guard_mode": "off"}),  # v5.5.1: keep this case about gate mode only
         )
         decision = PickDecision(
             headline="影子模式放行",

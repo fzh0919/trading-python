@@ -94,6 +94,38 @@ def _ratio_to_pct(value: Any) -> float | None:
     return round(num * 100.0, 4)
 
 
+# v5.5.1: FCF Yield sanity band. Cross-currency ADRs (JPY earnings / USD market cap)
+# can produce absurd ratios; anything outside -50% ~ +50% is treated as bad data.
+_FCF_YIELD_MIN_RATIO: float = -0.50
+_FCF_YIELD_MAX_RATIO: float = 0.50
+
+
+def _compute_safe_fcf_yield_pct(free_cashflow: Any, market_cap: Any) -> float | None:
+    """Compute free-cash-flow yield (%) with currency-scale guards.
+
+    Returns ``None`` when either input is missing/non-finite, when market cap is not
+    positive, or when the raw ratio falls outside the sane ``-50% ~ +50%`` band.
+    """
+    fcf = _safe_float(free_cashflow)
+    mcap = _safe_float(market_cap)
+    if fcf is None or mcap is None or mcap <= 0.0:
+        return None
+    ratio = fcf / mcap
+    if not math.isfinite(ratio) or ratio < _FCF_YIELD_MIN_RATIO or ratio > _FCF_YIELD_MAX_RATIO:
+        return None
+    return round(ratio * 100.0, 2)
+
+
+def _pick_peg_ratio(info: dict[str, Any]) -> float | None:
+    """Pick a sane PEG ratio from yfinance info (accepts 0 < PEG <= 50)."""
+    peg_val = _safe_float(info.get("pegRatio"))
+    if peg_val is None:
+        peg_val = _safe_float(info.get("trailingPegRatio"))
+    if peg_val is not None and 0.0 < peg_val <= 50.0:
+        return round(peg_val, 3)
+    return None
+
+
 def _is_us_symbol(symbol: str) -> bool:
     return "." not in symbol and "=" not in symbol and "^" not in symbol
 
@@ -380,6 +412,11 @@ class TickerMarketBundle(BaseModel):
     eps_estimate: float | None = None
     ex_dividend_date: str | None = None
     days_to_ex_dividend: int | None = None
+    # v5.5.1 dual-philosophy fundamentals (all optional -> old cached JSON stays valid)
+    fcf_yield_pct: float | None = None
+    target_high_price: float | None = None
+    target_low_price: float | None = None
+    peg_ratio: float | None = None
     news: list[dict[str, str]] = Field(default_factory=list)
     # History stored separately in analytics layer; serialized summary kept light
     has_history: bool = False
@@ -488,6 +525,8 @@ _FINNHUB_METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "ev_ebitda": ("evEbitdaTTM", "evEbitda", "enterpriseValueOverEBITDATTM"),
     "current_ratio": ("currentRatio", "currentRatioAnnual", "currentRatioQuarterly"),
     "beta": ("beta",),
+    # v5.5.1: P/FCF ratio -> converted to FCF yield % when yfinance has no free cashflow
+    "pfcf": ("pfcfShareTTM", "pfcfShareAnnual", "priceToFreeCashFlowTTM"),
 }
 
 
@@ -532,6 +571,11 @@ def apply_basic_financials(bundle: TickerMarketBundle, metrics: dict[str, Any] |
         beta = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["beta"])
         if beta is not None:
             bundle.beta = round(beta, 3)
+            changed = True
+    if bundle.fcf_yield_pct is None:
+        pfcf = _pick_metric(metrics, _FINNHUB_METRIC_ALIASES["pfcf"])
+        if pfcf is not None and pfcf >= 2.0:  # <=50% yield sanity guard
+            bundle.fcf_yield_pct = round(100.0 / pfcf, 2)
             changed = True
     if changed:
         bundle.metrics_source = "finnhub_metric"
@@ -1162,6 +1206,14 @@ class MarketDataService:
             bundle.debt_to_equity = _safe_float(info.get("debtToEquity"))
             bundle.analyst_count = _safe_int(info.get("numberOfAnalystOpinions"))
             bundle.recommendation_key = _clean_text(info.get("recommendationKey"))
+            # v5.5.1 dual-philosophy extras
+            bundle.target_high_price = _safe_float(info.get("targetHighPrice"))
+            bundle.target_low_price = _safe_float(info.get("targetLowPrice"))
+            bundle.peg_ratio = _pick_peg_ratio(info)
+            bundle.fcf_yield_pct = _compute_safe_fcf_yield_pct(
+                info.get("freeCashflow"),
+                info.get("marketCap"),
+            )
 
             ex_div_str, ex_div_delta = _parse_date_days_ahead(info.get("exDividendDate"))
             if ex_div_str and (ex_div_delta is None or ex_div_delta >= -3):
@@ -1996,6 +2048,10 @@ class MarketDataService:
             "recommendation_key": _clean_text(info.get("recommendationKey")),
             "beta": _safe_float(info.get("beta")),
             "target_mean_price": _safe_float(info.get("targetMeanPrice")),
+            "target_high_price": _safe_float(info.get("targetHighPrice")),
+            "target_low_price": _safe_float(info.get("targetLowPrice")),
+            "peg_ratio": _pick_peg_ratio(info),
+            "fcf_yield_pct": _compute_safe_fcf_yield_pct(info.get("freeCashflow"), info.get("marketCap")),
             "updated_at_ms": int(time.time() * 1000),
         }
 

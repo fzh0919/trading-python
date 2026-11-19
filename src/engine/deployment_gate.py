@@ -44,6 +44,7 @@ from src.data_providers.t212_client import (
 )
 from src.engine.portfolio_rules import (
     DEFAULT_VIX_DANGER_THRESHOLD,
+    ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT,
     _compute_adaptive_invest_stop_pct,
     _estimate_pending_order_gbp,
     _rescale_price_pair,
@@ -1523,6 +1524,11 @@ def scan_triggers_and_decide(
     isa_extreme_low_cash = bool(
         isa["ok"] and isa["total_cash_pct"] < ISA_EXTREME_LOW_CASH_PCT
     )
+    # v5.5.1: ISA keeps a staged contrarian value lane in a crisis (quality + >=20% discount),
+    # while Invest stays 100% frozen (slots_cap = 0, DEFEND).
+    crisis_value_enabled = bool(
+        getattr(strategy, "isa_value_crisis_buy_enabled", ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT)
+    )
     # Persistent deep drawdown (>=-10%) during RISK_OFF must keep the core-ETF channel open
     # even after the first-cross day has passed, otherwise a whole sideways bottom is missed.
     persistent_deep_drawdown = bool(
@@ -1639,7 +1645,8 @@ def scan_triggers_and_decide(
 
     if d_defend or isa_extreme_low_cash:
         invest["defend_note"] = (
-            "①优先撤除未成交个股买单 ②保护保本仓与已挂止损逆势仓，只收紧止盈 ③清退无保护浮亏弱股"
+            "①优先撤除 Invest 未成交个股买单；ISA 低位价值买单须核查基本面与≥20%安全边际，"
+            "未破逻辑不盲撤 ②保护保本仓与已挂止损逆势仓，只收紧止盈 ③清退 Invest 无保护浮亏弱股"
         )
         if isa_extreme_low_cash:
             invest["defend_note"] += " ④ISA 现金跌破2%结构垫，停止一切非必要支出/买入"
@@ -1671,8 +1678,16 @@ def scan_triggers_and_decide(
         global_status = "UNKNOWN"
 
     # ---------- Default pick gate (deterministic baseline, PM may only tighten) ----------
+    isa["value_crisis_mode"] = bool(regime == "RISK_OFF" and crisis_value_enabled)
+    isa_crisis_value_open = bool(
+        regime == "RISK_OFF"
+        and crisis_value_enabled
+        and not isa_extreme_low_cash
+    )
     isa_equity_open = bool(
-        isa["ok"] and regime != "RISK_OFF" and not isa["isa_satellite_saturated"]
+        isa["ok"]
+        and not isa["isa_satellite_saturated"]
+        and (regime != "RISK_OFF" or isa_crisis_value_open)
     )
     # In RISK_OFF the ISA wide-base channel only opens on a valid drawdown ladder step;
     # otherwise the gate WAIT text and the actual permission would contradict each other.
@@ -1680,6 +1695,10 @@ def scan_triggers_and_decide(
         isa["ok"]
         and (regime != "RISK_OFF" or a_core.get("hit") is not None or persistent_deep_drawdown)
     )
+    if regime == "RISK_OFF" and isa_equity_open:
+        crisis_note = "ISA 保留深度安全边际价值分批通道（≥20%折价+高质量，严禁追高/接低质飞刀）"
+        if crisis_note not in str(isa.get("reason") or ""):
+            isa["reason"] = f"{isa.get('reason') or ''}；{crisis_note}".strip("；")
     isa["equity_open"] = isa_equity_open
     isa["etf_open"] = isa_etf_open
     invest_open = invest_status == "RUN"

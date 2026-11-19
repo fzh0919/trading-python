@@ -244,7 +244,7 @@ def _format_benchmark_line(
 ) -> str:
     """One-line 'market vs me' dashboard: benchmark 7d/30d returns plus account change.
 
-    Kept to ~60 characters of numbers so the /report 1800-char hard cap is never squeezed.
+    Kept to ~60 characters of numbers so the /report 2200-char hard cap is never squeezed.
     """
     bench = (benchmark_symbol or "VWRP.L").strip().upper()
     ret_7 = compute_window_return_pct(hist, 5)  # 5 trading bars ≈ 7 calendar days
@@ -392,6 +392,11 @@ def build_analysis_context_pack(
                 "revenue_growth_pct": b.revenue_growth_pct,
                 "debt_to_equity": b.debt_to_equity,
                 "recommendation_key": b.recommendation_key,
+                # v5.5.1 dual-philosophy anchors (ISA value / Invest right-side)
+                "fcf_yield_pct": b.fcf_yield_pct,
+                "target_high_price": b.target_high_price,
+                "target_low_price": b.target_low_price,
+                "peg_ratio": b.peg_ratio,
                 "earnings_date": b.earnings_date,
                 "days_to_earnings": b.days_to_earnings,
                 "ex_dividend_date": b.ex_dividend_date,
@@ -1563,7 +1568,7 @@ async def generate_morning_report(
     """TradingAgents-Lite 3-step pipeline:
     1) Deterministic FactSheet + ContextPack + Concurrent Multi-Region Google Search Grounding
     2) Concurrent Analyst (Bull/Opportunity, HIGH, <=6 tool rounds) & Risk Auditor (Bear, Argon HIGH, <=6 tool rounds)
-    3) Portfolio Manager Pydantic Structured Synthesis + RiskOverride Guardrail -> <= 1800 chars
+    3) Portfolio Manager Pydantic Structured Synthesis + RiskOverride Guardrail -> <= 2200 chars
     """
     portfolio = await t212.get_portfolio(use_cache=False)
     if not portfolio.isa.ok and not portfolio.invest.ok:
@@ -1799,6 +1804,34 @@ async def generate_morning_report(
     core_policy_context = _format_core_policy_ticket_block(
         gate_preview, bundles, histories
     )
+
+    # v5.5.1: re-evaluate holdings under the RESOLVED regime before the debate, so ISA value
+    # holdings are never nagged by Invest-style volatility trims (and vice versa).
+    current_regime = "NEUTRAL"
+    if isinstance(gate_preview, dict):
+        current_regime = str(gate_preview.get("regime") or "NEUTRAL").strip().upper()
+    if current_regime in {"RISK_ON", "RISK_OFF"}:
+        regime_evals = evaluate_portfolio(
+            portfolio,
+            tech_map,
+            bundles,
+            cfg.strategy,
+            histories=histories,
+            regime=current_regime,
+            macro=macro,
+        )
+        regime_eval_text = format_evaluations_text(regime_evals)
+        base_eval_text = format_evaluations_text(evals)
+        if regime_eval_text != base_eval_text and base_eval_text in fact_sheet:
+            fact_sheet = fact_sheet.replace(base_eval_text, regime_eval_text, 1)
+        evals = regime_evals
+        evals_by_sym: dict[str, list[dict[str, Any]]] = {}
+        for ev in evals:
+            evals_by_sym.setdefault(ev.yahoo_symbol, []).append(ev.model_dump())
+        for sym_key, entry in (context_pack.get("symbols") or {}).items():
+            if isinstance(entry, dict):
+                entry["evaluations"] = evals_by_sym.get(sym_key, [])
+        context_pack["regime"] = current_regime
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
         f"{wallet_text}\n\n"
@@ -1833,7 +1866,9 @@ async def generate_morning_report(
         "你是组合机会分析师（Bull/Opportunity 视角）。请基于用户提供的唯一真实事实数据，用干货要点输出完整内部研报草稿供 PM 拍板（1200 字内）：\n"
         "1. 宏观利率/汇率主线与今日整体交易气候；\n"
         "2. 双账户净值、FX 拆解与近 7/30 天实盘复盘要点（严格区分外部出入金/派息与交易盈亏）；\n"
-        "3. 哪些持仓具备真实技术支撑（回踩 MA50/MA200 且基本面未坏）值得考虑加仓或顺势持有（写明支撑位/目标价与依据）；\n"
+        "3. 哪些持仓具备真实支撑值得考虑加仓或顺势持有（写明支撑位/目标价与依据）："
+        "ISA 价值仓按「护城河/财务质量 + 估值安全边际（常规≥12%）」判断，优质股回撤是分批左侧加仓机会（写明基本面未证伪依据）；"
+        "Invest 右侧仓按当日 Regime 动态 R:R（RISK_ON 领涨≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）与硬止损判断，绝不摊平；\n"
         f"4. 资金部署：若 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}% 且核心宽基未达标，"
         "只针对【今日核心宽基政策票据】中 Python 唯一签发的代码给出价位/节奏建议，"
         "严禁自行更换代码或放大金额；票据为空时明确建议不下新单；Invest 机动仓严格遵循右侧猎物门控，"
@@ -1849,7 +1884,8 @@ async def generate_morning_report(
     auditor_sys = build_agent_system_instruction(
         "你是独立风控与挂单审计官（Bear/Conservative 视角）。你的唯一任务是冷酷挑刺与风险一票否决，提供完整内部审计草稿供 PM 拍板（1200 字内）：\n"
         "1. 行业集中度与跨账户重叠审计：基于 Python 算出的行业权重、CVaR 与跨账户重叠，明确哪些行业/标的是否已超载、今天必须冻结禁止加码（列出红线）。\n"
-        "2. 破位与弱势持仓审计：跌破 MA200 或触及止损线（尤其 Invest 短线仓）或临近 5 日内财报的标的，明确减仓/硬止损/严禁补仓指令；"
+        "2. 破位与弱势持仓审计（双哲学分开审）：ISA 价值仓只看护城河/财务质量恶化与极端估值泡沫，"
+        "不得因单纯跌破 MA200、RSI≥75 或浮盈 25% 催卖；Invest 右侧仓看趋势破位、前瞻 R:R 恶化与硬止损（含临近 5 日内财报）；"
         "所有持仓的技术面、Finnhub 新闻与 Step 1 全市场 Google Search 摘要已完整注入上方上下文，常规持仓严禁重复调 `inspect_ticker`，直接依据既有证据严格审计即可。\n"
         "3. 【活动挂单零情面独立审计（一律按挂单限价核算）】：逐一核查【当前活动挂单】！"
         "无论挂单是用户手动下单还是前序 AI 建议，都以该挂单的限价（而非现价）为成本基线，结合均线位置、分析师目标价、"
@@ -1906,8 +1942,8 @@ async def generate_morning_report(
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
         "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=35字）。\n"
-        # [用户授权调整] /report 目标篇幅调至 1500~1650 字、安全天花板 1800 字；IMP-12 请保留。
-        "• 全文必须精炼直白，控制在 1500~1650 字左右（绝不可超 1800 字），确保财报预警与操作复盘完整展示。"
+        # [用户授权调整 v5.5.1] /report 目标篇幅调至 1700~2000 字、安全天花板 2200 字（单消息分账户排版）。
+        "• 全文必须精炼直白，控制在 1700~2000 字左右（绝不可超 2200 字），确保财报预警与操作复盘完整展示。"
     )
     if debate_pm_block:
         pm_role += (
@@ -1972,8 +2008,8 @@ async def generate_morning_report(
         alert_source="report_pm",
     )
     holiday_banner = "🇬🇧 今日英国 Bank Holiday（LSE 休市，英股/LSE ETF 暂不交易）\n\n" if uk_bank_holiday else ""
-    # [用户授权调整] /report 安全天花板由 1500 放宽至 1800（Prompt 控制 1500~1650 字）；IMP-12 接线时请保留 1800 上限。
-    max_body_chars = 1800 - len(holiday_banner)
+    # [用户授权调整 v5.5.1] /report 安全天花板 2200 字（Prompt 控制 1700~2000 字）；IMP-12 接线时请保留 2200 上限。
+    max_body_chars = 2200 - len(holiday_banner)
     if decision is not None:
         override_res = apply_risk_override_guardrail(
             decision,
@@ -1983,6 +2019,8 @@ async def generate_morning_report(
             bundle_map=bundles,
             evals=evals,
             trade_behavior=trade_ctx.get("trade_behavior"),
+            deployment_gate=gate_preview,
+            tech_map=tech_map,
         )
         resolved_decision = override_res.decision if isinstance(override_res.decision, MorningReportDecision) else decision
 
@@ -2394,8 +2432,8 @@ async def generate_us_sentinel(
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未生成 /report 红线）"
     if guardrails_stale:
         veto_block = "（以下为上一交易日旧红线，仅作参考，严禁当作今日裁决）\n" + veto_block
-    # [用户授权调整] 随 /report 放宽至 1800 同步放宽基线切片；IMP-12 请保留。
-    morning_baseline = morning_report_full[:1800] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
+    # [用户授权调整 v5.5.1] 随 /report 放宽至 2200 同步放宽基线切片；IMP-12 请保留。
+    morning_baseline = morning_report_full[:2200] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
     if morning_stale:
         morning_baseline = "⚠️ 今日 /report 尚未生成，以下为上一交易日基线，严禁当作今日裁决。\n" + morning_baseline
     gate_block = (

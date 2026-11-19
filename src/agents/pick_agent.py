@@ -26,6 +26,7 @@ from src.config import AppConfig
 if TYPE_CHECKING:
     from src.ops_notifier import OpsNotifier
 from src.data_providers.analytics import (
+    TechnicalSnapshot,
     classify_etf_distribution_policy,
     compute_correlation_matrix,
     compute_exposure_summary,
@@ -34,7 +35,7 @@ from src.data_providers.analytics import (
     normalize_issuer_root,
     resolve_market_benchmark,
 )
-from src.data_providers.market_data import MarketDataService, TickerMarketBundle
+from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import (
     PortfolioData,
     T212Client,
@@ -854,6 +855,15 @@ async def _post_screen_validate_decision(
         hydrated_actions.append(item)
 
     hydrated_decision = decision.model_copy(update={"selected_actions": hydrated_actions})
+    # v5.5.1 排雷: new candidates have no held tech snapshot, so ISA value / Invest dynamic R:R
+    # checks would otherwise run blind. Build one unified tech map (held + this round's picks).
+    all_tech_map: dict[str, TechnicalSnapshot] = {}
+    for sym_k, hist_df in all_histories.items():
+        snap_k = compute_technical_snapshot(
+            sym_k, hist_df, bundle=_lookup_ci(all_bundles, sym_k)
+        )
+        if snap_k is not None:
+            all_tech_map[sym_k] = snap_k
     high_corr_syms = _collect_high_correlation_symbols(
         isa_cands,
         invest_cands,
@@ -891,6 +901,7 @@ async def _post_screen_validate_decision(
         trade_behavior=trade_behavior,
         deployment_gate=gate_ctx,
         risk_budget_scale=risk_budget_scale,
+        tech_map=all_tech_map,
     )
     resolved_decision = (
         override_res.decision
@@ -1065,6 +1076,11 @@ async def generate_pick_radar(
     }
     if active_pool_rows:
         screener_kwargs["active_pool_rows"] = active_pool_rows
+    # v5.5.1: the ISA value / Invest right-side scoring needs the same macro + regime as the gate.
+    if isinstance(macro, MacroSnapshot):
+        screener_kwargs["macro"] = macro
+    if gate_ctx is not None:
+        screener_kwargs["regime_tag"] = str(gate_ctx.get("regime") or "")
 
     isa_cands, invest_cands = await run_quant_screener(**screener_kwargs)
     # Wide funnel -> DeepSeek ID filter: only tickers are selected; the raw candidate objects stay untouched.
@@ -1095,7 +1111,15 @@ async def generate_pick_radar(
         if snap is not None:
             tech_map[sym] = snap
 
-    evals = evaluate_portfolio(portfolio, tech_map, held_bundles, cfg.strategy, histories=held_histories)
+    evals = evaluate_portfolio(
+        portfolio,
+        tech_map,
+        held_bundles,
+        cfg.strategy,
+        histories=held_histories,
+        regime=str((gate_ctx or {}).get("regime") or "NEUTRAL"),
+        macro=macro,
+    )
     evals_text = format_evaluations_text(evals)
     exposure_text = compute_exposure_summary(portfolio, held_bundles, histories=held_histories)
     trade_ctx = build_trade_context(
@@ -1257,7 +1281,12 @@ async def generate_pick_radar(
         "仅当你通过工具实查到早报生成之后的突发新公告或股价已显著回落至早报认可区间时，才可提出修正并写明最新依据。\n"
         f"请参考历史 T+{cfg.strategy.settlement_holding_days} 交易日选股复盘教训，避免对近期连续失效的板块或追高形态重复推荐。\n"
         "请给出不超过 3 条核心提案（ISA 新股或 LSE ETF / Invest 短线催化 / 必要时的卖弱换强），"
-        "每条写清逻辑、介入区间、止损、目标；若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
+        "每条写清逻辑、介入区间、止损、目标。双轨终审标准："
+        "ISA 价值轨核查护城河质量 + 估值安全边际（常规≥12%、危机日≥20%），允许 `stop_price=0`，"
+        "但 `stop_condition` 必须写明基本面/护城河证伪条件，`target_price` 填保守合理估值锚；"
+        "Invest 右侧轨核查当日 Regime 动态 R:R（RISK_ON 领涨≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）"
+        "与止损幅≥max(1.5×ATR, 4%)，必填数值 `stop_price>0` 与 `target_price>0`；"
+        "若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
         cfg.strategy,
         include_order_audit_rule=False,
     )
@@ -1313,9 +1342,12 @@ async def generate_pick_radar(
         "直接输出最终结构化 JSON Decision（渲染后将限制在 1000 字内，结论置顶、废话为零）。\n\n"
         "【六重护栏】：\n"
         f"1. 盈亏比与摩擦：按目标空间扣除交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税 + 买卖价差估算；"
-        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%）计算 R:R，低于 {cfg.strategy.min_rr_ratio:.1f}:1 一律否决；"
-        "R:R 必须给出可复算的数字：所有个股与非核心主题 ETF 必须填数值 `stop_price` 与 `target_price`（标的本地货币数值，禁止只写在 stop_condition / entry_zone 文本里），"
-        "Python 会按 entry_price 与这两个价独立复算，并与分析师目标均值交叉校验（偏离>15% 以均值复核）；"
+        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%）计算 R:R；"
+        f"双轨门槛：ISA 价值个股不核价格止损 R:R，改核「质量门 + 安全边际（常规≥12% / 危机≥20%）」，"
+        f"Invest 按当日 Regime 动态 R:R（RISK_ON 领涨≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）且止损幅≥max(1.5×ATR, 4%)，未达标一律否决；"
+        "R:R 必须给出可复算的数字：Invest 个股与非核心主题 ETF 必须填数值 `stop_price` 与 `target_price`（标的本地货币数值，禁止只写在 stop_condition / entry_zone 文本里）；"
+        "ISA 长线价值个股可填 `stop_price=0`，但必须在 `stop_condition` 写明基本面/护城河证伪条件；"
+        "Python 会按 entry_price 与这两个价独立复算，并与分析师目标均值交叉校验（非 RISK_ON 领涨股偏离>15% 以均值复核）；"
         f"GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 现金利息仅作等待期保底，不得作为否决理由。\n"
         "2. 穿透科技暴露：结合上下文“穿透后真实科技暴露(估算)”（ETF 隐含科技 + 直接科技个股），加仓后科技因子明显集中的须降级或改用低科技权重宽基。\n"
         f"3. 频率与冷却（模式 {cfg.strategy.trade_cadence_guard_mode}）：近 7 天参考 ≤{cfg.strategy.max_weekly_new_buys} 笔、"
@@ -1336,13 +1368,13 @@ async def generate_pick_radar(
         "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
         "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
         "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
-        f"若无个股达到 R:R≥2:1，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%，"
+        f"若无个股达到双轨达标门槛，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%，"
         "应优先按【今日组合门控约束】的 Python 核心政策票据做分批定投：写明该票据代码的具体价位、"
         f"单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}，不得超过票据上限）与节奏，严禁自行换代码；"
         "核心宽基 DCA 的 stop_price/target_price 填 `null` 即可，严禁为宽基编造虚假止损位；"
-        "Invest 若门控未开或无 R:R≥2:1 右侧个股，直接令 selected_actions 为空数组 []"
+        "Invest 若门控未开或无达标右侧个股（动态 R:R 未过门槛），直接令 selected_actions 为空数组 []"
         "（如需在应税 Invest 配置长期底仓仅可提示派息型 VWRL.L，严禁混买累积型 VWRP.L 造成离岸 ERI 报税摩擦）；"
-        "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无 R:R≥2:1 标的，现金待命 + 下一次部署触发条件”，"
+        "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命 + 下一次部署触发条件”，"
         f"严禁默认写“现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
         cfg.strategy,
         include_order_audit_rule=False,

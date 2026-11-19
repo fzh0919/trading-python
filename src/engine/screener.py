@@ -25,12 +25,27 @@ from src.data_providers.analytics import (
     resolve_market_benchmark,
 )
 from src.data_providers.market_data import (
+    MacroSnapshot,
     MarketDataService,
     TickerMarketBundle,
     normalize_history_index,
 )
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData
-from src.engine.portfolio_rules import wallet_friction_context
+from src.engine.portfolio_rules import (
+    DEFAULT_RISK_FREE_YIELD_PCT,
+    _is_leverage_exempt_sector,
+    wallet_friction_context,
+)
+
+
+def _normalize_regime_tag(value: str) -> str:
+    """Normalize screener breadth tags (RISK-ON) and gate regimes (RISK_ON) to one vocabulary."""
+    raw = str(value or "").strip().upper().replace("_", "-")
+    if raw in {"RISK-ON", "RISKON"}:
+        return "RISK-ON"
+    if raw in {"RISK-OFF", "RISKOFF"}:
+        return "RISK-OFF"
+    return "NEUTRAL"
 
 
 class ScreenerCandidate(BaseModel):
@@ -788,6 +803,7 @@ def score_candidate(
     etf_symbols: Iterable[str] | None = None,
     deep_intel: dict[str, Any] | None = None,
     invest_wallet: AccountSnapshot | None = None,
+    macro: MacroSnapshot | None = None,
 ) -> ScreenerCandidate:
     """Score a candidate across 4 orthogonal capped dimensions with asymmetric dual-track weights & factor attribution."""
     pros: list[str] = []
@@ -809,26 +825,42 @@ def score_candidate(
     rs_slope = rs_info.get("rs_slope_20d")
     minervini = detect_minervini_stage2(hist, tech, rs_60d_pct=rs_60d)
     minervini_phase = int(minervini.get("phase", 0))
+    reg_norm = _normalize_regime_tag(regime_tag)
 
     if track == "ISA_LONG_TERM":
+        # v5.5.1: ISA is a Buffett value track — momentum breakdowns are NOT auto-penalized;
+        # a quality business on sale (drawdown) earns a margin-of-safety bonus instead.
+        isa_quality_ok = not (
+            (bundle is not None and bundle.profit_margin_pct is not None and bundle.profit_margin_pct <= 0.0)
+            or (bundle is not None and bundle.roe_pct is not None and bundle.roe_pct <= 0.0)
+            or (
+                bundle is not None
+                and bundle.revenue_growth_pct is not None
+                and bundle.revenue_growth_pct <= -10.0
+            )
+        )
         if tech.trend_regime == "BULL":
             dim1 += 5.0
             pros.append("上升趋势(MA50>MA200)")
         elif tech.trend_regime == "PULLBACK":
             dim1 += 7.0
             pros.append("多头回踩支撑区")
-        elif tech.trend_regime == "WEAK":
-            dim1 -= 7.0
-            cons.append("弱势低于MA200")
 
-        if tech.drawdown_52w_pct is not None and -18.0 <= tech.drawdown_52w_pct <= -4.0:
+        dd52 = tech.drawdown_52w_pct
+        if dd52 is not None and -18.0 <= dd52 <= -4.0:
             dim1 += 3.0
+        if dd52 is not None and -35.0 <= dd52 <= -10.0 and isa_quality_ok:
+            dim1 += 5.0
+            pros.append(f"优质股安全边际回撤({dd52:.0f}%)")
+        if (not isa_quality_ok) and tech.trend_regime == "WEAK":
+            dim1 -= 8.0
+            cons.append("基本面偏弱+下跌趋势(防价值陷阱)")
 
         if tech.rsi14 is not None:
             if 32.0 <= tech.rsi14 <= 55.0:
                 dim1 += 3.0
-            elif tech.rsi14 >= 68.0:
-                dim1 -= _linear_scale(tech.rsi14, 68.0, 82.0, 2.0, 6.0)
+            elif tech.rsi14 >= 72.0:
+                dim1 -= _linear_scale(tech.rsi14, 72.0, 85.0, 2.0, 6.0)
 
         if tech.volatility_60d_pct is not None and tech.volatility_60d_pct > 45.0:
             dim1 -= _linear_scale(tech.volatility_60d_pct, 45.0, 80.0, 2.0, 6.0)
@@ -861,14 +893,19 @@ def score_candidate(
         dim1 += 3.5
         pattern_signals.append("Minervini阶段2")
         pros.append(f"Minervini模板达标({minervini['criteria_passed']}/{minervini['criteria_total']})")
-    elif minervini_phase == 4:
-        # Option 2A: Penalize Phase 4 downtrend heavily while preserving visibility + warning tag
+        if track != "ISA_LONG_TERM" and reg_norm == "RISK-ON" and (rs_20d or 0.0) > 0.0:
+            # v5.5.1: RISK_ON reinforces Stage-2 leadership visibility on the Invest track.
+            dim1 += 2.0
+            pros.append("RISK_ON领涨结构强化")
+    elif minervini_phase == 4 and track != "ISA_LONG_TERM":
+        # Option 2A: Penalize Phase 4 downtrend heavily while preserving visibility + warning tag.
+        # v5.5.1: ISA value track is exempt (a quality name in a downtrend can be a bargain).
         dim1 -= 8.0
         cons.append("[Phase4弱势]")
 
-    if regime_tag == "RISK-OFF" and tech.trend_regime == "BULL" and (tech.rsi14 or 50.0) >= 62.0:
+    if reg_norm == "RISK-OFF" and tech.trend_regime == "BULL" and (tech.rsi14 or 50.0) >= 62.0:
         dim1 -= 2.0
-    elif regime_tag == "RISK-ON" and tech.trend_regime in {"BULL", "PULLBACK"}:
+    elif reg_norm == "RISK-ON" and tech.trend_regime in {"BULL", "PULLBACK"}:
         dim1 += 1.0
 
     if tech.weekly_bullish is True:
@@ -878,7 +915,7 @@ def score_candidate(
         else:
             dim1 += 2.0
             pros.append("周线多头")
-    elif tech.weekly_bullish is False:
+    elif tech.weekly_bullish is False and track != "ISA_LONG_TERM":
         dim1 -= 4.0
         cons.append("周线偏空")
 
@@ -988,10 +1025,34 @@ def score_candidate(
             dim3 += _linear_scale(bundle.profit_margin_pct, 2.0, 22.0, -1.0, 2.0)
         if bundle.revenue_growth_pct is not None:
             dim3 += _linear_scale(bundle.revenue_growth_pct, 0.0, 25.0, -0.5, 2.0)
+
+        # v5.5.1 ISA value quality: FCF yield + earnings yield spread, leverage exemption for
+        # banks/insurers/REITs/utilities, and hard penalties for value traps.
+        rf_yield = DEFAULT_RISK_FREE_YIELD_PCT
+        if macro is not None and macro.us_10y_yield is not None and macro.us_10y_yield > 0:
+            rf_yield = float(macro.us_10y_yield)
+        if track == "ISA_LONG_TERM":
+            if bundle.fcf_yield_pct is not None:
+                dim3 += _linear_scale(bundle.fcf_yield_pct, -1.0, 7.0, -2.5, 4.0)
+                if bundle.fcf_yield_pct >= 4.0:
+                    pros.append(f"高自由现金流(FCF={bundle.fcf_yield_pct:.1f}%)")
+            if pe_val is not None and pe_val > 0:
+                erp = (100.0 / pe_val) - rf_yield
+                dim3 += _linear_scale(erp, -1.5, 4.5, -2.0, 3.0)
+            if (
+                (bundle.profit_margin_pct is not None and bundle.profit_margin_pct <= 0.0)
+                or (bundle.roe_pct is not None and bundle.roe_pct <= 0.0)
+            ):
+                dim3 -= 6.0
+                cons.append("盈利为负(不符ISA质量门)")
+            if bundle.revenue_growth_pct is not None and bundle.revenue_growth_pct <= -10.0:
+                dim3 -= 4.0
+
         if bundle.debt_to_equity is not None and bundle.debt_to_equity >= 0.0:
-            dim3 += _linear_scale(bundle.debt_to_equity, 30.0, 200.0, 1.0, -2.0)
-            if bundle.debt_to_equity >= 180.0:
-                cons.append(f"高杠杆(D/E={bundle.debt_to_equity:.0f}%)")
+            if not _is_leverage_exempt_sector(bundle):
+                dim3 += _linear_scale(bundle.debt_to_equity, 30.0, 200.0, 1.0, -2.0)
+                if bundle.debt_to_equity >= 180.0:
+                    cons.append(f"高杠杆(D/E={bundle.debt_to_equity:.0f}%)")
         # IMP-18: Finnhub /stock/metric value multiples (only when the vendor supplied them).
         if bundle.price_to_book is not None and bundle.price_to_book > 0.0:
             if track == "ISA_LONG_TERM":
@@ -1131,10 +1192,11 @@ def score_candidate(
 
     # Asymmetric track-level weighting so ISA & Invest surface distinct candidate profiles
     if track == "ISA_LONG_TERM":
+        # v5.5.1: value/quality dominant (15/10/50/25) — kills the ISA momentum bias.
         weighted_raw = (
-            25.0 * dimension_pct["trend_rs"]
-            + 15.0 * dimension_pct["pattern_timing"]
-            + 35.0 * dimension_pct["value_quality"]
+            15.0 * dimension_pct["trend_rs"]
+            + 10.0 * dimension_pct["pattern_timing"]
+            + 50.0 * dimension_pct["value_quality"]
             + 25.0 * dimension_pct["portfolio_fit"]
         )
     else:
@@ -1224,6 +1286,8 @@ async def run_quant_screener(
     existing_histories: dict | None = None,
     top_n_per_track: int = 8,
     active_pool_rows: list[dict[str, Any]] | None = None,
+    macro: MacroSnapshot | None = None,
+    regime_tag: str = "",
 ) -> tuple[list[ScreenerCandidate], list[ScreenerCandidate]]:
     """Two-stage quantitative pre-screener: 0-info OHLCV multi-bucket filter -> Stage 2 bundle enrichment."""
     held_syms = portfolio.unique_yahoo_symbols()
@@ -1324,7 +1388,11 @@ async def run_quant_screener(
         histories=histories,
         benchmark_symbols=benchmarks,
     )
-    regime_tag = str(breadth_info.get("regime_tag", ""))
+    regime_tag = (
+        _normalize_regime_tag(regime_tag)
+        if str(regime_tag or "").strip()
+        else _normalize_regime_tag(breadth_info.get("regime_tag", ""))
+    )
 
     corr_cache: dict[str, tuple[str | None, float | None]] = {
         sym: max_correlation_against_portfolio(corr_matrix, sym, held_syms)
@@ -1372,6 +1440,7 @@ async def run_quant_screener(
                     is_recent_traded=(sym.upper() in recent_traded_set),
                     etf_symbols=etf_set,
                     invest_wallet=portfolio.invest,
+                    macro=macro,
                 )
             )
 
@@ -1550,6 +1619,7 @@ async def run_quant_screener(
                     etf_symbols=etf_set,
                     deep_intel=deep_intel_map.get(sym.upper()) or deep_intel_map.get(sym),
                     invest_wallet=portfolio.invest,
+                    macro=macro,
                 )
             )
         calibrated = _apply_percentile_calibration(out)

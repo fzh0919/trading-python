@@ -191,13 +191,17 @@ class PickActionItem(BaseModel):
     stop_price: float = Field(
         default=0.0,
         description=(
-            "数值硬止损价（标的本地货币，如 113.50 或 3480 GBp，必须 >0）；"
-            "Python 用它复算 R:R 与以损定仓，禁止只写在 stop_condition 文本里；确实无法定价才填 0"
+            "数值硬止损价（标的本地货币）。Invest 动作必填 >0 且止损宽度≥max(1.5×ATR, 4%)；"
+            "ISA 长线价值个股可填 0（须在 stop_condition 写明基本面/护城河证伪条件）；"
+            "Python 用它复算 R:R 与以损定仓，禁止只写在 stop_condition 文本里"
         ),
     )
     target_price: float = Field(
         default=0.0,
-        description="数值目标价（标的本地货币，必须 >0，优先取分析师目标均值）；与分析师均值偏离>15% 时 Python 会改用均值复核",
+        description=(
+            "数值目标价 / 保守内在价值锚（标的本地货币 >0）。"
+            "Invest 非牛市偏离分析师均值>15% 会回拨均值，RISK_ON 右侧强股放宽至高目标上沿；ISA 填保守合理估值锚"
+        ),
     )
     risk_note: str = Field(
         default="",
@@ -209,7 +213,7 @@ class PickDecision(BaseModel):
     headline: str = Field(
         description=(
             "一句话定调本轮最终选股结论与现金部署计划（不超过55字；严禁提及任何未入选、内部讨论或被否决的候选标的/方向；"
-            "若无推荐，写明“本轮无 R:R≥2:1 标的，现金待命待回踩”并给出基准 VWRP 相对态度或下一次部署触发条件）"
+            "若无推荐，写明“本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命”并给出基准 VWRP 相对态度或下一次部署触发条件）"
         )
     )
     selected_actions: list[PickActionItem] = Field(
@@ -443,10 +447,10 @@ def _extract_override_notes(risk_override: Any) -> list[str]:
     return formatted
 
 
-# [用户授权调整] /report 渲染默认安全天花板由 1500 放宽至 1800（Prompt 软约束 1500~1650 字）。
+# [用户授权调整] /report 渲染默认安全天花板由 1500 → 1800 → 2200（v5.5.1 用户授权；Prompt 软约束 1700~2000 字）。
 def render_morning_report(
     decision: MorningReportDecision,
-    max_chars: int = 1800,
+    max_chars: int = 2200,
     *,
     risk_override: RiskOverrideResult | None = None,
     gate_banner: str = "",
@@ -460,6 +464,10 @@ def render_morning_report(
 
     v5.4.1: ``size_notes`` carries Python-derived share counts keyed by (ACCOUNT, SYMBOL); the
     model only ever supplies ``size_hint`` (percentage / GBP amount / 全出), never share counts.
+
+    v5.5.1: section 1 is deterministically split into 🏛️ ISA 价值账户 / ⚡ Invest 右侧账户
+    blocks inside the SAME Telegram message (no extra message, no protocol change), and the
+    default ceiling is raised to 2200 chars (explicit ``max_chars`` callers still win).
     """
     ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
     if isinstance(ro_decision, MorningReportDecision):
@@ -477,7 +485,16 @@ def render_morning_report(
 
     notes = size_notes or {}
     action_lines = [f"📌 今日定调：{decision.headline}"]
-    for idx, act in enumerate(filtered_actions[:4], 1):
+
+    def _acct_bucket(raw_account: Any) -> str:
+        up = str(raw_account or "").strip().upper().replace(" ", "")
+        if "INVEST" in up:
+            return "INVEST"
+        if "ISA" in up:
+            return "ISA"
+        return "OTHER"
+
+    def _action_line(idx: int, act: Any) -> str:
         pz = f" @ {act.price_zone}" if act.price_zone else ""
         act_up = act.action.strip().upper()
         hint = act.size_hint.strip() if act_up in {"ADD", "TRIM", "STOP"} else ""
@@ -487,41 +504,75 @@ def render_morning_report(
         else:
             size_txt = f" · {hint}" if hint else ""
         note_txt = f" ({note})" if note else ""
-        action_lines.append(
-            f"{idx}. [{act.account}] {act.action} {act.symbol}{pz}{size_txt}{note_txt} — {act.reason}"
-        )
+        return f"{idx}. [{act.account}] {act.action} {act.symbol}{pz}{size_txt}{note_txt} — {act.reason}"
+
+    def _audit_line(aud: Any) -> str:
+        return f"• [{aud.account}] {aud.symbol} ({aud.order_summary}) →【{aud.verdict}】{aud.reason}"
+
+    action_buckets: dict[str, list[Any]] = {"ISA": [], "INVEST": [], "OTHER": []}
+    for act in filtered_actions[:4]:
+        action_buckets[_acct_bucket(getattr(act, "account", ""))].append(act)
+    audit_buckets: dict[str, list[Any]] = {"ISA": [], "INVEST": [], "OTHER": []}
+    for aud in decision.pending_order_audits:
+        audit_buckets[_acct_bucket(getattr(aud, "account", ""))].append(aud)
+
+    # Global / cross-account rows (e.g. CASH HOLD, 双账户) stay un-split right under the headline.
+    for idx, act in enumerate(action_buckets["OTHER"], 1):
+        action_lines.append(_action_line(idx, act))
+    for aud in audit_buckets["OTHER"]:
+        action_lines.append(_audit_line(aud))
 
     exec_core_items = [
         item
         for item in decision.core_deployment
         if str(getattr(item, "verdict", "APPROVE") or "APPROVE").strip().upper() in {"APPROVE", "SHRINK"}
     ]
+
+    isa_block: list[str] = [
+        _action_line(idx, act) for idx, act in enumerate(action_buckets["ISA"], 1)
+    ]
     if exec_core_items:
-        action_lines.append("【核心宽基部署】")
+        isa_block.append("【核心宽基部署】")
         for item in exec_core_items[:1]:
             verdict = str(getattr(item, "verdict", "APPROVE") or "APPROVE").strip().upper()
             verdict_tag = " · 缩减" if verdict == "SHRINK" else ""
-            action_lines.append(
+            isa_block.append(
                 f"• [{item.account}] BUY {item.symbol} @ {item.price_zone} · {item.size_hint}"
                 f"{verdict_tag} — {item.reason}"
             )
+    for aud in audit_buckets["ISA"]:
+        isa_block.append(_audit_line(aud))
 
+    invest_block: list[str] = [
+        _action_line(idx, act) for idx, act in enumerate(action_buckets["INVEST"], 1)
+    ]
+    for aud in audit_buckets["INVEST"]:
+        invest_block.append(_audit_line(aud))
+
+    if isa_block or invest_block:
+        if isa_block:
+            action_lines.append("🏛️ ISA 价值账户")
+            action_lines.extend(isa_block)
+        else:
+            action_lines.append("🏛️ ISA 价值账户：今日持仓观望，核心定投/安全边际待命")
+        if invest_block:
+            action_lines.append("⚡ Invest 右侧账户")
+            action_lines.extend(invest_block)
+        else:
+            action_lines.append("⚡ Invest 右侧账户：今日无右侧新动作，现金吃息待命")
+
+    # Guardrail / discipline notes always sit at the very END of section 1 so tail trimming
+    # of later sections can never hide a hard Python override.
     override_notes = _extract_override_notes(risk_override)
     for note in override_notes[:4]:
         action_lines.append(f"• {note}")
 
-    if decision.pending_order_audits:
-        action_lines.append("【活动挂单裁决】")
-        for aud in decision.pending_order_audits:
-            action_lines.append(
-                f"• [{aud.account}] {aud.symbol} ({aud.order_summary}) →【{aud.verdict}】{aud.reason}"
-            )
     sec1 = "【今日核心行动与挂单裁决】\n" + "\n".join(action_lines)
 
     veto_str = (
         "；".join(decision.daily_vetoes[:4])
         if decision.daily_vetoes
-        else "相对基准 VWRP 跟踪，严守 R:R≥2:1 与最小建仓额，不追高。"
+        else "相对基准 VWRP 跟踪，严守 ISA 安全边际 / Invest 动态 R:R 与最小建仓额，不追高。"
     )
     sec2 = (
         "【宏观、账户与今日风控红线】\n"

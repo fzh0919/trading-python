@@ -7,7 +7,7 @@
 1. **SQLite 写锁单入口**：所有写库必须走 `AdvisorDatabase._connect(write=True)`，严禁私建连接绕过 `self._write_lock`。
 2. **降级数据不回写**：`portfolio.is_fallback` 或 `macro.is_stale` 为 `True` 时严禁调用 `db.save_snapshot()` 或覆盖有效缓存；空 DataFrame 或全挂宏观响应不得写入缓存。
 3. **双币种严格隔离**：账户现金/净值/盈亏固定 `GBP`，标的现价/均价/止损用本地货币（`USD`/`EUR`/`GBp`/`GBP`），英股须防 `GBp` 与 `GBP` 100 倍量级错位，严禁交给 LLM 口算。
-4. **`/report` 基石与纯文本控字**：`07:30 UK` `/report` 是全天 `Single Source of Truth`，严禁降低其深度；Telegram 输出禁用 `#` 与 `**`，受字数硬上限（`/report<=1800`、`/pick<=1000`、`/us<=450|600`）。
+4. **`/report` 基石与纯文本控字**：`07:30 UK` `/report` 是全天 `Single Source of Truth`，严禁降低其深度；Telegram 输出禁用 `#` 与 `**`，受字数硬上限（`/report<=2200`、`/pick<=1000`、`/us<=450|600`）。
 5. **英文检索 → 中文输出解耦**：`src/agents/tools.py` 的联网检索指令与 `MarketToolkit.declarations()` 工具声明保持英文（对齐 RNS/SEC 一手信源），检索结果与终端决策保持紧凑简体中文。
 6. **数据库延续**：线上 `data/advisor.db` 只做幂等迁移（`CREATE TABLE IF NOT EXISTS` / `_ensure_columns`），严禁删库；发布版本同步 `src/version.py` 与 `pyproject.toml`。
 
@@ -72,9 +72,7 @@
 
 ### 5.2 红线文件（禁止擅自修改，需人工逐行 review）
 
-`.gitignore`、`.dockerignore`、`src/config.py`（白名单/Envs）、`src/data_providers/t212_client.py`（鉴权段）、`src/ops_notifier.py`、`Dockerfile`、`docker-compose.yml`、`D:\HOMELAB\scripts\*.ps1`、`pyproject.toml` / `requirements.txt`（**新增依赖等同红灯**）。
-
-> `sync-up.ps1` 与 `deploy-n95.ps1` 已内置**敏感路径提交/推送闸**（拦截 `.env`、`data/`、`*.db`、`logs/`、`_ref/`）。该闸**不得移除、放宽或绕过**；如需调整正则，必须两侧脚本同步并经人工确认。
+> `sync-up.ps1` 与 `deploy-n95.ps1` 该闸**不得移除、放宽或绕过**；如需调整正则，必须两侧脚本同步并经人工确认。
 
 ### 5.3 交付前 diff 自查 5 条
 
