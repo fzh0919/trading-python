@@ -694,7 +694,7 @@ class TestV552ScreenerValueTrack(unittest.TestCase):
 
 
 class TestV552ReportGroupedRendering(unittest.TestCase):
-    """13. Single-message dual-account layout + 2200-char ceiling + plain text."""
+    """13. Single-message dual-account layout + 2800-char ceiling + plain text."""
 
     @staticmethod
     def _decision() -> MorningReportDecision:
@@ -734,7 +734,7 @@ class TestV552ReportGroupedRendering(unittest.TestCase):
             trade_review="近30日交易克制。" + "复盘" * 120,
         )
 
-    def test_report_dual_account_grouped_rendering_and_2200_ceiling(self) -> None:
+    def test_report_dual_account_grouped_rendering_respects_explicit_limit(self) -> None:
         gate_banner = "组合门控：ISA 可分批宽基 / Invest WAIT"
         text = render_morning_report(self._decision(), gate_banner=gate_banner, max_chars=2200)
 
@@ -753,7 +753,7 @@ class TestV552ReportGroupedRendering(unittest.TestCase):
         self.assertIn("【宏观、账户与今日风控红线】\n" + gate_banner, text)
         self.assertIn("【财报预警、复盘与重点异动】", text)
 
-        # Ceiling + plain text rules
+        # Explicit ``max_chars`` callers still win over the v5.5.2 default of 2800.
         self.assertLessEqual(len(text), 2200)
         self.assertNotIn("#", text)
         self.assertNotIn("**", text)
@@ -776,13 +776,13 @@ class TestV552ReportGroupedRendering(unittest.TestCase):
         text2 = render_morning_report(invest_only)
         self.assertIn("🏛️ ISA 价值账户：今日持仓观望，核心定投/安全边际待命", text2)
 
-        # Default ceiling is 2200; a ~1950-char report is preserved intact
+        # Default ceiling is 2800 (v5.5.2); a >2200-char report is preserved intact
         long_decision = self._decision()
-        long_decision.macro_and_cash = "宏观" * 300
-        long_decision.account_diagnosis = "诊断" * 300
+        long_decision.macro_and_cash = "宏观" * 500
+        long_decision.account_diagnosis = "诊断" * 500
         rendered = render_morning_report(long_decision)
-        self.assertGreater(len(rendered), 1800)
-        self.assertLessEqual(len(rendered), 2200)
+        self.assertGreater(len(rendered), 2200)
+        self.assertLessEqual(len(rendered), 2800)
         self.assertIn("其余长线底仓持有不动", rendered)
 
 

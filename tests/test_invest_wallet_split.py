@@ -14,6 +14,7 @@ from src.data_providers.t212_client import (
     AccountSnapshot,
     HistoricalDividendItem,
     HistoricalTransactionItem,
+    PendingOrderItem,
     PortfolioData,
     T212Client,
     build_trade_context,
@@ -75,6 +76,23 @@ def _invest_snapshot(**overrides: object) -> AccountSnapshot:
     }
     base.update(overrides)
     return AccountSnapshot(**base)
+
+
+def _usd_buy_order(quantity: float, limit_price: float, *, side: str = "BUY", currency: str = "USD") -> PendingOrderItem:
+    return PendingOrderItem(
+        id=f"ord-{side}-{quantity:g}-{limit_price:g}",
+        account="Invest",
+        raw_ticker="NVDA_US_EQ",
+        ticker="NVDA",
+        yahoo_symbol="NVDA",
+        name="NVIDIA",
+        side=side,
+        order_type="LIMIT",
+        quantity=quantity,
+        value=quantity * limit_price,
+        limit_price=limit_price,
+        currency=currency,
+    )
 
 
 class TestReconcileInvestWallets(unittest.TestCase):
@@ -176,6 +194,80 @@ class TestReconcileInvestWallets(unittest.TestCase):
         )
         self.assertFalse(snap.multi_currency_enabled)
         self.assertIsNone(snap.gbp_wallet_total)
+
+    def test_active_usd_buy_order_freezes_usd_wallet_first(self) -> None:
+        snap = reconcile_invest_wallets(
+            _invest_snapshot(
+                pending_orders_supported=True,
+                pending_orders=[_usd_buy_order(5.0, 100.0)],
+            ),
+            _wallet_records(usd_available=600.0),
+            1.25,
+        )
+
+        # min(usd_total 600, pending 500, API reserved 500*1.25=625) = 500
+        self.assertEqual(snap.usd_cash_total, 600.0)
+        self.assertEqual(snap.usd_reserved_cash, 500.0)
+        self.assertEqual(snap.usd_available_to_trade, 100.0)
+        self.assertEqual(snap.gbp_wallet_total, 1520.0)
+        self.assertEqual(snap.gbp_wallet_available, 1420.0)
+        self.assertEqual(snap.gbp_wallet_reserved, 100.0)
+
+    def test_pending_order_above_usd_balance_is_clamped_by_usd_total(self) -> None:
+        snap = reconcile_invest_wallets(
+            _invest_snapshot(
+                pending_orders_supported=True,
+                pending_orders=[_usd_buy_order(10.0, 100.0)],
+            ),
+            _wallet_records(usd_available=600.0),
+            1.25,
+        )
+
+        self.assertEqual(snap.usd_reserved_cash, 600.0)
+        self.assertEqual(snap.usd_available_to_trade, 0.0)
+        self.assertEqual(snap.gbp_wallet_available, 1500.0)
+        self.assertEqual(snap.gbp_wallet_reserved, 20.0)
+
+    def test_cancelled_order_releases_manual_usd_reserve(self) -> None:
+        snap = reconcile_invest_wallets(
+            _invest_snapshot(pending_orders_supported=True, reserved_cash=500.0, pending_orders=[]),
+            _wallet_records(usd_available=300.0, usd_reserved=300.0),
+            1.25,
+        )
+
+        self.assertEqual(snap.usd_cash_total, 600.0)
+        self.assertEqual(snap.usd_reserved_cash, 0.0)
+        self.assertEqual(snap.usd_available_to_trade, 600.0)
+        self.assertEqual(snap.gbp_wallet_available, 1020.0)
+        self.assertEqual(snap.gbp_wallet_reserved, 500.0)
+
+    def test_pending_api_unavailable_falls_back_to_static_anchor(self) -> None:
+        snap = reconcile_invest_wallets(
+            _invest_snapshot(pending_orders_supported=False, pending_orders=[]),
+            _wallet_records(usd_available=480.0, usd_reserved=120.0),
+            1.25,
+        )
+
+        self.assertEqual(snap.usd_reserved_cash, 120.0)
+        self.assertEqual(snap.usd_available_to_trade, 480.0)
+        self.assertEqual(snap.gbp_wallet_available, 1116.0)
+        self.assertEqual(snap.gbp_wallet_reserved, 404.0)
+
+    def test_non_usd_or_sell_orders_do_not_freeze_usd(self) -> None:
+        snap = reconcile_invest_wallets(
+            _invest_snapshot(
+                pending_orders_supported=True,
+                pending_orders=[
+                    _usd_buy_order(5.0, 100.0, currency="GBP"),
+                    _usd_buy_order(5.0, 100.0, side="SELL"),
+                ],
+            ),
+            _wallet_records(usd_available=600.0),
+            1.25,
+        )
+
+        self.assertEqual(snap.usd_reserved_cash, 0.0)
+        self.assertEqual(snap.usd_available_to_trade, 600.0)
 
 
 class TestWalletPresentation(unittest.TestCase):

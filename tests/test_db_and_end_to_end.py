@@ -588,9 +588,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         from src.agents.report_agent import generate_us_sentinel
         from src.agents.tools import MarketToolkit
 
-        # 1) render_morning_report default ceiling is now 2200 chars (v5.5.1; 1950-char report preserved intact)
+        # 1) render_morning_report default ceiling is now 2800 chars (v5.5.2)
         medium_report = MorningReportDecision(
-            headline="2200字安全天花板验证",
+            headline="2800字安全天花板验证",
             top_actions=[ReportActionItem(account="ISA", symbol="NVDA", action="HOLD", price_zone="138", reason="趋势完整")],
             daily_vetoes=["控制半导体仓位"],
             macro_and_cash="宏观" * 180,
@@ -601,7 +601,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
         )
         rendered_default = render_morning_report(medium_report)
         self.assertGreater(len(rendered_default), 1000)
-        self.assertLessEqual(len(rendered_default), 2200)
+        self.assertLessEqual(len(rendered_default), 2800)
         self.assertIn("其余长线底仓持有", rendered_default)
 
         # 2) trim_text_at_line_boundary cleanly trims on newline without leaving dangling 【...】 or mid-clause breaks
@@ -734,7 +734,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("USD 钱包 $400.00", pipeline_calls[0]["prompt"])
                 self.assertIn("Invest 资金路径", pipeline_calls[2]["prompt"])
                 report_msg = tg.messages[-1]
-                self.assertLessEqual(len(report_msg), 2200)
+                self.assertLessEqual(len(report_msg), 2800)
                 self.assertTrue(report_msg.startswith("【今日核心行动与挂单裁决】"))
                 self.assertIn("CANCEL", report_msg)
                 guardrails = await db.get_daily_guardrails()
@@ -2214,7 +2214,7 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                     clear_grounding_cache()
                     await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/report"}}, wait=True)
                     report_msg = tg.messages[-1]
-                    self.assertLessEqual(len(report_msg), 2200)
+                    self.assertLessEqual(len(report_msg), 2800)
                     self.assertIsNotNone(await db.get_context_pack(allow_fallback=False))
 
                     await bot.handle_update({"message": {"chat": {"id": "999"}, "text": "/us"}}, wait=True)

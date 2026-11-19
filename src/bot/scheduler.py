@@ -499,22 +499,32 @@ def match_fill_history(
     recent_orders: list[Any],
     *,
     grace_ms: int = FILL_MATCH_GRACE_MS,
+    excluded_fill_ids: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Cross-verify a vanished pending order against T212 historical fills.
 
-    T212's history `id` is the fill id, NOT the order id, so the only reliable match is
-    account + symbol + side + a fill timestamp window anchored on first_seen_ms.
+    Three lines of defence against false "filled" receipts after a cancel:
+
+    1. When the original order id is known and history carries order ids, only an exact
+       ``fill.order_id`` match counts — no fuzzy degradation.
+    2. Legacy history rows without ``order_id`` may use the timestamp window, but a LIMIT
+       order must still respect its physical price boundary (BUY fill <= limit*1.005,
+       SELL fill >= limit*0.995).
+    3. ``excluded_fill_ids`` lets the caller enforce one-to-one consumption so a single
+       fill can never be claimed by two vanished orders in the same round.
     """
     account = str(order_row.get("account_label") or "").strip()
     symbol = str(order_row.get("yahoo_symbol") or "").strip().upper()
     side = str(order_row.get("side") or "").strip().upper()
     target_qty = float(order_row.get("quantity") or 0.0)
     first_seen_ms = int(order_row.get("first_seen_ms") or 0)
+    order_id = str(order_row.get("order_id") or order_row.get("id") or "").strip()
+    excluded = {str(i) for i in (excluded_fill_ids or set()) if str(i).strip()}
     if not account or not symbol or target_qty <= 0:
         return None
     window_start_ms = max(0, first_seen_ms - max(0, int(grace_ms))) if first_seen_ms > 0 else 0
 
-    matched: list[Any] = []
+    same_scope: list[Any] = []
     for fill in recent_orders or []:
         if str(getattr(fill, "account", "") or "").strip() != account:
             continue
@@ -522,10 +532,35 @@ def match_fill_history(
             continue
         if str(getattr(fill, "side", "") or "").strip().upper() != side:
             continue
-        filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
-        if filled_at_ms <= 0 or filled_at_ms < window_start_ms:
-            continue
-        matched.append(fill)
+        same_scope.append(fill)
+
+    history_has_order_ids = any(
+        str(getattr(fill, "order_id", "") or "").strip() for fill in same_scope
+    )
+    if order_id and history_has_order_ids:
+        # Strict mode: a cancel/expiry must return None rather than fall back to fuzzy matching.
+        matched = [
+            fill
+            for fill in same_scope
+            if str(getattr(fill, "order_id", "") or "").strip() == order_id
+            and str(getattr(fill, "id", "") or "").strip() not in excluded
+        ]
+    else:
+        limit_price = float(order_row.get("limit_price") or 0.0)
+        matched = []
+        for fill in same_scope:
+            if str(getattr(fill, "id", "") or "").strip() in excluded:
+                continue
+            filled_at_ms = int(getattr(fill, "filled_at_ms", 0) or 0)
+            if filled_at_ms <= 0 or filled_at_ms < window_start_ms:
+                continue
+            fill_price = float(getattr(fill, "price", 0.0) or 0.0)
+            if limit_price > 0 and fill_price > 0:
+                if side == "BUY" and fill_price > limit_price * 1.005:
+                    continue
+                if side == "SELL" and fill_price < limit_price * 0.995:
+                    continue
+            matched.append(fill)
     if not matched:
         return None
 
@@ -548,6 +583,11 @@ def match_fill_history(
         "last_filled_at_ms": last_filled_ms,
         "currency": currency,
         "is_complete": qty >= target_qty * (1.0 - FILL_QTY_TOLERANCE),
+        "fill_ids": [
+            str(getattr(fill, "id", "") or "").strip()
+            for fill in matched
+            if str(getattr(fill, "id", "") or "").strip()
+        ],
     }
 
 
@@ -598,7 +638,10 @@ def format_fill_receipt(
     if filled_uk:
         moment = f"跨日补发，成交时间 {filled_uk} UK" if cross_day else f"成交时间 {filled_uk} UK"
         lines.append(f"• {moment}")
-    lines.append("• 现金与持仓已变：请 /usd 金额 或 /wallet gbp x usd y 校准钱包，再用 /pos 复核实时仓位。")
+    if account.upper() == "ISA":
+        lines.append("• 现金与持仓已变：请用 /pos 复核实时仓位。")
+    else:
+        lines.append("• 现金与持仓已变：请 /usd 金额 或 /wallet gbp x usd y 校准钱包，再用 /pos 复核实时仓位。")
     return "\n".join(lines)[: max(0, int(max_chars))]
 
 
@@ -1818,19 +1861,21 @@ class TradingScheduler:
         now_ms = int(now_utc.timestamp() * 1000)
         receipts: list[tuple[str, str]] = []
         stale_keys: list[tuple[str, str]] = []
+        claimed_fill_ids: set[str] = set()
 
         for row in diff["partial"]:
             key = _snapshot_key(row)
             dedupe = f"{key[0]}:{key[1]}:p{float(row.get('filled_quantity') or 0.0):g}"
             if await self._is_job_locked(f"fill_receipt:{dedupe}", uk_date):
                 continue
-            match = match_fill_history(row, history) or {
+            match = match_fill_history(row, history, excluded_fill_ids=claimed_fill_ids) or {
                 "matched_quantity": float(row.get("filled_quantity") or 0.0),
                 "avg_price": 0.0,
                 "last_filled_at_ms": now_ms,
                 "currency": str(row.get("currency") or ""),
                 "is_complete": False,
             }
+            claimed_fill_ids.update(match.get("fill_ids") or [])
             receipts.append((dedupe, format_fill_receipt(row, match, partial=True)))
 
         for row in diff["vanished"]:
@@ -1842,7 +1887,7 @@ class TradingScheduler:
             stale_keys.append(key)
             if await self._is_job_locked(f"fill_receipt:{dedupe}", uk_date):
                 continue
-            match = match_fill_history(row, history)
+            match = match_fill_history(row, history, excluded_fill_ids=claimed_fill_ids)
             if match is None:
                 logger.info(
                     "Pending order %s %s vanished without a matching fill (likely cancelled)",
@@ -1850,6 +1895,7 @@ class TradingScheduler:
                     key[1],
                 )
                 continue
+            claimed_fill_ids.update(match.get("fill_ids") or [])
             cross_day = _format_uk_from_ms(int(match.get("last_filled_at_ms") or 0))[:10] != uk_date
             receipts.append(
                 (

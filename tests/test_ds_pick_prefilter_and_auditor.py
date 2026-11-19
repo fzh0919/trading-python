@@ -14,7 +14,7 @@ from src.agents.ds_sidecar import (
 from src.agents.pick_agent import _prefilter_candidates_with_ds, _resolve_keep_candidates
 from src.agents.semantic_auditor import audit_generated_output, build_fact_baseline
 from src.config import AppConfig, EnvSettings
-from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+from src.data_providers.t212_client import AccountSnapshot, PortfolioData, PositionItem
 from src.engine.screener import ScreenerCandidate
 
 
@@ -410,6 +410,50 @@ class TestSemanticAuditor(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(filler), 4000)
         baseline = build_fact_baseline(scope="report", portfolio=_portfolio(), fact_sheet=filler)
         self.assertIn("SYM399 | 现价 499.00 USD", baseline)
+
+    def test_fact_baseline_lists_cross_account_cost_and_price_table(self) -> None:
+        portfolio = _portfolio()
+        portfolio.isa.positions = [
+            PositionItem(
+                account="ISA",
+                raw_ticker="AMZN_US_EQ",
+                ticker="AMZN",
+                yahoo_symbol="AMZN",
+                name="Amazon",
+                inst_currency="USD",
+                quantity=10.0,
+                avg_price=170.0,
+                cur_price=180.0,
+                current_value=1800.0,
+                total_cost=1700.0,
+                pnl=100.0,
+                fx_impact=0.0,
+                return_pct=5.88,
+            )
+        ]
+        portfolio.invest.positions = [
+            PositionItem(
+                account="Invest",
+                raw_ticker="AMZN_US_EQ",
+                ticker="AMZN",
+                yahoo_symbol="AMZN",
+                name="Amazon",
+                inst_currency="USD",
+                quantity=5.0,
+                avg_price=175.0,
+                cur_price=180.0,
+                current_value=900.0,
+                total_cost=875.0,
+                pnl=25.0,
+                fx_impact=0.0,
+                return_pct=2.86,
+            )
+        ]
+        baseline = build_fact_baseline(scope="report", portfolio=portfolio)
+        self.assertIn("ISA 全持仓成本/现价表", baseline)
+        self.assertIn("Invest 全持仓成本/现价表", baseline)
+        self.assertIn("• ISA AMZN | 均价 170.00 USD | 现价 180.00 USD | 收益率 +5.88%", baseline)
+        self.assertIn("• Invest AMZN | 均价 175.00 USD | 现价 180.00 USD | 收益率 +2.86%", baseline)
 
 
 if __name__ == "__main__":

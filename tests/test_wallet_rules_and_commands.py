@@ -235,7 +235,7 @@ class TestWalletCommands(unittest.IsolatedAsyncioTestCase):
         await self.db.upsert_wallet_balance("Invest", "GBP", 1300.0)
         reply = await self.bot._handle_wallet_command("/usd 600 25")
 
-        self.assertIn("本地 USD 记录: $625.00", reply)
+        self.assertIn("USD 钱包: $625.00", reply)
         self.assertIn("核对差额", reply)
         records = await self.db.get_wallet_balances("Invest")
         self.assertEqual(records["USD"]["available_amount"], 600.0)

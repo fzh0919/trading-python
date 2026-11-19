@@ -32,7 +32,7 @@ class ReportActionItem(BaseModel):
     )
     reason: str = Field(
         description=(
-            "一句话核心依据（不超过35字）；Invest 调仓须标明资金路径，"
+            "一句话核心依据（不超过60字）；Invest 调仓须标明资金路径，"
             "如「USD钱包免换汇」或「GBP不足需USD换回+0.15%」"
         )
     )
@@ -54,7 +54,7 @@ class CoreDeploymentItem(BaseModel):
     )
     price_zone: str = Field(description="建议买入价位/区间，如 '35.2-35.6 GBP'")
     size_hint: str = Field(description="建议金额（如 '£1,600'）；必填，且不得超过 Python 今日预算上限")
-    reason: str = Field(description="一句话批准/缩减/暂缓依据（不超过35字）")
+    reason: str = Field(description="一句话批准/缩减/暂缓依据（不超过60字）")
 
 
 class PendingOrderAuditItem(BaseModel):
@@ -64,7 +64,7 @@ class PendingOrderAuditItem(BaseModel):
     order_summary: str = Field(description="极简挂单方向与价位，如 'BUY 1250 GBp' 或 'STOP 93.80 USD'")
     reason: str = Field(
         description=(
-            "结合现价、均线、目标价及印花税/换汇成本给出的一句话审计结论（不超过38字）；"
+            "结合现价、均线、目标价及印花税/换汇成本给出的一句话审计结论（不超过60字）；"
             "Invest 按实际资金来源计（同币种钱包 0% / 跨币种单边 0.15%）"
         )
     )
@@ -72,7 +72,7 @@ class PendingOrderAuditItem(BaseModel):
 
 class FlaggedPositionItem(BaseModel):
     symbol: str = Field(description="标的代码，如 NVDA、ULVR.L")
-    summary: str = Field(description="一句话异动/观察摘要（不超过40字）")
+    summary: str = Field(description="一句话异动/观察摘要（不超过60字）")
 
 
 def _coerce_flagged_position_str(raw: str) -> FlaggedPositionItem | None:
@@ -114,7 +114,7 @@ class PickGateDecision(BaseModel):
 
 
 class MorningReportDecision(BaseModel):
-    headline: str = Field(description="一句话定调今日核心策略与现金态度（不超过45字）")
+    headline: str = Field(description="一句话定调今日核心策略与现金态度（不超过55字）")
     top_actions: list[ReportActionItem] = Field(
         default_factory=list,
         description="今日现有持仓最优先的 1~3 条调仓动作（不含撤单/改单）；若持仓全部不动，给1条 CASH HOLD 即可",
@@ -132,24 +132,24 @@ class MorningReportDecision(BaseModel):
     )
     daily_vetoes: list[str] = Field(
         default_factory=list,
-        description="2~4条今日硬性风控红线（供后续/pick与/us严格继承，每条不超过35字）",
+        description="2~4条今日硬性风控红线（供后续/pick与/us严格继承，每条不超过50字）",
     )
     macro_and_cash: str = Field(
         description=(
             "宏观利率/VIX/汇率精炼要点，并说明相对基准 VWRP 的配置态度与现金部署计划"
-            "（现金占比、触发阈值、下一步具体价位与金额；不超过90字）"
+            "（现金占比、触发阈值、下一步具体价位与金额；不超过130字）"
         )
     )
-    account_diagnosis: str = Field(description="ISA与Invest净值、FX影响、行业/跨账户集中度痛点（不超过130字）")
+    account_diagnosis: str = Field(description="ISA与Invest净值、FX影响、行业/跨账户集中度痛点（不超过180字）")
     flagged_positions: list[FlaggedPositionItem] = Field(
         default_factory=list,
-        description="仅列出【未在 top_actions 与 pending_order_audits 中出现过】的其他异动/破位/观察持仓，每条<=40字（最多4条，严禁与上方重复）",
+        description="仅列出【未在 top_actions 与 pending_order_audits 中出现过】的其他异动/破位/观察持仓，每条<=60字（最多4条，严禁与上方重复）",
     )
-    hold_summary: str = Field(description="一句话合并概括其余常规持有不动仓位（不超过55字）")
-    trade_review: str = Field(description="近7-30天实盘操作与摩擦一句话短评（不超过70字）")
+    hold_summary: str = Field(description="一句话合并概括其余常规持有不动仓位（不超过80字）")
+    trade_review: str = Field(description="近7-30天实盘操作与摩擦一句话短评（不超过100字）")
     earnings_watch: list[str] = Field(
         default_factory=list,
-        description="近7日财报预警与应对预案（每条<=30字，无则为空数组）",
+        description="近7日财报预警与应对预案（每条<=45字，无则为空数组）",
     )
     pick_gate: PickGateDecision = Field(
         default_factory=PickGateDecision,
@@ -447,10 +447,10 @@ def _extract_override_notes(risk_override: Any) -> list[str]:
     return formatted
 
 
-# [用户授权调整] /report 渲染默认安全天花板由 1500 → 1800 → 2200（v5.5.1 用户授权；Prompt 软约束 1700~2000 字）。
+# [用户授权调整] /report 渲染默认安全天花板由 1500 → 1800 → 2200 → 2800（v5.5.2 用户授权；Prompt 软约束 2100~2500 字）。
 def render_morning_report(
     decision: MorningReportDecision,
-    max_chars: int = 2200,
+    max_chars: int = 2800,
     *,
     risk_override: RiskOverrideResult | None = None,
     gate_banner: str = "",
@@ -468,6 +468,9 @@ def render_morning_report(
     v5.5.1: section 1 is deterministically split into 🏛️ ISA 价值账户 / ⚡ Invest 右侧账户
     blocks inside the SAME Telegram message (no extra message, no protocol change), and the
     default ceiling is raised to 2200 chars (explicit ``max_chars`` callers still win).
+
+    v5.5.2: default ceiling raised to 2800 chars (still far below Telegram's 3800 split line)
+    so the report can read naturally instead of using telegraph-style abbreviations.
     """
     ro_decision = getattr(risk_override, "decision", None) if risk_override is not None else None
     if isinstance(ro_decision, MorningReportDecision):

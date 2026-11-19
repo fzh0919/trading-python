@@ -172,9 +172,12 @@ def _fill(
     *,
     account: str = "ISA",
     currency: str = "GBP",
+    order_id: str = "",
+    fill_id: str = "",
 ) -> HistoricalOrderItem:
     return HistoricalOrderItem(
-        id=f"fill-{symbol}-{filled_at_ms}",
+        id=fill_id or f"fill-{symbol}-{filled_at_ms}",
+        order_id=order_id,
         account=account,
         raw_ticker=f"{symbol}_EQ",
         ticker=symbol,
@@ -539,7 +542,7 @@ class TestFillReceipts(_SentinelTestCase):
     async def _seed(self):
         sched, _, tg, _ = self._build(
             positions=[],
-            orders=[_order("VWRP.L", 95.0, "GBP")],
+            orders=[_order("VWRP.L", 100.0, "GBP")],
             bundles={"VWRP.L": _bundle("VWRP.L", 100.0, "GBP")},
             histories={"VWRP.L": _history(100.0, 100.0)},
             pending_supported=True,
@@ -575,7 +578,8 @@ class TestFillReceipts(_SentinelTestCase):
         text = tg.sent[0][1]
         self.assertIn("挂单成交回执", text)
         self.assertIn("5/5", text)
-        self.assertIn("/usd", text)
+        self.assertIn("/pos", text)
+        self.assertNotIn("/usd", text)
         self.assertNotIn("#", text)
         self.assertNotIn("**", text)
         self.assertLessEqual(len(text), 450)
@@ -649,7 +653,8 @@ class TestFillReceipts(_SentinelTestCase):
 
         text = format_fill_receipt(row, match, cross_day=True)
         self.assertIn("跨日补发", text)
-        self.assertIn("/usd", text)
+        self.assertIn("/pos", text)
+        self.assertNotIn("/usd", text)
         self.assertLessEqual(len(text), 450)
 
         # A 403 account must never be treated as "all orders vanished".
@@ -665,6 +670,118 @@ class TestFillReceipts(_SentinelTestCase):
             len(diff_pending_order_snapshots([row], [], supported_accounts={"ISA"})["vanished"]),
             1,
         )
+
+    def test_cancelled_limit_order_never_matches_higher_fill(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        row = {
+            "account_label": "ISA",
+            "order_id": "ord-vwrp-133",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 25.0,
+            "filled_quantity": 0.0,
+            "limit_price": 133.50,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        # Real incident: two cancelled VWRP.L BUYs at 133.50/136.20 vs a 137.80 fill.
+        for limit_price in (133.50, 136.20):
+            row["limit_price"] = limit_price
+            fill = _fill("VWRP.L", 25.0, 137.80, first_seen + 60_000)
+            self.assertIsNone(match_fill_history(row, [fill]), msg=f"limit={limit_price}")
+
+    def test_order_id_exact_match_is_authoritative_and_never_degrades(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        row = {
+            "account_label": "ISA",
+            "order_id": "ord-exact",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 5.0,
+            "filled_quantity": 0.0,
+            "limit_price": 133.50,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        exact = _fill("VWRP.L", 5.0, 137.80, first_seen + 60_000, order_id="ord-exact", fill_id="fill-exact")
+        match = match_fill_history(row, [exact])
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match["fill_ids"], ["fill-exact"])
+
+        other = _fill("VWRP.L", 5.0, 137.80, first_seen + 60_000, order_id="ord-other", fill_id="fill-other")
+        self.assertIsNone(match_fill_history(row, [other]))
+
+    def test_legacy_stub_without_order_id_still_checks_price_boundary(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        row = {
+            "account_label": "ISA",
+            "order_id": "ord-legacy",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 5.0,
+            "filled_quantity": 0.0,
+            "limit_price": 133.50,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        within = _fill("VWRP.L", 5.0, 134.0, first_seen + 60_000, fill_id="fill-within")
+        self.assertIsNotNone(match_fill_history(row, [within]))
+        beyond = _fill("VWRP.L", 5.0, 137.80, first_seen + 60_000, fill_id="fill-beyond")
+        self.assertIsNone(match_fill_history(row, [beyond]))
+
+    def test_single_fill_can_only_be_claimed_once(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        base_row = {
+            "account_label": "ISA",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 5.0,
+            "filled_quantity": 0.0,
+            "limit_price": 100.0,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        fill = _fill("VWRP.L", 5.0, 99.5, first_seen + 60_000, fill_id="fill-once")
+        first = match_fill_history({**base_row, "order_id": "ord-a"}, [fill])
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(first["fill_ids"], ["fill-once"])
+
+        second = match_fill_history(
+            {**base_row, "order_id": "ord-b"},
+            [fill],
+            excluded_fill_ids=set(first["fill_ids"]),
+        )
+        self.assertIsNone(second)
+
+    def test_receipt_tail_differs_for_isa_and_invest(self) -> None:
+        first_seen = int(NOW.timestamp() * 1000)
+        row = {
+            "account_label": "ISA",
+            "order_id": "ord-1",
+            "yahoo_symbol": "VWRP.L",
+            "side": "BUY",
+            "quantity": 5.0,
+            "filled_quantity": 0.0,
+            "limit_price": 100.0,
+            "stop_price": None,
+            "currency": "GBP",
+            "first_seen_ms": first_seen,
+        }
+        match = match_fill_history(row, [_fill("VWRP.L", 5.0, 100.0, first_seen + 1000)])
+        assert match is not None
+        isa_text = format_fill_receipt(row, match)
+        self.assertIn("请用 /pos 复核实时仓位", isa_text)
+        self.assertNotIn("/usd", isa_text)
+
+        invest_text = format_fill_receipt({**row, "account_label": "Invest"}, match)
+        self.assertIn("/usd", invest_text)
+        self.assertIn("/wallet", invest_text)
 
 
 if __name__ == "__main__":

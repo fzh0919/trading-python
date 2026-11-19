@@ -154,7 +154,10 @@ class ModelsSection(BaseModel):
     # DeepSeek V4.1 Flash sidecar (ID filter / read-only linter / independent briefs / quoted memory)
     ds_helper_model: str = "deepseek-flash"
     ds_helper_thinking_level: ThinkingLevelLiteral = "HIGH"
-    ds_helper_timeout_seconds: float = Field(default=40.0, ge=5.0, le=60.0)
+    ds_helper_timeout_seconds: float = Field(default=60.0, ge=5.0, le=120.0)
+    # v5.5.2: DeepSeek think=HIGH peak latency (07:30 UK ≈ 14:30/15:30 CN) routinely reaches
+    # 70~110s; keep the read timeout and per-round wait ceiling aligned so 150s is a true hard cap.
+    deepseek_round_timeout_seconds: float = Field(default=150.0, ge=15.0, le=300.0)
     ds_pick_prefilter_enabled: bool = True
     ds_semantic_audit_enabled: bool = True
 

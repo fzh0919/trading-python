@@ -169,7 +169,7 @@ class AdvisorBot:
             f"🤖 Trading 212 × Gemini 量化投顾（v{APP_VERSION}）已就绪！\n\n"
             "【核心投研指令（见左侧 / 菜单栏）】\n"
             "• /pos — 瞬时拉取双账户实时净值、仓位、挂单与近7日成交（免等待 AI）\n"
-            "• /report — 深度全景晨报（全市场分域联网检索、30日复盘、逐仓与挂单审计，≤2200字）\n"
+            "• /report — 深度全景晨报（全市场分域联网检索、30日复盘、逐仓与挂单审计，≤2800字）\n"
             "• /pick [方向] — 全市场选股雷达（美/英/欧股 + LSE ETF 联网催化 + 风控终审，≤1000字）\n"
             "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报（平稳≤450字，异动≤600字）\n"
             "• /deep <问题> — 深度单聊升级版（1000~1200字、最多4轮工具的多维推演，Token 消耗更高）\n"
@@ -286,8 +286,8 @@ class AdvisorBot:
         )
         lines.append(f"• 实时 GBP/USD: {rate:.4f}" if rate else "• 实时 GBP/USD: 暂缺（宏观快照未就绪）")
         usd_line = (
-            f"• 本地 USD 记录: ${snap.usd_cash_total:,.2f}"
-            f"（可用 ${snap.usd_available_to_trade:,.2f} / 挂单 ${snap.usd_reserved_cash:,.2f}）"
+            f"• USD 钱包: ${snap.usd_cash_total:,.2f}"
+            f"（可用 ${snap.usd_available_to_trade:,.2f} / 挂单占用 ${snap.usd_reserved_cash:,.2f}）"
         )
         if rate:
             usd_line += f" ≈ £{snap.usd_cash_total / rate:,.2f}"
@@ -298,9 +298,14 @@ class AdvisorBot:
             lines.append("• GBP 钱包: 待汇率折算")
         else:
             src_lbl = "手动上报" if snap.wallet_source == "manual_both" else "按 API 总现金推算"
+            gbp_reserved_txt = (
+                f"，挂单占用 £{snap.gbp_wallet_reserved:,.2f}"
+                if (snap.gbp_wallet_reserved or 0.0) > 0
+                else ""
+            )
             lines.append(
                 f"• GBP 钱包: ≈ £{snap.gbp_wallet_total:,.2f}"
-                f"（可用 £{snap.gbp_wallet_available or 0.0:,.2f}，{src_lbl}）"
+                f"（可用 £{snap.gbp_wallet_available or 0.0:,.2f}{gbp_reserved_txt}，{src_lbl}）"
             )
             threshold = max(mismatch_floor, abs(float(invest.total_cash)) * 0.02)
             diff = (snap.gbp_wallet_total + snap.usd_cash_total / rate) - float(invest.total_cash)

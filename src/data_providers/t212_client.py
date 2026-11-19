@@ -63,6 +63,7 @@ class PendingOrderItem(BaseModel):
 
 class HistoricalOrderItem(BaseModel):
     id: str
+    order_id: str = ""
     account: str
     raw_ticker: str
     ticker: str
@@ -199,6 +200,29 @@ def _wallet_amount(record: dict[str, Any] | None, key: str) -> float:
         return 0.0
 
 
+def _pending_usd_buy_notional(pending_orders: list[Any] | None) -> float:
+    """Sum the USD notional frozen by active BUY orders (limit > stop > API value)."""
+    total = 0.0
+    for order in pending_orders or []:
+        if str(getattr(order, "side", "") or "").strip().upper() != "BUY":
+            continue
+        if str(getattr(order, "currency", "") or "").strip().upper() != "USD":
+            continue
+        qty = max(0.0, float(getattr(order, "quantity", 0.0) or 0.0))
+        if qty <= 0:
+            continue
+        limit_price = float(getattr(order, "limit_price", 0.0) or 0.0)
+        stop_price = float(getattr(order, "stop_price", 0.0) or 0.0)
+        if limit_price > 0:
+            notional = qty * limit_price
+        elif stop_price > 0:
+            notional = qty * stop_price
+        else:
+            notional = abs(float(getattr(order, "value", 0.0) or 0.0))
+        total += max(0.0, notional)
+    return total
+
+
 def reconcile_invest_wallets(
     invest_snap: AccountSnapshot,
     wallet_records: dict[str, dict[str, Any]] | None,
@@ -266,6 +290,23 @@ def reconcile_invest_wallets(
         return invest_snap.model_copy(update=updates)
 
     updates["gbp_usd_rate"] = round(rate, 4)
+
+    # v5.5.2: active USD BUY orders freeze the USD wallet first. The API only exposes the
+    # account-level reserved cash (GBP), so derive the USD slice with a triple clamp and
+    # auto-release it as soon as the order disappears (cancel / fill).
+    usd_available_effective = usd_avail
+    if invest_snap.pending_orders_supported:
+        pending_usd_buy = _pending_usd_buy_notional(getattr(invest_snap, "pending_orders", None))
+        api_reserved_usd = max(0.0, float(invest_snap.reserved_cash or 0.0)) * rate
+        if pending_usd_buy <= 0.0 or float(invest_snap.reserved_cash or 0.0) <= 0.01:
+            auto_usd_reserved = 0.0
+        else:
+            auto_usd_reserved = min(usd_total, pending_usd_buy, api_reserved_usd)
+        auto_usd_reserved = round(max(0.0, auto_usd_reserved), 2)
+        usd_available_effective = round(max(0.0, usd_total - auto_usd_reserved), 2)
+        updates["usd_reserved_cash"] = auto_usd_reserved
+        updates["usd_available_to_trade"] = usd_available_effective
+
     gbp_rec = records.get("GBP", {})
     gbp_source = str(gbp_rec.get("source") or "").strip().lower()
     gbp_updated_ms = int(_wallet_amount(gbp_rec, "updated_at_ms"))
@@ -293,8 +334,8 @@ def reconcile_invest_wallets(
         )
     else:
         derived_total = invest_snap.total_cash - usd_total / rate
-        derived_avail = invest_snap.available_to_trade - usd_avail / rate
-        derived_reserved = invest_snap.reserved_cash - usd_reserved / rate
+        derived_avail = invest_snap.available_to_trade - usd_available_effective / rate
+        derived_reserved = invest_snap.reserved_cash - float(updates["usd_reserved_cash"]) / rate
         if min(derived_total, derived_avail, derived_reserved) < -0.01:
             warnings.append("按 USD 锚推算的 GBP 钱包为负，USD 账本可能已因成交/换汇变化，请校准")
         updates.update(
@@ -984,6 +1025,7 @@ class T212Client:
                     recent_orders.append(
                         HistoricalOrderItem(
                             id=dedup_id,
+                            order_id=str(order.get("id") or "").strip(),
                             account=account_label,
                             raw_ticker=raw_ticker,
                             ticker=clean,

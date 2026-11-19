@@ -94,6 +94,7 @@ async def run_app(stop_event: asyncio.Event | None = None) -> None:
         round_timeout_seconds=cfg.models.gemini_round_timeout_seconds,
         max_transient_retries=cfg.models.gemini_max_transient_retries,
         timeout_max_retries=cfg.models.gemini_timeout_max_retries,
+        deepseek_round_timeout_seconds=cfg.models.deepseek_round_timeout_seconds,
         usage_summary_provider=db.get_usage_summary,
         search_free_quota_monthly=cfg.models.google_search_free_quota_monthly,
         search_warn_pct=cfg.models.google_search_warn_pct,

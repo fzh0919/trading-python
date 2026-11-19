@@ -244,7 +244,7 @@ def _format_benchmark_line(
 ) -> str:
     """One-line 'market vs me' dashboard: benchmark 7d/30d returns plus account change.
 
-    Kept to ~60 characters of numbers so the /report 2200-char hard cap is never squeezed.
+    Kept to ~60 characters of numbers so the /report 2800-char hard cap is never squeezed.
     """
     bench = (benchmark_symbol or "VWRP.L").strip().upper()
     ret_7 = compute_window_return_pct(hist, 5)  # 5 trading bars ≈ 7 calendar days
@@ -1568,7 +1568,7 @@ async def generate_morning_report(
     """TradingAgents-Lite 3-step pipeline:
     1) Deterministic FactSheet + ContextPack + Concurrent Multi-Region Google Search Grounding
     2) Concurrent Analyst (Bull/Opportunity, HIGH, <=6 tool rounds) & Risk Auditor (Bear, Argon HIGH, <=6 tool rounds)
-    3) Portfolio Manager Pydantic Structured Synthesis + RiskOverride Guardrail -> <= 2200 chars
+    3) Portfolio Manager Pydantic Structured Synthesis + RiskOverride Guardrail -> <= 2800 chars
     """
     portfolio = await t212.get_portfolio(use_cache=False)
     if not portfolio.isa.ok and not portfolio.invest.ok:
@@ -1941,9 +1941,10 @@ async def generate_morning_report(
         "• `size_hint` 必填数量口径：TRIM 写减仓比例（如 30%、1/3）或英镑金额（如 £2,300），ADD 写加仓金额或比例，STOP 写「全出」，HOLD/CASH 留空；严禁写股数（由 Python 按持仓确定性换算）。\n"
         "• `pending_order_audits` 逐一简洁裁决 KEEP/MODIFY/CANCEL，不要和上文重复抄写理由。\n"
         "• `flagged_positions` 只列出【未在 top_actions 或 pending_order_audits 中出现过】的其他异动/观察持仓（如暴跌、财报临近但暂不操作者），严禁再复述上方已给过动作的标的！\n"
-        "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=35字）。\n"
-        # [用户授权调整 v5.5.1] /report 目标篇幅调至 1700~2000 字、安全天花板 2200 字（单消息分账户排版）。
-        "• 全文必须精炼直白，控制在 1700~2000 字左右（绝不可超 2200 字），确保财报预警与操作复盘完整展示。"
+        "• `daily_vetoes` 将写入数据库强制约束今日后续 `/pick` 和 `/us`，只写简洁可执行的红线（2~4条，每条<=50字）。\n"
+        # [用户授权调整 v5.5.2] /report 目标篇幅调至 2100~2500 字、安全天花板 2800 字（单消息分账户排版）。
+        "• 全文必须自然完整、逻辑展开，控制在 2100~2500 字左右（绝不可超 2800 字），确保财报预警与操作复盘完整展示。"
+        "严禁把「撤单」和「吃息」写成因果关系（如“撤X吃息待命”）：未成交限价挂单本就计息，撤单原因只能是追高/超频/盈亏比不足等交易逻辑。"
     )
     if debate_pm_block:
         pm_role += (
@@ -2008,8 +2009,8 @@ async def generate_morning_report(
         alert_source="report_pm",
     )
     holiday_banner = "🇬🇧 今日英国 Bank Holiday（LSE 休市，英股/LSE ETF 暂不交易）\n\n" if uk_bank_holiday else ""
-    # [用户授权调整 v5.5.1] /report 安全天花板 2200 字（Prompt 控制 1700~2000 字）；IMP-12 接线时请保留 2200 上限。
-    max_body_chars = 2200 - len(holiday_banner)
+    # [用户授权调整 v5.5.2] /report 安全天花板 2800 字（Prompt 控制 2100~2500 字）；IMP-12 接线时请保留 2800 上限。
+    max_body_chars = 2800 - len(holiday_banner)
     if decision is not None:
         override_res = apply_risk_override_guardrail(
             decision,
@@ -2432,8 +2433,8 @@ async def generate_us_sentinel(
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未生成 /report 红线）"
     if guardrails_stale:
         veto_block = "（以下为上一交易日旧红线，仅作参考，严禁当作今日裁决）\n" + veto_block
-    # [用户授权调整 v5.5.1] 随 /report 放宽至 2200 同步放宽基线切片；IMP-12 请保留。
-    morning_baseline = morning_report_full[:2200] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
+    # [用户授权调整 v5.5.2] 随 /report 放宽至 2800 同步放宽基线切片；IMP-12 请保留。
+    morning_baseline = morning_report_full[:2800] if morning_report_full else (morning_conclusion or "（今日尚未运行 /report）")
     if morning_stale:
         morning_baseline = "⚠️ 今日 /report 尚未生成，以下为上一交易日基线，严禁当作今日裁决。\n" + morning_baseline
     gate_block = (

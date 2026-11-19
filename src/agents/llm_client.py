@@ -134,9 +134,13 @@ _TRANSIENT_KEYWORDS = (
 )
 
 
-# Our own `asyncio.wait_for` ceiling (not a transport error): a hard timeout usually means the
-# model is saturated, so retrying it costs minutes before failover can even start.
-_HARD_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (TimeoutError, asyncio.TimeoutError)
+# Our own `asyncio.wait_for` ceiling or an httpx transport read timeout (not a 5xx): a hard
+# timeout usually means the model is saturated, so retrying it costs minutes before failover.
+_HARD_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    asyncio.TimeoutError,
+    httpx.TimeoutException,
+)
 
 # Sentinel strings returned by `generate()` when every candidate model failed. They are meant for
 # end-user surfaces (Telegram), never as analyst/auditor content inside an internal prompt.
@@ -154,7 +158,7 @@ def is_degraded_llm_output(text: str | None) -> bool:
 
 
 def _is_transient_llm_error(exc: Exception) -> bool:
-    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException, ConnectionError, OSError)):
         return True
     msg = f"{type(exc).__name__}: {exc}".lower()
     return any(kw in msg for kw in _TRANSIENT_KEYWORDS)
@@ -279,7 +283,7 @@ class GeminiClient:
         deepseek_fallback_model: str = "deepseek-flash",
         deepseek_fallback_thinking_level: str = "HIGH",
         prefer_deepseek_over_flash_lite: bool = True,
-        deepseek_round_timeout_seconds: float = 60.0,
+        deepseek_round_timeout_seconds: float = 150.0,
         deepseek_max_retries: int = 1,
         round_timeout_seconds: float = 120.0,
         timeout_max_retries: int = 0,
@@ -798,19 +802,27 @@ class GeminiClient:
                     data = await _post(payload)
                     return data, eff_level
 
-                if attempt < self.deepseek_max_retries and _is_transient_llm_error(exc):
+                is_timeout = isinstance(exc, _HARD_TIMEOUT_ERRORS)
+                retry_budget = self.timeout_max_retries if is_timeout else self.deepseek_max_retries
+                if attempt < retry_budget and _is_transient_llm_error(exc):
                     delay = self.retry_base_delay_s * (2**attempt)
                     logger.warning(
                         "Transient DeepSeek error on %s (attempt %d/%d): %s; retrying in %.1fs",
                         model,
                         attempt + 1,
-                        self.deepseek_max_retries + 1,
+                        retry_budget + 1,
                         err_msg[:180],
                         delay,
                     )
                     if delay > 0:
                         await asyncio.sleep(delay)
                     continue
+                if is_timeout:
+                    logger.warning(
+                        "Hard timeout on DeepSeek %s after %.0fs; skipping further retries to fail over sooner",
+                        model,
+                        effective_timeout,
+                    )
                 raise
         raise RuntimeError(f"Exhausted DeepSeek retries for {model}")
 

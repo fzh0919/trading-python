@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import httpx
 from google.genai import types
 from pydantic import ValidationError
 
@@ -834,6 +835,60 @@ class TestGeminiClientTelemetryAndUsageDb(unittest.IsolatedAsyncioTestCase):
             self.assertIn("pending_order_audits", ds_json_payloads[0]["messages"][0]["content"])
             await client.close()
             await db.close()
+
+    async def test_deepseek_read_timeout_skips_retry_and_fails_over(self) -> None:
+        client = GeminiClient(
+            api_key="dummy-gem",
+            deepseek_api_key="dummy-ds",
+            fallback_model="gemini-4-hydrogen",
+            gemini_fallback_model="gemini-4-hydrogen",
+            gemini_fallback_thinking_level="MEDIUM",
+            deepseek_fallback_model="deepseek-flash",
+            deepseek_fallback_thinking_level="HIGH",
+            max_transient_retries=2,
+            timeout_max_retries=0,
+            deepseek_max_retries=2,
+            retry_base_delay_s=0.0,
+            deepseek_round_timeout_seconds=150.0,
+        )
+        ds_attempts: list[int] = []
+
+        async def _read_timeout(payload: dict) -> dict:
+            ds_attempts.append(1)
+            raise httpx.ReadTimeout("read timed out")
+
+        gem_calls: list[str] = []
+
+        async def _gem_ok(*, model, contents, config):
+            gem_calls.append(model)
+            return SimpleNamespace(
+                text="DeepSeek 超时后备援成功",
+                function_calls=[],
+                candidates=[],
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=10,
+                    cached_content_token_count=0,
+                    candidates_token_count=5,
+                    thoughts_token_count=0,
+                    total_token_count=15,
+                ),
+            )
+
+        client._post_deepseek_completion = _read_timeout  # type: ignore[method-assign]
+        client._client = SimpleNamespace(  # type: ignore[assignment]
+            aio=SimpleNamespace(models=SimpleNamespace(generate_content=_gem_ok))
+        )
+        reply = await client.generate(
+            model="deepseek-flash",
+            prompt="hi",
+            thinking_level="HIGH",
+            usage_label="report_debate",
+        )
+        self.assertEqual(reply, "DeepSeek 超时后备援成功")
+        # timeout_max_retries=0: one DeepSeek attempt only, immediate cross-vendor failover.
+        self.assertEqual(len(ds_attempts), 1)
+        self.assertEqual(gem_calls, ["gemini-4-hydrogen"])
+        await client.close()
 
 
 class TestEgressGuards(unittest.TestCase):

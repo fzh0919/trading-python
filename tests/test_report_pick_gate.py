@@ -1120,6 +1120,26 @@ class TestPmClampBannerAndRendering(unittest.TestCase):
         # The banner is the FIRST line of section 2 — nothing may separate it from the header.
         self.assertIn(f"{header}\n{banner.splitlines()[0]}", rendered)
 
+    def test_default_report_ceiling_is_2800(self) -> None:
+        moderate = MorningReportDecision(
+            headline="2800字默认天花板验证",
+            top_actions=[],
+            daily_vetoes=["控制集中度"],
+            macro_and_cash="宏" * 2300,
+            account_diagnosis="",
+            flagged_positions=[],
+            hold_summary="",
+            trade_review="",
+        )
+        rendered = render_morning_report(moderate)
+        self.assertGreater(len(rendered), 2200)
+        self.assertLessEqual(len(rendered), 2800)
+
+        oversized = moderate.model_copy(update={"macro_and_cash": "宏" * 5000})
+        capped = render_morning_report(oversized)
+        self.assertLessEqual(len(capped), 2800)
+        self.assertTrue(capped.startswith("【今日核心行动与挂单裁决】"))
+
     def test_render_strips_markdown_markers(self) -> None:
         decision = MorningReportDecision(
             headline="**加仓** #核心",

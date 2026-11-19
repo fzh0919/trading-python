@@ -92,6 +92,25 @@ def build_fact_baseline(
                 f" | 总现金 {_fmt_num(total_cash)}"
             )
         lines.append(line)
+    for label in ("isa", "invest"):
+        acct = getattr(portfolio, label, None)
+        if acct is None:
+            continue
+        positions = getattr(acct, "positions", None) or []
+        if not positions:
+            continue
+        display_label = "ISA" if label == "isa" else "Invest"
+        lines.append(f"{display_label} 全持仓成本/现价表（跨账户同名标的逐一列出）：")
+        for pos in positions:
+            sym = str(getattr(pos, "yahoo_symbol", "") or getattr(pos, "ticker", "") or "").strip()
+            if not sym:
+                continue
+            ccy = str(getattr(pos, "inst_currency", "") or "").strip()
+            lines.append(
+                f"• {display_label} {sym} | 均价 {_fmt_num(getattr(pos, 'avg_price', None))} {ccy}"
+                f" | 现价 {_fmt_num(getattr(pos, 'cur_price', None))} {ccy}"
+                f" | 收益率 {_fmt_num(getattr(pos, 'return_pct', None), '+.2f')}%"
+            )
     pending_text = str((trade_ctx or {}).get("pending_orders_text") or "").strip()
     if pending_text:
         lines.append("活动挂单（未成交仍计息）：\n" + pending_text[:1200])
@@ -143,8 +162,9 @@ def _strategy_hint(strategy: StrategySection) -> str:
 async def _emit_violations(result: SemanticAuditResult, *, scope: str, ops_notifier: Any) -> None:
     if not result.violations:
         return
+    full_text = sanitize_plain_text("；".join(result.violations), max(400, sum(len(v) for v in result.violations) + 16))
     joined = sanitize_plain_text("；".join(result.violations), 400)
-    logger.warning("Semantic audit (%s) flagged %d violation(s): %s", scope, len(result.violations), joined)
+    logger.warning("Semantic audit (%s) flagged %d violation(s): %s", scope, len(result.violations), full_text)
     if ops_notifier is None:
         return
     try:
