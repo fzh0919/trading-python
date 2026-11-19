@@ -2521,6 +2521,8 @@ async def generate_intraday_alert(
     order_dist_pct: float | None = None,
     pending_order_text: str = "",
     currency: str = "",
+    account_context: str = "",
+    trigger_reason: str = "",
     ops_notifier: OpsNotifier | None = None,
 ) -> str | None:
     """Event-driven intraday alert: 1-symbol grounding + DeepSeek push/no-push decision (<=250 chars)."""
@@ -2554,14 +2556,22 @@ async def generate_intraday_alert(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Intraday grounding failed for %s: %s", sym, exc)
 
-    morning_slice = trim_text_at_line_boundary(str(morning_text or ""), 1200)
+    morning_slice = trim_text_at_line_boundary(str(morning_text or ""), 1800)
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（无）"
     distance_text = "N/A" if order_dist_pct is None else f"{order_dist_pct:.2f}%"
+    account_tag = str(account_context or "").strip()
+    philosophy_map = {
+        "ISA": "ISA 巴菲特价值仓：忽略短期噪音，仅基本面破坏或深折价机会才打扰用户",
+        "Invest": "Invest 右侧动量仓：重点关注止损纪律与趋势破坏，破位需立即提醒",
+    }
+    philosophy_text = philosophy_map.get(account_tag, "未标注账户：按通用趋势/风控纪律判断")
     numeric = (
         "【Python 实时数值（唯一真源，禁止改写）】\n"
         f"{sym} 现价 {current_price:.2f} {currency or ''} | 日内涨跌 {move_pct:+.2f}% | "
         f"距最近挂单价 {distance_text}\n"
-        f"活动挂单：{pending_order_text or '无'}"
+        f"活动挂单：{pending_order_text or '无'}\n"
+        f"账户哲学：{philosophy_text}"
+        + (f"\n触发原因：{trigger_reason}" if trigger_reason else "")
     )
     prompt = (
         f"{numeric}\n\n【今日 /report 原文节选】\n{morning_slice or '（今日尚未生成 /report）'}\n\n"
@@ -2569,6 +2579,7 @@ async def generate_intraday_alert(
         + (f"【盘中联网快讯】\n{grounding}\n\n" if grounding else "")
         + "请判断这次异动是否值得立即打断用户：只在具备可执行意义（趋势破坏、催化确认或与今日红线直接相关）时推送；"
         "正常波动、已被早报覆盖或与红线无关时返回 should_push=false。"
+        "ISA 价值仓请严格执行噪音过滤，只有基本面破坏或深折价机会才推送；Invest 右侧仓优先止损纪律与趋势破坏。"
     )
     payload = await call_ds_json(
         cfg,

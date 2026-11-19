@@ -23,8 +23,11 @@ from src.agents.report_agent import (
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.analytics import (
+    _CORE_POLICY_BENCHMARK_WEIGHTS,
+    _compute_atr_and_adx,
     _normalize_adjusted_ohlcv,
     build_nav_row,
+    compute_core_policy_benchmark_comparison,
     compute_window_return_pct,
     resolve_market_benchmark,
 )
@@ -44,6 +47,7 @@ from src.engine.calendar_utils import (
     is_london_weekday,
     is_uk_bank_holiday,
 )
+from src.engine.deployment_gate import core_sleeve_for_symbol
 from src.engine.screener import run_offline_universe_and_threshold_audit, run_universe_audition
 from src.storage.db import AdvisorDatabase
 
@@ -282,6 +286,55 @@ def _compute_mfe_mae_pct(
     return mfe, mae
 
 
+def _match_recommendation_fill(
+    rec: dict[str, Any],
+    *,
+    start_date: date,
+    end_date: date,
+    recent_orders: list[Any],
+    entry_price: float,
+) -> tuple[float, float] | None:
+    """Return (volume-weighted fill price, adverse slippage %) for same-account/symbol/side fills.
+
+    Only fills inside [start_date, end_date] count. LSE fills are aligned to the recommendation's
+    native unit via ``_align_lse_unit_100x`` so a pence/sterling mismatch can never fake a 100x slip.
+    """
+    sym = str(rec.get("symbol") or "").strip().upper()
+    account = str(rec.get("account") or "").strip().upper()
+    action = str(rec.get("action") or "BUY").strip().upper()
+    side = "SELL" if _trade_direction(action) < 0 else "BUY"
+    if not sym or entry_price <= 0:
+        return None
+    qty_sum = 0.0
+    notional = 0.0
+    for order in recent_orders or []:
+        if str(getattr(order, "yahoo_symbol", "") or "").strip().upper() != sym:
+            continue
+        if str(getattr(order, "account", "") or "").strip().upper() != account:
+            continue
+        if str(getattr(order, "side", "") or "").strip().upper() != side:
+            continue
+        filled_ms = int(getattr(order, "filled_at_ms", 0) or 0)
+        if filled_ms <= 0:
+            continue
+        fill_day = datetime.fromtimestamp(filled_ms / 1000.0, tz=timezone.utc).astimezone(LONDON_TZ).date()
+        if fill_day < start_date or fill_day > end_date:
+            continue
+        qty = float(getattr(order, "quantity", 0.0) or 0.0)
+        price = float(getattr(order, "price", 0.0) or 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+        price = _align_lse_unit_100x(price, entry_price, sym)
+        qty_sum += qty
+        notional += qty * price
+    if qty_sum <= 0:
+        return None
+    avg_fill = notional / qty_sum
+    # Positive = worse than the recommended entry (BUY fills higher / SELL fills lower).
+    slippage_pct = ((avg_fill - entry_price) / entry_price) * 100.0 * _trade_direction(action)
+    return avg_fill, slippage_pct
+
+
 def _compute_benchmark_return_pct(
     bench_candidates: list[str],
     get_closes_fn: Any,
@@ -399,6 +452,100 @@ def _order_distance_pct(
                 trigger = _align_lse_unit_100x(trigger, px, order_sym)
             distances.append(abs(px - trigger) / px * 100.0)
     return min(distances) if distances else None
+
+
+def _normalize_account_label(raw: Any) -> str:
+    """Collapse any T212 account label to the two philosophy buckets used everywhere else."""
+    label = str(raw or "").strip().upper()
+    return "ISA" if label == "ISA" else "Invest"
+
+
+def _has_protective_stop(orders: list[Any] | None, *, account: str | None = None) -> bool:
+    """True when a live SELL STOP/STOP_LIMIT order protects this symbol (optionally per account)."""
+    wanted = _normalize_account_label(account) if account else ""
+    for order in orders or []:
+        if wanted and _normalize_account_label(getattr(order, "account", "")) != wanted:
+            continue
+        if str(getattr(order, "side", "") or "").strip().upper() != "SELL":
+            continue
+        if "STOP" in str(getattr(order, "order_type", "") or "").strip().upper():
+            return True
+    return False
+
+
+def _close_series_from_hist(hist: pd.DataFrame | None) -> pd.Series | None:
+    """Case-tolerant numeric Close series (dropna) for drawdown / ATR helpers."""
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    col = None
+    for candidate in hist.columns:
+        if str(candidate).strip().lower() == "close":
+            col = candidate
+            break
+    if col is None:
+        return None
+    closes = pd.to_numeric(hist[col], errors="coerce").dropna().astype(float)
+    return closes if not closes.empty else None
+
+
+def _drawdown_from_high_pct(hist: pd.DataFrame | None, window: int = 252) -> float | None:
+    """Latest close vs the highest close in the trailing window (negative = below high).
+
+    Both numbers come from the same daily series, so the LSE GBp/GBP 100x trap cannot leak in.
+    """
+    closes = _close_series_from_hist(hist)
+    if closes is None:
+        return None
+    window_closes = closes.tail(max(2, int(window)))
+    peak = float(window_closes.max())
+    if peak <= 0:
+        return None
+    return (float(window_closes.iloc[-1]) / peak - 1.0) * 100.0
+
+
+def _atr_pct_from_hist(hist: pd.DataFrame | None, period: int = 14) -> float | None:
+    """ATR(period) as a percentage of the latest close (None when High/Low history is missing)."""
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    by_lower = {str(c).strip().lower(): c for c in hist.columns}
+    high_col, low_col, close_col = by_lower.get("high"), by_lower.get("low"), by_lower.get("close")
+    if high_col is None or low_col is None or close_col is None:
+        return None
+    highs = pd.to_numeric(hist[high_col], errors="coerce").dropna().astype(float)
+    lows = pd.to_numeric(hist[low_col], errors="coerce").dropna().astype(float)
+    closes = pd.to_numeric(hist[close_col], errors="coerce").dropna().astype(float)
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 1:
+        return None
+    atr, _ = _compute_atr_and_adx(
+        highs.iloc[-n:].reset_index(drop=True),
+        lows.iloc[-n:].reset_index(drop=True),
+        closes.iloc[-n:].reset_index(drop=True),
+        period=period,
+    )
+    last_close = float(closes.iloc[-1])
+    if atr is None or atr <= 0 or last_close <= 0:
+        return None
+    return atr / last_close * 100.0
+
+
+def _invest_adaptive_stop_pct(hist: pd.DataFrame | None, strategy: Any) -> float:
+    """Naked-Invest adaptive stop line: 14-day ATR clamp (-8%..-18%) or the configured floor.
+
+    Whichever of the ATR line / `invest_stop_loss_alert_pct` is closer to zero wins, so an
+    unprotected position is flagged no later than either discipline would have cut it.
+    """
+    try:
+        config_line = float(getattr(strategy, "invest_stop_loss_alert_pct", -12.0) or -12.0)
+    except (TypeError, ValueError):
+        config_line = -12.0
+    if config_line > 0:
+        config_line = -config_line
+    atr_pct = _atr_pct_from_hist(hist)
+    if atr_pct is None or atr_pct <= 0:
+        return config_line
+    atr_line = -min(max(2.8 * atr_pct, 8.0), 18.0)
+    return max(config_line, atr_line)
 
 
 def _format_pending_orders(orders: list[Any]) -> str:
@@ -607,6 +754,7 @@ def format_fill_receipt(
     *,
     partial: bool = False,
     cross_day: bool = False,
+    usd_wallet_available: float | None = None,
     max_chars: int = FILL_RECEIPT_MAX_CHARS,
 ) -> str:
     """Render a plain-text fill receipt with an explicit wallet re-calibration nudge."""
@@ -642,6 +790,26 @@ def format_fill_receipt(
         lines.append("• 现金与持仓已变：请用 /pos 复核实时仓位。")
     else:
         lines.append("• 现金与持仓已变：请 /usd 金额 或 /wallet gbp x usd y 校准钱包，再用 /pos 复核实时仓位。")
+        # Read-only USD wallet hint: T212 may settle in USD or auto-convert, so never write the ledger.
+        if (
+            usd_wallet_available is not None
+            and currency.strip().upper() == "USD"
+            and avg_price > 0
+            and filled_qty > 0
+        ):
+            notional = avg_price * filled_qty
+            if side == "SELL":
+                ref = float(usd_wallet_available) + notional
+                lines.append(
+                    f"• 若走 USD 钱包结算，参考余额约 ${ref:,.2f}（若回流 USD 钱包约 +${notional:,.2f}），"
+                    f"核对后可发送 /usd {ref:,.2f}"
+                )
+            else:
+                ref = float(usd_wallet_available) - notional
+                lines.append(
+                    f"• 若走 USD 钱包结算，参考余额约 ${ref:,.2f}（已扣成交额 ${notional:,.2f}），"
+                    f"核对后可发送 /usd {ref:,.2f}"
+                )
     return "\n".join(lines)[: max(0, int(max_chars))]
 
 
@@ -916,6 +1084,10 @@ class TradingScheduler:
             "buys_30d": behavior.get("buys_30d"),
             "verdict": verdict,
         }
+        # v5.5.3: surface the four-bucket core policy mix vs VWRP.L so the weekly review can
+        # separate a deliberate UK/EU regional tilt (Beta) from genuine stock-picking Alpha.
+        core_cmp = compute_core_policy_benchmark_comparison(histories, lookback_days=60)
+        dashboard["core_policy_benchmark"] = core_cmp
         dashboard["summary_text"] = self._format_benchmark_dashboard_text(dashboard)
         return dashboard
 
@@ -938,6 +1110,16 @@ class TradingScheduler:
         fees = dash.get("fees_pct_of_turnover_30d")
         if fees is not None:
             parts.append(f"税费占成交额 {float(fees):.2f}%")
+        core = dash.get("core_policy_benchmark") or {}
+        if core:
+            te = core.get("tracking_error_pct")
+            parts.append(
+                f"四桶核心{int(core.get('lookback_days') or 60)}日 组合 {float(core['policy_return_pct']):+.1f}% "
+                f"vs {core['benchmark_symbol']} {float(core['benchmark_return_pct']):+.1f}%"
+                f"（倾斜 {float(core['allocation_effect_pct']):+.1f}pct"
+                + (f" | 跟踪误差 {float(te):.1f}%" if te is not None else "")
+                + "）"
+            )
         parts.append(str(dash.get("verdict") or ""))
         return " | ".join(p for p in parts if p)
 
@@ -959,11 +1141,36 @@ class TradingScheduler:
 
         bt = audit.get("threshold_backtest") or {}
         bench_dash = str((audit.get("benchmark_dashboard") or {}).get("summary_text") or "N/A")
+        cov = audit.get("fundamentals_coverage") or {}
+        cov_bits: list[str] = []
+        for market, item in (cov.get("markets") or {}).items():
+            if not item.get("symbols"):
+                continue
+            cov_map = item.get("coverage_pct") or {}
+            cov_bits.append(
+                f"{market}({item['symbols']}只) "
+                + "/".join(f"{k} {v if v is not None else 'N/A'}" for k, v in list(cov_map.items())[:3])
+            )
+        cov_text = " | ".join(cov_bits) if cov_bits else "N/A"
+        low_cov = "、".join((cov.get("low_coverage") or [])[:5]) or "无"
+        try:
+            quality = await self.db.get_ops_quality_summary(days=7)
+        except Exception as exc:
+            logger.debug("Weekly diagnosis ops quality summary failed: %s", exc)
+            quality = None
+        sem = (quality or {}).get("semantic_audit") or {}
+        degrade_txt = (
+            f"语义质检 {int(sem.get('total') or 0)} 次 | 降级 {int((quality or {}).get('degraded_alerts') or 0)} 次"
+            if quality
+            else "N/A"
+        )
         lines = [
             f"【本周体检 {uk_date}】池 {audit.get('universe_count', 0)} 只 | "
             f"重叠 {len(audit.get('overlap_candidates') or [])} | "
             f"僵尸 {len(audit.get('zombie_candidates') or [])}",
             f"【基准对照原始数字】{bench_dash[:300]}",
+            f"【价值因子覆盖率原始数字】{cov_text[:300]} | 覆盖率<50%: {low_cov[:120]}",
+            f"【近7天质检与降级】{degrade_txt}",
             f"【阈值回测原始数字】样本 {bt.get('sample_count', 0)} | {str(bt)[:600]}",
             f"【T+N 后验原始数字】总数 {stats.get('total_count', 0)} | 已结算 {stats.get('settled_count', 0)} | "
             f"原始胜率 {stats.get('win_rate_pct')} | Alpha 胜率 {stats.get('alpha_win_rate_pct')} | "
@@ -1082,6 +1289,13 @@ class TradingScheduler:
         }
         if active_pool_rows:
             audit_kwargs["active_pool_rows"] = active_pool_rows
+        # ISA value-factor coverage health: read the cached fundamentals (never fetch online here).
+        if all_syms and hasattr(self.db, "get_fundamentals_cache"):
+            try:
+                fundamentals_cache = await self.db.get_fundamentals_cache(all_syms)
+                audit_kwargs["fundamentals_rows"] = list((fundamentals_cache or {}).values())
+            except Exception as exc:
+                logger.debug("Weekly fundamentals coverage cache read failed: %s", exc)
         audit = run_offline_universe_and_threshold_audit(**audit_kwargs)
         if audition_res:
             audit["audition"] = audition_res
@@ -1090,6 +1304,14 @@ class TradingScheduler:
             previous_snapshot = await self.db.get_previous_snapshot(min_age_hours=24 * 6)
         except Exception as exc:
             logger.debug("Weekly benchmark baseline snapshot unavailable: %s", exc)
+        # Make sure all four core-policy sleeves are present before the comparison runs.
+        missing_core_syms = [s for s in _CORE_POLICY_BENCHMARK_WEIGHTS if s not in histories]
+        if missing_core_syms:
+            try:
+                extra_hist = await self.market_data.get_histories(missing_core_syms, period="2y")
+                histories.update(extra_hist or {})
+            except Exception as exc:
+                logger.debug("Weekly core policy histories fetch failed: %s", exc)
         audit["benchmark_dashboard"] = self._build_benchmark_dashboard(
             portfolio,
             histories,
@@ -1289,10 +1511,31 @@ class TradingScheduler:
             await self.db.prune_expired_preference_notes(uk_date)
         return saved
 
+    async def _load_recent_fills_by_account(self) -> tuple[dict[str, list[Any]], set[str]]:
+        """Best-effort T212 recent fills per account; failures degrade to "not checked" (None)."""
+        try:
+            portfolio = await self.t212.get_portfolio(use_cache=True)
+        except Exception as exc:  # noqa: BLE001 - settlement must never fail on this lookup
+            logger.debug("Settlement recent-fill portfolio fetch failed: %s", exc)
+            return {}, set()
+        fills: dict[str, list[Any]] = {}
+        available: set[str] = set()
+        for acc in (portfolio.isa, portfolio.invest):
+            if not getattr(acc, "ok", False) or not getattr(acc, "order_history_supported", False):
+                continue
+            label = str(getattr(acc, "account_label", "") or "").strip()
+            if not label:
+                continue
+            fills[label] = list(getattr(acc, "recent_orders", None) or [])
+            available.add(label)
+        return fills, available
+
     async def _run_daily_settlement_impl(self, now_utc: datetime | None = None) -> dict[str, Any]:
         base = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
         dt_uk = base.astimezone(LONDON_TZ)
         uk_now_str = dt_uk.strftime("%Y-%m-%d %H:%M")
+        # Read-only fill ledger: matching real fills never rewrites wallets, only annotates the pick.
+        fills_by_account, fills_available = await self._load_recent_fills_by_account()
         pending = await self.db.get_pending_settlements(limit=50, only_with_entry_price=False)
         followups = (
             await self.db.get_settled_recommendations_for_followup(limit=50)
@@ -1447,6 +1690,30 @@ class TradingScheduler:
                         exclude_rec_date=exclude_rec_date,
                     )
                 )
+                account_label = str(rec.get("account") or "").strip()
+                account_key = (
+                    account_label
+                    if account_label in fills_by_account
+                    else _normalize_account_label(account_label)
+                )
+                actual_filled: int | None = None
+                actual_fill_price: float | None = None
+                execution_slippage_pct: float | None = None
+                if account_key in fills_available:
+                    matched_fill = _match_recommendation_fill(
+                        rec,
+                        start_date=rec_date,
+                        end_date=exit_date,
+                        recent_orders=fills_by_account.get(account_key) or [],
+                        entry_price=eff_entry,
+                    )
+                    if matched_fill is not None:
+                        actual_filled = 1
+                        actual_fill_price = round(float(matched_fill[0]), 4)
+                        execution_slippage_pct = round(float(matched_fill[1]), 3)
+                        fill_status = "FILLED"
+                    else:
+                        actual_filled = 0
                 if fill_status == "NOT_FILLED":
                     saved = await self.db.settle_recommendation(
                         rec_id,
@@ -1457,6 +1724,9 @@ class TradingScheduler:
                         outcome_status="NOT_FILLED",
                         reflection_lesson="",
                         fill_status="NOT_FILLED",
+                        actual_filled=actual_filled,
+                        actual_fill_price=actual_fill_price,
+                        execution_slippage_pct=execution_slippage_pct,
                     )
                     if saved:
                         not_filled += 1
@@ -1476,24 +1746,34 @@ class TradingScheduler:
                     stock_ohlc, rec_date, exit_date, eff_entry, direction=direction
                 )
 
-                try:
-                    lesson = await self._generate_settlement_reflection(
-                        rec=rec,
-                        rec_date=rec_date,
-                        exit_date=exit_date,
-                        holding_days=holding_days,
-                        entry_price=eff_entry,
-                        exit_price=exit_price,
-                        raw_return_pct=raw_return_pct,
-                        benchmark_symbol=chosen_bench,
-                        bench_return_pct=bench_ret_pct,
-                        alpha_pct=alpha_pct,
-                        direction=direction,
-                    )
-                except Exception as exc:
-                    logger.warning("Settlement reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
-                    failed += 1
-                    continue
+                # v5.5.3 dual-philosophy layering: an ISA value BUY/ADD at T+5 is noise, not a lesson.
+                # Keep the T+5 outcome numeric only; the real post-mortem lands on the T+20 follow-up.
+                isa_value_entry = (
+                    _normalize_account_label(account_label) == "ISA"
+                    and action in {"BUY", "ADD"}
+                    and holding_days <= 5
+                )
+                if isa_value_entry:
+                    lesson = ""
+                else:
+                    try:
+                        lesson = await self._generate_settlement_reflection(
+                            rec=rec,
+                            rec_date=rec_date,
+                            exit_date=exit_date,
+                            holding_days=holding_days,
+                            entry_price=eff_entry,
+                            exit_price=exit_price,
+                            raw_return_pct=raw_return_pct,
+                            benchmark_symbol=chosen_bench,
+                            bench_return_pct=bench_ret_pct,
+                            alpha_pct=alpha_pct,
+                            direction=direction,
+                        )
+                    except Exception as exc:
+                        logger.warning("Settlement reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
+                        failed += 1
+                        continue
 
                 saved = await self.db.settle_recommendation(
                     rec_id,
@@ -1506,6 +1786,9 @@ class TradingScheduler:
                     mfe_pct=mfe_pct,
                     mae_pct=mae_pct,
                     fill_status=fill_status,
+                    actual_filled=actual_filled,
+                    actual_fill_price=actual_fill_price,
+                    execution_slippage_pct=execution_slippage_pct,
                 )
                 if saved:
                     settled += 1
@@ -1525,6 +1808,7 @@ class TradingScheduler:
                 t20_ret: float | None = None
                 t20_alpha: float | None = None
                 furthest_exit: date | None = None
+                t20_ctx: tuple[str, float, float, date, float] | None = None
 
                 for horizon_label, target_d in (("t10", t10_target), ("t20", t20_target)):
                     if target_d is None:
@@ -1541,7 +1825,7 @@ class TradingScheduler:
                     bench_res = _compute_benchmark_return_pct(bench_candidates, _get_closes, rec_date, ex_date)
                     if bench_res is None:
                         continue
-                    _, b_ret = bench_res
+                    b_sym, b_ret = bench_res
                     alpha_val = _direction_adjusted_alpha_pct(action, eff_entry, ex_price, b_ret)
                     if horizon_label == "t10":
                         t10_ret = round(raw_ret, 2)
@@ -1549,6 +1833,7 @@ class TradingScheduler:
                     else:
                         t20_ret = round(raw_ret, 2)
                         t20_alpha = round(alpha_val, 2)
+                        t20_ctx = (b_sym, b_ret, ex_price, ex_date, eff_entry)
                     if furthest_exit is None or ex_date > furthest_exit:
                         furthest_exit = ex_date
 
@@ -1571,6 +1856,32 @@ class TradingScheduler:
                         if mae_new is not None and prev_mae is not None:
                             mae_new = min(float(prev_mae), mae_new)
 
+                # T+20 补写：ISA 价值仓 T+5 刻意不写短期反思，在这里用 20 日真实表现补一条。
+                t20_lesson: str | None = None
+                if (
+                    t20_alpha is not None
+                    and t20_ctx is not None
+                    and not str(rec.get("reflection_lesson") or "").strip()
+                ):
+                    b_sym, b_ret, t20_exit_price, t20_exit_date, t20_eff_entry = t20_ctx
+                    try:
+                        t20_lesson = await self._generate_settlement_reflection(
+                            rec=rec,
+                            rec_date=rec_date,
+                            exit_date=t20_exit_date,
+                            holding_days=20,
+                            entry_price=t20_eff_entry,
+                            exit_price=t20_exit_price,
+                            raw_return_pct=float(t20_ret or 0.0),
+                            benchmark_symbol=b_sym,
+                            bench_return_pct=b_ret,
+                            alpha_pct=float(t20_alpha),
+                            direction=direction,
+                        )
+                    except Exception as exc:
+                        logger.warning("T+20 reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
+                        t20_lesson = None
+
                 updated = await self.db.update_recommendation_followup(
                     rec_id,
                     t10_return_pct=t10_ret,
@@ -1579,6 +1890,7 @@ class TradingScheduler:
                     t20_alpha_pct=t20_alpha,
                     mfe_pct=mfe_new,
                     mae_pct=mae_new,
+                    reflection_lesson=t20_lesson,
                 )
                 if updated:
                     followup_updated += 1
@@ -1862,6 +2174,17 @@ class TradingScheduler:
         receipts: list[tuple[str, str]] = []
         stale_keys: list[tuple[str, str]] = []
         claimed_fill_ids: set[str] = set()
+        # Read-only USD wallet anchor for the receipt hint; a lookup failure must never block receipts.
+        usd_wallet_available: float | None = None
+        get_wallet_balances = getattr(self.db, "get_wallet_balances", None)
+        if callable(get_wallet_balances):
+            try:
+                balances = await get_wallet_balances("Invest")
+                usd_row = (balances or {}).get("USD") or {}
+                usd_wallet_available = float(usd_row.get("available_amount") or 0.0)
+            except Exception as exc:  # noqa: BLE001 - degrade silently to no hint
+                logger.debug("Fill receipt USD wallet lookup failed: %s", exc)
+                usd_wallet_available = None
 
         for row in diff["partial"]:
             key = _snapshot_key(row)
@@ -1876,7 +2199,7 @@ class TradingScheduler:
                 "is_complete": False,
             }
             claimed_fill_ids.update(match.get("fill_ids") or [])
-            receipts.append((dedupe, format_fill_receipt(row, match, partial=True)))
+            receipts.append((dedupe, format_fill_receipt(row, match, partial=True, usd_wallet_available=usd_wallet_available)))
 
         for row in diff["vanished"]:
             key = _snapshot_key(row)
@@ -1905,6 +2228,7 @@ class TradingScheduler:
                         match,
                         partial=not bool(match.get("is_complete", True)),
                         cross_day=cross_day,
+                        usd_wallet_available=usd_wallet_available,
                     ),
                 )
             )
@@ -2060,14 +2384,29 @@ class TradingScheduler:
                 elif isinstance(result, Exception):
                     logger.debug("Intraday realtime quote overlay failed for %s: %s", sym, result)
 
-        position_by_symbol = {
-            str(getattr(pos, "yahoo_symbol", "") or "").strip().upper(): pos
-            for pos in portfolio.all_positions()
-            if str(getattr(pos, "yahoo_symbol", "") or "").strip()
-        }
+        position_by_symbol: dict[str, Any] = {}
+        positions_by_symbol: dict[str, list[Any]] = {}
+        for pos in portfolio.all_positions():
+            sym = str(getattr(pos, "yahoo_symbol", "") or "").strip().upper()
+            if not sym:
+                continue
+            positions_by_symbol.setdefault(sym, []).append(pos)
+            position_by_symbol.setdefault(sym, pos)
+
+        strategy = self.cfg.strategy
+        invest_move_threshold = float(getattr(strategy, "intraday_move_alert_pct", 3.5) or 3.5)
+        isa_move_threshold = float(getattr(strategy, "intraday_isa_move_alert_pct", 5.0) or 5.0)
+        activation_pct = float(getattr(strategy, "trailing_profit_activation_pct", 20.0) or 20.0)
+        trailing_dd_pct = float(getattr(strategy, "trailing_drawdown_from_peak_pct", -12.0) or -12.0)
+        if trailing_dd_pct > 0:
+            trailing_dd_pct = -trailing_dd_pct
+        core_drawdown_steps = sorted(
+            {abs(float(step)) for step in (getattr(strategy, "core_etf_drawdown_steps_pct", None) or []) if step},
+            reverse=True,
+        )
 
         today_uk = dt_uk.date()
-        triggered: list[tuple[float, str, float, float, float | None, str]] = []
+        triggered: list[tuple[float, str, float, float, float | None, str, str, str]] = []
         for sym in open_symbols:
             bundle = bundles.get(sym)
             quote = quotes.get(sym) or {}
@@ -2091,20 +2430,90 @@ class TradingScheduler:
                 symbol=sym,
             )
             order_dist = _order_distance_pct(price, pending_by_symbol.get(sym) or [], symbol=sym)
-            hit_move = move_pct is not None and abs(move_pct) >= self.cfg.strategy.intraday_move_alert_pct
-            hit_order = order_dist is not None and order_dist <= self.cfg.strategy.intraday_order_near_pct
-            if hit_move or hit_order:
-                currency = str(
-                    getattr(bundle, "currency", "") or getattr(position, "inst_currency", "") or ""
+
+            positions = positions_by_symbol.get(sym) or []
+            invest_positions = [
+                p for p in positions if _normalize_account_label(getattr(p, "account", "")) == "Invest"
+            ]
+            isa_positions = [
+                p for p in positions if _normalize_account_label(getattr(p, "account", "")) == "ISA"
+            ]
+            # Cross-account double holding follows the more sensitive Invest discipline.
+            account_ctx = "Invest" if invest_positions else ("ISA" if isa_positions else "")
+            move_threshold = invest_move_threshold if account_ctx != "ISA" else isa_move_threshold
+            hit_move = move_pct is not None and abs(move_pct) >= move_threshold
+            hit_order = order_dist is not None and order_dist <= strategy.intraday_order_near_pct
+
+            reasons: list[str] = []
+            priority = abs(move_pct or 0.0)
+            if hit_move:
+                direction = "上涨" if float(move_pct or 0.0) > 0 else "下跌"
+                reasons.append(
+                    f"日内{direction} {abs(float(move_pct or 0.0)):.1f}%（{account_ctx or '挂单'}阈值 {move_threshold:.1f}%）"
                 )
-                triggered.append(
-                    (abs(move_pct or 0.0), sym, price, float(move_pct or 0.0), order_dist, currency)
+            if hit_order:
+                reasons.append(f"距最近挂单价 {float(order_dist or 0.0):.1f}%")
+
+            if invest_positions:
+                invest_pos = invest_positions[0]
+                avg_price = _to_float(getattr(invest_pos, "avg_price", None))
+                loss_pct = _to_float(getattr(invest_pos, "return_pct", None))
+                cost_note = ""
+                if avg_price is not None and avg_price > 0:
+                    aligned_px = _align_lse_unit_100x(price, avg_price, sym) if sym.endswith(".L") else price
+                    loss_pct = (aligned_px / avg_price - 1.0) * 100.0
+                    cost_note = f"，成本 {avg_price:,.2f}"
+                naked_invest = not _has_protective_stop(pending_by_symbol.get(sym), account="Invest")
+                if naked_invest and loss_pct is not None:
+                    stop_line = _invest_adaptive_stop_pct(histories.get(sym), strategy)
+                    if loss_pct <= stop_line:
+                        reasons.append(
+                            "裸露止损/移动止盈逼近：Invest 无 STOP/STOP_LIMIT 挂单，"
+                            f"浮亏 {loss_pct:.1f}%{cost_note} 已跌破自适应止损线 {stop_line:.1f}%"
+                        )
+                        priority = max(priority, abs(loss_pct))
+                    elif loss_pct >= activation_pct:
+                        dd60 = _drawdown_from_high_pct(histories.get(sym), window=60)
+                        if dd60 is not None and dd60 <= trailing_dd_pct:
+                            reasons.append(
+                                "裸露止损/移动止盈逼近：Invest 无 STOP/STOP_LIMIT 挂单，"
+                                f"浮盈 {loss_pct:.1f}%{cost_note} 后自近 60 日高点回撤 {dd60:.1f}%"
+                            )
+                            priority = max(priority, abs(dd60))
+
+            if account_ctx == "ISA" and core_drawdown_steps:
+                if core_sleeve_for_symbol(sym, bundles) is not None:
+                    dd52 = _drawdown_from_high_pct(histories.get(sym), window=252)
+                    if dd52 is not None:
+                        crossed_steps = [step for step in core_drawdown_steps if dd52 <= -step]
+                        if crossed_steps:
+                            reasons.append(
+                                f"ISA 核心宽基距 52 周高点回撤 {dd52:.1f}%，已触及 {crossed_steps[0]:.0f}% 阶梯"
+                            )
+                            priority = max(priority, abs(dd52))
+
+            if not reasons:
+                continue
+            currency = str(
+                getattr(bundle, "currency", "") or getattr(position, "inst_currency", "") or ""
+            )
+            triggered.append(
+                (
+                    priority,
+                    sym,
+                    price,
+                    float(move_pct or 0.0),
+                    order_dist,
+                    currency,
+                    account_ctx,
+                    "；".join(reasons),
                 )
+            )
 
         triggered.sort(key=lambda item: item[0], reverse=True)
         max_alerts = 2
         alerts: list[tuple[str, str]] = []
-        for _, sym, price, move_pct, order_dist, currency in triggered:
+        for _, sym, price, move_pct, order_dist, currency, account_ctx, trigger_reason in triggered:
             if len(alerts) >= max_alerts:
                 logger.info("Intraday sentinel capped at %d alerts for this round", max_alerts)
                 break
@@ -2122,6 +2531,8 @@ class TradingScheduler:
                     order_dist_pct=order_dist,
                     pending_order_text=_format_pending_orders(pending_by_symbol.get(sym) or []),
                     currency=currency,
+                    account_context=account_ctx,
+                    trigger_reason=trigger_reason,
                     ops_notifier=self.ops,
                 )
             except Exception as exc:  # noqa: BLE001 - one symbol must never break the scan

@@ -562,13 +562,17 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res_lse_close["pruned"]["portfolio_snapshots"], 1)
             self.assertEqual(res_lse_close["pruned"]["ops_events"], 1)
 
-            # Verify AZN.L settled accurately (+6.0% vs ISF.L +1.0% -> Alpha +5.0%) despite GBP vs GBp entry
-            azn_lessons = await db.get_symbol_lessons("AZN.L", limit=1)
-            self.assertEqual(len(azn_lessons), 1)
-            self.assertAlmostEqual(azn_lessons[0]["raw_return_pct"], 6.0, places=2)
-            self.assertAlmostEqual(azn_lessons[0]["alpha_pct"], 5.0, places=2)
-            self.assertNotIn("#", azn_lessons[0]["reflection_lesson"])
-            self.assertNotIn("**", azn_lessons[0]["reflection_lesson"])
+            # Verify AZN.L settled accurately (+6.0% vs ISF.L +1.0% -> Alpha +5.0%) despite GBP vs GBp entry.
+            # v5.5.3: ISA value ADD deliberately writes no T+5 reflection (5-day noise must not train the
+            # Buffett discipline); the T+20 follow-up is where the post-mortem lands.
+            azn_rows = await db.get_settled_recommendations_for_followup(limit=50)
+            azn = next(r for r in azn_rows if r["symbol"] == "AZN.L")
+            self.assertAlmostEqual(azn["raw_return_pct"], 6.0, places=2)
+            self.assertAlmostEqual(azn["alpha_pct"], 5.0, places=2)
+            self.assertEqual(azn["reflection_lesson"], "")
+            self.assertFalse(
+                any("AZN.L" in str(c.get("prompt") or "") for c in llm.calls if c.get("usage_label") == "settlement_reflection")
+            )
 
             # At 22:00 UTC on 2026-11-13 via check_and_run_due_jobs -> daily_settlement runs
             fired = await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 22, 0, tzinfo=timezone.utc))

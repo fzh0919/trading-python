@@ -121,9 +121,9 @@ def _history(prev_close: float, last_close: float) -> pd.DataFrame:
     )
 
 
-def _position(symbol: str, currency: str, cur_price: float) -> PositionItem:
+def _position(symbol: str, currency: str, cur_price: float, *, account: str = "ISA") -> PositionItem:
     return PositionItem(
-        account="ISA",
+        account=account,
         raw_ticker=f"{symbol}_EQ",
         ticker=symbol,
         yahoo_symbol=symbol,
@@ -276,7 +276,7 @@ class TestIntradaySentinel(_SentinelTestCase):
     async def test_move_trigger_pushes_and_marks_dedupe(self) -> None:
         llm = _DsStubLLM('{"should_push": true, "alert_text": "NVDA 日内 +3.60%，放量跌破早报支撑，建议减半仓观察。"}')
         sched, md, tg, _ = self._build(
-            positions=[_position("NVDA", "USD", 103.6)],
+            positions=[_position("NVDA", "USD", 103.6, account="Invest")],
             bundles={"NVDA": _bundle("NVDA", 103.6, "USD")},
             histories={"NVDA": _history(100.0, 103.6)},
             llm=llm,
@@ -292,7 +292,7 @@ class TestIntradaySentinel(_SentinelTestCase):
     async def test_should_push_false_is_silent_and_keeps_dedupe_slot(self) -> None:
         llm = _DsStubLLM('{"should_push": false, "alert_text": ""}')
         sched, _, tg, _ = self._build(
-            positions=[_position("NVDA", "USD", 103.6)],
+            positions=[_position("NVDA", "USD", 103.6, account="Invest")],
             bundles={"NVDA": _bundle("NVDA", 103.6, "USD")},
             histories={"NVDA": _history(100.0, 103.6)},
             llm=llm,
@@ -320,7 +320,7 @@ class TestIntradaySentinel(_SentinelTestCase):
         for price, should_push in ((103.4, False), (103.6, True)):
             llm = _DsStubLLM('{"should_push": true, "alert_text": "触及异动阈值，建议复核早报支撑。"}')
             sched, _, tg, _ = self._build(
-                positions=[_position("NVDA", "USD", price)],
+                positions=[_position("NVDA", "USD", price, account="Invest")],
                 bundles={"NVDA": _bundle("NVDA", price, "USD")},
                 histories={"NVDA": _history(100.0, price)},
                 llm=llm,
@@ -388,7 +388,7 @@ class TestIntradaySentinel(_SentinelTestCase):
     async def test_throttle_and_daily_dedupe(self) -> None:
         llm = _DsStubLLM('{"should_push": true, "alert_text": "盘中放量下跌，建议复核早报止损位。"}')
         sched, md, tg, _ = self._build(
-            positions=[_position("NVDA", "USD", 96.0)],
+            positions=[_position("NVDA", "USD", 96.0, account="Invest")],
             bundles={"NVDA": _bundle("NVDA", 96.0, "USD")},
             histories={"NVDA": _history(100.0, 96.0)},
             llm=llm,
@@ -429,7 +429,7 @@ class TestIntradaySentinel(_SentinelTestCase):
         )
         llm = _DsStubLLM('{"should_push": true, "alert_text": "NVDA 实时 +4.00%，放量突破早报压力位。"}')
         sched, md, tg, _ = self._build(
-            positions=[_position("NVDA", "USD", 100.0)],
+            positions=[_position("NVDA", "USD", 100.0, account="Invest")],
             bundles={"NVDA": _bundle("NVDA", 100.0, "USD")},
             histories={"NVDA": stale_hist},
             quotes={"NVDA": {"symbol": "NVDA", "current_price": 104.0, "prev_close": 100.0}},
@@ -467,7 +467,7 @@ class TestIntradaySentinel(_SentinelTestCase):
         tg = _StubTg(fail=True)
         sched = TradingScheduler(
             self.cfg,
-            _StubT212(_portfolio([_position("NVDA", "USD", 96.0)])),
+            _StubT212(_portfolio([_position("NVDA", "USD", 96.0, account="Invest")])),
             md,
             llm,
             self.db,

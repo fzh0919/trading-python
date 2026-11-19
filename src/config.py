@@ -278,6 +278,8 @@ class StrategySection(BaseModel):
     intraday_sentinel_enabled: bool = True
     intraday_poll_minutes: int = Field(default=30, ge=10, le=120)
     intraday_move_alert_pct: float = Field(default=3.5, gt=0.0)
+    # ISA 价值仓日内噪音过滤阈值（高于 Invest 的 3.5%，避免巴菲特价值仓被日内噪声反复唤醒）
+    intraday_isa_move_alert_pct: float = Field(default=5.0, gt=0.0)
     intraday_order_near_pct: float = Field(default=1.5, gt=0.0)
     # Pending-order fill receipt: 0-token snapshot diff, cross-verified with order history
     intraday_fill_receipt_enabled: bool = True

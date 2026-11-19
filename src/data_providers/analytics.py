@@ -1956,7 +1956,10 @@ def build_nav_row(
     cash = float(getattr(portfolio, "total_combined_cash", 0.0) or 0.0)
 
     net_flow = 0.0
+    isa_net_flow = 0.0
+    invest_net_flow = 0.0
     for acc in (portfolio.isa, portfolio.invest):
+        acc_flow = 0.0
         for tx in getattr(acc, "recent_transactions", []) or []:
             if _event_uk_date(tx) != day:
                 continue
@@ -1972,7 +1975,13 @@ def build_nav_row(
             sign = _EXTERNAL_FLOW_SIGNS.get(str(getattr(tx, "tx_type", "") or "").strip().upper())
             if sign is None:
                 continue
-            net_flow += sign * amount
+            acc_flow += sign * amount
+        net_flow += acc_flow
+        # v5.5.3: split the same external-flow stream per philosophical account for split TWR.
+        if str(getattr(acc, "account_label", "") or "").strip().upper() == "ISA":
+            isa_net_flow += acc_flow
+        else:
+            invest_net_flow += acc_flow
 
     return {
         "uk_date": day,
@@ -1982,6 +1991,8 @@ def build_nav_row(
         "net_flow_gbp": round(net_flow, 2),
         "isa_value_gbp": round(float(getattr(portfolio.isa, "total_account_value", 0.0) or 0.0), 2),
         "invest_value_gbp": round(float(getattr(portfolio.invest, "total_account_value", 0.0) or 0.0), 2),
+        "isa_net_flow_gbp": round(isa_net_flow, 2),
+        "invest_net_flow_gbp": round(invest_net_flow, 2),
         "benchmark_close": round(float(benchmark_close), 6) if benchmark_close else None,
         "cash_rate_pct": float(getattr(portfolio, "cash_interest_rate_pct", 0.0) or 0.0),
     }
@@ -2176,6 +2187,52 @@ def compute_portfolio_performance(
         "bench_tracking_error_pct": round(tracking_error, 2) if tracking_error is not None else None,
         "bench_info_ratio": round(info_ratio, 2) if info_ratio is not None else None,
     }
+
+
+def compute_account_split_performance(
+    nav_rows: list[dict[str, Any]],
+    benchmark_hist: pd.DataFrame | None = None,
+    risk_free_annual_pct: float | None = None,
+) -> dict[str, Any]:
+    """Per-philosophy TWR: ISA value book vs Invest momentum book on the same math.
+
+    Each account reuses ``compute_portfolio_performance`` with its own NAV leg
+    (``*_value_gbp + *_net_flow_gbp``) and its own external-flow stream, so ISA
+    capital injections never masquerade as Invest alpha (or vice versa).
+    """
+    out: dict[str, Any] = {"ok": False, "isa": None, "invest": None}
+    if not nav_rows:
+        return out
+
+    def _leg(prefix: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for row in nav_rows:
+            try:
+                value = float(row.get(f"{prefix}_value_gbp") or 0.0)
+                flow = float(row.get(f"{prefix}_net_flow_gbp") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "uk_date": row.get("uk_date"),
+                    "total_value_gbp": value + flow,
+                    "net_flow_gbp": flow,
+                    "cash_gbp": 0.0,
+                    "benchmark_close": row.get("benchmark_close"),
+                }
+            )
+        return rows
+
+    isa_perf = compute_portfolio_performance(
+        _leg("isa"), benchmark_hist=benchmark_hist, risk_free_annual_pct=risk_free_annual_pct
+    )
+    invest_perf = compute_portfolio_performance(
+        _leg("invest"), benchmark_hist=benchmark_hist, risk_free_annual_pct=risk_free_annual_pct
+    )
+    out["isa"] = isa_perf
+    out["invest"] = invest_perf
+    out["ok"] = bool(isa_perf.get("ok") or invest_perf.get("ok"))
+    return out
 
 
 def compute_trade_attribution(portfolio: PortfolioData) -> dict[str, Any]:

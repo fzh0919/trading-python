@@ -2,6 +2,20 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.3`（2026-11-19）
+
+单聊上下文对齐、双哲学盘中哨兵、分账归因与实盘成交反哺、LLM 可靠性与 ISA 价值因子覆盖率可观测性。
+
+1. **单聊早报上下文对齐（`src/agents/chat_agent.py`）**：`answer_user_chat()` 早报切片 `2050 → 2800`，与 `v5.5.2` 的 `/report<=2800` 对齐，避免 Invest 区块尾部与 `[🛡️风控护栏修正]` 被截断。
+2. **双哲学差异化盘中哨兵（`src/config.py`, `config.yaml`, `src/bot/scheduler.py`, `src/agents/report_agent.py`）**：新增 `intraday_isa_move_alert_pct=5.0`；哨兵按标的所属账户分流（跨账户双持按更敏感的 Invest 口径），Invest 无 `STOP`/`STOP_LIMIT` 裸露仓位在浮亏跌破自适应止损线（`invest_stop_loss_alert_pct` 与 14 日 ATR 钳位 `-clamp(2.8×atr,8%,18%)` 取更早触发者）或浮盈后自 60 日高点回撤触及移动止盈线时，即使单日未达 3.5% 也预警；ISA 普通个股改用 5.0% 噪音阈值，ISA 核心宽基新增 52 周高点 `core_etf_drawdown_steps_pct` 阶梯通道。`generate_intraday_alert()` 新增 `account_context`/`trigger_reason`（带默认值向后兼容），`morning_slice` `1200 → 1800`，仍限 `<=250` 字纯文本。
+3. **Invest USD 成交回执只读对账参考（`src/bot/scheduler.py`）**：`format_fill_receipt()` 新增 `usd_wallet_available`，Invest 且 USD 成交时追加「若走 USD 钱包结算，参考余额约 $xxx，核对后可发送 /usd xxx」，**绝不自动改写 `wallet_balances`**；`_collect_order_fill_receipts()` 安全读取 USD 锚点，异常静默降级为 `None`，总字数仍受 `FILL_RECEIPT_MAX_CHARS=450` 限制。
+4. **分账户外部现金流与分账 TWR（`src/storage/db.py`, `src/data_providers/analytics.py`, `src/bot/handlers.py`）**：`nav_history` 幂等补列 `isa_net_flow_gbp` / `invest_net_flow_gbp`（默认 0，旧行自动兼容）；`build_nav_row()` 原 `net_flow_gbp` 不变并分账户累加；新增 `compute_account_split_performance()` 分别复用 `compute_portfolio_performance()` 口径输出 ISA/Invest 双 TWR、最大回撤与样本数。
+5. **四桶核心政策归因接线（`src/bot/handlers.py`, `src/bot/scheduler.py`）**：`/perf` 输出「分账户归因」并展示「四桶核心政策（60日）：组合 X% vs VWRP Y%（区域倾斜效应 ±Z% | 跟踪误差 T%）」；`_build_benchmark_dashboard()` 同步写入 `core_policy_benchmark` 与摘要，周六离线体检与 DeepSeek 周度诊断可区分区域倾斜 Beta 与选股 Alpha。
+6. **推荐台账实盘成交对齐与反思分层（`src/storage/db.py`, `src/bot/scheduler.py`, `src/bot/handlers.py`）**：`pick_recommendations` 幂等补列 `actual_filled` / `actual_fill_price` / `execution_slippage_pct`；结算时按同账户+同标的+同方向在 `[rec_date, exit_date]` 匹配 T212 真实成交（经 GBp/GBP 100 倍对齐后计算执行滑点），命中置 `fill_status=FILLED`，账户历史可用但未命中记 `actual_filled=0`，历史不可用保持 `NULL` 不误判。ISA `BUY/ADD` 的 T+5 不再生成短期反思（避免 5 日噪音污染巴菲特纪律），改在 T+20 结算时若 `reflection_lesson` 为空再补写；Invest 保持 T+5 即时反思。`get_recommendation_stats()` 新增 `by_account` 与 `adoption_stats`，`/stats` 展示分账户表现与实盘采纳率/平均滑点，旧字段全部保留。
+7. **0 改表可观测性聚合（`src/storage/db.py`, `src/bot/handlers.py`）**：新增 `get_llm_reliability_summary()`（近 N 天总体与分模型/分节点 `calls`/`failed_calls`/`success_rate_pct`/P50/P95，Python 端算分位避免 SQLite 扩展）与 `get_ops_quality_summary()`（语义质检 report/pick 分类、`[事实价不符]`/`[建议价方向异常]`/`内部驳回` 标签、degraded/fallback 降级计数）；`/usage` 追加「近 7 天模型可靠性」与「近 7 天质检与降级」两小节，`/health` 追加一行摘要，查询失败一律安全忽略。
+8. **ISA 价值因子多市场覆盖率体检（`src/engine/screener.py`, `src/bot/scheduler.py`）**：新增纯函数 `compute_fundamentals_coverage()` 按 US/UK(.L)/EU(.AS/.DE/.PA) 统计非 ETF 标的 `roe_pct`/`debt_to_equity`/`revenue_growth_pct`/`fcf_yield_pct`/`peg_ratio`/目标价覆盖率并列出 `<50%` 风险；`run_offline_universe_and_threshold_audit()` 新增可选 `fundamentals_rows`；周六审计从 `db.get_fundamentals_cache()` 读取并注入 `_generate_weekly_diagnosis()` 原始数字（仍 `<=450` 字且禁止编造）。
+9. **文档与版本**：`src/version.py` / `pyproject.toml` 升至 `5.5.3`，`DEVELOPER_GUIDE.md` 对齐 `/report<=2800`、四桶核心宽基、双哲学、Neon 路由、超时 `150s`/`60s` 与 `nav_history`/`pick_recommendations` 新列；新增 `tests/test_v553_observability_and_attribution.py` 离线覆盖。
+
 ### `v5.5.2`（2026-11-19）
 
 双钱包挂单冻结、成交回执防误报、早报篇幅放宽与 DeepSeek 高峰期超时治理（[`docs/plans/2026-11-19-5.5.2-wallet-receipt-report-hardening-plan.md`](./docs/plans/2026-11-19-5.5.2-wallet-receipt-report-hardening-plan.md)）。

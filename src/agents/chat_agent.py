@@ -676,7 +676,7 @@ async def answer_user_chat(
     calendar_alerts = get_market_calendar_alerts()
     calendar_inline = ("｜" + "；".join(calendar_alerts)) if calendar_alerts else ""
     morning_block = (
-        trim_text_at_line_boundary(morning_static_text, 2050)
+        trim_text_at_line_boundary(morning_static_text, 2800)
         if morning_static_text
         else (morning_conclusion or "（暂无）")
     )

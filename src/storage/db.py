@@ -26,7 +26,7 @@ _RECOMMENDATION_SELECT_COLS = (
     "horizon_days, benchmark_symbol, settled_at_uk, raw_return_pct, alpha_pct, "
     "outcome_status, reflection_lesson, "
     "t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct, "
-    "source, fill_status"
+    "source, fill_status, actual_filled, actual_fill_price, execution_slippage_pct"
 )
 
 
@@ -73,6 +73,9 @@ def _row_to_recommendation(row: tuple[Any, ...]) -> dict[str, Any]:
         "mae_pct": row[20],
         "source": str(row[21] or "pick"),
         "fill_status": str(row[22] or ""),
+        "actual_filled": (None if row[23] is None else int(row[23])),
+        "actual_fill_price": row[24],
+        "execution_slippage_pct": row[25],
     }
 
 
@@ -157,6 +160,8 @@ class AdvisorDatabase:
                     net_flow_gbp REAL NOT NULL DEFAULT 0,
                     isa_value_gbp REAL NOT NULL DEFAULT 0,
                     invest_value_gbp REAL NOT NULL DEFAULT 0,
+                    isa_net_flow_gbp REAL NOT NULL DEFAULT 0,
+                    invest_net_flow_gbp REAL NOT NULL DEFAULT 0,
                     benchmark_close REAL,
                     cash_rate_pct REAL,
                     created_at_ms INTEGER NOT NULL
@@ -205,7 +210,10 @@ class AdvisorDatabase:
                     mfe_pct REAL,
                     mae_pct REAL,
                     source TEXT DEFAULT 'pick',
-                    fill_status TEXT DEFAULT ''
+                    fill_status TEXT DEFAULT '',
+                    actual_filled INTEGER DEFAULT NULL,
+                    actual_fill_price REAL DEFAULT NULL,
+                    execution_slippage_pct REAL DEFAULT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -416,6 +424,14 @@ class AdvisorDatabase:
             )
             await _ensure_columns(
                 db,
+                "nav_history",
+                {
+                    "isa_net_flow_gbp": "REAL NOT NULL DEFAULT 0",
+                    "invest_net_flow_gbp": "REAL NOT NULL DEFAULT 0",
+                },
+            )
+            await _ensure_columns(
+                db,
                 "pick_recommendations",
                 {
                     "horizon_days": "INTEGER DEFAULT 5",
@@ -433,6 +449,9 @@ class AdvisorDatabase:
                     "mae_pct": "REAL",
                     "source": "TEXT DEFAULT 'pick'",
                     "fill_status": "TEXT DEFAULT ''",
+                    "actual_filled": "INTEGER DEFAULT NULL",
+                    "actual_fill_price": "REAL DEFAULT NULL",
+                    "execution_slippage_pct": "REAL DEFAULT NULL",
                 },
             )
             await _ensure_columns(
@@ -547,6 +566,8 @@ class AdvisorDatabase:
             float(row.get("net_flow_gbp") or 0.0),
             float(row.get("isa_value_gbp") or 0.0),
             float(row.get("invest_value_gbp") or 0.0),
+            float(row.get("isa_net_flow_gbp") or 0.0),
+            float(row.get("invest_net_flow_gbp") or 0.0),
             (None if row.get("benchmark_close") is None else float(row["benchmark_close"])),
             (None if row.get("cash_rate_pct") is None else float(row["cash_rate_pct"])),
             now_ms,
@@ -556,9 +577,10 @@ class AdvisorDatabase:
                 """
                 INSERT INTO nav_history (
                     uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
-                    isa_value_gbp, invest_value_gbp, benchmark_close, cash_rate_pct, created_at_ms
+                    isa_value_gbp, invest_value_gbp, isa_net_flow_gbp, invest_net_flow_gbp,
+                    benchmark_close, cash_rate_pct, created_at_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(uk_date) DO UPDATE SET
                     total_value_gbp = excluded.total_value_gbp,
                     cash_gbp = excluded.cash_gbp,
@@ -566,6 +588,8 @@ class AdvisorDatabase:
                     net_flow_gbp = excluded.net_flow_gbp,
                     isa_value_gbp = excluded.isa_value_gbp,
                     invest_value_gbp = excluded.invest_value_gbp,
+                    isa_net_flow_gbp = excluded.isa_net_flow_gbp,
+                    invest_net_flow_gbp = excluded.invest_net_flow_gbp,
                     benchmark_close = COALESCE(excluded.benchmark_close, nav_history.benchmark_close),
                     cash_rate_pct = COALESCE(excluded.cash_rate_pct, nav_history.cash_rate_pct),
                     created_at_ms = excluded.created_at_ms
@@ -581,7 +605,8 @@ class AdvisorDatabase:
             cur = await db.execute(
                 """
                 SELECT uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
-                       isa_value_gbp, invest_value_gbp, benchmark_close, cash_rate_pct
+                       isa_value_gbp, invest_value_gbp, isa_net_flow_gbp, invest_net_flow_gbp,
+                       benchmark_close, cash_rate_pct
                 FROM nav_history
                 ORDER BY uk_date DESC
                 LIMIT ?
@@ -597,10 +622,18 @@ class AdvisorDatabase:
             "net_flow_gbp",
             "isa_value_gbp",
             "invest_value_gbp",
+            "isa_net_flow_gbp",
+            "invest_net_flow_gbp",
             "benchmark_close",
             "cash_rate_pct",
         )
-        out = [dict(zip(cols, row)) for row in rows]
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            # Old rows migrated by `_ensure_columns` carry 0 defaults; normalise defensively.
+            item["isa_net_flow_gbp"] = float(item.get("isa_net_flow_gbp") or 0.0)
+            item["invest_net_flow_gbp"] = float(item.get("invest_net_flow_gbp") or 0.0)
+            out.append(item)
         out.reverse()
         return out
 
@@ -968,6 +1001,9 @@ class AdvisorDatabase:
         mfe_pct: float | None = None,
         mae_pct: float | None = None,
         fill_status: str | None = None,
+        actual_filled: int | None = None,
+        actual_fill_price: float | None = None,
+        execution_slippage_pct: float | None = None,
     ) -> bool:
         """Idempotently settle a PENDING recommendation; returns False if already settled."""
         status = str(outcome_status or "SETTLED").strip().upper()
@@ -986,7 +1022,10 @@ class AdvisorDatabase:
                     reflection_lesson = ?,
                     mfe_pct = COALESCE(?, mfe_pct),
                     mae_pct = COALESCE(?, mae_pct),
-                    fill_status = CASE WHEN ? = '' THEN fill_status ELSE ? END
+                    fill_status = CASE WHEN ? = '' THEN fill_status ELSE ? END,
+                    actual_filled = COALESCE(?, actual_filled),
+                    actual_fill_price = COALESCE(?, actual_fill_price),
+                    execution_slippage_pct = COALESCE(?, execution_slippage_pct)
                 WHERE id = ? AND (outcome_status IS NULL OR outcome_status = 'PENDING')
                 """,
                 (
@@ -1000,6 +1039,9 @@ class AdvisorDatabase:
                     mae_pct,
                     fill,
                     fill,
+                    (None if actual_filled is None else int(actual_filled)),
+                    actual_fill_price,
+                    execution_slippage_pct,
                     int(rec_id),
                 ),
             )
@@ -1030,6 +1072,7 @@ class AdvisorDatabase:
         t20_alpha_pct: float | None = None,
         mfe_pct: float | None = None,
         mae_pct: float | None = None,
+        reflection_lesson: str | None = None,
     ) -> bool:
         """Update non-null T+10/T+20 follow-up returns and MFE/MAE metrics on a SETTLED recommendation."""
         updates: list[str] = []
@@ -1046,6 +1089,10 @@ class AdvisorDatabase:
             if val is not None:
                 updates.append(f"{col} = ?")
                 params.append(float(val))
+        lesson_txt = str(reflection_lesson or "").strip()[:600]
+        if lesson_txt:
+            updates.append("reflection_lesson = ?")
+            params.append(lesson_txt)
         if not updates:
             return False
 
@@ -1120,6 +1167,72 @@ class AdvisorDatabase:
             )
             core_row = await core_cur.fetchone()
             core_dca_count = int(core_row[0] or 0) if core_row else 0
+            split_cur = await db.execute(
+                """
+                SELECT account,
+                       COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN outcome_status = 'SETTLED' AND raw_return_pct > 0 THEN 1 ELSE 0 END), 0),
+                       AVG(CASE WHEN outcome_status = 'SETTLED' THEN alpha_pct END),
+                       AVG(CASE WHEN outcome_status = 'SETTLED' THEN t10_alpha_pct END),
+                       AVG(CASE WHEN outcome_status = 'SETTLED' THEN t20_alpha_pct END)
+                FROM pick_recommendations
+                WHERE COALESCE(source, 'pick') != 'core_dca'
+                GROUP BY account
+                """
+            )
+            split_rows = await split_cur.fetchall()
+            adopt_cur = await db.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN actual_filled IS NOT NULL THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN actual_filled = 1 THEN 1 ELSE 0 END), 0),
+                    AVG(CASE WHEN actual_filled = 1 THEN execution_slippage_pct END)
+                FROM pick_recommendations
+                WHERE COALESCE(source, 'pick') != 'core_dca'
+                """
+            )
+            adopt_row = await adopt_cur.fetchone()
+
+        by_account: dict[str, dict[str, Any]] = {
+            "ISA": {
+                "settled_count": 0,
+                "win_rate_pct": 0.0,
+                "avg_alpha_pct": None,
+                "avg_t10_alpha_pct": None,
+                "avg_t20_alpha_pct": None,
+            },
+            "Invest": {
+                "settled_count": 0,
+                "win_rate_pct": 0.0,
+                "avg_alpha_pct": None,
+                "avg_t10_alpha_pct": None,
+                "avg_t20_alpha_pct": None,
+            },
+        }
+        for split_row in split_rows or []:
+            label = str(split_row[0] or "").strip()
+            key = "ISA" if label.upper() == "ISA" else ("Invest" if label else "")
+            if key not in by_account:
+                continue
+            settled_n = int(split_row[1] or 0)
+            win_n = int(split_row[2] or 0)
+            by_account[key] = {
+                "settled_count": settled_n,
+                "win_rate_pct": round((win_n / settled_n) * 100.0, 1) if settled_n > 0 else 0.0,
+                "avg_alpha_pct": round(float(split_row[3]), 2) if split_row[3] is not None else None,
+                "avg_t10_alpha_pct": round(float(split_row[4]), 2) if split_row[4] is not None else None,
+                "avg_t20_alpha_pct": round(float(split_row[5]), 2) if split_row[5] is not None else None,
+            }
+        checked_count = int(adopt_row[0] or 0) if adopt_row else 0
+        filled_count = int(adopt_row[1] or 0) if adopt_row else 0
+        adoption_stats = {
+            "checked_count": checked_count,
+            "filled_count": filled_count,
+            "adoption_rate_pct": round((filled_count / checked_count) * 100.0, 1) if checked_count > 0 else 0.0,
+            "avg_slippage_pct": (
+                round(float(adopt_row[2]), 3) if adopt_row and adopt_row[2] is not None else None
+            ),
+        }
         if not row:
             return {
                 "total_count": 0,
@@ -1138,6 +1251,8 @@ class AdvisorDatabase:
                 "avg_mfe_pct": None,
                 "avg_mae_pct": None,
                 "core_dca_count": core_dca_count,
+                "by_account": by_account,
+                "adoption_stats": adoption_stats,
             }
         settled = int(row[4] or 0)
         win_cnt = int(row[5] or 0)
@@ -1159,6 +1274,8 @@ class AdvisorDatabase:
             "avg_mfe_pct": round(float(row[11]), 2) if row[11] is not None else None,
             "avg_mae_pct": round(float(row[12]), 2) if row[12] is not None else None,
             "core_dca_count": core_dca_count,
+            "by_account": by_account,
+            "adoption_stats": adoption_stats,
         }
 
     async def get_settled_outcome_series(self, limit: int = 400) -> list[dict[str, Any]]:
@@ -1380,6 +1497,141 @@ class AdvisorDatabase:
             "this_month": this_month,
             "by_label_7d": by_label_7d,
             "by_model_nd": by_model_nd,
+        }
+
+    async def get_llm_reliability_summary(
+        self,
+        days: int = 7,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """0-schema-change LLM reliability rollup: success rate + P50/P95 latency by model/label.
+
+        Percentiles are computed in Python over the sorted raw latency list so no SQLite
+        extension (percentile/median) is required on the deployed build.
+        """
+        ref = now_utc or datetime.now(timezone.utc)
+        cutoff_ms = int(ref.timestamp() * 1000) - max(days, 1) * 86400 * 1000
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT model, call_label, latency_ms, success FROM llm_usage_logs "
+                "WHERE created_at_ms >= ?",
+                (cutoff_ms,),
+            )
+            rows = await cur.fetchall()
+
+        def _percentile(values: list[int], pct: float) -> int | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            idx = int(round((len(ordered) - 1) * pct))
+            return int(ordered[max(0, min(idx, len(ordered) - 1))])
+
+        def _bucket() -> dict[str, Any]:
+            return {"calls": 0, "failed_calls": 0, "latencies": []}
+
+        total = _bucket()
+        by_model: dict[str, dict[str, Any]] = {}
+        by_label: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            model = str(row[0] or "unknown")
+            label = str(row[1] or "unknown")
+            latency = int(row[2] or 0)
+            ok = bool(row[3])
+            for bucket in (
+                total,
+                by_model.setdefault(model, _bucket()),
+                by_label.setdefault(label, _bucket()),
+            ):
+                bucket["calls"] += 1
+                if not ok:
+                    bucket["failed_calls"] += 1
+                if latency > 0:
+                    bucket["latencies"].append(latency)
+
+        def _finalise(bucket: dict[str, Any]) -> dict[str, Any]:
+            calls = int(bucket["calls"])
+            failed = int(bucket["failed_calls"])
+            latencies = bucket["latencies"]
+            return {
+                "calls": calls,
+                "failed_calls": failed,
+                "success_rate_pct": round(((calls - failed) / calls) * 100.0, 1) if calls > 0 else None,
+                "p50_latency_ms": _percentile(latencies, 0.5),
+                "p95_latency_ms": _percentile(latencies, 0.95),
+                "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
+            }
+
+        models = {
+            name: _finalise(bucket)
+            for name, bucket in sorted(by_model.items(), key=lambda kv: kv[1]["calls"], reverse=True)
+        }
+        labels = {
+            name: _finalise(bucket)
+            for name, bucket in sorted(by_label.items(), key=lambda kv: kv[1]["calls"], reverse=True)
+        }
+        slowest = sorted(
+            (name for name, item in labels.items() if item["p95_latency_ms"] is not None),
+            key=lambda name: int(labels[name]["p95_latency_ms"] or 0),
+            reverse=True,
+        )[:3]
+        most_failed = sorted(
+            (name for name, item in labels.items() if item["failed_calls"] > 0),
+            key=lambda name: labels[name]["failed_calls"],
+            reverse=True,
+        )[:3]
+        return {
+            "days": max(days, 1),
+            "total": _finalise(total),
+            "by_model": models,
+            "by_label": labels,
+            "slowest_labels": slowest,
+            "most_failed_labels": most_failed,
+        }
+
+    async def get_ops_quality_summary(
+        self,
+        days: int = 7,
+        now_utc: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Semantic-audit + degradation alert rollup from ops_events (read-only, no schema change)."""
+        ref = now_utc or datetime.now(timezone.utc)
+        cutoff_ms = int(ref.timestamp() * 1000) - max(days, 1) * 86400 * 1000
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT source, alert_key, message FROM ops_events WHERE created_at_ms >= ?",
+                (cutoff_ms,),
+            )
+            rows = await cur.fetchall()
+
+        semantic = {"total": 0, "report": 0, "pick": 0}
+        tag_counts = {
+            "事实价不符": 0,
+            "建议价方向异常": 0,
+            "内部驳回": 0,
+        }
+        degraded = 0
+        for row in rows:
+            source = str(row[0] or "")
+            alert_key = str(row[1] or "")
+            message = str(row[2] or "")
+            lowered_key = alert_key.lower()
+            if "degraded" in lowered_key or "fallback" in lowered_key:
+                degraded += 1
+            if source.startswith("semantic_audit:"):
+                semantic["total"] += 1
+                scope = source.split(":", 1)[1].strip().lower()
+                if scope == "report":
+                    semantic["report"] += 1
+                elif scope == "pick":
+                    semantic["pick"] += 1
+                for tag in tag_counts:
+                    if tag in message or tag in alert_key:
+                        tag_counts[tag] += 1
+        return {
+            "days": max(days, 1),
+            "semantic_audit": semantic,
+            "violation_tags": {k: v for k, v in tag_counts.items() if v > 0},
+            "degraded_alerts": degraded,
         }
 
     async def log_ops_event(

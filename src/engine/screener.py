@@ -1874,6 +1874,86 @@ def _backtest_breakout_thresholds(
     }
 
 
+_FUNDAMENTAL_COVERAGE_FIELDS: tuple[str, ...] = (
+    "roe_pct",
+    "debt_to_equity",
+    "revenue_growth_pct",
+    "fcf_yield_pct",
+    "peg_ratio",
+    "target_price",
+)
+
+
+def compute_fundamentals_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-market ISA value-factor coverage audit over cached fundamentals (non-ETF only).
+
+    A field counts as covered only when it is a finite number (0 is a valid value).
+    Any field below 50% coverage in a market is surfaced as a risk warning so the
+    value screen cannot quietly degrade into a momentum screen on missing data.
+    """
+    markets: dict[str, list[dict[str, Any]]] = {"US": [], "UK": [], "EU": []}
+
+    def _market_of(sym: str) -> str:
+        s = sym.strip().upper()
+        if s.endswith(".L"):
+            return "UK"
+        if s.endswith((".AS", ".DE", ".PA")):
+            return "EU"
+        return "US"
+
+    def _has(field: str, row: dict[str, Any]) -> bool:
+        if field == "target_price":
+            raw_values = (row.get("target_mean_price"), row.get("target_high_price"))
+        else:
+            raw_values = (row.get(field),)
+        for raw in raw_values:
+            if raw is None or raw == "":
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(val):
+                return True
+        return False
+
+    skipped_etf = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        if str(row.get("quote_type") or "").strip().upper() == "ETF":
+            skipped_etf += 1
+            continue
+        markets[_market_of(sym)].append(row)
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "non_etf_count": 0,
+        "skipped_etf": skipped_etf,
+        "markets": {},
+        "low_coverage": [],
+    }
+    for market, items in markets.items():
+        count = len(items)
+        out["non_etf_count"] += count
+        coverage: dict[str, float | None] = {}
+        for field in _FUNDAMENTAL_COVERAGE_FIELDS:
+            covered = sum(1 for row in items if _has(field, row))
+            coverage[field] = round(covered / count * 100.0, 1) if count > 0 else None
+        low = [
+            f"{market} {field} {pct:.0f}%"
+            for field, pct in coverage.items()
+            if pct is not None and pct < 50.0
+        ]
+        out["markets"][market] = {"symbols": count, "coverage_pct": coverage}
+        out["low_coverage"].extend(low)
+
+    return out
+
+
 def run_offline_universe_and_threshold_audit(
     histories: dict[str, pd.DataFrame],
     portfolio: PortfolioData,
@@ -1881,6 +1961,7 @@ def run_offline_universe_and_threshold_audit(
     strategy: StrategySection,
     *,
     active_pool_rows: list[dict[str, Any]] | None = None,
+    fundamentals_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run 0-token offline universe redundancy, Phase 4 zombie, and TP/SL threshold backtest audit."""
     if active_pool_rows:
@@ -1959,12 +2040,31 @@ def run_offline_universe_and_threshold_audit(
         ),
     ]
 
+    fundamentals_coverage: dict[str, Any] | None = None
+    if fundamentals_rows is not None:
+        fundamentals_coverage = compute_fundamentals_coverage(fundamentals_rows)
+        market_bits: list[str] = []
+        for market, item in (fundamentals_coverage.get("markets") or {}).items():
+            if not item.get("symbols"):
+                continue
+            cov = item.get("coverage_pct") or {}
+            avg_cov = [v for v in cov.values() if v is not None]
+            avg_s = f"{sum(avg_cov) / len(avg_cov):.0f}%" if avg_cov else "N/A"
+            market_bits.append(f"{market} {item['symbols']}只均值 {avg_s}")
+        if market_bits:
+            summary_lines.append("• 价值因子覆盖率: " + " | ".join(market_bits))
+        if fundamentals_coverage.get("low_coverage"):
+            summary_lines.append(
+                "• 覆盖率风险(<50%): " + "、".join(fundamentals_coverage["low_coverage"][:6])
+            )
+
     return {
         "universe_count": len(universe_syms),
         "held_count": len(held_syms),
         "overlap_candidates": overlap_candidates,
         "zombie_candidates": zombie_candidates,
         "threshold_backtest": backtest_stats,
+        "fundamentals_coverage": fundamentals_coverage,
         "summary_text": "\n".join(summary_lines),
     }
 

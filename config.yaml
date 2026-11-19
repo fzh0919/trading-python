@@ -192,6 +192,7 @@ strategy:
   intraday_sentinel_enabled: true
   intraday_poll_minutes: 30
   intraday_move_alert_pct: 3.5
+  intraday_isa_move_alert_pct: 5.0    # ISA 价值仓日内噪音过滤阈值（Invest 仍用 3.5%）
   intraday_order_near_pct: 1.5
   intraday_fill_receipt_enabled: true   # 挂单成交回执（快照比对 + 历史成交交叉验证，0 额外 API）
 

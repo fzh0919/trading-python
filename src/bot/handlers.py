@@ -18,7 +18,10 @@ from src.agents.report_agent import generate_morning_report, generate_us_sentine
 from src.bot.telegram_client import TelegramClient
 from src.config import AppConfig
 from src.data_providers.analytics import (
+    _CORE_POLICY_BENCHMARK_WEIGHTS,
+    compute_account_split_performance,
     compute_concentration_metrics,
+    compute_core_policy_benchmark_comparison,
     compute_portfolio_performance,
     compute_signal_quality,
     compute_trade_attribution,
@@ -426,8 +429,15 @@ class AdvisorBot:
             return
 
         if lower.startswith("/usage"):
-            summary = await self.db.get_usage_summary(days=30)
-            await self._send_reply(chat_id, self._format_usage_message(summary))
+            summary, reliability, quality = await asyncio.gather(
+                self.db.get_usage_summary(days=30),
+                self._safe_reliability_summary(),
+                self._safe_ops_quality_summary(),
+            )
+            await self._send_reply(
+                chat_id,
+                self._format_usage_message(summary, reliability=reliability, quality=quality),
+            )
             return
 
         # Cancel any still-running heavy AI command when the user issues another heavy query;
@@ -540,6 +550,43 @@ class AdvisorBot:
                 lines.append("• 相对基准: 基准序列不足，暂无法回归")
             if perf.get("cash_drag_pct") is not None:
                 lines.append(f"• 现金拖累: 平均现金占比 {perf['cash_drag_pct']:.1f}%")
+
+        if nav_rows:
+            split = compute_account_split_performance(
+                nav_rows, benchmark_hist=bench_hist, risk_free_annual_pct=rf_pct
+            )
+
+            def _split_seg(label: str, item: dict[str, Any] | None) -> str:
+                if not item or not item.get("ok"):
+                    return f"{label} 样本不足"
+                return (
+                    f"{label} TWR {item['total_return_pct']:+.2f}% | 最大回撤 {item['max_drawdown_pct']:.2f}%"
+                    f"（{item['samples']} 快照）"
+                )
+
+            lines.append(
+                "• 分账户归因: "
+                + _split_seg("ISA 价值", split.get("isa"))
+                + " ／ "
+                + _split_seg("Invest 右侧", split.get("invest"))
+            )
+
+            core_cmp = None
+            try:
+                core_hist_map = await self.market_data.get_histories(
+                    list(_CORE_POLICY_BENCHMARK_WEIGHTS), period="1y"
+                )
+                core_cmp = compute_core_policy_benchmark_comparison(core_hist_map or {}, lookback_days=60)
+            except Exception as exc:
+                logger.warning("/perf core policy benchmark failed: %s", exc)
+            if core_cmp:
+                te = core_cmp.get("tracking_error_pct")
+                te_s = f"{te:.1f}%" if te is not None else "N/A"
+                lines.append(
+                    f"• 四桶核心政策（{core_cmp['lookback_days']}日）: 组合 {core_cmp['policy_return_pct']:+.2f}% "
+                    f"vs {core_cmp['benchmark_symbol']} {core_cmp['benchmark_return_pct']:+.2f}%"
+                    f"（区域倾斜效应 {core_cmp['allocation_effect_pct']:+.2f}% | 跟踪误差 {te_s}）"
+                )
 
         if portfolio is not None:
             attribution = compute_trade_attribution(portfolio)
@@ -670,6 +717,31 @@ class AdvisorBot:
             )
         else:
             lines.append("• 胜率与 Alpha: 暂无已结算 (T+N) 样本，待盘后结算后自动生成。")
+
+        split_accounts = stats.get("by_account") or {}
+        if stats["settled_count"] > 0 and split_accounts:
+            isa_a = split_accounts.get("ISA") or {}
+            inv_a = split_accounts.get("Invest") or {}
+
+            def _alpha_s(val: Any) -> str:
+                return f"{float(val):+.2f}%" if val is not None else "N/A"
+
+            lines.append(
+                "• 分账户表现: "
+                f"ISA 价值 {isa_a.get('settled_count', 0)} 笔 | 胜率 {isa_a.get('win_rate_pct', 0.0):.0f}% | "
+                f"T+20 Alpha {_alpha_s(isa_a.get('avg_t20_alpha_pct'))} ／ "
+                f"Invest 右侧 {inv_a.get('settled_count', 0)} 笔 | 胜率 {inv_a.get('win_rate_pct', 0.0):.0f}% | "
+                f"T+5 Alpha {_alpha_s(inv_a.get('avg_alpha_pct'))} | "
+                f"T+10 Alpha {_alpha_s(inv_a.get('avg_t10_alpha_pct'))}"
+            )
+        adoption = stats.get("adoption_stats") or {}
+        if adoption.get("checked_count", 0) > 0:
+            slip = adoption.get("avg_slippage_pct")
+            slip_s = f"{float(slip):+.2f}%" if slip is not None else "N/A"
+            lines.append(
+                f"• 实盘采纳: {adoption.get('filled_count', 0)}/{adoption.get('checked_count', 0)} 条命中真实成交 "
+                f"| 采纳率 {float(adoption.get('adoption_rate_pct') or 0.0):.1f}% | 平均执行滑点 {slip_s}"
+            )
 
         if lessons:
             lines.append("\n【近期复盘教训】")
@@ -851,6 +923,27 @@ class AdvisorBot:
                     f"• [{ev['created_at_uk']}] [{ev['severity']}] {ev['source']}: {ev['message'][:80]} ({push_tag}{sup})"
                 )
 
+        # v5.5.3 observability one-liner: read-only, best-effort, never allowed to break /health.
+        try:
+            rel = await self._safe_reliability_summary()
+            qual = await self._safe_ops_quality_summary()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Health observability summary skipped: %s", exc)
+            rel = qual = None
+        health_bits: list[str] = []
+        if rel:
+            total_rel = rel.get("total") or {}
+            rate = total_rel.get("success_rate_pct")
+            rate_s = f"{float(rate):.1f}%" if rate is not None else "N/A"
+            health_bits.append(f"近7天 LLM 成功率 {rate_s}（{int(total_rel.get('calls') or 0)} 次）")
+        if qual:
+            sem = qual.get("semantic_audit") or {}
+            health_bits.append(
+                f"语义质检 {int(sem.get('total') or 0)} 次 | 降级 {int(qual.get('degraded_alerts') or 0)} 次"
+            )
+        if health_bits:
+            lines.append("• 近7天质量: " + " | ".join(health_bits))
+
         return "\n".join(lines)
 
     async def _run_query_task(self, chat_id: str, text: str) -> None:
@@ -998,7 +1091,33 @@ class AdvisorBot:
         finally:
             self._active_status_msg_id = None
 
-    def _format_usage_message(self, summary: dict[str, Any]) -> str:
+    async def _safe_reliability_summary(self) -> dict[str, Any] | None:
+        """Optional 7-day LLM reliability rollup; never let observability break /usage or /health."""
+        getter = getattr(self.db, "get_llm_reliability_summary", None)
+        if not callable(getter):
+            return None
+        try:
+            return await getter(days=7)
+        except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort
+            logger.warning("LLM reliability summary failed: %s", exc)
+            return None
+
+    async def _safe_ops_quality_summary(self) -> dict[str, Any] | None:
+        getter = getattr(self.db, "get_ops_quality_summary", None)
+        if not callable(getter):
+            return None
+        try:
+            return await getter(days=7)
+        except Exception as exc:  # noqa: BLE001 - diagnostics are best-effort
+            logger.warning("Ops quality summary failed: %s", exc)
+            return None
+
+    def _format_usage_message(
+        self,
+        summary: dict[str, Any],
+        reliability: dict[str, Any] | None = None,
+        quality: dict[str, Any] | None = None,
+    ) -> str:
         def _fmt_bucket(title: str, b: dict[str, Any]) -> str:
             in_tok = b["prompt_tokens"]
             cached_tok = b["cached_tokens"]
@@ -1071,6 +1190,48 @@ class AdvisorBot:
                 )
         if summary["last_nd"]["calls"] == 0:
             lines.append("\nℹ️ 暂无调用记录（运行 /report、/us、/pick 或单聊后会自动累计）。")
+
+        if reliability:
+            total_rel = reliability.get("total") or {}
+            calls = int(total_rel.get("calls") or 0)
+            if calls <= 0:
+                lines.append("\n【近 7 天模型可靠性】\n• 暂无调用样本")
+            else:
+                rate = total_rel.get("success_rate_pct")
+                rate_s = f"{float(rate):.1f}%" if rate is not None else "N/A"
+                p95 = total_rel.get("p95_latency_ms")
+                p95_s = f"{float(p95) / 1000.0:.1f}s" if p95 is not None else "N/A"
+                p50 = total_rel.get("p50_latency_ms")
+                p50_s = f"{float(p50) / 1000.0:.1f}s" if p50 is not None else "N/A"
+                lines.append("\n【近 7 天模型可靠性】")
+                lines.append(
+                    f"• 总体 {calls} 次 | 成功率 {rate_s}（失败 {int(total_rel.get('failed_calls') or 0)}）"
+                    f" | P50 {p50_s} / P95 {p95_s}"
+                )
+                model_bits: list[str] = []
+                for name, item in list((reliability.get("by_model") or {}).items())[:3]:
+                    m_rate = item.get("success_rate_pct")
+                    m_rate_s = f"{float(m_rate):.0f}%" if m_rate is not None else "N/A"
+                    m_p95 = item.get("p95_latency_ms")
+                    m_p95_s = f"{float(m_p95) / 1000.0:.1f}s" if m_p95 is not None else "N/A"
+                    model_bits.append(f"{name} {m_rate_s}/P95 {m_p95_s}")
+                if model_bits:
+                    lines.append("• 分模型: " + " | ".join(model_bits))
+
+        if quality:
+            sem = quality.get("semantic_audit") or {}
+            tags = quality.get("violation_tags") or {}
+            sem_total = int(sem.get("total") or 0)
+            degraded = int(quality.get("degraded_alerts") or 0)
+            if sem_total <= 0 and degraded <= 0:
+                lines.append("\n【近 7 天质检与降级】\n• 语义质检 0 次，模型/辩论降级 0 次")
+            else:
+                tag_s = "、".join(f"{k} {v}" for k, v in tags.items()) or "无明确违规范畴"
+                lines.append("\n【近 7 天质检与降级】")
+                lines.append(
+                    f"• 语义质检触发 {sem_total} 次（report {int(sem.get('report') or 0)} / "
+                    f"pick {int(sem.get('pick') or 0)}）| 主要类别: {tag_s} | 降级 {degraded} 次"
+                )
 
         lines.append(
             "\n【当前模型路由】\n"
