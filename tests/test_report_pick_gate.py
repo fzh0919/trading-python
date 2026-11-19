@@ -368,7 +368,8 @@ def _up_candidate(symbol: str = "PANW") -> dict:
         "account": "Invest",
         "tech": TechnicalSnapshot(
             symbol=symbol, last_close=300.0, ma50=295.0, ma200=270.0,
-            dist_ma50_pct=0.8, rsi14=60.0, trend_regime="BULL",
+            dist_ma50_pct=0.8, dist_ma200_pct=11.1, rsi14=60.0, trend_regime="BULL",
+            weekly_bullish=True,
         ),
         "bundle": None,
     }
@@ -1774,9 +1775,12 @@ class TestPickGateEndToEnd(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await md.close()
-        # 0.5R = £42.5 budget -> 42.5 / 5% stop = £850 cap (full 1R would be £1,700)
+        # 0.5R = £42.5 budget ÷ 含摩擦止损 5.2% (5% price + 0.20% spread) ≈ £817 cap
+        # (full 1R with the pure 5% stop would be £1,700).
         self.assertIn("预算£42", text)
-        self.assertIn("£850", text)
+        self.assertIn("£817", text)
+        self.assertIn("含摩擦止损5.2%", text)
+        self.assertIn("≈1股", text)
 
 
 # ===========================================================================
@@ -2806,6 +2810,555 @@ class TestV556Wave4RegimeInjection(unittest.IsolatedAsyncioTestCase):
             self.assertIn("不得自行改判 Regime", prompt)
             self.assertIn("ISA 门控 = ", prompt)
         self.assertIn("无达到当日动态 R:R 门槛的强信号时明确维持持币待命", by_label["report_analyst"]["system_instruction"])
+
+
+class TestV557Wave1DeterministicTruth(unittest.TestCase):
+    """v5.5.7 Wave 1: VIX floor sync, fake right-side rejection, gate ticket dedupe."""
+
+    @staticmethod
+    def _portfolio_with_pending(symbol: str = "ISF.L") -> PortfolioData:
+        pending = PendingOrderItem(
+            id="p1",
+            account="ISA",
+            raw_ticker=f"{symbol}_EQ",
+            ticker=symbol.split(".")[0],
+            yahoo_symbol=symbol,
+            name=symbol,
+            side="BUY",
+            order_type="LIMIT",
+            quantity=100.0,
+            value=1020.0,
+            currency="GBP",
+        )
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            total_account_value=100000.0,
+            positions=[],
+            pending_orders=[pending],
+        )
+        invest = AccountSnapshot(
+            ok=True, account_label="Invest", total_account_value=10000.0, positions=[]
+        )
+        return PortfolioData(
+            fetched_at_uk="2026-11-19 09:30",
+            fetched_at_ms=1763544600000,
+            isa=isa,
+            invest=invest,
+            total_combined_value=110000.0,
+        )
+
+    def test_scan_a_rejects_below_ma200_and_weekly_bearish(self) -> None:
+        healthy = TechnicalSnapshot(
+            symbol="LSEG.L", last_close=9000.0, ma50=8950.0, ma200=8000.0,
+            dist_ma50_pct=0.5, dist_ma200_pct=12.0, rsi14=55.0,
+            trend_regime="PULLBACK", weekly_bullish=True,
+        )
+        below_ma200 = TechnicalSnapshot(
+            symbol="RR.L", last_close=500.0, ma50=498.0, ma200=560.0,
+            dist_ma50_pct=0.4, dist_ma200_pct=-8.0, rsi14=52.0,
+            trend_regime="PULLBACK", weekly_bullish=True,
+        )
+        weekly_bearish = TechnicalSnapshot(
+            symbol="SIE.DE", last_close=180.0, ma50=179.0, ma200=150.0,
+            dist_ma50_pct=0.3, dist_ma200_pct=18.0, rsi14=50.0,
+            trend_regime="PULLBACK", weekly_bullish=False,
+        )
+        candidates = [
+            {"symbol": t.symbol, "tech": t, "account": "Invest"}
+            for t in (healthy, below_ma200, weekly_bearish)
+        ]
+        hits = _scan_a_equity_candidates(
+            candidates, self._portfolio_with_pending("ZZZ.L"), StrategySection(), None
+        )
+        self.assertEqual([h["symbol"] for h in hits], ["LSEG.L"])
+
+    def test_gate_block_skips_core_ticket_after_report_approval(self) -> None:
+        gate = {
+            "regime": "NEUTRAL",
+            "global_status": "RUN",
+            "etf_set": ["ISF.L", "VWRL.L"],
+            "isa": {
+                "approved_report_core_gbp": 1000.0,
+                "prefer_core_diversifier": True,
+                "core_allocation_plan": {
+                    "tickets": [
+                        {
+                            "symbol": "ISF.L",
+                            "sleeve_label": "UK_DIVERSIFIER",
+                            "current_pct": 10.0,
+                            "target_pct": 15.0,
+                            "recommended_gbp": 1000.0,
+                        }
+                    ]
+                },
+            },
+            "invest": {
+                "status": "WAIT",
+                "slots_used": 0,
+                "slots_cap": 2,
+                "invest_min_rr_floor": 2.5,
+                "invest_rr_tier_label": "高波防御门槛(VIX≥22)",
+            },
+        }
+        text = _format_gate_constraint_block(gate, self._portfolio_with_pending())
+        self.assertNotIn("今日核心宽基政策票据", text)
+        self.assertIn("不再重复签发核心宽基票据", text)
+        self.assertIn("≥2.5:1", text)
+        self.assertIn("高波防御门槛", text)
+
+    def test_gate_block_marks_ticket_already_pending(self) -> None:
+        gate = {
+            "regime": "NEUTRAL",
+            "global_status": "RUN",
+            "etf_set": ["ISF.L"],
+            "isa": {
+                "approved_report_core_gbp": 0.0,
+                "prefer_core_diversifier": True,
+                "core_allocation_plan": {
+                    "tickets": [
+                        {
+                            "symbol": "ISF.L",
+                            "sleeve_label": "UK_DIVERSIFIER",
+                            "current_pct": 10.0,
+                            "target_pct": 15.0,
+                            "recommended_gbp": 1000.0,
+                        }
+                    ]
+                },
+            },
+            "invest": {"status": "WAIT", "slots_used": 0, "slots_cap": 2},
+        }
+        text = _format_gate_constraint_block(gate, self._portfolio_with_pending("ISF.L"))
+        self.assertIn("今日核心宽基政策票据", text)
+        self.assertIn("已挂单执行中，勿重复建仓", text)
+
+
+class TestV557PickFxRefresh(unittest.IsolatedAsyncioTestCase):
+    """v5.5.7 Wave 1: /pick re-derives the in-memory portfolio FX before any cash text."""
+
+    async def test_pick_refreshes_portfolio_fx_before_cash_base(self) -> None:
+        from tests.test_db_and_end_to_end import _FakeMarketData, _FakeT212, _sample_portfolio
+        from src.agents.pick_agent import generate_pick_radar
+        from src.agents.tools import clear_grounding_cache
+
+        portfolio = _sample_portfolio().model_copy(update={"gbp_usd_rate": None})
+        self.assertIsNone(portfolio.gbp_usd_rate)
+
+        class _FxT212(_FakeT212):
+            def __init__(self, data: PortfolioData) -> None:
+                super().__init__(data)
+                self.refresh_rates: list[float] = []
+
+            def refresh_portfolio_fx(self, pf: PortfolioData, rate: float | None) -> PortfolioData:
+                self.refresh_rates.append(rate)  # type: ignore[arg-type]
+                return pf.model_copy(update={"gbp_usd_rate": rate})
+
+        class _IdleLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def generate(self, **kwargs) -> str:
+                self.calls.append(kwargs)
+                if getattr(kwargs.get("response_schema"), "__name__", "") == "PickDecision":
+                    return PickDecision(
+                        headline="本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命",
+                        selected_actions=[],
+                        rejected_or_frozen=[],
+                        consistency_and_cash_note="现金待命",
+                    ).model_dump_json()
+                return "投研员提案：本轮维持现金待命。"
+
+        cfg = AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            models={"enable_forced_search_grounding": False},
+            universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["SHEL.L"]),
+            strategy=StrategySection(overlap_correlation_threshold=1.0),
+        )
+        llm = _IdleLLM()
+        t212 = _FxT212(portfolio)
+        clear_grounding_cache()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "pick_fx.db")
+            await db.init()
+            await db.save_morning_report(
+                "REPORT",
+                "conclusion",
+                context_pack={
+                    "symbols": {},
+                    "deployment_gate": {
+                        "isa": {"equity_open": True, "etf_open": True},
+                        "invest": {"status": "WAIT", "mode": "none", "slots_used": 0, "slots_cap": 2},
+                        "pm": {"allow": True},
+                        "regime": "NEUTRAL",
+                        "global_status": "RUN",
+                        "etf_set": [],
+                    },
+                },
+            )
+            md = _FakeMarketData()
+            try:
+                await generate_pick_radar(cfg, t212, md, llm, db)
+            finally:
+                await md.close()
+                await db.close()
+
+        self.assertEqual(t212.refresh_rates, [1.275])
+        researcher = next(c for c in llm.calls if c.get("usage_label") == "pick_researcher")
+        self.assertIn("GBP/USD 1.2750", researcher["prompt"])
+        self.assertNotIn("GBP/USD 暂缺", researcher["prompt"])
+
+    async def test_closed_isa_equity_channel_short_circuits_screener(self) -> None:
+        from tests.test_db_and_end_to_end import _FakeMarketData, _FakeT212, _sample_portfolio
+        from src.agents.pick_agent import generate_pick_radar
+        from src.agents.tools import clear_grounding_cache
+        from unittest.mock import patch
+
+        captured: dict = {}
+
+        async def _fake_screener(**kwargs):
+            captured.update(kwargs)
+            return [], []
+
+        class _IdleLLM:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+
+            async def generate(self, **kwargs) -> str:
+                self.calls.append(kwargs)
+                if getattr(kwargs.get("response_schema"), "__name__", "") == "PickDecision":
+                    return PickDecision(
+                        headline="ISA 个股通道关闭，现金待命",
+                        selected_actions=[],
+                        rejected_or_frozen=[],
+                        consistency_and_cash_note="现金待命",
+                    ).model_dump_json()
+                return "投研员提案：ISA 个股通道关闭。"
+
+        cfg = AppConfig(
+            env=EnvSettings(_env_file=None, telegram_chat_id="999"),
+            models={"enable_forced_search_grounding": False},
+            universe=UniverseSection(isa_long_term=["VWRP.L", "ULVR.L"], invest_tactical=["SHEL.L"]),
+            strategy=StrategySection(
+                overlap_correlation_threshold=1.0,
+                user_preference_memory_enabled=False,
+            ),
+        )
+        portfolio = _sample_portfolio()
+        clear_grounding_cache()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "pick_closed_isa.db")
+            await db.init()
+            await db.upsert_preference_notes(
+                [
+                    {
+                        "source_cycle_date": "2026-11-18",
+                        "quote_text": "我更喜欢英镑计价的宽基",
+                        "rule_summary": "优先 LSE 英镑 ETF",
+                        "expires_on_uk": "2030-01-01",
+                    }
+                ]
+            )
+            await db.save_morning_report(
+                "REPORT",
+                "conclusion",
+                context_pack={
+                    "symbols": {},
+                    "deployment_gate": {
+                        "isa": {"equity_open": False, "etf_open": True},
+                        "invest": {"status": "WAIT", "mode": "none", "slots_used": 0, "slots_cap": 2},
+                        "pm": {"allow": True},
+                        "regime": "NEUTRAL",
+                        "global_status": "RUN",
+                        "etf_set": ["VWRP.L"],
+                    },
+                },
+            )
+            md = _FakeMarketData()
+            llm = _IdleLLM()
+            try:
+                with patch("src.agents.pick_agent.run_quant_screener", _fake_screener):
+                    await generate_pick_radar(cfg, _FakeT212(portfolio), md, llm, db)
+            finally:
+                await md.close()
+                await db.close()
+
+        self.assertIs(captured.get("enable_isa_equities"), False)
+        self.assertIs(captured.get("enable_isa_etfs"), True)
+        researcher = next(c for c in llm.calls if c.get("usage_label") == "pick_researcher")
+        self.assertNotIn("优先 LSE 英镑 ETF", researcher["prompt"])
+        self.assertNotIn("用户长期偏好", researcher["prompt"])
+
+
+class TestV557Wave4CriticFacts(unittest.TestCase):
+    """v5.5.7 Wave 4: strict whitelist fact card + audit trimming."""
+
+    def test_fact_card_uses_whitelist_intersection_only(self) -> None:
+        from types import SimpleNamespace
+        from src.agents.pick_agent import _build_proposal_fact_card
+
+        bundle = TickerMarketBundle(
+            symbol="NVDA",
+            quote_type="EQUITY",
+            currency="USD",
+            sector="Technology",
+            current_price=120.0,
+            target_mean_price=140.0,
+            analyst_count=10,
+            days_to_earnings=9,
+        )
+        tech = TechnicalSnapshot(
+            symbol="NVDA", last_close=120.0, rsi14=58.0, atr14=3.2, atr_pct=2.7,
+            dist_ma50_pct=4.0, dist_ma200_pct=22.0, trend_regime="BULL", weekly_bullish=True,
+        )
+        toolkit = SimpleNamespace(_inspect_cache={"TSM": {}}, _corr_cache={})
+        text, syms = _build_proposal_fact_card(
+            "建议 NVDA 突破，另关注 TSM；ATR 与 RSI 仅作指标，ISA 通道关闭。",
+            isa_cands=[],
+            invest_cands=[],
+            merged_bundles={"NVDA": bundle, "TSM": bundle.model_copy(update={"symbol": "TSM"})},
+            tech_map={},
+            stage2_tech={"NVDA": tech, "TSM": tech.model_copy(update={"symbol": "TSM"})},
+            toolkit=toolkit,
+            portfolio=TestV557Wave1DeterministicTruth._portfolio_with_pending("ZZZ.L"),
+            cfg=AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999")),
+            macro=MacroSnapshot(fetched_at_utc="2026-11-19T07:25:00Z", gbp_usd=1.25, vix=15.0),
+            regime="NEUTRAL",
+        )
+        self.assertIn("【提案标的一手事实卡", text)
+        self.assertIn("• NVDA", text)
+        self.assertIn("• TSM", text)
+        self.assertEqual(syms, {"NVDA", "TSM"})
+        self.assertNotIn("• ATR", text)
+        self.assertNotIn("• RSI", text)
+        self.assertNotIn("• ISA", text)
+
+    def test_fact_card_returns_empty_without_whitelist_hit(self) -> None:
+        from types import SimpleNamespace
+        from src.agents.pick_agent import _build_proposal_fact_card
+
+        text, syms = _build_proposal_fact_card(
+            "只讨论 ATR/RSI/VIX 与 ISA 结构，没有具体标的。",
+            isa_cands=[],
+            invest_cands=[],
+            merged_bundles={"NVDA": TickerMarketBundle(symbol="NVDA", quote_type="EQUITY", currency="USD")},
+            tech_map={},
+            stage2_tech={},
+            toolkit=SimpleNamespace(_inspect_cache={}, _corr_cache={}),
+            portfolio=TestV557Wave1DeterministicTruth._portfolio_with_pending("ZZZ.L"),
+            cfg=AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999")),
+            macro=None,
+            regime="NEUTRAL",
+        )
+        self.assertEqual(text, "")
+        self.assertEqual(syms, set())
+
+    def test_critic_audit_filter_keeps_pending_and_related_holdings(self) -> None:
+        from src.agents.pick_agent import _filter_audit_text_for_critic
+
+        text = "\n".join(
+            [
+                "• [持仓裁决] [ISA] TRIM NVDA @ 168-170 USD — 财报前减仓",
+                "• [挂单裁决] [Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】印花税",
+                "• [持仓裁决] [ISA] HOLD ULVR.L — 长线持有",
+            ]
+        )
+        filtered = _filter_audit_text_for_critic(text, {"NVDA"})
+        self.assertIn("TRIM NVDA", filtered)
+        self.assertIn("SHEL.L", filtered)
+        self.assertNotIn("ULVR.L", filtered)
+
+
+class TestV557Wave5Guards(unittest.TestCase):
+    """v5.5.7 Wave 5: duplicate Invest pending BUY + Python-owned post-execution cash."""
+
+    def _invest_pending_portfolio(self) -> PortfolioData:
+        pending = PendingOrderItem(
+            id="inv-panw",
+            account="Invest",
+            raw_ticker="PANW_EQ",
+            ticker="PANW",
+            yahoo_symbol="PANW",
+            name="Palo Alto",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=2.0,
+            value=600.0,
+            currency="USD",
+        )
+        return PortfolioData(
+            fetched_at_uk="2026-11-19 09:30",
+            fetched_at_ms=1763544600000,
+            isa=AccountSnapshot(
+                ok=True, account_label="ISA", total_account_value=50000.0, available_to_trade=10000.0
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                total_account_value=5000.0,
+                available_to_trade=2000.0,
+                positions=[],
+                pending_orders=[pending],
+            ),
+            total_combined_value=55000.0,
+        )
+
+    def test_invest_duplicate_pending_buy_is_hard_intercepted(self) -> None:
+        portfolio = self._invest_pending_portfolio()
+        decision = PickDecision(
+            headline="再次买入 PANW",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest",
+                    symbol="PANW",
+                    action="BUY",
+                    thesis="右侧突破",
+                    entry_zone="300",
+                    stop_condition="285",
+                    target_window="340",
+                    entry_price=300.0,
+                    stop_price=285.0,
+                    target_price=340.0,
+                )
+            ],
+            consistency_and_cash_note="测试",
+        )
+        gate = {
+            "regime": "NEUTRAL",
+            "global_status": "RUN",
+            "etf_set": [],
+            "isa": {},
+            "pm": {"allow": True},
+            "invest": {
+                "status": "RUN",
+                "slots_used": 0,
+                "slots_cap": 3,
+                "daily_cap": 1,
+                "today_new_equity_entries": 0,
+                "committed_heat_pct": 0.0,
+                "heat_cap_pct": 3.0,
+            },
+        }
+        hardened, notes = _apply_gate_channel_constraints(decision, portfolio, gate, bundles={})
+        self.assertEqual(hardened.selected_actions, [])
+        self.assertTrue(any("未成交买入挂单" in n and "叠加热力" in n for n in notes))
+
+    def test_deterministic_cash_note_clamps_and_never_double_deducts(self) -> None:
+        from src.agents.pick_agent import _build_deterministic_cash_note
+
+        portfolio = self._invest_pending_portfolio()
+        portfolio.isa.pending_orders = [
+            PendingOrderItem(
+                id="isa-isf",
+                account="ISA",
+                raw_ticker="ISF_EQ",
+                ticker="ISF",
+                yahoo_symbol="ISF.L",
+                name="FTSE 100",
+                side="BUY",
+                order_type="LIMIT",
+                quantity=100.0,
+                value=1020.0,
+                currency="GBP",
+            )
+        ]
+        decision = PickDecision(
+            headline="ISA 定投",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA",
+                    symbol="ISF.L",
+                    action="BUY",
+                    thesis="核心宽基定投",
+                    entry_zone="£1,600",
+                    stop_condition="跌破MA200",
+                    target_window="长线",
+                    entry_price=10.2,
+                    planned_amount_gbp=1600.0,
+                )
+            ],
+            consistency_and_cash_note="继承早报红线",
+        )
+        note = _build_deterministic_cash_note(
+            decision,
+            portfolio,
+            {"ISA|ISF.L": {"suggested_gbp": 1800.0}},
+            {"isa": {"core_allocation_plan": {"tickets": [{"symbol": "ISF.L", "recommended_gbp": 1000.0}]}}},
+        )
+        # planned £1,600 → ticket cap £1,000; already £1,020 pending → no extra deduction.
+        self.assertIn("ISA £10,000", note)
+        self.assertIn("Invest £2,000", note)
+        self.assertIn("不重复扣挂单", note)
+        self.assertIn("继承早报红线", note)
+
+        empty = PickDecision(
+            headline="现金待命",
+            selected_actions=[],
+            consistency_and_cash_note="现金待命",
+        )
+        note_empty = _build_deterministic_cash_note(empty, portfolio, {}, None)
+        self.assertIn("ISA £10,000", note_empty)
+        self.assertIn("Invest £2,000", note_empty)
+
+
+class TestV557Wave6RenderAndAudit(unittest.TestCase):
+    """v5.5.7 Wave 6: headline leak (incl. Chinese aliases), empty-state copy, fact anchors."""
+
+    def test_reconcile_headline_catches_chinese_broad_base_alias(self) -> None:
+        from src.agents.pick_agent import _reconcile_pick_headline
+
+        original = [
+            PickActionItem(
+                account="ISA", symbol="ISF.L", action="BUY", thesis="x",
+                entry_zone="1020 GBp", stop_condition="跌破MA200", target_window="长线",
+                entry_price=1020.0,
+            ),
+            PickActionItem(
+                account="Invest", symbol="META", action="BUY", thesis="y",
+                entry_zone="520 USD", stop_condition="480", target_window="580",
+                entry_price=520.0, stop_price=480.0, target_price=580.0,
+            ),
+        ]
+        decision = PickDecision(
+            headline="加仓富时100并买入 META",
+            selected_actions=[original[1]],
+            rejected_or_frozen=[],
+            consistency_and_cash_note="测试",
+        )
+        rebuilt = _reconcile_pick_headline(decision, original_actions=original)
+        self.assertIn("风控筛后执行", rebuilt.headline)
+        self.assertIn("META", rebuilt.headline)
+        self.assertNotIn("富时100", rebuilt.headline)
+        self.assertNotIn("ISF", rebuilt.headline)
+
+    def test_empty_state_copy_has_no_hardcoded_rr(self) -> None:
+        from src.agents.schemas import render_pick_report
+
+        decision = PickDecision(
+            headline="本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命",
+            selected_actions=[],
+            rejected_or_frozen=[],
+            consistency_and_cash_note="Python精确余现：ISA £10,000 / Invest £2,000",
+        )
+        text = render_pick_report(decision, max_chars=1000)
+        self.assertIn("本轮无达标机会", text)
+        self.assertIn("ISA 安全边际 / Invest 动态 R:R 未达标", text)
+        self.assertNotIn("R:R≥2:1", text)
+
+    def test_fact_baseline_anchors_new_pick_price_and_currency(self) -> None:
+        from src.agents.semantic_auditor import build_fact_baseline
+
+        baseline = build_fact_baseline(
+            scope="pick",
+            portfolio=TestV557Wave1DeterministicTruth._portfolio_with_pending("ZZZ.L"),
+            candidate_bundles={
+                "ISF.L": TickerMarketBundle(
+                    symbol="ISF.L", quote_type="ETF", currency="GBp", current_price=1020.0
+                )
+            },
+        )
+        self.assertIn("本次入选新标的现价锚点", baseline)
+        self.assertIn("ISF.L | 现价 1,020.00 GBp", baseline)
 
 
 if __name__ == "__main__":

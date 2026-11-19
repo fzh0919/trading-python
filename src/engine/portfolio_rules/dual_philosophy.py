@@ -127,22 +127,29 @@ def _resolve_pick_rr(
         "stop": 0.0,
         "target": 0.0,
         "risk_pct": None,
+        "effective_risk_pct": None,
         "upside_pct": None,
         "rr": None,
         "friction_pct": None,
         "target_replaced": False,
         "price_rescaled": False,
+        "entry_planned": False,
         "stop_too_tight": False,
         "min_stop_pct": None,
     }
+    ref_price = (
+        float(bundle.current_price)
+        if (bundle is not None and bundle.current_price and float(bundle.current_price) > 0)
+        else 0.0
+    )
     entry = float(getattr(item, "entry_price", 0.0) or 0.0)
-    if entry <= 0 and bundle is not None and bundle.current_price and bundle.current_price > 0:
-        entry = float(bundle.current_price)
+    if entry <= 0 and ref_price > 0:
+        entry = ref_price
     if entry <= 0:
         return out
     # Align the LLM-supplied entry with the live quote currency before any R:R maths.
-    if bundle is not None and bundle.current_price and float(bundle.current_price) > 0:
-        rescaled_entry = _rescale_price_pair(entry, float(bundle.current_price))
+    if ref_price > 0:
+        rescaled_entry = _rescale_price_pair(entry, ref_price)
         if rescaled_entry != entry:
             out["price_rescaled"] = True
             entry = rescaled_entry
@@ -154,6 +161,18 @@ def _resolve_pick_rr(
     if rescaled_stop != stop or rescaled_target != target:
         out["price_rescaled"] = True
     stop, target = rescaled_stop, rescaled_target
+
+    # v5.5.7: an optional planned limit centre may not be used to fake a better R:R —
+    # rescale for GBp/GBP, clamp into [current*0.92, current*1.03] and require > stop.
+    planned_raw = getattr(item, "planned_entry_price", None)
+    if planned_raw is not None and float(planned_raw) > 0 and ref_price > 0:
+        planned_entry = _rescale_price_pair(float(planned_raw), ref_price)
+        lo, hi = ref_price * 0.92, ref_price * 1.03
+        if lo <= planned_entry <= hi and (stop <= 0 or planned_entry > stop):
+            if abs(planned_entry - entry) > 1e-9:
+                out["price_rescaled"] = True
+            entry = planned_entry
+            out["entry_planned"] = True
 
     analyst_target = 0.0
     if (
@@ -208,17 +227,23 @@ def _resolve_pick_rr(
         account or str(getattr(item, "account", "") or ""),
         wallet,
     )
+    effective_risk_pct = (
+        round(float(risk_pct) + float(friction_pct), 2) if risk_pct is not None else None
+    )
     out.update(
         {
             "entry": round(entry, 4),
             "stop": round(stop, 4),
             "target": round(target, 4),
             "risk_pct": round(risk_pct, 2) if risk_pct is not None else None,
+            "effective_risk_pct": effective_risk_pct,
             "upside_pct": round(upside_pct, 2) if upside_pct is not None else None,
             "friction_pct": round(friction_pct, 2),
         }
     )
     # v5.5.1 Invest stop must clear the ATR noise floor — a razor-thin stop fakes a huge R:R.
+    # v5.5.7: this check keeps using the PURE price stop (risk_pct); friction only enters the
+    # net R:R and risk-based sizing denominator, so a narrow stop cannot bypass the ATR floor.
     if risk_pct is not None and tech is not None and tech.atr_pct is not None and tech.atr_pct > 0:
         atr_mult = float(getattr(strategy, "invest_stop_min_atr_mult", INVEST_STOP_MIN_ATR_MULT))
         floor_pct = float(getattr(strategy, "invest_stop_min_pct_floor", INVEST_STOP_MIN_PCT_FLOOR))
@@ -226,8 +251,8 @@ def _resolve_pick_rr(
         out["min_stop_pct"] = min_stop
         if risk_pct < min_stop:
             out["stop_too_tight"] = True
-    if risk_pct is not None and risk_pct > 0 and upside_pct is not None:
-        out["rr"] = round((upside_pct - friction_pct) / risk_pct, 2)
+    if effective_risk_pct is not None and effective_risk_pct > 0 and upside_pct is not None:
+        out["rr"] = round((upside_pct - friction_pct) / effective_risk_pct, 2)
     return out
 
 
@@ -463,9 +488,16 @@ def resolve_invest_dynamic_rr_floor(
     regime: str | None,
     tech: TechnicalSnapshot | None,
     strategy: StrategySection,
+    *,
+    vix: float | None = None,
 ) -> tuple[float, str]:
-    """Regime × structure dynamic R:R floor for Invest (1.6 / 2.0 / 2.5)."""
-    reg = str(regime or "NEUTRAL").strip().upper()
+    """Regime × structure × VIX dynamic R:R floor for Invest (1.6 / 2.0 / 2.5).
+
+    v5.5.7: the VIX tighten line is folded in here so the morning report, Researcher prompt,
+    Critic prompt and Python guardrail all read one and the same number (no more 2.0 vs 2.5
+    split). A high-VIX tape tightens NEUTRAL to the 2.5 defensive floor.
+    """
+    reg = str(regime or "NEUTRAL").strip().upper().replace("-", "_")
     base_neutral = float(
         getattr(strategy, "invest_min_rr_neutral", None)
         or getattr(strategy, "min_rr_ratio", INVEST_MIN_RR_NEUTRAL)
@@ -475,9 +507,14 @@ def resolve_invest_dynamic_rr_floor(
         getattr(strategy, "invest_min_rr_risk_on_leader", INVEST_MIN_RR_RISK_ON_LEADER)
     )
     rr_weak = float(getattr(strategy, "invest_min_rr_weak_or_risk_off", INVEST_MIN_RR_WEAK_OR_RISK_OFF))
+    vix_threshold = float(
+        getattr(strategy, "invest_vix_tighten_rr_threshold", 22.0) or 22.0
+    )
+    vix_high = bool(vix is not None and float(vix) >= vix_threshold)
 
     is_weak = bool(
         reg == "RISK_OFF"
+        or vix_high
         or (
             tech is not None
             and (
@@ -487,6 +524,8 @@ def resolve_invest_dynamic_rr_floor(
         )
     )
     if is_weak:
+        if vix_high and reg != "RISK_OFF":
+            return rr_weak, f"高波防御门槛(VIX≥{vix_threshold:.0f})"
         return rr_weak, "弱势/防御高赔率门槛"
     if reg == "RISK_ON" and _is_right_side_leader(tech):
         return min(rr_leader, base_neutral), "RISK_ON右侧强结构"

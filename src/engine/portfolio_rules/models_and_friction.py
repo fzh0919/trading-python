@@ -122,6 +122,8 @@ class RiskOverrideResult(BaseModel):
     applied: bool = False
     overrides: list[RiskOverrideRecord] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # v5.5.7: per-ticket deterministic sizing ("ACCT|SYMBOL" -> sizing dict) for exact cash notes.
+    sizing_map: dict[str, Any] = Field(default_factory=dict)
 
 
 def _is_uk_listing(yahoo_symbol: str, inst_currency: str) -> bool:

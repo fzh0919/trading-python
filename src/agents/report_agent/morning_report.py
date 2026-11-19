@@ -101,9 +101,13 @@ def _build_regime_anchor_text(
     cfg: AppConfig,
     gate_preview: dict[str, Any] | None,
     current_regime: str,
+    *,
+    vix: float | None = None,
 ) -> str:
     """Deterministic Regime / dynamic R:R anchor prepended to the shared Bull/Bear/PM context."""
-    rr_floor, rr_tier = resolve_invest_dynamic_rr_floor(current_regime, None, cfg.strategy)
+    rr_floor, rr_tier = resolve_invest_dynamic_rr_floor(
+        current_regime, None, cfg.strategy, vix=vix
+    )
     regime_reason = ""
     isa_status = "未启用门控"
     invest_status = "未启用门控"
@@ -111,6 +115,12 @@ def _build_regime_anchor_text(
         regime_reason = str(gate_preview.get("regime_reason") or "").strip()
         isa_g = gate_preview.get("isa") or {}
         inv_g = gate_preview.get("invest") or {}
+        if isinstance(inv_g, dict):
+            # v5.5.7: the gate already resolved the VIX-inclusive floor — quote it verbatim.
+            if inv_g.get("invest_min_rr_floor") is not None:
+                rr_floor = float(inv_g.get("invest_min_rr_floor") or rr_floor)
+            if inv_g.get("invest_rr_tier_label"):
+                rr_tier = str(inv_g.get("invest_rr_tier_label"))
         if isinstance(isa_g, dict) and isa_g.get("status"):
             isa_status = f"{isa_g.get('status')}（{isa_g.get('reason') or '无补充理由'}）"
         if isinstance(inv_g, dict) and inv_g.get("status"):
@@ -582,7 +592,12 @@ async def generate_morning_report(
             if isinstance(entry, dict):
                 entry["evaluations"] = evals_by_sym.get(sym_key, [])
     context_pack["regime"] = current_regime
-    regime_anchor = _build_regime_anchor_text(cfg, gate_preview, current_regime)
+    regime_anchor = _build_regime_anchor_text(
+        cfg,
+        gate_preview,
+        current_regime,
+        vix=(macro.vix if (macro is not None and macro.vix is not None) else None),
+    )
     shared_context = (
         f"时间：英国时间 {now_uk}（{get_uk_weekday_label()} | {dst_note}）\n\n"
         f"{regime_anchor}\n\n"

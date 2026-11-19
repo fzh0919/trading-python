@@ -46,7 +46,11 @@ from src.data_providers.t212_client import (
 from src.engine.calendar_utils import get_market_calendar_alerts, get_us_market_schedule_uk
 from src.engine.portfolio_rules import (
     HoldingEvaluation,
+    _estimate_entry_friction_pct,
+    _estimate_pending_order_gbp,
+    _rescale_price_pair,
     apply_risk_override_guardrail,
+    evaluate_isa_value_gate,
     evaluate_portfolio,
     format_evaluations_text,
 )
@@ -73,11 +77,26 @@ _DISTRIBUTING_CORE_ETFS = {
 }
 
 
-def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
+def _format_gate_constraint_block(
+    gate_ctx: dict[str, Any],
+    portfolio: PortfolioData | None = None,
+) -> str:
     """Render the deterministic deployment-gate constraints for Researcher/Critic prompts."""
     isa_g = gate_ctx.get("isa") if isinstance(gate_ctx.get("isa"), dict) else {}
     inv_g = gate_ctx.get("invest") if isinstance(gate_ctx.get("invest"), dict) else {}
     lines = ["【今日组合门控约束（确定性底线，严禁违反）】"]
+    # v5.5.7: sync with today's /report approval + live pending BUY orders so /pick never
+    # re-issues a core ticket that the morning report (or a resting order) already funded.
+    approved_core_gbp = float(isa_g.get("approved_report_core_gbp") or 0.0)
+    pending_buy_syms: set[str] = set()
+    if portfolio is not None:
+        for order in portfolio.all_pending_orders():
+            if str(getattr(order, "side", "") or "").strip().upper() != "BUY":
+                continue
+            for raw in (getattr(order, "yahoo_symbol", ""), getattr(order, "ticker", "")):
+                sym = str(raw or "").strip().upper()
+                if sym:
+                    pending_buy_syms.update({sym, sym.split(".")[0]})
     if isa_g.get("isa_satellite_saturated"):
         lines.append(
             f"• ISA 个股卫星层已饱和（持仓+挂单 {isa_g.get('committed_satellite_count')}只/"
@@ -91,13 +110,23 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
     if isa_g.get("prefer_core_diversifier"):
         plan = isa_g.get("core_allocation_plan") if isinstance(isa_g.get("core_allocation_plan"), dict) else {}
         tickets = plan.get("tickets") or []
-        if tickets:
+        if approved_core_gbp > 0.0:
+            lines.append(
+                f"• 今日 /report 已批核心宽基定投 £{approved_core_gbp:,.0f}，/pick 不再重复签发核心宽基票据："
+                "专注 Invest 右侧机会或必要换仓（同日双通道重复扣减现金为硬拦截）。"
+            )
+        elif tickets:
             t = tickets[0]
+            ticket_sym = str(t.get("symbol") or "").strip().upper()
+            already_pending = bool(
+                ticket_sym and ticket_sym in pending_buy_syms
+            )
             lines.append(
                 f"• 今日核心宽基政策票据：{t.get('symbol')}（子桶 {t.get('sleeve_label')} "
                 f"{float(t.get('current_pct') or 0.0):.1f}%→目标 {float(t.get('target_pct') or 0.0):.1f}%），"
                 f"金额上限 £{float(t.get('recommended_gbp') or 0.0):,.0f}；"
                 "只能按该代码执行，严禁自行换代码或超额；已持有子桶走 top_actions ADD。"
+                + ("该标的已挂单执行中，勿重复建仓。" if already_pending else "")
             )
         else:
             lines.append(
@@ -108,6 +137,11 @@ def _format_gate_constraint_block(gate_ctx: dict[str, Any]) -> str:
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
     )
+    if inv_g.get("invest_min_rr_floor") is not None:
+        lines.append(
+            f"• Invest 当日动态净 R:R 门槛 ≥{float(inv_g.get('invest_min_rr_floor') or 0.0):.1f}:1"
+            f"（{inv_g.get('invest_rr_tier_label') or '动态门槛'}；含摩擦止损分母，Python 独立复算）。"
+        )
     committed_heat = float(inv_g.get("committed_heat_pct") or 0.0)
     heat_cap = float(inv_g.get("heat_cap_pct") or 0.0)
     unit_risk = float(inv_g.get("unit_risk_gbp") or 0.0)
@@ -212,6 +246,14 @@ def _apply_gate_channel_constraints(
             # Themed / dividend / bond ETFs are NOT core wide-base vehicles: in Invest they
             # must obey the same slot, daily-cap and regime channel as single-name equities.
             is_core_etf = bool(is_etf and (sym in etf_set or base in etf_set))
+            if acct == "INVEST" and not is_core_etf and act_up in {"BUY", "ADD"}:
+                existing_pending = pending_buy_by_acct.get("INVEST", set())
+                if sym in existing_pending or base in existing_pending:
+                    notes.append(
+                        f"{_GUARDRAIL_TAG} [{item.account}] {item.symbol}({item.action}→拦截): "
+                        "Invest 已有该标的未成交买入挂单，严禁重复建仓叠加热力"
+                    )
+                    continue
             bundle = None
             if bundles:
                 bundle = bundles.get(sym) or bundles.get(base)
@@ -411,8 +453,14 @@ def _lookup_ci(mapping: dict[str, Any], symbol: str) -> Any:
 def _extract_morning_audit_context(
     context_pack: dict[str, Any] | None,
     morning_report_full: str = "",
+    *,
+    portfolio: PortfolioData | None = None,
 ) -> tuple[str, dict[str, list[str]], list[dict[str, Any]]]:
-    """Extract /report top_actions & pending_order_audits for /pick alignment and screener tagging."""
+    """Extract /report top_actions & pending_order_audits for /pick alignment and screener tagging.
+
+    v5.5.7: verdicts already executed/repriced since 07:30 are dropped by diffing against the
+    live portfolio (a filled or cancelled order must not reappear as today's open verdict).
+    """
     report_dec = (
         context_pack.get("report_decision")
         if isinstance(context_pack, dict) and isinstance(context_pack.get("report_decision"), dict)
@@ -424,6 +472,22 @@ def _extract_morning_audit_context(
     pending_audits = [
         item for item in (report_dec.get("pending_order_audits") or []) if isinstance(item, dict)
     ]
+    live_pending: set[str] = set()
+    live_held: set[str] = set()
+    if portfolio is not None:
+        for order in portfolio.all_pending_orders():
+            for raw in (getattr(order, "yahoo_symbol", ""), getattr(order, "ticker", "")):
+                s = str(raw or "").strip().upper()
+                if s:
+                    live_pending.update({s, s.split(".")[0]})
+        for pos in portfolio.all_positions():
+            for raw in (getattr(pos, "yahoo_symbol", ""), getattr(pos, "ticker", "")):
+                s = str(raw or "").strip().upper()
+                if s:
+                    live_held.update({s, s.split(".")[0]})
+
+    def _live(sym: str, pool: set[str]) -> bool:
+        return bool(sym and (sym in pool or sym.split(".")[0] in pool))
 
     lines: list[str] = []
     symbol_tags: dict[str, list[str]] = {}
@@ -435,6 +499,8 @@ def _extract_morning_audit_context(
         pz = str(act.get("price_zone") or "").strip()
         reason = str(act.get("reason") or "").strip()
         if not sym or sym == "CASH":
+            continue
+        if portfolio is not None and verb in {"TRIM", "STOP", "HOLD"} and not _live(sym, live_held):
             continue
         pz_part = f" @ {pz}" if pz else ""
         lines.append(f"• [持仓裁决] [{acct}] {verb} {sym}{pz_part} — {reason}")
@@ -448,6 +514,8 @@ def _extract_morning_audit_context(
         summary = str(aud.get("order_summary") or "").strip()
         reason = str(aud.get("reason") or "").strip()
         if not sym:
+            continue
+        if portfolio is not None and not _live(sym, live_pending):
             continue
         lines.append(f"• [挂单裁决] [{acct}] {sym} ({summary}) →【{verdict}】{reason}")
         if verdict in {"CANCEL", "MODIFY", "KEEP"}:
@@ -496,9 +564,31 @@ def _prefilter_row(candidate: ScreenerCandidate) -> str:
         state.append("已持有")
     if candidate.overlap_warning:
         state.append("高重叠")
+    # v5.5.7: the ID filter now sees the odds/friction metrics that actually decide the ticket.
+    metrics = candidate.filter_metrics or {}
+    metric_bits: list[str] = []
+    sector = str(metrics.get("sector") or "").strip()
+    region = str(metrics.get("region") or "").strip()
+    location = "/".join(x for x in (sector, region) if x)
+    if location:
+        metric_bits.append(location)
+    if metrics.get("target_upside_pct") is not None:
+        metric_bits.append(f"目标{float(metrics['target_upside_pct']):+.0f}%")
+    if metrics.get("atr_pct") is not None:
+        metric_bits.append(f"ATR14 {float(metrics['atr_pct']):.1f}%")
+    if metrics.get("rs_60d_pct") is not None:
+        metric_bits.append(f"60日RS {float(metrics['rs_60d_pct']):+.1f}%")
+    if candidate.track != "ISA_LONG_TERM" and metrics.get("est_rr") is not None:
+        metric_bits.append(f"预估R:R {float(metrics['est_rr']):.2f}:1")
+    if candidate.track == "ISA_LONG_TERM":
+        if metrics.get("mos_pct") is not None:
+            metric_bits.append(f"安全边际 {float(metrics['mos_pct']):+.1f}%")
+        if metrics.get("fcf_yield_pct") is not None:
+            metric_bits.append(f"FCF {float(metrics['fcf_yield_pct']):.1f}%")
+    metrics_str = f" | {' | '.join(metric_bits)}" if metric_bits else ""
     return (
         f"{candidate.symbol} | {candidate.track} | 分 {candidate.score:.1f} | {dims or '无维度'} | "
-        f"{candidate.asset_type}/{candidate.currency or '?'} | 优点 {pros or '-'} | 风险 {cons or '-'} | "
+        f"{candidate.asset_type}/{candidate.currency or '?'}{metrics_str} | 优点 {pros or '-'} | 风险 {cons or '-'} | "
         f"形态 {patterns or '-'} | {'/'.join(state) or '无'}"
     )
 
@@ -654,44 +744,234 @@ async def _fetch_candidate_symbol_lessons(
     return out
 
 
-def _build_holding_identity_section(
-    tracked_syms: list[str],
-    held_bundles: dict[str, TickerMarketBundle],
-    isin_map: dict[str, str],
-    pack_symbols: dict[str, Any],
+def _build_proposal_fact_card(
+    research_output: str,
+    *,
+    isa_cands: list[ScreenerCandidate],
+    invest_cands: list[ScreenerCandidate],
+    merged_bundles: dict[str, TickerMarketBundle],
+    tech_map: dict[str, Any],
+    stage2_tech: dict[str, Any],
+    toolkit: MarketToolkit,
+    portfolio: PortfolioData,
+    cfg: AppConfig,
+    macro: Any,
+    regime: str,
+) -> tuple[str, set[str]]:
+    """0-token one-hand fact card for the Critic, restricted to a strict symbol whitelist.
+
+    The whitelist is the intersection of the Researcher's prose with symbols that really exist in
+    this cycle's candidates / inspect cache / holdings, so words like ATR/RSI/VIX/ISA can never be
+    mistaken for tickers.
+    """
+    candidate_corr: dict[str, tuple[float | None, str | None]] = {}
+    candidate_syms: list[str] = []
+    for cand in (*isa_cands, *invest_cands):
+        sym_up = cand.symbol.strip().upper()
+        if not sym_up:
+            continue
+        candidate_syms.append(sym_up)
+        candidate_corr[sym_up] = (cand.most_correlated_holding, cand.max_portfolio_corr)
+    inspect_syms = [str(s).strip().upper() for s in getattr(toolkit, "_inspect_cache", {}) or {}]
+    held_syms = [str(s).strip().upper() for s in merged_bundles]
+    whitelist = list(dict.fromkeys([*inspect_syms, *candidate_syms, *held_syms]))
+
+    text_up = str(research_output or "").upper()
+    matched: list[str] = []
+    for sym in whitelist:
+        base = sym.split(".")[0]
+        tokens = {sym, base}
+        hit = any(
+            tok
+            and re.search(rf"(?<![A-Z0-9]){re.escape(tok)}(?![A-Z0-9])", text_up)
+            for tok in tokens
+        )
+        if hit:
+            matched.append(sym)
+        if len(matched) >= 5:
+            break
+    if not matched:
+        return "", set()
+
+    lines = ["【提案标的一手事实卡（Python 独立真源，直接对照核验）】"]
+    crisis = str(regime or "").upper() == "RISK_OFF"
+    for sym in matched:
+        bundle = _lookup_ci(merged_bundles, sym)
+        tech = _lookup_ci(stage2_tech, sym) or _lookup_ci(tech_map, sym)
+        if bundle is None and tech is None:
+            continue
+        price = float(bundle.current_price) if (bundle and bundle.current_price) else (
+            float(tech.last_close) if tech is not None else 0.0
+        )
+        ccy = str(getattr(bundle, "currency", "") or "")
+        sector = str(getattr(bundle, "sector", "") or getattr(bundle, "industry", "") or "")[:16]
+        region = "UK" if sym.endswith(".L") else ("EU" if sym.endswith((".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".F")) else "US")
+        atr_txt = (
+            f"{float(tech.atr14):.2f}({float(tech.atr_pct):.1f}%)"
+            if (tech is not None and tech.atr14 is not None and tech.atr_pct is not None)
+            else "N/A"
+        )
+        rsi_txt = f"{float(tech.rsi14):.0f}" if (tech is not None and tech.rsi14 is not None) else "N/A"
+        ma50_txt = f"{float(tech.dist_ma50_pct):+.1f}%" if (tech is not None and tech.dist_ma50_pct is not None) else "N/A"
+        ma200_txt = f"{float(tech.dist_ma200_pct):+.1f}%" if (tech is not None and tech.dist_ma200_pct is not None) else "N/A"
+        corr_sym, corr_val = candidate_corr.get(sym, (None, None))
+        if corr_val is None:
+            corr_entry = (getattr(toolkit, "_corr_cache", {}) or {}).get(sym) or {}
+            corr_val = corr_entry.get("max_correlation_60d")
+            corr_sym = corr_entry.get("most_correlated_holding")
+        corr_txt = f"{corr_sym} {float(corr_val):.2f}" if (corr_val is not None and corr_sym) else "N/A"
+        earn_days = getattr(bundle, "days_to_earnings", None) if bundle is not None else None
+        ex_days = getattr(bundle, "days_to_ex_dividend", None) if bundle is not None else None
+        earn_txt = f"{int(earn_days)}天" if earn_days is not None else "无"
+        ex_txt = f"{int(ex_days)}天" if ex_days is not None else "无"
+        sell_txt = "N/A"
+        if (
+            bundle is not None
+            and (bundle.analyst_count or 0) >= 3
+            and bundle.target_mean_price is not None
+            and bundle.target_mean_price > 0
+            and price > 0
+        ):
+            mean_t = _rescale_price_pair(float(bundle.target_mean_price), price)
+            sell_txt = f"{mean_t:.2f}({int(bundle.analyst_count)}家)"
+        isa_fric = _estimate_entry_friction_pct(sym, bundle, cfg.strategy, "ISA", None)
+        inv_fric = _estimate_entry_friction_pct(
+            sym, bundle, cfg.strategy, "INVEST", portfolio.invest
+        )
+        fric_txt = (
+            f"ISA {isa_fric:.2f}%/Invest {inv_fric:.2f}%"
+            if abs(isa_fric - inv_fric) >= 0.01
+            else f"{isa_fric:.2f}%"
+        )
+        line = (
+            f"• {sym} [{sector or '-'}/{region}] | 现价 {price:.2f} {ccy} | ATR14 {atr_txt} | RSI14 {rsi_txt}"
+            f" | 距MA50/MA200 {ma50_txt}/{ma200_txt} | 60日最大持仓相关 {corr_txt}"
+            f" | 财报 {earn_txt} | 除息 {ex_txt} | 卖方均值 {sell_txt} | 摩擦 {fric_txt}"
+        )
+        if sym.endswith(".L") and not str(getattr(bundle, "quote_type", "") or "").upper() == "ETF":
+            gate = evaluate_isa_value_gate(
+                bundle,
+                tech,
+                macro,
+                cfg.strategy,
+                symbol=sym,
+                crisis_mode=crisis,
+            )
+            line += f" | ISA价值门预判：{'通过' if gate.get('passed') else '未通过'}（{gate.get('summary')}）"
+        lines.append(line)
+    if len(lines) <= 1:
+        return "", set()
+    return "\n".join(lines), set(matched)
+
+
+def _filter_audit_text_for_critic(audit_text: str, proposal_syms: set[str]) -> str:
+    """Keep all live pending-order verdicts, plus only holding verdicts tied to this proposal."""
+    if not audit_text:
+        return ""
+    kept: list[str] = []
+    for line in audit_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "[挂单裁决]" in stripped:
+            kept.append(stripped)
+            continue
+        if "[持仓裁决]" in stripped:
+            upper = stripped.upper()
+            if any(
+                sym and re.search(rf"(?<![A-Z0-9]){re.escape(sym.split('.')[0])}(?![A-Z0-9])", upper)
+                for sym in proposal_syms
+            ):
+                kept.append(stripped)
+    return "\n".join(kept)
+
+
+_ENTRY_GBP_RE = re.compile(r"£\s*([\d,]+(?:\.\d+)?)")
+
+
+def _build_deterministic_cash_note(
+    decision: PickDecision,
+    portfolio: PortfolioData,
+    sizing_map: dict[str, Any] | None,
+    gate_ctx: dict[str, Any] | None,
 ) -> str:
-    """Build compact identity & ex-dividend anchor lines only for symbols near ex-dividend."""
-    lines: list[str] = []
-    for sym in tracked_syms:
-        b = held_bundles.get(sym)
-        pack_entry = _lookup_ci(pack_symbols, sym) if pack_symbols else None
-        anchor = ""
-        ex_div_date = None
-        days_to_ex_div = None
-        if b is not None:
-            anchor = b.identity_summary or b.build_identity_anchor(isin_override=isin_map.get(sym))
-            ex_div_date = b.ex_dividend_date
-            days_to_ex_div = b.days_to_ex_dividend
-        if not anchor and isinstance(pack_entry, dict):
-            anchor = str(pack_entry.get("identity_summary") or "").strip()
-        if isinstance(pack_entry, dict) and ex_div_date is None:
-            bsum = pack_entry.get("bundle_summary") or {}
-            if isinstance(bsum, dict):
-                ex_div_date = bsum.get("ex_dividend_date")
-                days_to_ex_div = bsum.get("days_to_ex_dividend")
-        if days_to_ex_div is None:
+    """Python-owned post-execution cash line so a Critic's pre-interception arithmetic can't leak."""
+    sizing_map = sizing_map or {}
+    isa_g = gate_ctx.get("isa") if isinstance((gate_ctx or {}).get("isa"), dict) else {}
+    plan = isa_g.get("core_allocation_plan") if isinstance(isa_g.get("core_allocation_plan"), dict) else {}
+    ticket_caps: dict[str, float] = {}
+    for tk in plan.get("tickets") or []:
+        if isinstance(tk, dict) and tk.get("symbol"):
+            ticket_caps[str(tk.get("symbol")).strip().upper()] = float(tk.get("recommended_gbp") or 0.0)
+
+    remaining = {
+        "ISA": float(portfolio.isa.available_to_trade or 0.0),
+        "INVEST": float(portfolio.invest.available_to_trade or 0.0),
+    }
+    pending_gbp: dict[tuple[str, str], float] = {}
+    pos_by_sym = {p.yahoo_symbol.upper(): p for p in portfolio.all_positions()}
+    for order in portfolio.all_pending_orders():
+        if str(order.side or "").strip().upper() != "BUY":
             continue
-        try:
-            days_val = int(days_to_ex_div)
-        except (TypeError, ValueError):
+        acct = str(order.account or "").strip().upper()
+        sym = str(order.yahoo_symbol or order.ticker or "").strip().upper()
+        if not sym:
             continue
-        if not (-3 <= days_val <= 7):
+        pending_gbp[(acct, sym)] = pending_gbp.get((acct, sym), 0.0) + float(
+            _estimate_pending_order_gbp(order, pos_by_symbol=pos_by_sym) or 0.0
+        )
+
+    for item in decision.selected_actions:
+        act = str(item.action or "").strip().upper()
+        if act not in {"BUY", "ADD", "SWAP"}:
             continue
-        ex_note = ""
-        if ex_div_date:
-            ex_note = f" | 除息日 {ex_div_date}({days_val}天后)"
-        lines.append(f"• {anchor or sym}{ex_note}")
-    return "\n".join(lines)
+        acct = str(item.account or "").strip().upper()
+        sym = str(item.symbol or "").strip().upper()
+        if acct not in remaining or not sym:
+            continue
+        size = sizing_map.get(f"{acct}|{sym}") or {}
+        suggested = float(size.get("suggested_gbp") or 0.0) if isinstance(size, dict) else 0.0
+        planned_raw = getattr(item, "planned_amount_gbp", None)
+        planned: float | None = None
+        if planned_raw is not None and float(planned_raw) > 0:
+            planned = float(planned_raw)
+            if acct == "INVEST" and suggested > 0:
+                planned = min(planned, suggested)
+            elif acct == "ISA":
+                cap = ticket_caps.get(sym) or ticket_caps.get(sym.split(".")[0]) or 0.0
+                if cap > 0:
+                    planned = min(planned, cap)
+        if planned is None and suggested > 0:
+            planned = suggested
+        if planned is None:
+            zone = str(getattr(item, "entry_zone", "") or "")
+            match = _ENTRY_GBP_RE.search(zone)
+            if match:
+                try:
+                    planned = float(match.group(1).replace(",", ""))
+                except ValueError:
+                    planned = None
+        if planned is None or planned <= 0:
+            continue
+        existing = pending_gbp.get((acct, sym), 0.0)
+        if existing <= 0:
+            existing = pending_gbp.get((acct, sym.split(".")[0]), 0.0)
+        deduction = max(0.0, float(planned) - float(existing))
+        remaining[acct] = max(0.0, remaining[acct] - deduction)
+
+    cash_line = (
+        f"Python精确余现：ISA £{remaining['ISA']:,.0f} / Invest £{remaining['INVEST']:,.0f}"
+        "（已扣本次执行额，不重复扣挂单）"
+    )
+    critic_note = str(decision.consistency_and_cash_note or "").strip()
+    if not critic_note:
+        return cash_line
+    combined = f"{cash_line}；{critic_note[:45]}"
+    if len(combined) > 95:
+        # v5.5.7: the cash line is the non-negotiable tail — trim the critic declaration instead.
+        tail_budget = 95 - len(cash_line) - 1
+        combined = f"{cash_line}；{critic_note[:tail_budget]}" if tail_budget > 4 else cash_line
+    return combined
 
 
 def _collect_high_correlation_symbols(
@@ -754,6 +1034,20 @@ def _collect_high_correlation_symbols(
     return high_corr
 
 
+_CORE_ETF_CN_ALIASES: dict[str, tuple[str, ...]] = {
+    "ISF": ("富时100", "FTSE100", "FTSE 100"),
+    "VUKE": ("富时100", "FTSE100", "FTSE 100"),
+    "VUSA": ("标普500", "S&P500", "S&P 500"),
+    "IUSA": ("标普500", "S&P500", "S&P 500"),
+    "SPY": ("标普500", "S&P500", "S&P 500"),
+    "VERX": ("标普500", "S&P500"),
+    "VWRL": ("全球宽基", "全球ETF"),
+    "VWRP": ("全球宽基", "全球ETF"),
+    "VEUR": ("欧股宽基", "欧洲宽基"),
+    "IMEU": ("欧股宽基", "欧洲宽基"),
+}
+
+
 def _reconcile_pick_headline(
     decision: PickDecision,
     *,
@@ -762,7 +1056,7 @@ def _reconcile_pick_headline(
     """Keep PickDecision.headline consistent after Python guardrails intercept actions.
 
     Prevents semantic-audit violations where the LLM-written headline still promotes
-    a ticker that was subsequently stripped from `selected_actions` by guardrails.
+    a ticker (or its Chinese broad-base alias) that was subsequently stripped by guardrails.
     """
     orig_syms = {
         str(getattr(a, "symbol", "") or "").strip().upper()
@@ -800,12 +1094,23 @@ def _reconcile_pick_headline(
         for tok in check_tokens
     )
     if not leaked:
+        # v5.5.7: also catch Chinese broad-base aliases leaking the intercepted core ETF.
+        headline_raw = str(decision.headline or "")
+        alias_tokens: set[str] = set()
+        for sym in intercepted_syms:
+            base = sym.split(".")[0]
+            if base in kept_bases:
+                continue
+            for alias in _CORE_ETF_CN_ALIASES.get(base, ()):
+                alias_tokens.add(alias)
+        leaked = any(alias in headline_raw for alias in alias_tokens)
+    if not leaked:
         return decision
 
-    parts = [f"{a.account} {a.action} {a.symbol}" for a in kept_actions[:3]]
-    rebuilt = f"风控筛后执行：{' / '.join(parts)}"
-    if len(rebuilt) > 45:
-        rebuilt = rebuilt[:44] + "…"
+    parts = [f"{a.account} {a.action} {a.symbol}" for a in kept_actions[:2]]
+    rebuilt = f"风控筛后执行：{'、'.join(parts)}，其余现金待命"
+    if len(rebuilt) > 55:
+        rebuilt = rebuilt[:54] + "…"
     return decision.model_copy(update={"headline": rebuilt})
 
 
@@ -873,7 +1178,15 @@ async def _post_screen_validate_decision(
                 item = item.model_copy(update={"entry_price": round(resolved_price, 4)})
         hydrated_actions.append(item)
 
-    hydrated_decision = decision.model_copy(update={"selected_actions": hydrated_actions})
+    hydrated_decision = decision.model_copy(
+        update={
+            "selected_actions": [
+                a.model_copy(update={"risk_note": ""}) for a in hydrated_actions
+            ],
+            # v5.5.7: Python owns these fields — never trust the model's leftovers.
+            "rejected_or_frozen": [],
+        }
+    )
     # v5.5.1 排雷: new candidates have no held tech snapshot, so ISA value / Invest dynamic R:R
     # checks would otherwise run blind. Build one unified tech map (held + this round's picks).
     all_tech_map: dict[str, TechnicalSnapshot] = {}
@@ -896,6 +1209,12 @@ async def _post_screen_validate_decision(
         recent_days=7,
         history_days=cfg.strategy.order_history_days,
         cooldown_days=cfg.strategy.rebuy_cooldown_days,
+        exempt_symbols={
+            str(s).strip().upper()
+            for s in ((deployment_gate or {}).get("etf_set") or [])
+            if str(s).strip()
+        }
+        | {str(cfg.strategy.benchmark_symbol).strip().upper()},
     )
     # v5.4.0: gate-linked sizing — after a loss-streak cooldown the recovery pilot runs at
     # half risk (0.5R ≈ £42.5) so the suggested share count scales automatically.
@@ -937,6 +1256,18 @@ async def _post_screen_validate_decision(
         final_decision,
         original_actions=hydrated_decision.selected_actions,
     )
+    # v5.5.7: Python recomputes the post-execution cash line after every guardrail, so a Critic's
+    # pre-interception arithmetic (and double-deducted pending orders) can never reach Telegram.
+    final_decision = final_decision.model_copy(
+        update={
+            "consistency_and_cash_note": _build_deterministic_cash_note(
+                final_decision,
+                portfolio,
+                override_res.sizing_map,
+                gate_ctx,
+            )
+        }
+    )
     final_text = render_pick_report(
         final_decision,
         max_chars=1000,
@@ -966,12 +1297,24 @@ async def _post_screen_validate_decision(
             "BUY",
             "ADD",
         }
+        # v5.5.7: the T+5/T+20 settlement anchor is always the live market price — an LLM's
+        # optimistic entry/limit can never pollute attribution.
+        anchor_bundle = _lookup_ci(all_bundles, item.symbol)
+        anchor_price = (
+            float(anchor_bundle.current_price)
+            if (
+                anchor_bundle is not None
+                and anchor_bundle.current_price is not None
+                and float(anchor_bundle.current_price) > 0
+            )
+            else (item.entry_price if item.entry_price > 0 else None)
+        )
         parsed_picks.append(
             {
                 "account": item.account,
                 "symbol": item.symbol,
                 "action": item.action,
-                "entry_price": item.entry_price if item.entry_price > 0 else None,
+                "entry_price": anchor_price,
                 "thesis": item.thesis,
                 "horizon_days": 20 if is_core_dca else cfg.strategy.settlement_holding_days,
                 "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
@@ -999,6 +1342,7 @@ async def _post_screen_validate_decision(
                 evals=evals,
                 trade_ctx=trade_ctx,
                 guardrails=guardrails,
+                candidate_bundles=all_bundles,
             ),
             rendered_text=final_text,
             strategy=cfg.strategy,
@@ -1070,10 +1414,20 @@ async def generate_pick_radar(
     morning_report_full, morning_conclusion = baseline_text, baseline_conclusion
 
     # Feed the latest GBP/USD mid so subsequent Invest wallet splits can be derived locally.
+    # v5.5.7: mirror /report — re-derive the in-memory portfolio FX BEFORE any cash/wallet text
+    # is built, otherwise the precise cash base still prints "GBP/USD 暂缺" on a cold start.
     if getattr(macro, "gbp_usd", None):
-        set_rate = getattr(t212, "set_gbp_usd_rate", None)
-        if callable(set_rate):
-            set_rate(macro.gbp_usd)
+        refresh_fx = getattr(t212, "refresh_portfolio_fx", None)
+        if callable(refresh_fx):
+            try:
+                portfolio = refresh_fx(portfolio, macro.gbp_usd) or portfolio
+            except Exception as exc:
+                logger.debug("In-place portfolio FX refresh skipped: %s", exc)
+                refresh_fx = None
+        if not callable(refresh_fx):
+            set_rate = getattr(t212, "set_gbp_usd_rate", None)
+            if callable(set_rate):
+                set_rate(macro.gbp_usd)
 
     # Step 2: Load curated 150-stock active pool (if auditioned) & reuse held_histories in quant screener
     active_pool_rows: list[dict[str, Any]] = []
@@ -1084,6 +1438,35 @@ async def generate_pick_radar(
             logger.debug("Failed loading active_universe_pool; falling back to config.yaml: %s", exc)
             active_pool_rows = []
 
+    # v5.5.7: channel short-circuits + cooldown pre-filter. A closed ISA equity channel or a
+    # hard-mode 15-day re-buy cooldown must never burn Stage-2 IO / DeepSeek tokens.
+    gate_isa = gate_ctx.get("isa") if isinstance(gate_ctx, dict) and isinstance(gate_ctx.get("isa"), dict) else {}
+    has_focus = bool(focus_query.strip())
+    enable_isa_equities = has_focus or (gate_isa.get("equity_open") is not False)
+    enable_isa_etfs = has_focus or (gate_isa.get("etf_open") is not False)
+    cooldown_excluded: set[str] = set()
+    core_etf_exempt = {
+        str(s).strip().upper()
+        for s in ((gate_ctx or {}).get("etf_set") or [])
+        if str(s).strip()
+    } | {str(cfg.strategy.benchmark_symbol).strip().upper()}
+    if str(getattr(cfg.strategy, "trade_cadence_guard_mode", "advisory")).lower() == "hard":
+        try:
+            early_behavior = compute_trade_behavior_stats(
+                portfolio,
+                recent_days=7,
+                history_days=cfg.strategy.order_history_days,
+                cooldown_days=cfg.strategy.rebuy_cooldown_days,
+                exempt_symbols=core_etf_exempt,
+            )
+            cooldown_excluded = {
+                str(row.get("ticker") or "").strip().upper()
+                for row in (early_behavior.get("recently_closed") or [])
+                if row.get("in_cooldown") and str(row.get("ticker") or "").strip()
+            }
+        except Exception as exc:
+            logger.debug("Cooldown pre-filter skipped in /pick: %s", exc)
+
     screener_kwargs: dict[str, Any] = {
         "portfolio": portfolio,
         "market_data": market_data,
@@ -1092,6 +1475,9 @@ async def generate_pick_radar(
         "strategy": cfg.strategy,
         "existing_histories": held_histories,
         "top_n_per_track": cfg.strategy.pick_wide_funnel_top_n,
+        "enable_isa_equities": enable_isa_equities,
+        "enable_isa_etfs": enable_isa_etfs,
+        "excluded_symbols": cooldown_excluded or None,
     }
     if active_pool_rows:
         screener_kwargs["active_pool_rows"] = active_pool_rows
@@ -1101,6 +1487,12 @@ async def generate_pick_radar(
     if gate_ctx is not None:
         screener_kwargs["regime_tag"] = str(gate_ctx.get("regime") or "")
 
+    stage2_bundles: dict[str, TickerMarketBundle] = {}
+    stage2_intel: dict[str, dict[str, Any]] = {}
+    stage2_tech: dict[str, TechnicalSnapshot] = {}
+    screener_kwargs["out_bundles"] = stage2_bundles
+    screener_kwargs["out_intel"] = stage2_intel
+    screener_kwargs["out_tech"] = stage2_tech
     isa_cands, invest_cands = await run_quant_screener(**screener_kwargs)
     # Wide funnel -> DeepSeek ID filter: only tickers are selected; the raw candidate objects stay untouched.
     isa_cands, invest_cands = await _prefilter_candidates_with_ds(cfg, llm, isa_cands, invest_cands)
@@ -1113,7 +1505,7 @@ async def generate_pick_radar(
     # v5.4.0: the deterministic deployment gate was parsed above before the screener.
     gate_block = ""
     if gate_ctx is not None and gate_mode == "advise":
-        gate_block = _format_gate_constraint_block(gate_ctx)
+        gate_block = _format_gate_constraint_block(gate_ctx, portfolio)
     if not recent_lessons and isinstance(context_pack, dict):
         pack_recent = context_pack.get("recent_lessons")
         if isinstance(pack_recent, list):
@@ -1139,7 +1531,14 @@ async def generate_pick_radar(
         regime=str((gate_ctx or {}).get("regime") or "NEUTRAL"),
         macro=macro,
     )
-    evals_text = format_evaluations_text(evals)
+    evals_text = format_evaluations_text(
+        evals,
+        collapse_isa_add=bool(
+            isinstance(gate_ctx, dict)
+            and isinstance(gate_ctx.get("isa"), dict)
+            and gate_ctx["isa"].get("equity_open") is False
+        ),
+    )
     exposure_text = compute_exposure_summary(portfolio, held_bundles, histories=held_histories)
     trade_ctx = build_trade_context(
         portfolio,
@@ -1149,11 +1548,13 @@ async def generate_pick_radar(
         tech_map=tech_map,
         histories=held_histories,
         cooldown_days=cfg.strategy.rebuy_cooldown_days,
+        exempt_symbols=core_etf_exempt,
     )
 
     morning_audits_text, morning_symbol_tags, report_top_actions = _extract_morning_audit_context(
         context_pack,
         morning_report_full,
+        portfolio=portfolio,
     )
     isa_cands_text = _format_candidates_with_morning_tags(
         isa_cands, morning_symbol_tags, "（ISA 候选池暂无达标标的）"
@@ -1171,7 +1572,11 @@ async def generate_pick_radar(
         )
     )
     veto_block = "\n".join(f"• {g}" for g in guardrails) if guardrails else "（今日尚未运行 /report，请独立执行全部风控红线检查）"
-    preference_block = format_preference_notes_block(pref_notes)
+    preference_block = (
+        format_preference_notes_block(pref_notes)
+        if bool(getattr(cfg.strategy, "user_preference_memory_enabled", True))
+        else ""
+    )
     us_sched = get_us_market_schedule_uk()
     calendar_alerts = get_market_calendar_alerts()
     calendar_note = f"｜{'；'.join(calendar_alerts)}" if calendar_alerts else ""
@@ -1204,37 +1609,13 @@ async def generate_pick_radar(
     async def _empty_grounding() -> str:
         return ""
 
-    async def _fetch_cand_bundles_cached() -> dict[str, TickerMarketBundle]:
-        missing_cands = [s for s in cand_syms if s not in held_bundles]
-        if not missing_cands:
-            return {}
-        try:
-            _, bmap = await market_data.get_bundles(
-                missing_cands,
-                include_news=True,
-                include_earnings=True,
-            )
-            return bmap
-        except Exception as exc:
-            logger.debug("Pre-populating candidate bundles failed in /pick: %s", exc)
-            return {}
-
-    async def _fetch_cand_deep_intel() -> dict[str, dict[str, Any]]:
-        us_cands = [s for s in cand_syms if "." not in s and hasattr(market_data, "get_us_deep_intel_batch")]
-        if not us_cands or not hasattr(market_data, "get_us_deep_intel_batch"):
-            return {}
-        try:
-            return await market_data.get_us_deep_intel_batch(us_cands)
-        except Exception as exc:
-            logger.debug("Pre-populating candidate US deep intel failed in /pick: %s", exc)
-            return {}
-
     grounding_coro = (
         run_forced_market_grounding(
             llm=llm,
             search_model=cfg.models.search_model,
             scope="pick",
             symbols=cand_syms,
+            priority_symbols=cand_syms[:6],
             focus_query=focus_query,
             ttl_seconds=cfg.app.market_data_ttl_seconds,
             ops_notifier=ops_notifier,
@@ -1244,13 +1625,18 @@ async def generate_pick_radar(
         if cfg.models.enable_forced_search_grounding
         else _empty_grounding()
     )
-    grounding_brief, symbol_lessons, extra_cand_bundles, cand_intel_map = await asyncio.gather(
+    grounding_brief, symbol_lessons = await asyncio.gather(
         grounding_coro,
         _fetch_candidate_symbol_lessons(db, lesson_syms, pack_symbols),
-        _fetch_cand_bundles_cached(),
-        _fetch_cand_deep_intel(),
     )
-    merged_cand_bundles = {**held_bundles, **extra_cand_bundles}
+    merged_cand_bundles = {**held_bundles, **stage2_bundles}
+    cand_intel_map = stage2_intel
+    if grounding_brief:
+        # v5.5.7: one explicit coverage manifest so the Researcher never re-runs search_market_news.
+        grounding_brief = (
+            f"已联网核查清单：[{', '.join(cand_syms) or '无'}]；"
+            "以下结果为最新核查结论，严禁重复调用 search_market_news。\n" + grounding_brief
+        )
     cand_detail_lines: list[str] = []
     for sym in cand_syms:
         b = merged_cand_bundles.get(sym)
@@ -1259,7 +1645,21 @@ async def generate_pick_radar(
         if intel_str:
             parts.append(intel_str)
         if b is not None and b.news:
-            news_str = " / ".join(f"[{n['date']}] {n['title'][:70]}" for n in b.news[:2] if n.get("title"))
+            name_tokens = {
+                sym.upper(),
+                sym.upper().split(".")[0],
+                str(b.short_name or "").strip().upper(),
+            }
+            relevant_news = [
+                n
+                for n in b.news
+                if n.get("title")
+                and any(
+                    tok and tok in str(n.get("title", "")).upper()
+                    for tok in name_tokens
+                )
+            ]
+            news_str = " / ".join(f"[{n['date']}] {n['title'][:70]}" for n in relevant_news[:2])
             if news_str:
                 parts.append(f"新闻: {news_str}")
         if parts:
@@ -1275,12 +1675,6 @@ async def generate_pick_radar(
         symbol_lessons,
         cfg.strategy.settlement_holding_days,
     )
-    identity_text = _build_holding_identity_section(tracked_syms, held_bundles, isin_map, pack_symbols)
-    pack_disagreement_text = (
-        str(context_pack.get("disagreement_text") or "").strip()
-        if isinstance(context_pack, dict)
-        else ""
-    )
 
     toolkit = MarketToolkit(
         market_data,
@@ -1290,6 +1684,7 @@ async def generate_pick_radar(
         ops_notifier=ops_notifier,
         db=db,
         search_cache_ttl_seconds=cfg.app.grounding_cache_ttl_seconds,
+        include_macro_tool=False,
     )
 
     # ---------- Stage 1: Incremental Opportunity Researcher ----------
@@ -1299,11 +1694,15 @@ async def generate_pick_radar(
         "对今日 `/report` 已裁决【CANCEL】或【MODIFY】的活动挂单，以及已裁决【TRIM】/【STOP】的持仓，默认必须严格遵循不得推翻；"
         "仅当你通过工具实查到早报生成之后的突发新公告或股价已显著回落至早报认可区间时，才可提出修正并写明最新依据。\n"
         f"请参考历史 T+{cfg.strategy.settlement_holding_days} 交易日选股复盘教训，避免对近期连续失效的板块或追高形态重复推荐。\n"
-        "请给出不超过 3 条核心提案（ISA 新股或 LSE ETF / Invest 短线催化 / 必要时的卖弱换强），"
-        "每条写清逻辑、介入区间、止损、目标。双轨终审标准："
+        "输出硬约束：总长 ≤1,200 字；共不超过 3 条核心提案（ISA 新股或 LSE ETF / Invest 短线催化 / 必要时的卖弱换强）。\n"
+        "分轨授权 0 提案：某一轨若确实无达标票，直接写『ISA 轨 0 提案』或『Invest 轨 0 提案』即可，"
+        "严禁长篇列举被淘汰代码或复述早报已维持的持仓项；另一轨的有效提案不受影响。\n"
+        "每条提案必须按 5 要素落盘：①标的与账户；②介入区间；③止损位/证伪条件；④目标位与观察周期；"
+        "⑤1 句校准式 Pre-Mortem（格式：最大单点失败路径是 X，但当前 Y 支撑/催化提供对冲；仅当 Z 触发时止损认输）。\n"
+        "双轨终审标准："
         "ISA 价值轨核查护城河质量 + 估值安全边际（常规≥12%、危机日≥20%），允许 `stop_price=0`，"
         "但 `stop_condition` 必须写明基本面/护城河证伪条件，`target_price` 填保守合理估值锚；"
-        "Invest 右侧轨核查当日 Regime 动态 R:R（RISK_ON 领涨≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）"
+        "Invest 右侧轨核查当日 Regime 动态 R:R（以【今日组合门控约束】印出的 Python 确定性门槛为准）"
         "与止损幅≥max(1.5×ATR, 4%)，必填数值 `stop_price>0` 与 `target_price>0`；"
         "若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
         cfg.strategy,
@@ -1328,8 +1727,6 @@ async def generate_pick_radar(
         f"【精确现金底座（禁止自行估算比例）】：{exact_cash_summary}\n"
         f"【宏观快照】：{macro.to_text()}\n"
         f"【行业与跨账户暴露】：\n{exposure_text}\n"
-        + (f"【存量标的身份与除息日历锚点】：\n{identity_text}\n" if identity_text else "")
-        + (f"【今日早报多空冲突摘要（ContextPack）】：\n{pack_disagreement_text}\n" if pack_disagreement_text else "")
         + f"【ISA 账户概览】：{format_account_overview(portfolio.isa).splitlines()[0]}\n"
         f"【Invest 账户概览】：{format_account_overview(portfolio.invest).splitlines()[0]}\n"
         f"【活动挂单】：\n{trade_ctx['pending_orders_text']}\n"
@@ -1355,63 +1752,72 @@ async def generate_pick_radar(
     if research_output.startswith("⚠️"):
         return research_output
 
+    # v5.5.7: 0-token one-hand fact card so the Critic verifies real numbers instead of trusting
+    # the Researcher's second-hand prose (whitelist intersection only — never a loose regex).
+    fact_card_text, proposal_syms = _build_proposal_fact_card(
+        research_output,
+        isa_cands=isa_cands,
+        invest_cands=invest_cands,
+        merged_bundles=merged_cand_bundles,
+        tech_map=tech_map,
+        stage2_tech=stage2_tech,
+        toolkit=toolkit,
+        portfolio=portfolio,
+        cfg=cfg,
+        macro=macro,
+        regime=str((gate_ctx or {}).get("regime") or "NEUTRAL"),
+    )
+    critic_audits_text = _filter_audit_text_for_critic(morning_audits_text, proposal_syms)
+
     # ---------- Stage 2: Risk & Bear Critic -> Structured PickDecision ----------
     critic_sys = build_agent_system_instruction(
-        "你是独立风控官（Risk & Bear Critic）。请按下列六重护栏与今日 `/report` 红线严格审核投研员提案，"
+        "你是独立风控官（Risk & Bear Critic）。请按下列【六重护栏（精炼版）】与今日 `/report` 红线审核投研员提案，"
         "直接输出最终结构化 JSON Decision（渲染后将限制在 1000 字内，结论置顶、废话为零）。\n\n"
-        "【六重护栏】：\n"
-        f"1. 盈亏比与摩擦：按目标空间扣除交易摩擦（ISA 美欧往返 {cfg.strategy.fx_fee_pct * 2:.2f}% / 英股买入 {cfg.strategy.uk_stamp_duty_pct:.1f}%印花税 + 买卖价差估算；"
-        f"Invest 双钱包同币种 0% 换汇、跨币种单边 {cfg.strategy.fx_fee_pct:.2f}%）计算 R:R；"
-        f"双轨门槛：ISA 价值个股不核价格止损 R:R，改核「质量门 + 安全边际（常规≥12% / 危机≥20%）」，"
-        f"Invest 按当日 Regime 动态 R:R（RISK_ON 领涨≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）且止损幅≥max(1.5×ATR, 4%)，未达标一律否决；"
-        "R:R 必须给出可复算的数字：Invest 个股与非核心主题 ETF 必须填数值 `stop_price` 与 `target_price`（标的本地货币数值，禁止只写在 stop_condition / entry_zone 文本里）；"
-        "ISA 长线价值个股可填 `stop_price=0`，但必须在 `stop_condition` 写明基本面/护城河证伪条件；"
-        "Python 会按 entry_price 与这两个价独立复算，并与分析师目标均值交叉校验（非 RISK_ON 领涨股偏离>15% 以均值复核）；"
-        f"GBP {cfg.strategy.cash_interest_rate_pct:.1f}% / USD {cfg.strategy.usd_cash_interest_rate_pct:.1f}% 现金利息仅作等待期保底，不得作为否决理由。\n"
-        "2. 穿透科技暴露：结合上下文“穿透后真实科技暴露(估算)”（ETF 隐含科技 + 直接科技个股），加仓后科技因子明显集中的须降级或改用低科技权重宽基。\n"
-        f"3. 频率与冷却（模式 {cfg.strategy.trade_cadence_guard_mode}）：近 7 天参考 ≤{cfg.strategy.max_weekly_new_buys} 笔、"
-        f"近 30 天 ≤{cfg.strategy.max_monthly_new_buys} 笔，清仓 {cfg.strategy.rebuy_cooldown_days} 天内同标的回补需谨慎；"
-        + (
-            "该约束由 Python 硬拦截，不要重复推荐已被拦截的标的。\n"
-            if str(cfg.strategy.trade_cadence_guard_mode).lower() == "hard"
-            else "若确有必要超额开仓或抢回补（强催化/避险切换），必须在该条 thesis 写明破例依据。\n"
-        )
-        + f"4. 相关性与行业红线：与当前持仓 60 日相关性 >= {cfg.strategy.overlap_correlation_threshold:.2f}、或违背 `/report` 今日红线名单的标的必须驳回。\n"
-        "5. 财报/除息/过热排雷：5日内财报、RSI>=72 追高全部否决或降级；"
-        f"距除息 ≤{cfg.strategy.ex_div_entry_guard_days} 天的新建仓必须在 thesis 写明是「抢息」还是「等除息后再买」，"
-        "Invest 应税轨须按股息税后净额计入 R:R（ISA 股息免税可忽略），除息数据见候选行的「除息」标注；"
-        "结合历史复盘教训，近期连续失效板块/追高形态从严否决。\n"
-        "6. 一致性、精确现金与零内部对话外泄：严格继承 `/report` 红线与挂单/持仓裁决"
-        "（对早报已裁决 CANCEL/MODIFY 的活动挂单及 TRIM/STOP 的持仓，除非投研员提供早报之后的新催化或股价显著跌至早报认可区间的新证据，否则不得推翻或继续按早报否决的旧价位推荐；"
-        "仅用提供的精确现金数字与比例，禁止自行瞎编比例）；"
-        "若当前为周末/休市且有推荐标的，请在 headline 标明“下周一开盘/限价挂单参考”；"
-        "禁止任何内部审查对话外泄：`headline` 严禁提及任何未入选、淘汰或被你否决的股票代码/方向（严禁出现“驳回XX”等字样），只写最终入选标的与现金安排；"
-        "`rejected_or_frozen` 一律返回空数组 `[]`（不要列举任何未入选候选或否决理由，节省输出字数）；"
+        "【六重护栏（精炼版）】：\n"
+        "1. 盈亏比与摩擦：Invest 必须给出标的本地货币的数值 `stop_price>0` 与 `target_price>0`；"
+        "Python 会按含摩擦止损分母独立复算净 R:R，并以【今日组合门控约束】印出的当日确定性门槛与 ATR 噪声地板裁决；"
+        "ISA 长线价值个股可填 `stop_price=0`，但必须在 `stop_condition` 写明基本面/护城河证伪条件，改核「质量门 + 安全边际（常规≥12% / 危机≥20%）」。\n"
+        "2. 独立核验：必须对照【提案标的一手事实卡（Python 独立真源）】交叉核验投研员引用的现价/ATR/RSI/均线/财报/除息/卖方均值；"
+        "发现事实冲突即降级或否决，事实卡未覆盖的标的不允许凭空补充数字。\n"
+        "3. 穿透科技暴露与相关性：穿透后科技因子明显集中、或与持仓 60 日相关性达标、或违背今日红线名单的标的必须驳回。\n"
+        "4. 财报/除息/过热排雷：5 日内财报、RSI 过热追高全部否决或降级；除息窗口新建仓须在 thesis 写明「抢息」或「等除息后再买」，"
+        "Invest 应税轨按股息税后净额计入 R:R（ISA 股息免税可忽略）。\n"
+        "5. 结构与槽位：ISA 个股通道关闭或卫星层饱和时只准按 Python 政策票据做宽基；"
+        "Invest 新开仓须遵守在险槽位、承诺热力、单日额度与 ROTATE 置换资金源纪律。\n"
+        "6. 一致性、精确现金与零内部对话外泄：严格继承 /report 红线与相关裁决；现金只用提供的精确数字，禁止口算；"
+        "`headline` 严禁提及任何未入选、淘汰或被否决的标的/方向；`rejected_or_frozen` 一律返回空数组 `[]`；"
+        "`consistency_and_cash_note` 只写一句 ≤45 字风控红线遵循声明（严禁自行计算余现，执行后余现由 Python 精确接管）；"
+        "若当前为周末/休市且有推荐标的，请在 headline 标明「下周一开盘/限价挂单参考」。\n"
         f"若无个股达到双轨达标门槛，且 ISA 现金占比 >{cfg.strategy.isa_cash_deploy_trigger_pct:.0f}%，"
-        "应优先按【今日组合门控约束】的 Python 核心政策票据做分批定投：写明该票据代码的具体价位、"
-        f"单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f}，不得超过票据上限）与节奏，严禁自行换代码；"
-        "核心宽基 DCA 的 stop_price/target_price 填 `null` 即可，严禁为宽基编造虚假止损位；"
-        "Invest 若门控未开或无达标右侧个股（动态 R:R 未过门槛），直接令 selected_actions 为空数组 []"
-        "（如需在应税 Invest 配置长期底仓仅可提示派息型 VWRL.L，严禁混买累积型 VWRP.L 造成离岸 ERI 报税摩擦）；"
-        "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明“本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命 + 下一次部署触发条件”，"
-        f"严禁默认写“现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息”。",
+        "应优先按【今日组合门控约束】的 Python 核心政策票据做分批定投：写明票据代码、具体价位、"
+        f"单笔金额（ISA ETF ≥£{cfg.strategy.min_isa_etf_order_gbp:,.0f} 且不超票据上限）与节奏，严禁自行换代码；"
+        "核心宽基 stop_price/target_price 填 `null`；"
+        "Invest 若无达标右侧个股（动态 R:R 未过门槛）直接令 selected_actions 为空数组 []；"
+        "若确实连宽基部署空间都没有，才让 `selected_actions` 为空数组 `[]`，并在 headline 说明"
+        "「本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命 + 下一次部署触发条件」，"
+        f"严禁默认写「现金拿住吃 {cfg.strategy.cash_interest_rate_pct:.1f}% 利息」。",
         cfg.strategy,
         include_order_audit_rule=False,
+        compact_for_pick_critic=True,
     )
     critic_prompt = (
         f"{gate_block}"
         f"【时段状态】：{market_phase_note}\n"
         f"【今日 /report 基线】：{morning_conclusion or '（暂无）'}\n"
-        + (f"【今日 /report 持仓与挂单裁决（默认遵循）】：\n{morning_audits_text}\n" if morning_audits_text else "")
+        + (
+            f"【今日 /report 持仓与挂单裁决（默认遵循，仅列相关项）】：\n{critic_audits_text}\n"
+            if critic_audits_text
+            else ""
+        )
         + f"【今日红线】：\n{veto_block}\n\n"
         + (f"{preference_block}\n\n" if preference_block else "")
         + f"【当前活动挂单】：\n{trade_ctx['pending_orders_text']}\n\n"
         f"【交易频率与冷却（Python 计算）】：{trade_ctx['trade_behavior_text']}\n\n"
         f"【历史 T+{cfg.strategy.settlement_holding_days} 选股复盘教训】：\n{lessons_text}\n\n"
         f"【精确现金底座】：{exact_cash_summary}\n"
-        f"【双钱包明细与资金路径】：\n{build_wallet_context_text(portfolio, cfg.strategy)}\n"
         f"【行业暴露】：\n{exposure_text}\n\n"
-        f"【投研员提案（待审）】：\n{research_output}"
+        + (f"{fact_card_text}\n\n" if fact_card_text else "")
+        + f"【投研员提案（待审）】：\n{research_output}"
     )
 
     raw_critic = await llm.generate(

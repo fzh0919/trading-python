@@ -265,12 +265,17 @@ def compute_trade_behavior_stats(
     history_days: int = 30,
     cooldown_days: int = 15,
     now_ms: int | None = None,
+    exempt_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
     """0-Token trade cadence, ticket size, fee ratio and post-exit cooldown statistics.
 
     ``partial`` is True when the fetched order history covers less than ``history_days``;
     callers must treat cadence caps as advisory (never a hard block) in that case.
     Amounts stay in each fill's wallet currency — USD never inflates GBP totals.
+
+    v5.5.7: zero-quota core wide-base ETF buys are excluded via ``exempt_symbols`` and buys of the
+    same (account, ticker, UK date) are merged to one ticket so a partially filled limit order
+    cannot inflate the weekly/monthly buy count.
     """
     now = int(now_ms) if now_ms is not None else int(time.time() * 1000)
     orders = sorted(
@@ -280,8 +285,23 @@ def compute_trade_behavior_stats(
     )
     recent_cutoff = now - max(1, recent_days) * 86400 * 1000
     history_cutoff = now - max(1, history_days) * 86400 * 1000
+    exempt_up = {str(s).strip().upper() for s in (exempt_symbols or set()) if str(s).strip()}
+
+    def _is_exempt(o: Any) -> bool:
+        sym = str(getattr(o, "yahoo_symbol", "") or "").strip().upper()
+        tick = str(getattr(o, "ticker", "") or "").strip().upper()
+        for candidate in (sym, tick):
+            if candidate and (candidate in exempt_up or candidate.split(".")[0] in exempt_up):
+                return True
+        return False
+
+    def _ticket_day(o: Any) -> str:
+        uk_date = str(getattr(o, "uk_time_str", "") or "").strip()[:10]
+        return uk_date or str(int(getattr(o, "filled_at_ms", 0) or 0) // 86400000)
 
     buys_7d = buys_30d = sells_7d = sells_30d = 0
+    buy_keys_7d: set[tuple[str, str, str]] = set()
+    buy_keys_30d: set[tuple[str, str, str]] = set()
     buy_amt_by_ccy: dict[str, float] = {}
     buy_cnt_by_ccy: dict[str, int] = {}
     turnover_30d = taxes_30d = 0.0
@@ -295,19 +315,30 @@ def compute_trade_behavior_stats(
         ccy = str(o.wallet_currency or "GBP").strip().upper() or "GBP"
         in_30d = o.filled_at_ms >= history_cutoff
         in_7d = o.filled_at_ms >= recent_cutoff
+        quota_exempt = bool(is_buy and _is_exempt(o))
+        ticket_key = (
+            (o.account or "").upper(),
+            (o.ticker or o.yahoo_symbol or "").upper(),
+            _ticket_day(o),
+        )
+        counted_buy = bool(is_buy and not quota_exempt)
+        new_buy_30d = counted_buy and ticket_key not in buy_keys_30d
+        new_buy_7d = counted_buy and ticket_key not in buy_keys_7d
         if in_30d:
             turnover_30d += abs(float(o.net_value or 0.0))
             taxes_30d += abs(float(o.tax_total or 0.0))
-            if is_buy:
+            if counted_buy and new_buy_30d:
                 buys_30d += 1
-            else:
+                buy_keys_30d.add(ticket_key)
+            elif not is_buy:
                 sells_30d += 1
         if in_7d:
-            if is_buy:
+            if counted_buy and new_buy_7d:
                 buys_7d += 1
-            else:
+                buy_keys_7d.add(ticket_key)
+            elif not is_buy:
                 sells_7d += 1
-        if is_buy and in_30d:
+        if counted_buy and in_30d:
             buy_amt_by_ccy[ccy] = buy_amt_by_ccy.get(ccy, 0.0) + float(o.net_value or 0.0)
             buy_cnt_by_ccy[ccy] = buy_cnt_by_ccy.get(ccy, 0) + 1
         if not is_buy:
@@ -398,7 +429,10 @@ def format_trade_behavior_text(behavior: dict[str, Any]) -> str:
         )
         parts.append(f"清仓 {cooldown} 天冷却清单: {items}")
     if behavior.get("partial"):
-        parts.append(f"⚠️成交历史仅覆盖 {behavior.get('coverage_days', 0)} 天，频率统计不完整")
+        parts.append(
+            f"⚠️历史仅覆盖 {behavior.get('coverage_days', 0)} 天，"
+            f"7/30天频次暂不硬拦（{int(behavior.get('cooldown_days') or 0)}天清仓冷却硬生效）"
+        )
     return " | ".join(parts)
 
 
@@ -413,6 +447,7 @@ def build_trade_context(
     tech_map: dict[str, Any] | None = None,
     histories: dict[str, Any] | None = None,
     cooldown_days: int = 15,
+    exempt_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build pending orders, 7-day fills, and 30-day ticker behavior stats for AI prompts."""
     all_orders = sorted(
@@ -658,6 +693,7 @@ def build_trade_context(
         recent_days=recent_days,
         history_days=history_days,
         cooldown_days=cooldown_days,
+        exempt_symbols=exempt_symbols,
     )
 
     return {

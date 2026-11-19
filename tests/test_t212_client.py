@@ -1457,7 +1457,9 @@ class TestTradeBehaviorStats(unittest.TestCase):
         self.assertIn("近7天买入 1 笔 / 近30天 3 笔", text)
         self.assertIn("税费占成交额 0.42%", text)
         self.assertIn("清仓 15 天冷却清单: AAPL(4天·冷却)", text)
-        self.assertIn("频率统计不完整", text)
+        self.assertIn("历史仅覆盖 12.0 天", text)
+        self.assertIn("7/30天频次暂不硬拦", text)
+        self.assertIn("15天清仓冷却硬生效", text)
         self.assertEqual(format_trade_behavior_text({}), "")
 
 

@@ -779,7 +779,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIn("Invest半导体占比超限", pick_pipeline[0]["prompt"])
                 self.assertIn("实时 Google Search", pick_pipeline[0]["prompt"])
-                self.assertIn("双钱包明细与资金路径", pick_pipeline[1]["prompt"])
+                # v5.5.7: the duplicate wallet block is gone; the compact cash base carries it.
+                self.assertNotIn("双钱包明细与资金路径", pick_pipeline[1]["prompt"])
+                self.assertIn("现金(GBP/USD", pick_pipeline[1]["prompt"])
                 self.assertTrue(
                     all("一律按挂单限价核算" not in c["system_instruction"] for c in pick_pipeline)
                 )
@@ -1350,10 +1352,13 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("🇬🇧 今日 LSE 半日市 12:30 收盘", research_call["prompt"])
             self.assertIn("英股医药除息前追高易回撤", research_call["prompt"])
             self.assertIn("财报前两周追高易遇获利回吐", research_call["prompt"])
-            self.assertIn("NVDA: 多空分歧", research_call["prompt"])
-            self.assertIn("ISIN:US67066G1040", research_call["prompt"])
-            self.assertIn("除息日 2026-11-20", research_call["prompt"])
             self.assertIn("T+7", research_call["prompt"])
+            # v5.5.7: ContextPack disagreement + duplicate identity blocks are gone; the Critic
+            # instead receives the Python one-hand fact card and only one wallet view.
+            self.assertNotIn("今日早报多空冲突摘要", research_call["prompt"])
+            self.assertNotIn("存量标的身份与除息日历锚点", research_call["prompt"])
+            self.assertIn("【提案标的一手事实卡", critic_call["prompt"])
+            self.assertNotIn("【双钱包明细与资金路径】", critic_call["prompt"])
             self.assertIn("英股医药除息前追高易回撤", critic_call["prompt"])
             self.assertIn("T+7", critic_call["prompt"])
 
@@ -1494,8 +1499,9 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             research_call = next(c for c in llm.calls if c.get("usage_label") == "pick_researcher")
             critic_call = next(c for c in llm.calls if c.get("usage_label") == "pick_critic")
             self.assertIn("[Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】", research_call["prompt"])
-            self.assertIn("[ISA] AZN.L (BUY 13400 GBp) →【MODIFY】", research_call["prompt"])
-            self.assertIn("⚠️今日早报已裁决: 挂单MODIFY(ISA)", research_call["prompt"])
+            # v5.5.7: AZN.L has no live pending BUY, so its stale 07:30 verdict is dropped.
+            self.assertNotIn("[ISA] AZN.L (BUY 13400 GBp) →【MODIFY】", research_call["prompt"])
+            self.assertNotIn("⚠️今日早报已裁决: 挂单MODIFY(ISA)", research_call["prompt"])
             self.assertIn("[Invest] SHEL.L (BUY 3675 GBp) →【CANCEL】", critic_call["prompt"])
             self.assertIn("SHEL.L", critic_call["prompt"])
             self.assertIn("当前活动挂单", critic_call["prompt"])

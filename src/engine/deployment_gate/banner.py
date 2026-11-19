@@ -32,6 +32,7 @@ from src.engine.deployment_gate.regime import (
     evaluate_market_regime,
 )
 from src.engine.deployment_gate.triggers import scan_triggers_and_decide
+from src.engine.portfolio_rules.dual_philosophy import resolve_invest_dynamic_rr_floor
 
 # ---------------------------------------------------------------------------
 # 6. <=110-char pure-text banner
@@ -217,6 +218,13 @@ def evaluate_deployment_gate(
     )
     # /report's approved core ticket is deducted from the same-day /pick core budget.
     decision["isa"].setdefault("approved_report_core_gbp", 0.0)
+    # v5.5.7: publish the one deterministic Invest R:R floor (VIX included) so the morning
+    # report, Researcher, Critic and Python guardrail all quote the same number.
+    inv_rr_floor, inv_rr_tier = resolve_invest_dynamic_rr_floor(
+        regime_info["regime"], None, strategy, vix=macro_vix
+    )
+    decision["invest"]["invest_min_rr_floor"] = round(float(inv_rr_floor), 2)
+    decision["invest"]["invest_rr_tier_label"] = inv_rr_tier
 
     gate = {
         "version": _GATE_VERSION,

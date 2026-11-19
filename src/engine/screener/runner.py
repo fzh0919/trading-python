@@ -45,8 +45,21 @@ async def run_quant_screener(
     active_pool_rows: list[dict[str, Any]] | None = None,
     macro: MacroSnapshot | None = None,
     regime_tag: str = "",
+    enable_isa_equities: bool = True,
+    enable_isa_etfs: bool = True,
+    enable_invest_track: bool = True,
+    excluded_symbols: set[str] | None = None,
+    out_bundles: dict[str, TickerMarketBundle] | None = None,
+    out_intel: dict[str, dict[str, Any]] | None = None,
+    out_tech: dict[str, TechnicalSnapshot] | None = None,
 ) -> tuple[list[ScreenerCandidate], list[ScreenerCandidate]]:
-    """Two-stage quantitative pre-screener: 0-info OHLCV multi-bucket filter -> Stage 2 bundle enrichment."""
+    """Two-stage quantitative pre-screener: 0-info OHLCV multi-bucket filter -> Stage 2 bundle enrichment.
+
+    v5.5.7 channel short-circuits: a closed ISA equity/ETF channel (or a closed Invest track)
+    never triggers its Stage-2 bundle enrichment, DeepSeek filter, Finnhub aggregation or Google
+    search. ``excluded_symbols`` front-loads the 15-day re-buy cooldown so those names never even
+    consume a shortlist slot.
+    """
     held_syms = portfolio.unique_yahoo_symbols()
     held_set = {s.upper() for s in held_syms}
     watch_set = {s.upper() for s in watchlist}
@@ -102,6 +115,22 @@ async def run_quant_screener(
     else:
         isa_pool = list(dict.fromkeys([*watchlist, *universe.isa_long_term, *recent_isa]))
         invest_pool = list(dict.fromkeys([*watchlist, *universe.invest_tactical, *recent_invest]))
+
+    # v5.5.7: front-load the 15-day re-buy cooldown and honour closed channels before any IO.
+    excluded_up = {str(s).strip().upper() for s in (excluded_symbols or set()) if str(s).strip()}
+    if excluded_up:
+        def _is_excluded(sym: str) -> bool:
+            sym_up = str(sym or "").strip().upper()
+            return bool(sym_up and (sym_up in excluded_up or sym_up.split(".")[0] in excluded_up))
+
+        isa_pool = [s for s in isa_pool if not _is_excluded(s)]
+        invest_pool = [s for s in invest_pool if not _is_excluded(s)]
+    if not enable_isa_equities:
+        isa_pool = [s for s in isa_pool if str(s).strip().upper() in etf_set]
+    if not enable_isa_etfs:
+        isa_pool = [s for s in isa_pool if str(s).strip().upper() not in etf_set]
+    if not enable_invest_track:
+        invest_pool = []
 
     all_needed = list(dict.fromkeys([*held_syms, *isa_pool, *invest_pool]))
 
@@ -342,11 +371,21 @@ async def run_quant_screener(
         for sym, df in bundle_hists.items():
             if (sym not in histories or histories[sym].empty) and df is not None and not df.empty:
                 histories[sym] = df
+        # v5.5.7: hand the already-fetched Stage-2 artefacts back to /pick so it never re-fetches
+        # bundles or Finnhub deep intel a second time for the same candidates.
+        if out_bundles is not None:
+            out_bundles.update(bundles)
+        if out_intel is not None:
+            out_intel.update(deep_intel_map)
 
     stage2_tech: dict[str, TechnicalSnapshot | None] = {
         sym: compute_technical_snapshot(sym, histories.get(sym), bundle=bundles.get(sym))
         for sym in top_syms
     }
+    if out_tech is not None:
+        for sym_out, snap_out in stage2_tech.items():
+            if snap_out is not None:
+                out_tech[sym_out] = snap_out
 
     def _build_track(shortlist: list[str], track: str) -> list[ScreenerCandidate]:
         out: list[ScreenerCandidate] = []

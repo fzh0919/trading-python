@@ -50,6 +50,8 @@ class ScreenerCandidate(BaseModel):
     pattern_signals: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
     summary_line: str = ""
+    # v5.5.7: 0-token diagnostic metrics surfaced to the DeepSeek ID filter (never used in scoring).
+    filter_metrics: dict[str, Any] = Field(default_factory=dict)
 
 
 def _linear_scale(

@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.config import StrategySection, UniverseSection
 from src.data_providers.analytics import (
+    TechnicalSnapshot,
     compute_correlation_matrix,
     compute_rsi_wilder,
     compute_technical_snapshot,
@@ -3217,15 +3218,19 @@ class TestV534PickBuyGuards(unittest.TestCase):
         )
         res = apply_risk_override_guardrail(
             self._pick(symbol="SHEL.L", account="ISA", entry=25.0, stop=22.5, target=35.0),
-            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            # v5.5.7: effective stop = 10% price stop + 0.7% stamp/spread friction = 10.7%.
+            strategy=StrategySection(
+                pick_rr_guard_mode="hard", min_isa_equity_order_gbp=100.0
+            ),
             bundle_map={"SHEL.L": bundle},
             macro=MacroSnapshot(fetched_at_utc="2026-11-18T07:25:00Z", vix=15.0),
             trade_behavior={"partial": True},
         )
         self.assertFalse(res.applied)
         note = res.decision.selected_actions[0].risk_note
-        # £85 ÷ 止损 10% = £850 => 850 / £25 = 34 股（旧缺陷会按 £0.25 => 3,400 股）
-        self.assertIn("≈34股", note)
+        # £85 ÷ 含摩擦止损 10.7% = £794 => 794 / £25 = 31 股（旧缺陷会按 £0.25 => 3,400 股）
+        self.assertIn("≈31股", note)
+        self.assertIn("含摩擦止损10.7%", note)
         self.assertNotIn("3,400", note)
 
         # 缺失币种时不得把 VWRP.L 等英镑报价 ETF 盲除 100。
@@ -3467,6 +3472,437 @@ class TestV551CoreDcaGuard(unittest.TestCase):
         res = self._run(self._decision("VERG.L"), gate, portfolio, verg)
         self.assertFalse(res.applied)
         self.assertEqual(len(res.decision.selected_actions), 1)
+
+
+class TestV557ScreenerFunnel(unittest.TestCase):
+    """v5.5.7 Wave 2: Invest friction/R:R reachability, dim1 differentiation, channel short-circuit."""
+
+    @staticmethod
+    def _tech(symbol: str, **overrides) -> TechnicalSnapshot:
+        tech_cls = TechnicalSnapshot
+        base = dict(
+            symbol=symbol,
+            last_close=100.0,
+            ret_5d_pct=1.0,
+            ret_20d_pct=3.0,
+            ret_1d_pct=0.5,
+            dist_ma20_pct=1.0,
+            dist_ma50_pct=0.5,
+            dist_ma200_pct=8.0,
+            drawdown_52w_pct=-5.0,
+            rsi14=55.0,
+            trend_regime="BULL",
+            weekly_bullish=True,
+            atr_pct=2.0,
+            volatility_60d_pct=20.0,
+            volume_ratio_20d=1.1,
+        )
+        base.update(overrides)
+        return tech_cls(**base)
+
+    def test_invest_uk_equity_charges_stamp_duty_instead_of_fx_bonus(self) -> None:
+        from src.engine.screener import score_candidate
+
+        bundle = TickerMarketBundle(
+            symbol="LSEG.L",
+            quote_type="EQUITY",
+            currency="GBp",
+            current_price=100.0,
+            target_mean_price=130.0,
+            analyst_count=8,
+        )
+        tech = self._tech("LSEG.L")
+        invest = score_candidate(
+            "LSEG.L", "INVEST_TACTICAL", tech, bundle, 0.30, "NVDA", False, False, StrategySection()
+        )
+        joined_cons = " ".join(invest.cons)
+        self.assertIn("印花税", joined_cons)
+        self.assertIn("短线高摩擦", joined_cons)
+        self.assertNotIn("免换汇", " ".join(invest.pros))
+
+        isa = score_candidate(
+            "LSEG.L", "ISA_LONG_TERM", tech, bundle, 0.30, "NVDA", False, False, StrategySection()
+        )
+        self.assertIn("英镑计价免换汇", " ".join(isa.pros))
+
+    def test_invest_narrow_space_rr_soft_gate_penalizes(self) -> None:
+        from src.engine.screener import score_candidate
+
+        tech = self._tech("NARROW")
+        narrow_bundle = TickerMarketBundle(
+            symbol="NARROW",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            target_mean_price=103.0,
+            analyst_count=8,
+        )
+        wide_bundle = TickerMarketBundle(
+            symbol="WIDE",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            target_mean_price=135.0,
+            analyst_count=8,
+        )
+        narrow = score_candidate(
+            "NARROW", "INVEST_TACTICAL", tech, narrow_bundle, 0.30, "NVDA", False, False, StrategySection()
+        )
+        wide = score_candidate(
+            "WIDE", "INVEST_TACTICAL", self._tech("WIDE"), wide_bundle, 0.30, "NVDA", False, False, StrategySection()
+        )
+        self.assertIn("预估R:R", " ".join(narrow.cons))
+        self.assertNotIn("预估R:R", " ".join(wide.cons))
+        self.assertLess(narrow.score, wide.score)
+        self.assertIsNotNone(narrow.filter_metrics.get("est_rr"))
+        self.assertLess(float(narrow.filter_metrics["est_rr"]), 1.0)
+
+    def test_invest_dim1_top_band_reserved_for_strong_rs(self) -> None:
+        from src.engine.screener import score_candidate
+
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        bench = np.linspace(100.0, 118.0, 160).tolist() + np.linspace(118.0, 112.0, 60).tolist()
+        df_bench = pd.DataFrame(
+            {
+                "Open": np.array(bench) * 0.998,
+                "High": np.array(bench) * 1.005,
+                "Low": np.array(bench) * 0.995,
+                "Close": bench,
+                "Volume": np.full(220, 5_000_000.0),
+            },
+            index=dates,
+        )
+        strong_closes = np.linspace(80.0, 150.0, 220)
+        df_strong = pd.DataFrame(
+            {
+                "Open": strong_closes * 0.997,
+                "High": strong_closes * 1.012,
+                "Low": strong_closes * 0.988,
+                "Close": strong_closes,
+                "Volume": np.full(220, 1_500_000.0),
+            },
+            index=dates,
+        )
+        weak_closes = np.linspace(125.0, 95.0, 220)
+        df_flat = pd.DataFrame(
+            {
+                "Open": weak_closes * 0.999,
+                "High": weak_closes * 1.002,
+                "Low": weak_closes * 0.998,
+                "Close": weak_closes,
+                "Volume": np.full(220, 1_500_000.0),
+            },
+            index=dates,
+        )
+        strong = score_candidate(
+            "STRONG", "INVEST_TACTICAL", self._tech("STRONG", atr_pct=1.5),
+            None, 0.30, "NVDA", False, False, StrategySection(),
+            hist=df_strong, benchmark_hist=df_bench,
+        )
+        flat = score_candidate(
+            "FLAT", "INVEST_TACTICAL", self._tech("FLAT"),
+            None, 0.30, "NVDA", False, False, StrategySection(),
+            hist=df_flat, benchmark_hist=df_bench,
+        )
+        self.assertLessEqual(strong.dimension_scores["trend_rs"], 30.0)
+        self.assertLessEqual(flat.dimension_scores["trend_rs"], 24.0)
+        self.assertGreater(
+            strong.dimension_scores["trend_rs"], flat.dimension_scores["trend_rs"]
+        )
+
+    def test_prefilter_row_carries_decision_metrics(self) -> None:
+        from src.agents.pick_agent import _prefilter_row
+        from src.engine.screener import score_candidate
+
+        bundle = TickerMarketBundle(
+            symbol="NVDA",
+            quote_type="EQUITY",
+            currency="USD",
+            sector="Technology",
+            current_price=100.0,
+            target_mean_price=120.0,
+            analyst_count=10,
+        )
+        cand = score_candidate(
+            "NVDA", "INVEST_TACTICAL", self._tech("NVDA"), bundle, 0.30, "NVDA", False, False, StrategySection()
+        )
+        row = _prefilter_row(cand)
+        self.assertIn("Technology/US", row)
+        self.assertIn("ATR14", row)
+        self.assertIn("目标", row)
+        self.assertIn("预估R:R", row)
+
+    def test_channel_short_circuit_and_cooldown_exclusion(self) -> None:
+        import asyncio
+        from src.data_providers.t212_client import AccountSnapshot, PortfolioData
+
+        class _RecordingMD(MarketDataService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.hist_syms: list[str] = []
+                self.bundle_syms: list[str] = []
+
+            async def get_histories(self, symbols, period="1y"):
+                self.hist_syms.extend(symbols)
+                idx = pd.date_range("2025-09-01", periods=220, freq="B")
+                out = {}
+                for s in symbols:
+                    base = np.linspace(80.0, 140.0, 220)
+                    out[s] = pd.DataFrame(
+                        {
+                            "Open": base * 0.997,
+                            "High": base * 1.012,
+                            "Low": base * 0.988,
+                            "Close": base,
+                            "Volume": np.full(220, 1_500_000.0),
+                        },
+                        index=idx,
+                    )
+                return out
+
+            async def get_bundles(self, symbols, include_news=True, include_earnings=True, include_info=True, isin_map=None):
+                self.bundle_syms.extend(symbols)
+                hists = await self.get_histories(symbols)
+                bundles = {
+                    s: TickerMarketBundle(
+                        symbol=s,
+                        quote_type="ETF" if s == "VWRP.L" else "EQUITY",
+                        currency="GBP" if s.endswith(".L") else "USD",
+                        current_price=float(hists[s]["Close"].iloc[-1]),
+                        target_mean_price=float(hists[s]["Close"].iloc[-1]) * 1.2,
+                        analyst_count=8,
+                    )
+                    for s in symbols
+                }
+                return hists, bundles
+
+        md = _RecordingMD()
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-19 09:30",
+            fetched_at_ms=1763544600000,
+            isa=AccountSnapshot(ok=True, account_label="ISA"),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        universe = UniverseSection(
+            isa_long_term=["VWRP.L", "MSFT", "AAPL"],
+            invest_tactical=["AMD", "META"],
+            etf_symbols=["VWRP.L"],
+        )
+        asyncio.run(
+            run_quant_screener(
+                portfolio=portfolio,
+                market_data=md,
+                universe=universe,
+                watchlist=[],
+                strategy=StrategySection(),
+                top_n_per_track=4,
+                enable_isa_equities=False,
+                excluded_symbols={"AMD"},
+            )
+        )
+        self.assertNotIn("AMD", md.hist_syms)
+        self.assertNotIn("MSFT", md.bundle_syms)
+        self.assertNotIn("AAPL", md.bundle_syms)
+        self.assertIn("VWRP.L", md.bundle_syms)
+        self.assertIn("META", md.bundle_syms)
+
+
+    def test_summary_line_carries_atr_structure_and_calibrated_sell_side(self) -> None:
+        from src.engine.screener import _format_summary_line
+
+        tech = TechnicalSnapshot(
+            symbol="HSBA.L",
+            last_close=700.0,
+            ret_5d_pct=1.0,
+            ret_20d_pct=3.0,
+            dist_ma50_pct=1.5,
+            dist_ma200_pct=6.0,
+            rsi14=58.0,
+            drawdown_52w_pct=-6.0,
+            atr14=9.1,
+            atr_pct=1.3,
+            weekly_bullish=True,
+            adx14=28.0,
+            volume_ratio_20d=1.4,
+            cyq_avg_cost=690.0,
+        )
+        # Vendor target prices arrive in GBP while the quote is GBp -> the .L calibration must x100.
+        bundle = TickerMarketBundle(
+            symbol="HSBA.L",
+            currency="GBp",
+            sector="Financials",
+            current_price=700.0,
+            target_low_price=6.80,
+            target_mean_price=8.20,
+            target_high_price=9.50,
+            analyst_count=5,
+        )
+        line = _format_summary_line(
+            symbol="HSBA.L",
+            track="INVEST_TACTICAL",
+            asset_type="EQUITY",
+            score=72.0,
+            tech=tech,
+            bundle=bundle,
+            upside_pct=17.0,
+            corr_holding=None,
+            max_corr=None,
+            rs_20d_pct=2.0,
+            marginal_vol_delta_pct=None,
+            regime_tag="NEUTRAL",
+            dimension_pct={},
+            pros=[],
+            cons=[],
+            rs_60d_pct=5.5,
+            structure_levels="20d低 690.00/MA50 700.00/52w高 760.00",
+        )
+        self.assertIn("[Financials/UK]", line)
+        self.assertIn("ATR14 9.10 (1.3%)", line)
+        self.assertIn("周线多头/ADX 28", line)
+        self.assertIn("60日RS +5.5%", line)
+        self.assertIn("量比 1.4x", line)
+        self.assertIn("CYQ均成本 690.00", line)
+        self.assertIn("结构[20d低 690.00/MA50 700.00/52w高 760.00]", line)
+        self.assertIn("卖方(5家) 680.00~820.00~950.00(+17%)", line)
+        self.assertNotIn("广度 NEUTRAL", line)
+
+
+    def test_below_min_order_hard_blocks_unfundable_ticket(self) -> None:
+        from src.agents.schemas import PickActionItem, PickDecision
+        from src.data_providers.t212_client import PortfolioData
+        from src.engine.portfolio_rules import apply_risk_override_guardrail
+
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-19 09:30",
+            fetched_at_ms=1763544600000,
+            isa=AccountSnapshot(ok=True, account_label="ISA"),
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=2000.0),
+            total_combined_value=2000.0,
+            gbp_usd_rate=1.25,
+        )
+        bundle = TickerMarketBundle(
+            symbol="MSFT", quote_type="EQUITY", currency="USD", current_price=100.0
+        )
+        res = apply_risk_override_guardrail(
+            PickDecision(
+                headline="测试",
+                selected_actions=[
+                    PickActionItem(
+                        account="Invest",
+                        symbol="MSFT",
+                        action="BUY",
+                        thesis="测试逻辑",
+                        entry_zone="100 附近",
+                        stop_condition="跌破 80",
+                        target_window="3个月",
+                        entry_price=100.0,
+                        stop_price=80.0,
+                        target_price=200.0,
+                    )
+                ],
+                consistency_and_cash_note="测试",
+            ),  # 20% stop => 85/0.20 = £425 < £700
+            strategy=StrategySection(pick_rr_guard_mode="hard"),
+            portfolio=portfolio,
+            bundle_map={"MSFT": bundle},
+            macro=MacroSnapshot(fetched_at_utc="2026-11-19T07:25:00Z", vix=15.0),
+            trade_behavior={"partial": True},
+        )
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[-1].trigger_type, "BELOW_MIN_ORDER_SIZE")
+        self.assertIn("止损过宽致预算额", res.overrides[-1].reason)
+        self.assertEqual(res.decision.selected_actions, [])
+
+    def test_cadence_partial_with_coverage_enforces_cooldown_only(self) -> None:
+        from src.engine.portfolio_rules.risk_override import _cadence_violation
+
+        strategy = StrategySection(trade_cadence_guard_mode="hard")
+        proven = {
+            "partial": True,
+            "coverage_days": 24.4,
+            "cooldown_days": 15,
+            "buys_7d": 99,
+            "buys_30d": 99,
+            "recently_closed": [
+                {"ticker": "CRWD", "in_cooldown": True, "days_since_sell": 0.0}
+            ],
+        }
+        breach = _cadence_violation(proven, "CRWD", "CRWD", strategy)
+        self.assertIsNotNone(breach)
+        self.assertEqual(breach[0], "REBUY_COOLDOWN")
+
+        # Frequency caps stay soft while the history is partial.
+        freq_only = dict(proven, recently_closed=[])
+        self.assertIsNone(_cadence_violation(freq_only, "TSLA", "TSLA", strategy))
+
+        # Legacy bare {"partial": True} stub keeps the old full no-op.
+        self.assertIsNone(
+            _cadence_violation(
+                {
+                    "partial": True,
+                    "recently_closed": [
+                        {"ticker": "TSLA", "in_cooldown": True, "days_since_sell": 0.0}
+                    ],
+                },
+                "TSLA",
+                "TSLA",
+                strategy,
+            )
+        )
+
+    def test_trade_behavior_exempts_core_etf_and_merges_same_day_fills(self) -> None:
+        import time
+        from src.data_providers.t212_client import (
+            HistoricalOrderItem,
+            PortfolioData,
+            compute_trade_behavior_stats,
+        )
+
+        now_ms = int(time.time() * 1000)
+
+        def _order(sym: str, ms: int, ticker: str | None = None) -> HistoricalOrderItem:
+            return HistoricalOrderItem(
+                id=f"{sym}-{ms}",
+                account="Invest",
+                raw_ticker=sym,
+                ticker=ticker or sym.split(".")[0],
+                yahoo_symbol=sym,
+                name=sym,
+                inst_currency="GBP",
+                side="BUY",
+                order_type="LIMIT",
+                filled_at="2026-11-19T09:00:00Z",
+                filled_at_ms=ms,
+                uk_time_str="2026-11-19 09:00",
+                quantity=1.0,
+                price=100.0,
+                net_value=100.0,
+                wallet_currency="GBP",
+                realised_pnl=0.0,
+                tax_total=0.0,
+            )
+
+        day_ms = now_ms - 2 * 86400 * 1000
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-19 09:30",
+            fetched_at_ms=now_ms,
+            isa=AccountSnapshot(ok=True, account_label="ISA"),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                recent_orders=[
+                    _order("VWRP.L", day_ms),
+                    _order("VWRP.L", day_ms + 60_000),
+                    _order("MSFT", day_ms),
+                    _order("MSFT", day_ms + 60_000),  # same-day partial fills => one ticket
+                ],
+            ),
+        )
+        stats = compute_trade_behavior_stats(
+            portfolio, now_ms=now_ms, exempt_symbols={"VWRP.L", "VWRL"}
+        )
+        self.assertEqual(stats["buys_7d"], 1)
+        self.assertEqual(stats["buys_30d"], 1)
 
 
 if __name__ == "__main__":

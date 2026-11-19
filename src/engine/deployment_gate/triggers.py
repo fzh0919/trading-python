@@ -125,8 +125,15 @@ def _scan_a_equity_candidates(
         rsi = getattr(tech, "rsi14", None)
         if rsi is not None and float(rsi) >= TRIGGER_RSI_EXCLUDE_ABOVE:
             continue
+        # v5.5.7: a real right-side pullback must still be above MA200 with a non-bearish
+        # weekly structure — never surface weekly-downtrend names as "right-side prey".
+        dist_ma200 = getattr(tech, "dist_ma200_pct", None)
+        if dist_ma200 is None or float(dist_ma200) <= 0.0:
+            continue
+        if getattr(tech, "weekly_bullish", None) is False:
+            continue
         dist_ma50 = getattr(tech, "dist_ma50_pct", None)
-        pullback = dist_ma50 is not None and abs(float(dist_ma50)) <= tol
+        pullback = dist_ma50 is not None and -2.0 <= float(dist_ma50) <= tol
         if not pullback:
             continue
         ma50 = getattr(tech, "ma50", None)

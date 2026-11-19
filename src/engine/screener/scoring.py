@@ -12,7 +12,11 @@ from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
 from src.data_providers.t212_client import AccountSnapshot
 from src.engine.portfolio_rules import (
     DEFAULT_RISK_FREE_YIELD_PCT,
+    _estimate_entry_friction_pct,
     _is_leverage_exempt_sector,
+    _is_right_side_leader,
+    evaluate_isa_value_gate,
+    resolve_invest_dynamic_rr_floor,
     wallet_friction_context,
 )
 from src.engine.screener.patterns import (
@@ -74,6 +78,33 @@ def _resolve_configured_etfs(
     return etf_set
 
 
+_EQ_REGION_SUFFIXES = (".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".BR", ".VI", ".F")
+
+
+def _region_label(symbol: str) -> str:
+    """Coarse listing region for the /pick candidate prefilter line (0-token, suffix-based)."""
+    sym = str(symbol or "").strip().upper()
+    if sym.endswith(".L"):
+        return "UK"
+    if sym.endswith(_EQ_REGION_SUFFIXES):
+        return "EU"
+    return "US"
+
+
+def _calibrate_l_price(symbol: str, value: float | None, ref_price: float) -> float | None:
+    """Fix the GBp/GBP 100x slip between a vendor price and the .L quote currency."""
+    if value is None or value <= 0 or ref_price <= 0:
+        return None
+    price = float(value)
+    if str(symbol or "").strip().upper().endswith(".L"):
+        ratio = price / ref_price
+        if 0.005 <= ratio <= 0.05:
+            price *= 100.0
+        elif 20.0 <= ratio <= 200.0:
+            price /= 100.0
+    return price
+
+
 def _format_summary_line(
     *,
     symbol: str,
@@ -91,6 +122,9 @@ def _format_summary_line(
     dimension_pct: dict[str, float],
     pros: list[str],
     cons: list[str],
+    rs_60d_pct: float | None = None,
+    structure_levels: str = "",
+    usd_wallet_ok: bool = False,
 ) -> str:
     pe_str = ""
     is_etf = asset_type == "ETF"
@@ -135,8 +169,62 @@ def _format_summary_line(
                 ex_div_str = f" | 除息已过{abs(ex_days)}天"
     corr_str = f" | 最高相关({corr_holding})={max_corr:.2f}" if max_corr is not None and corr_holding else ""
     rs_str = f" | 20日RS {rs_20d_pct:+.1f}%" if rs_20d_pct is not None else ""
+    rs60_str = f" | 60日RS {rs_60d_pct:+.1f}%" if rs_60d_pct is not None else ""
     mvol_str = f" | 增量波动 {marginal_vol_delta_pct:+.2f}%" if marginal_vol_delta_pct is not None else ""
-    reg_str = f" | 广度 {regime_tag}" if regime_tag else ""
+    sector = str((bundle.sector or bundle.industry) if bundle else "") or ""
+    region = _region_label(symbol)
+    loc_str = f" | [{sector}/{region}]" if sector else f" | [{region}]"
+    atr_bits: list[str] = []
+    if tech.atr14 is not None:
+        atr_bits.append(f"{float(tech.atr14):.2f}")
+    if tech.atr_pct is not None:
+        atr_bits.append(f"({float(tech.atr_pct):.1f}%)")
+    atr_str = f" | ATR14 {' '.join(atr_bits)}" if atr_bits else ""
+    weekly_bits: list[str] = []
+    if tech.weekly_bullish is True:
+        weekly_bits.append("周线多头")
+    elif tech.weekly_bullish is False:
+        weekly_bits.append("周线偏空")
+    if tech.adx14 is not None:
+        weekly_bits.append(f"ADX {float(tech.adx14):.0f}")
+    weekly_str = f" | {'/'.join(weekly_bits)}" if weekly_bits else ""
+    vol_str = (
+        f" | 量比 {float(tech.volume_ratio_20d):.1f}x"
+        if tech.volume_ratio_20d is not None
+        else ""
+    )
+    cyq_cost_str = (
+        f" | CYQ均成本 {float(tech.cyq_avg_cost):.2f}"
+        if (not is_etf and tech.cyq_avg_cost is not None)
+        else ""
+    )
+    structure_str = f" | 结构[{structure_levels}]" if structure_levels else ""
+    usd_str = " | USD钱包可用" if usd_wallet_ok else ""
+    sell_side_str = ""
+    if (
+        bundle is not None
+        and (bundle.analyst_count or 0) >= 3
+        and bundle.target_mean_price is not None
+        and bundle.target_mean_price > 0
+    ):
+        ref_price = (
+            float(bundle.current_price)
+            if (bundle.current_price is not None and float(bundle.current_price) > 0)
+            else float(tech.last_close)
+        )
+        mean = _calibrate_l_price(symbol, bundle.target_mean_price, ref_price)
+        low = _calibrate_l_price(symbol, bundle.target_low_price, ref_price)
+        high = _calibrate_l_price(symbol, bundle.target_high_price, ref_price)
+        if mean is not None and ref_price > 0:
+            mean_upside = ((mean / ref_price) - 1.0) * 100.0
+            spread = (
+                f"{low:.2f}~{mean:.2f}~{high:.2f}"
+                if (low is not None and high is not None)
+                else f"{mean:.2f}"
+            )
+            sell_side_str = (
+                f" | 卖方({int(bundle.analyst_count)}家) {spread}({mean_upside:+.0f}%)"
+            )
     dim_str = (
         f" | 4维 T{dimension_pct.get('trend_rs', 0.0) * 100:.0f}%/"
         f"P{dimension_pct.get('pattern_timing', 0.0) * 100:.0f}%/"
@@ -158,16 +246,17 @@ def _format_summary_line(
     ):
         return (
             f"• [{track}][{asset_type}] {symbol}"
-            f"{f' ({bundle.short_name})' if bundle and bundle.short_name else ''} "
+            f"{f' ({bundle.short_name})' if bundle and bundle.short_name else ''}{loc_str} "
             f"| 量化初筛分 {score:.0f}{dim_str} | 现价 {tech.last_close:.2f}"
             f"{f' {bundle.currency}' if bundle and bundle.currency else ''} | "
             f"5日 {tech.ret_5d_pct:+.1f}% / 20日 {tech.ret_20d_pct:+.1f}% | "
             f"距MA50 {tech.dist_ma50_pct:+.1f}% / MA200 {tech.dist_ma200_pct:+.1f}% | "
             f"RSI {tech.rsi14:.0f} | 距52w高点 {tech.drawdown_52w_pct:+.1f}%"
-            f"{pe_str}{roe_str}{div_str}{upside_str}{rs_str}{cyq_str}{ed_str}{ex_div_str}{corr_str}{mvol_str}{reg_str}"
+            f"{pe_str}{roe_str}{div_str}{upside_str}{rs_str}{rs60_str}{atr_str}{weekly_str}{vol_str}"
+            f"{cyq_str}{cyq_cost_str}{structure_str}{sell_side_str}{ed_str}{ex_div_str}{corr_str}{mvol_str}{usd_str}"
             f"{pros_str}{cons_str}"
         )
-    return f"• [{track}][{asset_type}] {symbol} | 分数 {score:.0f}{dim_str}{reg_str}{ex_div_str}{pros_str}{cons_str}"
+    return f"• [{track}][{asset_type}] {symbol}{loc_str} | 分数 {score:.0f}{dim_str}{ex_div_str}{pros_str}{cons_str}"
 
 
 def score_candidate(
@@ -213,6 +302,14 @@ def score_candidate(
     minervini = detect_minervini_stage2(hist, tech, rs_60d_pct=rs_60d)
     minervini_phase = int(minervini.get("phase", 0))
     reg_norm = _normalize_regime_tag(regime_tag)
+    # v5.5.7: the 24~30 top band on the Invest track is reserved for genuine right-side
+    # leaders (20d & 60d RS positive and rising); ordinary bulls are capped lower.
+    strong_rs = bool(
+        track != "ISA_LONG_TERM"
+        and (rs_20d or 0.0) > 0.0
+        and (rs_60d or 0.0) > 0.0
+        and (rs_slope or 0.0) > 0.0
+    )
 
     if track == "ISA_LONG_TERM":
         # v5.5.1: ISA is a Buffett value track — momentum breakdowns are NOT auto-penalized;
@@ -253,6 +350,9 @@ def score_candidate(
             dim1 -= _linear_scale(tech.volatility_60d_pct, 45.0, 80.0, 2.0, 6.0)
             cons.append(f"高波动({tech.volatility_60d_pct:.0f}%)")
     else:
+        if not strong_rs:
+            # v5.5.7: trim the ordinary-bull baseline so mediocre momentum no longer saturates.
+            dim1 -= 2.5
         if tech.trend_regime == "PULLBACK":
             dim1 += 6.0
             pros.append("强趋势回调买点")
@@ -311,7 +411,8 @@ def score_candidate(
     if rs_slope is not None and rs_slope > 0.15 and (rs_20d or 0.0) > 0.0:
         dim1 += 1.5
 
-    dim1 = round(max(0.0, min(30.0, dim1)), 2)
+    dim1_cap = 30.0 if (track == "ISA_LONG_TERM" or strong_rs) else 24.0
+    dim1 = round(max(0.0, min(dim1_cap, dim1)), 2)
 
     # ------------------------------------------------------------------
     # Dim 2: Pattern & Volume-Price Structure Timing (0..25, midpoint 10.0)
@@ -385,8 +486,43 @@ def score_candidate(
     # ------------------------------------------------------------------
     dim3 = 10.0
     upside_pct = _safe_target_upside_pct(symbol, tech, bundle)
+    score_penalty = 0.0
+    est_rr: float | None = None
     if upside_pct is not None:
         dim3 += _linear_scale(upside_pct, -15.0, 25.0, -4.0, 5.0)
+
+    # v5.5.7 Invest forward R:R reachability soft gate: a name whose remaining upside cannot
+    # pay for the ATR noise-floor stop + friction is a low-odds ticket; ladder-penalize it so it
+    # cannot hog the Invest shortlist. RISK_ON leaders and no-analyst names are exempt.
+    if (
+        track != "ISA_LONG_TERM"
+        and not is_etf
+        and upside_pct is not None
+        and bundle is not None
+        and (bundle.analyst_count or 0) >= 3
+        and not (reg_norm == "RISK-ON" and _is_right_side_leader(tech))
+    ):
+        atr_pct_val = float(tech.atr_pct) if (tech.atr_pct or 0.0) > 0 else 0.0
+        atr_floor_pct = max(1.5 * atr_pct_val, 4.0) if atr_pct_val > 0 else 4.5
+        est_friction_pct = _estimate_entry_friction_pct(
+            sym_up, bundle, strategy, "INVEST", invest_wallet
+        )
+        est_rr = round(
+            (float(upside_pct) - est_friction_pct) / (atr_floor_pct + est_friction_pct), 2
+        )
+        min_rr_floor, rr_tier = resolve_invest_dynamic_rr_floor(
+            reg_norm,
+            tech,
+            strategy,
+            vix=(macro.vix if (macro is not None and macro.vix is not None) else None),
+        )
+        reach_floor = 0.7 * float(min_rr_floor)
+        if est_rr < reach_floor:
+            deficit = reach_floor - est_rr
+            score_penalty = min(15.0, max(8.0, 8.0 + 10.0 * deficit))
+            cons.append(
+                f"预估R:R仅{est_rr:.2f}:1(目标空间{float(upside_pct):+.0f}%/门槛{min_rr_floor:.1f}:1 {rr_tier})"
+            )
 
     if bundle and not is_etf:
         pe_val = (
@@ -473,15 +609,14 @@ def score_candidate(
             dim3 += 2.5
             pros.append(f"LSE英镑ETF(Invest GBP不足:USD换回+{strategy.fx_fee_pct:.2f}%换汇)")
     elif sym_up.endswith(".L"):
-        if track == "ISA_LONG_TERM" or not wallet_enabled or gbp_avail > 0.01:
+        if track == "ISA_LONG_TERM":
             dim3 += 2.5
-            pros.append("英镑计价免换汇" if track == "ISA_LONG_TERM" else "英镑计价(Invest GBP充足:免换汇)")
+            pros.append("英镑计价免换汇")
         else:
-            dim3 += 1.0
-            cons.append(
-                f"英股需USD换回GBP(+{strategy.fx_fee_pct:.2f}%换汇+"
-                f"{strategy.uk_stamp_duty_pct:.1f}%印花税)"
-            )
+            # v5.5.7: stamp duty is a hard round-trip drag on short-term tactical entries —
+            # cancel the old "no FX needed" bonus and charge the friction instead.
+            dim3 -= 1.0
+            cons.append(f"含{float(strategy.uk_stamp_duty_pct):.1f}%印花税(短线高摩擦)")
 
     if track != "ISA_LONG_TERM" and wallet_enabled and not sym_up.endswith(".L"):
         is_eur = sym_up.endswith((".DE", ".PA", ".AS", ".MI", ".MC", ".SW", ".BR", ".VI", ".F"))
@@ -593,10 +728,53 @@ def score_candidate(
             + 15.0 * dimension_pct["value_quality"]
             + 15.0 * dimension_pct["portfolio_fit"]
         )
-    score = round(max(0.0, min(100.0, weighted_raw)), 1)
+    score = round(max(0.0, min(100.0, weighted_raw - score_penalty)), 1)
     reasons = [*pros, *cons]
 
+    filter_metrics: dict[str, Any] = {
+        "sector": (str(bundle.sector or bundle.industry or "")[:18] if bundle else ""),
+        "region": _region_label(symbol),
+        "target_upside_pct": (round(float(upside_pct), 1) if upside_pct is not None else None),
+        "atr_pct": (round(float(tech.atr_pct), 2) if tech.atr_pct is not None else None),
+        "rs_60d_pct": (round(float(rs_60d), 2) if rs_60d is not None else None),
+        "est_rr": est_rr,
+    }
+    if track == "ISA_LONG_TERM" and not is_etf and bundle is not None:
+        isa_gate = evaluate_isa_value_gate(
+            bundle,
+            tech,
+            macro,
+            strategy,
+            symbol=sym_up,
+            crisis_mode=(reg_norm == "RISK-OFF"),
+        )
+        filter_metrics["mos_pct"] = isa_gate.get("mos_pct")
+        filter_metrics["fcf_yield_pct"] = isa_gate.get("fcf_yield_pct")
+
     rs_20d_round = round(rs_20d, 2) if rs_20d is not None else None
+    rs_60d_round = round(rs_60d, 2) if rs_60d is not None else None
+    structure_bits: list[str] = []
+    if hist is not None and not hist.empty and "Low" in hist.columns:
+        lows = pd.to_numeric(hist["Low"], errors="coerce").dropna()
+        if len(lows) >= 20:
+            structure_bits.append(f"20d低 {float(lows.tail(20).min()):.2f}")
+        if len(lows) >= 60:
+            structure_bits.append(f"60d低 {float(lows.tail(60).min()):.2f}")
+    if tech.ma50 is not None:
+        structure_bits.append(f"MA50 {float(tech.ma50):.2f}")
+    if tech.ma200 is not None:
+        structure_bits.append(f"MA200 {float(tech.ma200):.2f}")
+    if tech.high_52w is not None:
+        structure_bits.append(f"52w高 {float(tech.high_52w):.2f}")
+    structure_levels = "/".join(structure_bits)
+
+    usd_wallet_ok = False
+    if invest_wallet is not None and track != "ISA_LONG_TERM":
+        _, usd_avail, _ = wallet_friction_context(invest_wallet)
+        rate = float(getattr(macro, "gbp_usd", 0.0) or 0.0) if macro is not None else 0.0
+        usd_wallet_ok = bool(
+            rate > 0 and usd_avail >= float(strategy.min_invest_order_gbp) * rate
+        )
     summary_line = _format_summary_line(
         symbol=symbol,
         track=track,
@@ -613,6 +791,9 @@ def score_candidate(
         dimension_pct=dimension_pct,
         pros=pros,
         cons=cons,
+        rs_60d_pct=rs_60d_round,
+        structure_levels=structure_levels,
+        usd_wallet_ok=usd_wallet_ok,
     )
 
     return ScreenerCandidate(
@@ -638,6 +819,7 @@ def score_candidate(
         pattern_signals=pattern_signals,
         reasons=reasons,
         summary_line=summary_line,
+        filter_metrics=filter_metrics,
     )
 
 

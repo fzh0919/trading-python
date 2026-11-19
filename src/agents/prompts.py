@@ -87,7 +87,10 @@ def build_investor_profile(
     strategy: StrategySection,
     *,
     include_order_audit_rule: bool = True,
+    compact_for_pick_critic: bool = False,
 ) -> str:
+    if compact_for_pick_critic:
+        return _build_compact_pick_critic_profile(strategy)
     benchmark = getattr(strategy, "benchmark_symbol", "VWRP.L")
     gbp_rate = float(strategy.cash_interest_rate_pct)
     usd_rate = float(getattr(strategy, "usd_cash_interest_rate_pct", 3.4))
@@ -173,16 +176,42 @@ def build_investor_profile(
     )
 
 
+def _build_compact_pick_critic_profile(strategy: StrategySection) -> str:
+    """v5.5.7: /pick Critic-only condensed profile — drops /report-only sell/audit and crumb rules."""
+    benchmark = getattr(strategy, "benchmark_symbol", "VWRP.L")
+    fx = float(strategy.fx_fee_pct)
+    stamp = float(strategy.uk_stamp_duty_pct)
+    min_invest = float(getattr(strategy, "min_invest_order_gbp", 700.0))
+    min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
+    min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
+    cadence_mode = str(getattr(strategy, "trade_cadence_guard_mode", "advisory") or "advisory").strip().lower()
+    return (
+        "【投资者画像与硬性规则（/pick 风控终审精简版）】：\n"
+        "• 英国个人投资者，Trading 212 Stocks ISA + Invest 双账户，不用杠杆/期权/做空。\n"
+        f"• 目标：双账户合计净值长期跑赢全球宽基 {benchmark}；现金利息只是等待期保底，不是投资终点。\n"
+        "• ISA 长线（巴菲特价值）：核心宽基 + 优质护城河个股；开仓只审「质量门 + 安全边际（常规≥12% / 危机≥20%）」，"
+        "不以短期波动或浮盈卖飞；仅基本面/护城河证伪、极端估值泡沫、更优机会成本置换、集中度超限才卖出。\n"
+        "• Invest 短线（右侧动量）：严守当日 Python 动态 R:R 门槛与止损 ATR 噪声地板，按以损定仓、绝不摊平；"
+        f"单笔 ≥£{min_invest:,.0f}，ISA 个股 ≥£{min_isa_eq:,.0f}、ISA ETF ≥£{min_isa_etf:,.0f}，严禁碎单。\n"
+        f"• 摩擦口径：换汇 {fx:.2f}%/边、英股印花税 {stamp:.1f}%、买卖价差按保守估算；"
+        "理由须写明资金路径；应税 Invest 低赔率频繁换仓会侵蚀净收益。\n"
+        f"• 频率与冷却（模式 {cadence_mode}）：由 Python 统计近 7/30 天笔数与清仓冷却，禁止重推已被拦截的标的。\n"
+        "• ISA 核心宽基只按 Python 政策票据执行，严禁自行换代码；Invest 槽位/热力/单日额度触顶即须等待或置换。\n"
+        "• 零 Quota：卖出存量仓位与买入核心宽基 ETF 永不消耗周/月开仓配额，也不占在险槽位。"
+    )
+
+
 def build_agent_system_instruction(
     role_instruction: str,
     strategy: StrategySection,
     *,
     include_order_audit_rule: bool = True,
+    compact_for_pick_critic: bool = False,
 ) -> str:
     """Combine stable role instructions and investor profile for Gemini `system_instruction`."""
     return (
         f"{role_instruction.strip()}\n\n"
-        f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule)}"
+        f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule, compact_for_pick_critic=compact_for_pick_critic)}"
     )
 
 

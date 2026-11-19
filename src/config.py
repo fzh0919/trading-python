@@ -318,6 +318,9 @@ class StrategySection(BaseModel):
     pick_rr_guard_mode: Literal["off", "advisory", "hard"] = "advisory"
     min_rr_ratio: float = Field(default=2.0, gt=0.0, le=10.0)
     ex_div_entry_guard_days: int = Field(default=3, ge=0, le=30)
+    # v5.5.7: single-source VIX tighten line for the Invest dynamic R:R floor. When VIX is at or
+    # above this level the floor climbs to invest_min_rr_weak_or_risk_off (2.5) even in NEUTRAL.
+    invest_vix_tighten_rr_threshold: float = Field(default=22.0, gt=0.0, le=100.0)
 
     # --- v5.4.0 组合门控、ISA 核心-卫星结构与 Invest 渐进式火力引擎 ---
     # off = 完全关闭旁路 | log = 仅写日志与 context_pack | advise = 早报渲染并联动 /pick

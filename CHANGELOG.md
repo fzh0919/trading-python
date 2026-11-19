@@ -2,6 +2,31 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.7`（2026-11-19）
+
+`/pick` 全链路重构（Researcher + Critic + 确定性风控闭环），施工总计划见 [`docs/plans/2026-11-19-5.5.7-pick-pipeline-plan.md`](./docs/plans/2026-11-19-5.5.7-pick-pipeline-plan.md)。
+
+1. **Wave 1 — 确定性真源统一**：
+   - `src/config.py` 新增 `invest_vix_tighten_rr_threshold=22.0`；`dual_philosophy.resolve_invest_dynamic_rr_floor` 纳入 VIX（NEUTRAL+VIX≥22 → 2.5），并透传至 `holding_eval`、`sizing`、`risk_override`、`deployment_gate.evaluate_deployment_gate` 与早报 FactSheet，实现早报/Researcher/Critic/Python 四处同一门槛。
+   - `pick_agent` 对齐 `/report` 调用 `refresh_portfolio_fx` 后再构建现金底座，根除 `GBP/USD 暂缺`。
+   - `deployment_gate/triggers._scan_a_equity_candidates` 新增右侧硬门槛（`dist_ma200_pct>0`、`weekly_bullish is not False`、回踩区间 `[-2%, tol]`），拒绝假右侧猎物。
+   - `_format_gate_constraint_block` 同步 `approved_report_core_gbp` 与实时活动买单：不再重复签发核心宽基票据，已挂单标的标注“已挂单执行中，勿重复建仓”。
+2. **Wave 2 — 选股漏斗与 DeepSeek 初筛**：
+   - `run_quant_screener` 新增通道短路参数（`enable_isa_equities` / `enable_isa_etfs` / `enable_invest_track` / `excluded_symbols` / `out_bundles` / `out_intel` / `out_tech`），ISA 通道关闭即跳过 Stage-2/搜索，15 天冷却股前置剔除。
+   - `scoring.py`：Invest 英股取消 `+2.5` 免换汇改为 `-1.0` 印花税摩擦、新增前瞻 R:R 可达性降权（8~15 分）、Invest `dim1` 顶格 24~30 仅留给强右侧领涨；`_prefilter_row` 增补行业/地区、目标空间、ATR14、60日RS、预估R:R、安全边际/FCF。
+3. **Wave 3 — Researcher 上下文与 1-to-1 深搜**：
+   - `_format_summary_line` 增补 `[行业/地区]`、ATR14、周线/ADX、60日RS、量比、CYQ 均成本、结构支撑位与 `.L` 校准后的卖方区间，删除每行重复 `广度`。
+   - `run_forced_market_grounding` 为 `scope="pick"` 新增 30 天反方深搜与独立缓存键 `grounding:{date}:pick_deep:{sym}`（上限 6 只），`scope="report"` 提示词与 `prio` 缓存键一字未动。
+   - 早报裁决按实时持仓/挂单差集过滤；ISA 个股通道关闭时折叠绿标加仓持仓；移除 ContextPack 冲突摘要与重复身份段、复用 Stage-2 bundles/deep intel；`/pick` 工具集移除 `get_macro_snapshot`；Researcher 输出收紧至 ≤1,200 字、分轨授权 0 提案、5 要素含 1 句 Pre-Mortem。
+4. **Wave 4 — Critic 一手事实卡与去噪**：新增 0-Token 白名单事实卡（严格交集候选/`_inspect_cache`/持仓，上限 5 只，含现价/ATR/RSI/均线/相关性/财报/除息/卖方/摩擦/ISA 价值门预判）；删除重复双钱包块；偏好记忆开关同时门控读取；Critic 画像改为 `compact_for_pick_critic` 精简版，六重护栏压缩去重。
+5. **Wave 5 — Schema 洁净化与统一风控数学**：
+   - `PickDecision.stop_price/target_price` 改为 `float | None`，新增 `planned_entry_price/planned_amount_gbp`；`planned_entry_price` 经 `.L` 校准并钳位 `[现价×0.92, ×1.03]` 且 `> stop`，入库 `entry_price` 永远锁死市场现价。
+   - 净 R:R 与以损定仓统一用 `effective_risk_pct = risk_pct + friction_pct`；`stop_too_tight` 仍用纯价格 `risk_pct` 对比 `max(1.5×ATR, 4%)`。
+   - 碎单（`below_min_order`）在 hard 模式硬拦截并区分“止损过宽/单仓余量不足”；Invest 已有未成交买入挂单的同票重复推荐硬拦截。
+   - `compute_trade_behavior_stats` 支持 `exempt_symbols` 剔除零 Quota 核心宽基，并按 `(账户, 标的, 日期)` 归并同日拆单；`_cadence_violation` 在 `partial=True` 且 `coverage_days>0` 时仍硬拦 15 天清仓冷却（7/30 天频次保持软提示，纯 `{"partial": True}` 极简桩保持原样）。
+   - 新增 `_build_deterministic_cash_note`：Python 接管执行后精确余现，已挂单不重复扣减，拦截前后账目一致。
+6. **Wave 6 — 渲染与质检补盲**：`_reconcile_pick_headline` 识别被拦标的的中文宽基简称并重建“风控筛后执行…其余现金待命”；空仓文案移除硬编码 `R:R≥2:1`；`build_fact_baseline(scope="pick", candidate_bundles=...)` 补齐新股现价与币种锚点；版本同步 `5.5.7`。
+
 ### `v5.5.6`（2026-11-19）
 
 LLM 工具调用末轮强制收口、`/stats` 账本 5 日跨源去重与存量清理、盘中哨兵静默冷却与侧车思考降档（规划见 [`docs/plans/2026-11-19-5.5.6-hardening-plan.md`](./docs/plans/2026-11-19-5.5.6-hardening-plan.md)）。

@@ -137,6 +137,10 @@ async def run_forced_market_grounding(
 
     clean_syms = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
     prio_ordered = list(dict.fromkeys(s.strip().upper() for s in (priority_symbols or ()) if s and s.strip()))
+    # v5.5.7: /pick caps 1-to-1 deep dives at 6 names (reusing max_concurrent_searches=4) and
+    # uses its own 30-day cache key; the /report 72h/7d contract stays byte-identical.
+    if scope == "pick" and len(prio_ordered) > 6:
+        prio_ordered = prio_ordered[:6]
     prio_set = set(prio_ordered)
     grouped_syms = [s for s in clean_syms if s not in prio_set]
 
@@ -196,7 +200,15 @@ async def run_forced_market_grounding(
 
     for sym in prio_ordered:
         region = _classify_symbol_region(sym, qtypes.get(sym, ""))
-        if region in {"UK", "UK_ETF"}:
+        if scope == "pick":
+            p_prompt = (
+                f"Perform a 1-to-1 Google Search deep dive over the past 30 days for ticker {sym}: "
+                "check (1) earnings/guidance revisions, (2) institutional rating and target-price changes, "
+                "and (3) the core bear case — regulatory, litigation, competitive or operational headwinds. "
+                "You MUST include material opposing/bearish evidence, not just the bull case. "
+                "Output verified dates and key numbers concisely in Simplified Chinese within 220 Chinese characters."
+            )
+        elif region in {"UK", "UK_ETF"}:
             p_prompt = (
                 f"Perform a 1-to-1 Google Search deep dive for London Stock Exchange ticker {sym}: "
                 "check RNS regulatory announcements, trading updates, earnings/dividend/ex-dividend news, sudden price-move drivers, "
@@ -217,8 +229,13 @@ async def run_forced_market_grounding(
                 "dividends/buybacks, and analyst rating changes over the past 72 hours. "
                 "Output verified dates and key numbers concisely in Simplified Chinese within 180 Chinese characters."
             )
+        deep_key = (
+            f"grounding:{uk_date}:pick_deep:{sym}"
+            if scope == "pick"
+            else f"grounding:{uk_date}:prio:{sym}"
+        )
         tasks_meta.append(
-            (f"【重点标的1对1深搜 · {sym}】", p_prompt, f"grounding:{uk_date}:prio:{sym}", [sym], True)
+            (f"【重点标的1对1深搜 · {sym}】", p_prompt, deep_key, [sym], True)
         )
 
     batch_size = 3
@@ -456,6 +473,7 @@ class MarketToolkit:
         ops_notifier: OpsNotifier | None = None,
         db: AdvisorDatabase | None = None,
         allow_search_tool: bool = True,
+        include_macro_tool: bool = True,
         search_cache_ttl_seconds: int = _DEFAULT_PERSIST_TTL_SECONDS,
     ) -> None:
         self.market_data = market_data
@@ -465,6 +483,7 @@ class MarketToolkit:
         self.ops_notifier = ops_notifier
         self.db = db
         self.allow_search_tool = bool(allow_search_tool)
+        self.include_macro_tool = bool(include_macro_tool)
         self.search_cache_ttl_seconds = max(0, int(search_cache_ttl_seconds))
         self._inspect_cache: dict[str, dict[str, Any]] = {}
         self._corr_cache: dict[str, dict[str, Any]] = {}
@@ -525,6 +544,9 @@ class MarketToolkit:
                 parameters={"type": "OBJECT", "properties": {}},
             ),
         ]
+        if not self.include_macro_tool:
+            # /pick already injects a Python-computed macro snapshot into the prompt.
+            decls = [d for d in decls if d.name != "get_macro_snapshot"]
         if self.llm is not None and self.allow_search_tool:
             decls.append(
                 types.FunctionDeclaration(
@@ -601,7 +623,6 @@ class MarketToolkit:
             payload: dict[str, Any] = {
                 "symbol": sym,
                 "summary": format_technical_line(sym, tech, bundle),
-                "name": bundle.short_name if bundle else sym,
                 "identity_summary": bundle.identity_summary if bundle else "",
                 "currency": bundle.currency if bundle else "",
                 "quote_type": quote_type,

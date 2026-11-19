@@ -31,6 +31,7 @@ from src.engine.portfolio_rules import (
     _resolve_pick_rr,
     apply_risk_override_guardrail,
     evaluate_holding,
+    resolve_invest_dynamic_rr_floor,
 )
 
 
@@ -784,6 +785,191 @@ class TestV552ReportGroupedRendering(unittest.TestCase):
         self.assertGreater(len(rendered), 2200)
         self.assertLessEqual(len(rendered), 2800)
         self.assertIn("其余长线底仓持有不动", rendered)
+
+
+class TestV557VixDynamicRRFloor(unittest.TestCase):
+    """v5.5.7 Wave 1: one VIX-inclusive Invest R:R floor shared by every layer."""
+
+    def _leader(self) -> TechnicalSnapshot:
+        return TechnicalSnapshot(
+            symbol="NVDA",
+            last_close=100.0,
+            dist_ma20_pct=2.0,
+            dist_ma50_pct=6.0,
+            dist_ma200_pct=20.0,
+            trend_regime="BULL",
+            weekly_bullish=True,
+            atr_pct=2.5,
+        )
+
+    def test_vix_tightens_neutral_to_defensive_floor(self) -> None:
+        rr, label = resolve_invest_dynamic_rr_floor(
+            "NEUTRAL", self._leader(), StrategySection(), vix=25.3
+        )
+        self.assertEqual(rr, 2.5)
+        self.assertIn("VIX", label)
+
+        calm, _ = resolve_invest_dynamic_rr_floor(
+            "NEUTRAL", self._leader(), StrategySection(), vix=16.0
+        )
+        self.assertEqual(calm, 2.0)
+
+        leader, _ = resolve_invest_dynamic_rr_floor(
+            "RISK_ON", self._leader(), StrategySection(), vix=15.0
+        )
+        self.assertEqual(leader, 1.6)
+
+        tightened, label2 = resolve_invest_dynamic_rr_floor(
+            "RISK_ON", self._leader(), StrategySection(), vix=24.0
+        )
+        self.assertEqual(tightened, 2.5)
+        self.assertIn("VIX", label2)
+
+        # No vix passed => byte-identical legacy behaviour.
+        legacy, _ = resolve_invest_dynamic_rr_floor("NEUTRAL", self._leader(), StrategySection())
+        self.assertEqual(legacy, 2.0)
+
+    def test_risk_override_applies_vix_floor_to_recomputed_rr(self) -> None:
+        bundle = TickerMarketBundle(
+            symbol="NVDA",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+        )
+        tech = self._leader()
+        decision = _pick("Invest", "NVDA", stop=95.0, target=111.0)
+        hard = StrategySection(pick_rr_guard_mode="hard", invest_min_rr_neutral=2.0)
+        # Upside 11% vs 5% risk => ~2.2:1, fine in calm NEUTRAL but below the 2.5 VIX floor.
+        res = apply_risk_override_guardrail(
+            decision,
+            portfolio=_portfolio([]),
+            macro=_macro(vix=25.3),
+            strategy=hard,
+            bundle_map={"NVDA": bundle},
+            trade_behavior={"partial": True},
+            deployment_gate={"regime": "NEUTRAL"},
+            tech_map={"NVDA": tech},
+        )
+        self.assertTrue(res.applied)
+        self.assertEqual(res.overrides[0].trigger_type, "RR_BELOW_FLOOR")
+        self.assertIn("VIX", res.overrides[0].reason)
+
+
+class TestV557Wave5UnifiedMath(unittest.TestCase):
+    """v5.5.7 Wave 5: planned price clamp, friction-aware net R:R, nullable price schema."""
+
+    def test_planned_entry_is_clamped_and_falls_back(self) -> None:
+        bundle = TickerMarketBundle(
+            symbol="NVDA", quote_type="EQUITY", currency="USD", current_price=100.0
+        )
+        base = _pick("Invest", "NVDA", stop=94.0, target=120.0).selected_actions[0]
+
+        in_band = _resolve_pick_rr(
+            base.model_copy(update={"planned_entry_price": 98.0}),
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+        )
+        self.assertAlmostEqual(in_band["entry"], 98.0, places=2)
+        self.assertTrue(in_band["entry_planned"])
+
+        too_low = _resolve_pick_rr(
+            base.model_copy(update={"planned_entry_price": 80.0}),
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+        )
+        self.assertAlmostEqual(too_low["entry"], 100.0, places=2)
+        self.assertFalse(too_low["entry_planned"])
+
+        too_high = _resolve_pick_rr(
+            base.model_copy(update={"planned_entry_price": 110.0}),
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+        )
+        self.assertAlmostEqual(too_high["entry"], 100.0, places=2)
+
+        below_stop = _resolve_pick_rr(
+            base.model_copy(update={"planned_entry_price": 93.0}),
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+        )
+        self.assertAlmostEqual(below_stop["entry"], 100.0, places=2)
+
+    def test_net_rr_uses_friction_denominator_but_atr_floor_uses_pure_stop(self) -> None:
+        bundle = TickerMarketBundle(
+            symbol="NVDA", quote_type="EQUITY", currency="USD", current_price=100.0
+        )
+        tech = TechnicalSnapshot(
+            symbol="NVDA",
+            last_close=100.0,
+            dist_ma200_pct=20.0,
+            trend_regime="BULL",
+            weekly_bullish=True,
+            atr_pct=3.0,
+        )
+        info = _resolve_pick_rr(
+            _pick("Invest", "NVDA", stop=97.0, target=120.0).selected_actions[0],
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+            tech=tech,
+            regime="NEUTRAL",
+        )
+        self.assertAlmostEqual(info["risk_pct"], 3.0, places=2)
+        self.assertAlmostEqual(
+            info["effective_risk_pct"], round(3.0 + info["friction_pct"], 2), places=2
+        )
+        self.assertGreater(info["effective_risk_pct"], info["risk_pct"])
+        expected_rr = round(
+            (info["upside_pct"] - info["friction_pct"]) / info["effective_risk_pct"], 2
+        )
+        self.assertAlmostEqual(info["rr"], expected_rr, places=2)
+        # ATR floor = max(1.5*3.0, 4.0) = 4.5 — the 3% pure stop is still too tight.
+        self.assertTrue(info["stop_too_tight"])
+        self.assertAlmostEqual(info["min_stop_pct"], 4.5, places=2)
+
+    def test_pick_schema_accepts_null_stop_target_and_new_optional_fields(self) -> None:
+        decision = PickDecision(
+            headline="测试",
+            selected_actions=[
+                PickActionItem(
+                    account="ISA",
+                    symbol="ULVR.L",
+                    action="BUY",
+                    thesis="护城河稳健",
+                    entry_zone="3850-3900 GBp",
+                    stop_condition="基本面证伪",
+                    target_window="3年",
+                    entry_price=3880.0,
+                    stop_price=None,
+                    target_price=None,
+                    planned_entry_price=3860.0,
+                    planned_amount_gbp=1500.0,
+                )
+            ],
+            rejected_or_frozen=[],
+            consistency_and_cash_note="继承早报红线",
+        )
+        self.assertIsNone(decision.selected_actions[0].stop_price)
+        self.assertEqual(decision.selected_actions[0].planned_amount_gbp, 1500.0)
+        info = _resolve_pick_rr(
+            decision.selected_actions[0],
+            TickerMarketBundle(symbol="ULVR.L", quote_type="EQUITY", currency="GBp", current_price=3880.0),
+            StrategySection(),
+            symbol="ULVR.L",
+            account="ISA",
+        )
+        self.assertIsNone(info["risk_pct"])
+        self.assertIsNone(info["rr"])
+        self.assertAlmostEqual(info["entry"], 3860.0, places=2)
 
 
 if __name__ == "__main__":

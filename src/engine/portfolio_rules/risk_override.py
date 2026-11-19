@@ -32,7 +32,7 @@ from src.engine.portfolio_rules.models_and_friction import (
     _CORE_WIDE_BASE_FAMILIES,
     _estimate_pending_order_gbp,
 )
-from src.engine.portfolio_rules.sizing import _build_pick_size_note
+from src.engine.portfolio_rules.sizing import _resolve_pick_sizing
 
 _VETO_BLOCK_KEYWORDS = ("禁止", "严禁", "勿", "不买", "不加", "暂停", "回避", "拦截", "冻结", "VETO", "NO ")
 _NON_TICKER_TOKENS = {
@@ -134,7 +134,28 @@ def _cadence_violation(
     """
     if is_etf:
         return None
-    if not behavior or behavior.get("partial"):
+    if not behavior:
+        return None
+    partial = bool(behavior.get("partial"))
+    coverage_days = float(behavior.get("coverage_days") or 0.0)
+    # v5.5.7: a hard 15-day re-buy cooldown is *proven* by a real closed position even when the
+    # fetched history is shorter than 30 days. Only the frequency caps stay soft under `partial`
+    # (a legacy bare {"partial": True} stub with no coverage_days keeps the old no-op behaviour).
+    if not partial or coverage_days > 0.0:
+        base_root = normalize_issuer_root(base)
+        for row in behavior.get("recently_closed") or []:
+            if not row.get("in_cooldown"):
+                continue
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            if ticker == sym_up or ticker == base or normalize_issuer_root(ticker) == base_root:
+                return (
+                    "REBUY_COOLDOWN",
+                    f"{ticker} 于 {float(row.get('days_since_sell') or 0):.0f} 天前清仓，处于 "
+                    f"{int(behavior.get('cooldown_days') or 0)} 天再买冷却期",
+                )
+    if partial:
         return None
     weekly_cap = int(getattr(strategy, "max_weekly_new_buys", 0) or 0)
     monthly_cap = int(getattr(strategy, "max_monthly_new_buys", 0) or 0)
@@ -148,19 +169,6 @@ def _cadence_violation(
             "FREQUENCY_CAP",
             f"近 30 天已新开仓 {int(behavior.get('buys_30d') or 0)} 笔(≥上限{monthly_cap})，本月额度已用完",
         )
-    base_root = normalize_issuer_root(base)
-    for row in behavior.get("recently_closed") or []:
-        if not row.get("in_cooldown"):
-            continue
-        ticker = str(row.get("ticker") or "").strip().upper()
-        if not ticker:
-            continue
-        if ticker == sym_up or ticker == base or normalize_issuer_root(ticker) == base_root:
-            return (
-                "REBUY_COOLDOWN",
-                f"{ticker} 于 {float(row.get('days_since_sell') or 0):.0f} 天前清仓，处于 "
-                f"{int(behavior.get('cooldown_days') or 0)} 天再买冷却期",
-            )
     return None
 
 
@@ -342,13 +350,16 @@ def _apply_pick_overrides(
     regime: str,
     risk_budget_scale: float,
     cadence_advisories: list[str],
+    core_etf_syms: set[str] | None = None,
 ) -> RiskOverrideResult:
     """Apply deterministic risk overrides and position sizing notes to PickDecision."""
     overrides: list[RiskOverrideRecord] = []
     notes: list[str] = []
     kept_actions = []
+    sizing_map: dict[str, Any] = {}
     new_rejected = list(getattr(decision, "rejected_or_frozen", []) or [])
     sizing_applied = False
+    core_etf_syms = {str(s).strip().upper() for s in (core_etf_syms or set()) if str(s).strip()}
     gbp_usd_rate = getattr(portfolio, "gbp_usd_rate", None) if portfolio is not None else None
     for item in decision.selected_actions:
         violation = check_violation(
@@ -375,6 +386,7 @@ def _apply_pick_overrides(
                 acct_up = item.account.strip().upper()
                 sym_up = item.symbol.strip().upper()
                 sym_base = sym_up.split(".")[0]
+                bundle_item = bundle_lookup.get(sym_up) or bundle_lookup.get(sym_base)
                 existing_val = 0.0
                 if portfolio is not None:
                     item_root = normalize_issuer_root(sym_up)
@@ -386,9 +398,9 @@ def _apply_pick_overrides(
                         )
                         if held_root == item_root:
                             existing_val += float(held.current_value or 0.0)
-                size_note = _build_pick_size_note(
+                sizing_res = _resolve_pick_sizing(
                     item,
-                    bundle_lookup.get(sym_up) or bundle_lookup.get(sym_base),
+                    bundle_item,
                     strat,
                     account=item.account,
                     account_total_value_gbp=account_totals.get(acct_up),
@@ -400,10 +412,60 @@ def _apply_pick_overrides(
                     macro=macro,
                     regime=regime,
                 )
+                size_note = str(sizing_res.get("note") or "")
+                size_dict = sizing_res.get("size")
+                if isinstance(size_dict, dict) and size_dict:
+                    sizing_map[f"{acct_up}|{sym_up}"] = dict(size_dict)
                 if size_note:
                     # risk_note 是 Python 侧保留字段：模型必须返回空串，落地前由这里写入。
                     keep_item = item.model_copy(update={"risk_note": size_note})
                     sizing_applied = True
+                # v5.5.7: an unfundable ticket must be hard-blocked, not pushed with a
+                # contradictory "建议买 + 勿碎单" line.
+                pick_core_etf = False
+                if isinstance(size_dict, dict) and size_dict:
+                    root = normalize_issuer_root(sym_up)
+                    pick_core_etf = bool(
+                        sym_up in core_etf_syms
+                        or sym_base in core_etf_syms
+                        or root in {normalize_issuer_root(s) for s in core_etf_syms}
+                    )
+                    if not pick_core_etf:
+                        family = infer_etf_index_family(sym_up, bundle_item)
+                        pick_core_etf = family in _CORE_WIDE_BASE_FAMILIES
+                if (
+                    _pick_guard_mode(strat) == "hard"
+                    and not pick_core_etf
+                    and isinstance(size_dict, dict)
+                    and bool(size_dict.get("below_min_order"))
+                ):
+                    min_order = float(size_dict.get("min_order_gbp") or 0.0)
+                    budget_sized = float(size_dict.get("budget_sized_gbp") or 0.0)
+                    headroom = float(size_dict.get("headroom_gbp") or 0.0)
+                    if 0.0 < budget_sized < min_order:
+                        why = (
+                            f"止损过宽致预算额 £{budget_sized:,.0f} < 最小单笔额 £{min_order:,.0f}，"
+                            "无法按以损定仓建仓；请收窄止损或改选标的"
+                        )
+                    else:
+                        why = (
+                            f"单仓权重余量 £{headroom:,.0f} < 最小单笔额 £{min_order:,.0f}，"
+                            "剩余空间不足以建仓"
+                        )
+                    overrides.append(
+                        RiskOverrideRecord(
+                            account=item.account,
+                            symbol=item.symbol,
+                            from_action=item.action,
+                            to_action="REJECTED",
+                            trigger_type="BELOW_MIN_ORDER_SIZE",
+                            reason=why,
+                        )
+                    )
+                    note = f"[🛡️风控护栏修正] [{item.account}] {item.symbol}({item.action}→拦截): {why}"
+                    notes.append(note)
+                    new_rejected.append(note)
+                    continue
             kept_actions.append(keep_item)
     copied = (
         decision.model_copy(
@@ -418,6 +480,7 @@ def _apply_pick_overrides(
         applied=bool(overrides),
         overrides=overrides,
         notes=notes,
+        sizing_map=sizing_map,
     )
 
 
@@ -783,7 +846,12 @@ def apply_risk_override_guardrail(
                             if advisory not in cadence_advisories:
                                 cadence_advisories.append(advisory)
                         else:
-                            min_rr, tier_label = resolve_invest_dynamic_rr_floor(regime, t_snap, strat)
+                            min_rr, tier_label = resolve_invest_dynamic_rr_floor(
+                                regime,
+                                t_snap,
+                                strat,
+                                vix=macro_vix,
+                            )
                             if float(rr) < min_rr:
                                 rr_msg = (
                                     f"Python 复算 R:R 仅{float(rr):.2f}:1(<{min_rr:.1f}:1 {tier_label}；"
@@ -858,6 +926,7 @@ def apply_risk_override_guardrail(
             regime=regime,
             risk_budget_scale=risk_budget_scale,
             cadence_advisories=cadence_advisories,
+            core_etf_syms=core_etf_syms,
         )
 
     return RiskOverrideResult(decision=decision, applied=False)

@@ -127,7 +127,7 @@ def build_report_size_notes(top_actions: list[Any] | None, portfolio: Any | None
     return notes
 
 
-def _build_pick_size_note(
+def _resolve_pick_sizing(
     item: Any,
     bundle: TickerMarketBundle | None,
     strategy: StrategySection,
@@ -142,8 +142,8 @@ def _build_pick_size_note(
     macro: MacroSnapshot | None = None,
     regime: str = "NEUTRAL",
     existing_position_weight_pct: float = 0.0,
-) -> str:
-    """Deterministic sizing hint: risk budget / stop distance for Invest, value batching for ISA."""
+) -> dict[str, Any]:
+    """Resolve the deterministic sizing note plus the raw sizing/R:R dicts for guardrails."""
     acct_up = str(account or "").strip().upper()
     symbol = str(getattr(item, "symbol", "") or "")
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
@@ -161,19 +161,29 @@ def _build_pick_size_note(
             crisis_mode=str(regime or "").upper() == "RISK_OFF",
         )
         if not gate.get("mos_pass"):
-            return ""
+            return {"note": "", "size": None, "rr": None, "is_etf": is_etf}
         total = float(account_total_value_gbp or 0.0)
         if total <= 0:
-            return f"ISA价值分批建议：{gate.get('summary')}，建议分批逢低建仓"
+            return {
+                "note": f"ISA价值分批建议：{gate.get('summary')}，建议分批逢低建仓",
+                "size": None,
+                "rr": None,
+                "is_etf": is_etf,
+            }
         cap_pct = float(getattr(strategy, "max_single_name_portfolio_pct", 12.0) or 12.0)
         headroom = max(0.0, total * cap_pct / 100.0 - float(existing_position_value_gbp or 0.0))
         if headroom <= 0:
-            return ""
+            return {"note": "", "size": None, "rr": None, "is_etf": is_etf}
         step = min(headroom, max(float(strategy.min_isa_equity_order_gbp), total * 0.04))
-        return (
-            f"ISA价值分批建议 £{step:,.0f}"
-            f"（单票余量£{headroom:,.0f}，{gate.get('summary')}，建议分批逢低建仓）"
-        )
+        return {
+            "note": (
+                f"ISA价值分批建议 £{step:,.0f}"
+                f"（单票余量£{headroom:,.0f}，{gate.get('summary')}，建议分批逢低建仓）"
+            ),
+            "size": None,
+            "rr": None,
+            "is_etf": is_etf,
+        }
 
     info = _resolve_pick_rr(
         item,
@@ -188,12 +198,14 @@ def _build_pick_size_note(
     entry = float(info.get("entry") or 0.0)
     stop = float(info.get("stop") or 0.0)
     risk_pct = info.get("risk_pct")
-    if entry <= 0 or stop <= 0 or not risk_pct:
-        return ""
+    effective_risk_pct = info.get("effective_risk_pct")
+    friction_pct = float(info.get("friction_pct") or 0.0)
+    if entry <= 0 or stop <= 0 or not risk_pct or not effective_risk_pct:
+        return {"note": "", "size": None, "rr": info, "is_etf": is_etf}
     sizing = compute_risk_based_size_gbp(
         account=account,
         strategy=strategy,
-        effective_stop_pct=-abs(float(risk_pct)),
+        effective_stop_pct=-abs(float(effective_risk_pct)),
         is_etf=is_etf,
         account_total_value_gbp=account_total_value_gbp,
         existing_position_value_gbp=float(existing_position_value_gbp or 0.0),
@@ -201,14 +213,20 @@ def _build_pick_size_note(
     )
     suggested = sizing.get("suggested_gbp")
     if not suggested or float(suggested) <= 0:
-        return ""
+        return {"note": "", "size": sizing, "rr": info, "is_etf": is_etf}
     cap_pct = float(sizing.get("single_name_cap_pct") or 0.0)
     parts = [
         f"以损定仓上限 £{float(suggested):,.0f}"
-        f"（预算£{float(sizing.get('risk_budget_gbp') or 0.0):,.0f}÷止损{float(risk_pct):.1f}%，单仓≤{cap_pct:.0f}%）"
+        f"（预算£{float(sizing.get('risk_budget_gbp') or 0.0):,.0f}÷含摩擦止损{float(effective_risk_pct):.1f}%"
+        f"=纯止损{float(risk_pct):.1f}%+摩擦{friction_pct:.2f}%，单仓≤{cap_pct:.0f}%）"
     ]
     if acct_up == "INVEST":
-        min_rr, tier_label = resolve_invest_dynamic_rr_floor(regime, tech, strategy)
+        min_rr, tier_label = resolve_invest_dynamic_rr_floor(
+            regime,
+            tech,
+            strategy,
+            vix=(macro.vix if (macro is not None and macro.vix is not None) else None),
+        )
         parts.append(f"动态门槛{tier_label}≥{min_rr:.1f}:1")
     shares = _shares_from_gbp(
         float(suggested),
@@ -218,7 +236,47 @@ def _build_pick_size_note(
         gbp_usd_rate,
     )
     if shares is not None and shares > 0:
-        parts.append(f"≈{shares}股")
+        parts.append(f"≈{shares}股(上限)")
+    planned_amount = getattr(item, "planned_amount_gbp", None)
+    if planned_amount is not None and float(planned_amount) > float(suggested) * 1.05:
+        parts.append(f"建议金额£{float(planned_amount):,.0f}超上限，按£{float(suggested):,.0f}钳位")
     if sizing.get("below_min_order"):
         parts.append(f"低于最小建仓额£{float(sizing.get('min_order_gbp') or 0.0):,.0f}，勿碎单")
-    return "，".join(parts)
+    return {"note": "，".join(parts), "size": sizing, "rr": info, "is_etf": is_etf}
+
+
+def _build_pick_size_note(
+    item: Any,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    *,
+    account: str,
+    account_total_value_gbp: float | None = None,
+    existing_position_value_gbp: float = 0.0,
+    gbp_usd_rate: float | None = None,
+    wallet: AccountSnapshot | None = None,
+    risk_budget_scale: float = 1.0,
+    tech: TechnicalSnapshot | None = None,
+    macro: MacroSnapshot | None = None,
+    regime: str = "NEUTRAL",
+    existing_position_weight_pct: float = 0.0,
+) -> str:
+    """Deterministic sizing hint: risk budget / stop distance for Invest, value batching for ISA."""
+    return str(
+        _resolve_pick_sizing(
+            item,
+            bundle,
+            strategy,
+            account=account,
+            account_total_value_gbp=account_total_value_gbp,
+            existing_position_value_gbp=existing_position_value_gbp,
+            gbp_usd_rate=gbp_usd_rate,
+            wallet=wallet,
+            risk_budget_scale=risk_budget_scale,
+            tech=tech,
+            macro=macro,
+            regime=regime,
+            existing_position_weight_pct=existing_position_weight_pct,
+        ).get("note")
+        or ""
+    )

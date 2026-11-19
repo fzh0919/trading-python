@@ -1648,5 +1648,69 @@ class TestRedaction(unittest.TestCase):
         self.assertIn("ConnectError", err)
 
 
+class TestV557PickDeepGrounding(unittest.IsolatedAsyncioTestCase):
+    """v5.5.7 Wave 3: /pick gets its own 1-to-1 30-day deep search, /report stays untouched."""
+
+    class _FakeCacheDB:
+        def __init__(self) -> None:
+            self.saved: list[dict] = []
+
+        async def get_grounding_news_cache(self, keys, max_age_seconds: int = 0):
+            return {}
+
+        async def upsert_grounding_news_cache(self, entries):
+            self.saved.extend(entries)
+
+    async def test_pick_scope_uses_30d_deep_key_and_report_untouched(self) -> None:
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+
+        clear_grounding_cache()
+        seen_prompts: list[str] = []
+
+        class _LLM:
+            async def generate(self, **kwargs) -> str:
+                seen_prompts.append(str(kwargs.get("prompt") or ""))
+                return "ok"
+
+        uk_date = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/London")).date().isoformat()
+        syms = [f"S{i}" for i in range(8)]
+        pick_db = self._FakeCacheDB()
+        await run_forced_market_grounding(
+            llm=_LLM(),
+            search_model="gemini-4-hydrogen",
+            scope="pick",
+            symbols=syms,
+            priority_symbols=syms,
+            ttl_seconds=60,
+            db=pick_db,
+        )
+        deep_prompts = [p for p in seen_prompts if "past 30 days" in p]
+        self.assertEqual(len(deep_prompts), 6)  # hard cap 6
+        self.assertTrue(all("core bear case" in p for p in deep_prompts))
+        pick_keys = {e["cache_key"] for e in pick_db.saved}
+        self.assertIn(f"grounding:{uk_date}:pick_deep:S0", pick_keys)
+        self.assertNotIn(f"grounding:{uk_date}:prio:S0", pick_keys)
+
+        clear_grounding_cache()
+        seen_prompts.clear()
+        report_db = self._FakeCacheDB()
+        await run_forced_market_grounding(
+            llm=_LLM(),
+            search_model="gemini-4-hydrogen",
+            scope="report",
+            symbols=["NVDA", "AZN.L"],
+            priority_symbols=["NVDA", "AZN.L"],
+            ttl_seconds=60,
+            db=report_db,
+        )
+        self.assertFalse(any("past 30 days" in p for p in seen_prompts))
+        self.assertTrue(any("past 72 hours" in p for p in seen_prompts))
+        report_keys = {e["cache_key"] for e in report_db.saved}
+        self.assertIn(f"grounding:{uk_date}:prio:NVDA", report_keys)
+        self.assertNotIn(f"grounding:{uk_date}:pick_deep:NVDA", report_keys)
+        clear_grounding_cache()
+
+
 if __name__ == "__main__":
     unittest.main()

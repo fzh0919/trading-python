@@ -667,6 +667,9 @@ async def answer_user_chat(
         db.get_context_pack(allow_fallback=True),
         db.get_active_preference_notes(),
     )
+    if not bool(getattr(cfg.strategy, "user_preference_memory_enabled", True)):
+        # v5.5.7: the switch must gate READS too, not just writes.
+        pref_notes = []
 
     is_deep_query = user_query.strip().lower().startswith("/deep")
     history_block = _format_chat_history_compact(history_turns, recent_full_turns=3 if is_deep_query else 2)

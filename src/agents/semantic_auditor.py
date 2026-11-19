@@ -63,6 +63,7 @@ def build_fact_baseline(
     trade_ctx: dict[str, str] | None = None,
     guardrails: list[str] | None = None,
     fact_sheet: str = "",
+    candidate_bundles: dict[str, Any] | None = None,
 ) -> str:
     """Assemble a deterministic numeric baseline (Python/SQLite truth) for the linter to compare against."""
     lines = [f"【原始数字底座（只含已存在的事实价） | {_SCOPE_LABELS.get(scope, scope)}】"]
@@ -115,6 +116,17 @@ def build_fact_baseline(
     pending_text = str((trade_ctx or {}).get("pending_orders_text") or "").strip()
     if pending_text:
         lines.append("活动挂单（未成交仍计息）：\n" + pending_text[:1200])
+    if scope == "pick" and candidate_bundles:
+        # v5.5.7: anchor this round's new picks so the linter can catch a GBp/GBP 100x slip.
+        anchor_lines: list[str] = []
+        for sym, bundle in list(candidate_bundles.items())[:12]:
+            price = getattr(bundle, "current_price", None)
+            if price is None or float(price) <= 0:
+                continue
+            ccy = str(getattr(bundle, "currency", "") or "")
+            anchor_lines.append(f"• {sym} | 现价 {_fmt_num(price)} {ccy} | 币种 {ccy or '待核'}")
+        if anchor_lines:
+            lines.append("本次入选新标的现价锚点（含币种）：\n" + "\n".join(anchor_lines))
     if evals:
         try:
             from src.engine.portfolio_rules import format_evaluations_text

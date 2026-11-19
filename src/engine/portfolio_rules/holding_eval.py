@@ -522,7 +522,12 @@ def evaluate_holding(
     if is_invest and effective_stop is not None and float(effective_stop) < 0 and upside_pct is not None:
         risk_pct = abs(float(effective_stop))
         rr_ratio = (upside_pct - friction_pct) / risk_pct if risk_pct > 0 else None
-        min_rr, rr_tier = resolve_invest_dynamic_rr_floor(reg_up, tech, strategy)
+        min_rr, rr_tier = resolve_invest_dynamic_rr_floor(
+            reg_up,
+            tech,
+            strategy,
+            vix=(macro.vix if (macro is not None and macro.vix is not None) else None),
+        )
         if rr_ratio is not None and rr_ratio < min_rr:
             add_score = 0
             reasons.append(
@@ -904,7 +909,12 @@ def _is_routine_hold(ev: HoldingEvaluation) -> bool:
     return not any(kw in joined_reasons for kw in _HIGH_PRIORITY_HOLD_KEYWORDS)
 
 
-def format_evaluations_text(evals: list[HoldingEvaluation], compact_hold: bool = True) -> str:
+def format_evaluations_text(
+    evals: list[HoldingEvaluation],
+    compact_hold: bool = True,
+    *,
+    collapse_isa_add: bool = False,
+) -> str:
     if not evals:
         return "（当前无持仓需要触发器评估）"
     badge = {
@@ -915,7 +925,12 @@ def format_evaluations_text(evals: list[HoldingEvaluation], compact_hold: bool =
     }
     lines: list[str] = []
     routine_holds: list[str] = []
+    folded_isa_adds: list[str] = []
     for ev in evals:
+        if collapse_isa_add and ev.account.upper() == "ISA" and ev.action_bias == "ADD_CANDIDATE":
+            # v5.5.7: a closed ISA equity channel must not spam 7 green add-candidate rows.
+            folded_isa_adds.append(ev.ticker)
+            continue
         if compact_hold and _is_routine_hold(ev):
             routine_holds.append(f"{ev.ticker}[{ev.account} {ev.weight_pct:.1f}%/{ev.return_pct:+.1f}%]")
             continue
@@ -923,6 +938,10 @@ def format_evaluations_text(evals: list[HoldingEvaluation], compact_hold: bool =
             f"• [{ev.account}] {ev.ticker} {badge.get(ev.action_bias, ev.action_bias)} "
             f"(占比 {ev.weight_pct:.1f}%, 浮盈 {ev.return_pct:+.1f}%, {ev.friction_note}): "
             + "；".join(ev.reasons)
+        )
+    if folded_isa_adds:
+        lines.append(
+            f"• 🟢 [ISA 加仓候选 x{len(folded_isa_adds)} 只，通道关闭仅登记不执行]：{', '.join(folded_isa_adds)}"
         )
     if routine_holds:
         lines.append(f"• ⚪ [常规持有 x{len(routine_holds)} 只均无异常]：{', '.join(routine_holds)}")

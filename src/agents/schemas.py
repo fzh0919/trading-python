@@ -180,52 +180,51 @@ class PickActionItem(BaseModel):
     action: Literal["BUY", "ADD", "TRIM", "SWAP"] = Field(description="BUY / ADD / TRIM / SWAP")
     thesis: str = Field(
         description=(
-            "交易逻辑与催化剂，说明相对基准 VWRP 的配置理由、目标空间/盈亏比(R:R)与摩擦承受度（不超过55字）；"
-            "Invest 动作用须标明资金路径，如「用 USD 钱包免换汇」或「GBP 不足需 USD 换回含 0.15% 损耗」"
+            "交易逻辑、催化与目标空间/盈亏比(R:R)（≤55字）；Invest 须写明资金路径，如「USD钱包免换汇」或「GBP不足需USD换回含0.15%损耗」"
         )
     )
-    entry_zone: str = Field(description="建议买入或加减仓价位区间与建议金额")
+    entry_zone: str = Field(description="建议价位区间与金额")
     stop_condition: str = Field(description="硬止损位或证伪条件")
     target_window: str = Field(description="目标位或观察周期")
-    entry_price: float = Field(default=0.0, description="当前参考现价数字（用于数据库记录，未知填0）")
-    stop_price: float = Field(
-        default=0.0,
-        description=(
-            "数值硬止损价（标的本地货币）。Invest 动作必填 >0 且止损宽度≥max(1.5×ATR, 4%)；"
-            "ISA 长线价值个股可填 0（须在 stop_condition 写明基本面/护城河证伪条件）；"
-            "Python 用它复算 R:R 与以损定仓，禁止只写在 stop_condition 文本里"
-        ),
+    entry_price: float = Field(default=0.0, description="当前参考现价（未知填0，Python 会回填）")
+    stop_price: float | None = Field(
+        default=None,
+        description="数值硬止损价（本地货币）。Invest 必填且止损宽度≥max(1.5×ATR,4%)；ISA 价值股可填 null 并在 stop_condition 写证伪条件",
     )
-    target_price: float = Field(
-        default=0.0,
-        description=(
-            "数值目标价 / 保守内在价值锚（标的本地货币 >0）。"
-            "Invest 非牛市偏离分析师均值>15% 会回拨均值，RISK_ON 右侧强股放宽至高目标上沿；ISA 填保守合理估值锚"
-        ),
+    target_price: float | None = Field(
+        default=None,
+        description="数值目标价/保守内在价值锚（本地货币）；Invest 必填，ISA 填保守估值锚",
+    )
+    planned_entry_price: float | None = Field(
+        default=None,
+        description="可选：建议限价中枢（留空按现价；Python 会做 .L 校准并钳位在现价 -8%~+3%）",
+    )
+    planned_amount_gbp: float | None = Field(
+        default=None,
+        description="可选：建议本笔建仓 GBP 整数金额（Python 会按以损定仓上限钳位）",
     )
     risk_note: str = Field(
         default="",
-        description="内部保留字段，模型输出时请一律返回空字符串 ''（由 Python 写入 R:R 与仓位校验结论）",
+        description="内部保留字段，模型一律返回空字符串 ''（由 Python 写入 R:R 与仓位校验结论）",
     )
 
 
 class PickDecision(BaseModel):
     headline: str = Field(
         description=(
-            "一句话定调本轮最终选股结论与现金部署计划（不超过55字；严禁提及任何未入选、内部讨论或被否决的候选标的/方向；"
-            "若无推荐，写明“本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命”并给出基准 VWRP 相对态度或下一次部署触发条件）"
+            "一句话最终结论、现金部署计划与基准 VWRP 相对态度（≤55字；严禁提及未入选/被否决标的；空仓时写明「本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命」）"
         )
     )
     selected_actions: list[PickActionItem] = Field(
         default_factory=list,
-        description="通过风控官六重护栏的最终推荐（0~3条）；若均未达标请返回空数组",
+        description="通过六重护栏的最终推荐（0~3条）；均未达标返回空数组",
     )
     rejected_or_frozen: list[str] = Field(
         default_factory=list,
-        description="内部保留字段，模型输出时请一律返回空数组 []（严禁在最终回复中列举未入选候选股或内部审查过程）",
+        description="内部保留字段，模型一律返回空数组 []（Python 会强制归零）",
     )
     consistency_and_cash_note: str = Field(
-        description="一句话说明执行建议后的双账户剩余现金与占总资产精确比例，及对早报红线的继承（不超过85字）"
+        description="一句 ≤45 字风控红线遵循声明（严禁口算余现，余现由 Python 精确接管）"
     )
 
 
@@ -664,7 +663,9 @@ def render_pick_report(
 
     sec1_lines = [f"📌 本轮结论：{decision.headline}"]
     if not decision.selected_actions:
-        sec1_lines.append("• ⚪ 本轮无 R:R≥2:1 标的，现金待命待回踩（非永久空仓）。")
+        sec1_lines.append(
+            "• ⚪ 本轮无达标机会（ISA 安全边际 / Invest 动态 R:R 未达标），现金待命待回踩（非永久空仓）。"
+        )
     else:
         for idx, item in enumerate(decision.selected_actions[:3], 1):
             sec1_lines.append(
