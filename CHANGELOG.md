@@ -2,6 +2,24 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.4`（2026-11-19）
+
+核心模块结构瘦身（纯结构重构、零业务逻辑变更；规划归档见 [`docs/plans/2026-11-19-5.5.4-module-slimdown-plan.md`](./docs/plans/2026-11-19-5.5.4-module-slimdown-plan.md)）。采用**子包门面模式（Subpackage Facade）**将全部 9 个突破 2,100~2,851 行的核心文件（共 22,820 行，占 `src/` 74%）拆解为 47 个高内聚领域子模块 + 9 个兼容门面，最大子模块降至 929 行，全部外部调用方与原有 459 个单测零改动。
+
+1. **Wave 1 — 纯确定性计算层**：
+   - `src/engine/deployment_gate/`（原 2,109L）：拆为 `common` / `core_policy` / `ledgers` / `regime` / `triggers` / `banner`（180~539L），形成严格无环依赖图。
+   - `src/data_providers/analytics/`（原 2,482L）：拆为 `technical` / `exposure` / `correlation` / `performance`（339~845L），门面保留 10 个跨模块私用符号。
+   - `src/engine/screener/`（原 2,487L）：拆为 `patterns` / `scoring` / `runner` / `audit` / `audition`（385~664L）。
+2. **Wave 2 — 存储仓与核心风控层**：
+   - `src/storage/db/`（原 2,851L）：以 Domain Mixins 拆为 `core` / `schema` / `portfolio_repo` / `recommendations_repo` / `ops_and_chat_repo` / `market_cache_repo` / `memory_and_wallet_repo`（87~661L）；仅 `core.py` 直接操作 `aiosqlite`，严守 `_connect(write=True)` 单写锁铁律。
+   - `src/engine/portfolio_rules/`（原 2,739L）：拆为 `models_and_friction` / `dual_philosophy` / `sizing` / `holding_eval` / `risk_override`（224~929L），并无损提炼 `_evaluate_holding_technicals` 及 `_build_override_portfolio_context` / `_apply_report_overrides` / `_apply_pick_overrides` 阶段函数。
+   - `src/data_providers/t212_client/`（原 2,446L）：拆为 `models` / `wallets_and_tickers` / `http_mixin` / `client` / `context_formatting`（175~795L），HTTP/限流/重试逻辑原样平移。
+3. **Wave 3 — 高 `mock.patch` 耦合与异步编排层**：
+   - `src/data_providers/market_data/`（原 2,293L）：拆为 `models_and_parsing` / `external_clients` / `yahoo_mixin` / `service`（394~743L），完整保护 26 处 `yf`/`time` 补丁接缝。
+   - `src/agents/report_agent/`（原 2,601L）：拆为 `fact_sheet` / `debate` / `core_deployment` / `morning_report` / `sentinels`（437~795L），无损提炼 `_build_morning_pm_prompt` 与 `_persist_morning_report_and_audit`，经门面运行时解析保护 4 处外部函数补丁接缝。
+   - `src/bot/scheduler/`（原 2,812L）：拆为 `settlement_math` / `fill_receipts` / `settlement_mixin` / `weekly_audit_mixin` / `intraday_mixin` / `core`（344~650L），经门面运行时解析保护 4 处外部函数补丁接缝。
+4. **防线单测与版本同步**：新增 `tests/test_v554_module_facades.py`（验证 9 个子包门面导出、`<1000` 行上限、`db` 单写锁铁律与 `mock.patch` 接缝）；`src/version.py` / `pyproject.toml` 升至 `5.5.4`，同步更新 `AGENTS.md` 模块索引；全量回归 **463/463 全绿**，`scripts/audit_egress.py` `RESULT: CLEAN`。
+
 ### `v5.5.3`（2026-11-19）
 
 单聊上下文对齐、双哲学盘中哨兵、分账归因与实盘成交反哺、LLM 可靠性与 ISA 价值因子覆盖率可观测性。

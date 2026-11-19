@@ -1,4 +1,5 @@
 _ref/
+.agents/
 .git/
 .gitignore
 .venv/
