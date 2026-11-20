@@ -174,6 +174,7 @@ def build_investor_profile(
     gbp_rate = float(strategy.cash_interest_rate_pct)
     usd_rate = float(getattr(strategy, "usd_cash_interest_rate_pct", 3.4))
     min_invest = float(getattr(strategy, "min_invest_order_gbp", 700.0))
+    min_pilot = float(getattr(strategy, "min_invest_pilot_order_gbp", 500.0))
     min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
     min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
     risk_budget = float(getattr(strategy, "invest_risk_budget_gbp", 85.0))
@@ -217,14 +218,25 @@ def build_investor_profile(
         "严禁仅因浮盈 25%、RSI≥75 或短期回撤 12% 卖飞好公司；"
         "ISA 卖出/减仓仅限 4 情形：基本面/护城河证伪、极端估值泡沫、显著更优机会成本置换、集中度超限/边角料归核。\n"
         "• Invest（短线机动仓，右侧动量战术流派）：严守硬止损与以损定仓、绝不摊平；"
-        "按当日市场状态（Regime）动态适配 R:R（RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1）与止损 ATR 噪声地板（禁止窄止损作弊）；"
-        "牛市站稳 MA20 不因单一 RSI 急卖、而是上移移动止损；震荡/退潮收紧锁利并结合前瞻 R:R（<0.8:1）做置换。\n"
+        "按当日四态市场状态（RISK_ON 强攻 / NEUTRAL 震荡 / RECOVERY 早春轻兵试探 / RISK_OFF 危机防御）"
+        "动态适配 R:R（RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1；RECOVERY 仅 1 槽位/1.0%热力/0.6R试探，VIX<22 为 ≥2.0:1、VIX≥22 收紧至 ≥2.5:1）"
+        "与止损 ATR 噪声地板（禁止窄止损作弊）；"
+        "非 RISK_OFF 下确认强领涨股（MA200上方+BULL/PULLBACK+周线不空+RS20>0且RS60>0）目标上限解锁双锚"
+        "max(卖方均值×1.15, 卖方高位×0.90, 入场+4×ATR)，非领涨/弱势/RISK_OFF 标的仍严锁卖方均值 ±15%；"
+        "牛市站稳 MA20 不因单一 RSI 急卖、而是上移移动止损；"
+        "Invest 浮盈+15%推保本（止损上移至成本+往返摩擦即转0热力/0槽位解锁新火力），"
+        "浮盈+25%站稳MA20无放量派发不催卖、改将止损抬升至max(成本+10%锁盈地板,沿MA20跟踪)让利润奔跑；"
+        "震荡/早春/退潮收紧锁利并结合前瞻 R:R（<0.8:1）做置换。\n"
         f"• 资金分桶与部署纪律：① ISA 现金占比 >{isa_trigger:.0f}% 时须给出具体价位与金额的宽基/优质低估值长线分批配置提案；"
         f"② Invest 现金长期 >{invest_idle:.0f}% 须说明为何没有达到当日动态 R:R 门槛（RISK_ON≥1.6 / NEUTRAL≥2.0 / 弱势≥2.5）的机会（资金效率提醒）；"
-        "③ 但严禁为“把钱花掉或凑满仓位”而降低标准，宁可不交易也不做低于当日门槛的低赔率单。\n"
+        "③ 但严禁为“把钱花掉或凑满仓位”而降低标准，宁可不交易也不做低于当日门槛的低赔率单；"
+        f"④ Invest 溢出现金仅在 Python 签发派息宽基蓄水池票据时停泊（仅 DIST 白名单 {'/'.join(getattr(strategy, 'invest_reservoir_etf_whitelist', ['VWRL.L', 'ISF.L', 'VERX.L', 'VEUR.L']))}，"
+        "零槽位零热力零Quota，应税账户严禁自选代码或买累积型 ETF）；"
+        "⑤ 若右侧个股建仓金额>Invest 可用现金且账户持有蓄水池，由 Python 确定性生成“先卖蓄水池宽基释放现金→再建仓”配对指令（含价差/汇率缓冲），"
+        "严禁自行口算股数或绕过该指令另筹资金。\n"
         f"• 卖出分类（其余情况不下卖出结论）：① 逻辑证伪或触及硬止损；② 长期弱势机会成本置换（连续跑输 {benchmark} 且跌破长期趋势如 MA200）；"
         "③ 穿透后集中度超限的再平衡；④ ISA 另含极端估值泡沫与历史边角料归核。\n"
-        f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
+        f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}（试探缩放期地板 £{min_pilot:,.0f}）、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
         f"以损定仓——Invest 单笔最大可承受亏损 = max(£{risk_budget:,.0f} 地板, Invest 净值×{risk_pct:.2f}%)（仓位 ≈ 该风险预算 ÷ 止损百分比）；"
         f"{cadence_rule}\n"
         f"• 闲置现金与挂单计息：ISA 仅有 GBP 钱包（约 {gbp_rate:.1f}% 年化）；"
@@ -244,10 +256,12 @@ def build_investor_profile(
         f"• ISA 核心-卫星结构（v5.5.6）：ISA 核心宽基目标占比 ≥{strategy.isa_core_etf_target_pct:.0f}%（按全球/美股/欧洲/英国四桶宽基政策配置，严禁偏离 Python 政策票据），"
         f"个股卫星硬上限 ≤{strategy.isa_satellite_max_total_pct:.0f}% 且 ≤{strategy.isa_satellite_max_count} 只"
         "（含未成交个股买单）；一旦超限即锁死 ISA 新开个股通道，只准审撤个股买单并把闲钱分批归拢核心宽基；"
-        f"存量 <£{min_isa_eq:,.0f} 的历史小额散仓享老仓豁免，只在反弹接近回本/阻力窗顺势归拢，严禁低位急割。\n"
+        f"存量 <£{min_isa_eq:,.0f} 的历史小额散仓享老仓豁免，只在反弹接近回本/阻力窗顺势归拢，严禁低位急割；"
+        f"已挂全额卖出限价单的边角料不计入 {strategy.isa_satellite_max_count} 只锁定席位（撤销卖单即自动回锁）。\n"
         f"• 零 Quota 豁免（v5.4.0）：卖出任何存量仓位/清理边角料，以及买入核心宽基 ETF（{benchmark} 等），"
         "永远不消耗周/月开仓次数配额，也不占用在险槽位。\n"
-        f"• Invest 在险槽位与以盈解锁（v5.4.0）：Invest 现金再多也绝不催买，只有右侧突破猎物才触发开仓；"
+        f"• Invest 在险槽位与以盈解锁（v5.4.0）：Invest 现金再多也绝不催买个股，只有右侧突破猎物才触发开仓"
+        "（溢出现金仅按 Python 蓄水池票据停泊派息宽基，属现金停泊而非催买）；"
         "已挂保本止损（止损价≥成本+摩擦）的仓位占用 0 槽位并立即释放新开仓额度，未脱险仓位与未成交个股买单各占 1 槽位；"
         f"同一交易日最多新开 1 笔个股；近 {strategy.consecutive_loss_lookback_days} 天连损 {strategy.consecutive_loss_limit} 笔"
         f"自动冷静 {strategy.consecutive_loss_cooldown_days} 个交易日，恢复首单按半仓试探（风险预算×{float(strategy.recovery_pilot_risk_scale):.1f}），首单盈利推保本后恢复全额火力。"
@@ -261,6 +275,7 @@ def _build_compact_pick_critic_profile(strategy: StrategySection) -> str:
     fx = float(strategy.fx_fee_pct)
     stamp = float(strategy.uk_stamp_duty_pct)
     min_invest = float(getattr(strategy, "min_invest_order_gbp", 700.0))
+    min_pilot = float(getattr(strategy, "min_invest_pilot_order_gbp", 500.0))
     min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
     min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
     cadence_mode = str(getattr(strategy, "trade_cadence_guard_mode", "advisory") or "advisory").strip().lower()
@@ -271,11 +286,14 @@ def _build_compact_pick_critic_profile(strategy: StrategySection) -> str:
         "• ISA 长线（巴菲特价值）：核心宽基 + 优质护城河个股；开仓只审「质量门 + 安全边际（常规≥12% / 危机≥20%）」，"
         "不以短期波动或浮盈卖飞；仅基本面/护城河证伪、极端估值泡沫、更优机会成本置换、集中度超限才卖出。\n"
         "• Invest 短线（右侧动量）：严守当日 Python 动态 R:R 门槛与止损 ATR 噪声地板，按以损定仓、绝不摊平；"
-        f"单笔 ≥£{min_invest:,.0f}，ISA 个股 ≥£{min_isa_eq:,.0f}、ISA ETF ≥£{min_isa_etf:,.0f}，严禁碎单。\n"
+        "非 RISK_OFF 确认强领涨股（MA200上方+BULL/PULLBACK+周线不空+RS20>0且RS60>0）解锁双锚目标上限，非领涨/弱势/RISK_OFF 仍死锁卖方均值 ±15%；"
+        f"单笔 ≥£{min_invest:,.0f}（试探缩放期地板 £{min_pilot:,.0f}），ISA 个股 ≥£{min_isa_eq:,.0f}、ISA ETF ≥£{min_isa_etf:,.0f}，严禁碎单。\n"
         f"• 摩擦口径：换汇 {fx:.2f}%/边、英股印花税 {stamp:.1f}%、买卖价差按保守估算；"
         "理由须写明资金路径；应税 Invest 低赔率频繁换仓会侵蚀净收益。\n"
         f"• 频率与冷却（模式 {cadence_mode}）：由 Python 统计近 7/30 天笔数与清仓冷却，禁止重推已被拦截的标的。\n"
         "• ISA 核心宽基只按 Python 政策票据执行，严禁自行换代码；Invest 槽位/热力/单日额度触顶即须等待或置换。\n"
+        "• Invest 派息宽基蓄水池（DIST 白名单）零槽位零热力零Quota：溢出现金停泊与“清宽基换股”配对指令均以 Python 输出为准，"
+        "严禁自行选码/口算股数/买入累积型 ETF。\n"
         "• 零 Quota：卖出存量仓位与买入核心宽基 ETF 永不消耗周/月开仓配额，也不占在险槽位。"
     )
 
@@ -322,6 +340,7 @@ def _build_compact_chat_profile(strategy: StrategySection, *, include_order_audi
     fx = float(strategy.fx_fee_pct)
     stamp = float(strategy.uk_stamp_duty_pct)
     min_invest = float(getattr(strategy, "min_invest_order_gbp", 700.0))
+    min_pilot = float(getattr(strategy, "min_invest_pilot_order_gbp", 500.0))
     min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
     min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
     risk_budget = float(getattr(strategy, "invest_risk_budget_gbp", 85.0))
@@ -345,10 +364,12 @@ def _build_compact_chat_profile(strategy: StrategySection, *, include_order_audi
         "优质股下跌若基本面与护城河未证伪、且估值安全边际扩大，反而是分批左侧加仓机会，严禁仅因浮盈、RSI 超买或短期回撤卖飞好公司；"
         "ISA 卖出/减仓仅限 4 情形：基本面/护城河证伪、极端估值泡沫、显著更优机会成本置换、集中度超限/边角料归核。\n"
         "• Invest（短线机动仓，右侧动量战术流派）：Invest 现金再多也绝不催买，只有右侧突破猎物才触发开仓；"
-        "严守当日市场状态（Regime）动态适配 R:R（RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1，以当日注入门槛为准）"
+        "严守当日四态市场状态（RISK_ON / NEUTRAL / RECOVERY 早春试探 / RISK_OFF）动态适配 R:R（RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1，以当日注入门槛为准）"
         "与止损 ATR 噪声地板，按以损定仓、绝不摊平；"
-        "已挂保本止损（止损价≥成本+摩擦）的仓位占用 0 槽位并立即释放新开仓额度，未脱险仓位与未成交个股买单各占 1 槽位。\n"
-        f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
+        "已挂保本止损（止损价≥成本+摩擦）的仓位占用 0 槽位并立即释放新开仓额度，未脱险仓位与未成交个股买单各占 1 槽位；"
+        "持仓中的派息宽基蓄水池（VWRL.L/ISF.L/VERX.L/VEUR.L）是 Beta 停车场——旁路短线止损与移动止盈、零槽位零热力零Quota，"
+        "仅退潮期复查防御处置，勿按个股短线纪律点评它。\n"
+        f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}（试探缩放期地板 £{min_pilot:,.0f}）、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
         f"Invest 单笔最大可承受亏损 = max(£{risk_budget:,.0f} 地板, Invest 净值×{risk_pct:.2f}%)（仓位 ≈ 该风险预算 ÷ 止损百分比）。\n"
         f"• 钱包与摩擦：ISA 仅 GBP 钱包（{gbp_rate:.1f}%）；Invest 为 GBP（{gbp_rate:.1f}%）+ USD（{usd_rate:.1f}%）双钱包，"
         f"复用同币种钱包 0% 换汇，跨币种买入计单边 {fx:.2f}% 换汇费（英股买入另收 {stamp:.1f}% 印花税），卖出所得默认留存原币种钱包；"

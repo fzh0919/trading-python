@@ -14,9 +14,9 @@ from src.engine.portfolio_rules import (
     DEFAULT_RISK_FREE_YIELD_PCT,
     _estimate_entry_friction_pct,
     _is_leverage_exempt_sector,
-    _is_right_side_leader,
     evaluate_isa_value_gate,
     resolve_invest_dynamic_rr_floor,
+    resolve_invest_target_anchors,
     wallet_friction_context,
 )
 from src.engine.screener.patterns import (
@@ -298,6 +298,10 @@ def score_candidate(
     rs_info = compute_relative_strength(hist, benchmark_hist)
     rs_20d = rs_info.get("rs_20d_pct")
     rs_60d = rs_info.get("rs_60d_pct")
+    if rs_20d is None and tech.rs_20d_pct is not None:
+        rs_20d = float(tech.rs_20d_pct)
+    if rs_60d is None and tech.rs_60d_pct is not None:
+        rs_60d = float(tech.rs_60d_pct)
     rs_slope = rs_info.get("rs_slope_20d")
     minervini = detect_minervini_stage2(hist, tech, rs_60d_pct=rs_60d)
     minervini_phase = int(minervini.get("phase", 0))
@@ -365,12 +369,24 @@ def score_candidate(
 
         if tech.rsi14 is not None:
             if tech.rsi14 <= 38.0:
-                dim1 += 4.5
+                # v5.5.9 M3: the oversold-reversal flavour belongs to the ISA value
+                # track; Invest no longer pays a +4.5 bottom-fishing bonus here.
+                dim1 += 1.5
             elif 40.0 <= tech.rsi14 <= 60.0 and (tech.ret_20d_pct or 0.0) > 0.0:
                 dim1 += 3.0
                 pros.append("动量健康")
             elif tech.rsi14 >= 70.0:
-                dim1 -= _linear_scale(tech.rsi14, 70.0, 84.0, 2.0, 7.0)
+                if strong_rs and minervini["passes"]:
+                    # v5.5.9 M3: genuine Stage-2 leaders are not punished for strength
+                    # (RSI 70~80 is the daily norm for volume-backed breakouts); only
+                    # extreme blow-offs (>=82) get a light caution so a parabolic top
+                    # still surfaces a warning. ISA track is unreachable here —
+                    # strong_rs is hard-wired False for ISA_LONG_TERM.
+                    if tech.rsi14 >= 82.0:
+                        dim1 -= _linear_scale(tech.rsi14, 82.0, 92.0, 1.0, 3.0)
+                        cons.append("极端超买(≥82)轻提示")
+                else:
+                    dim1 -= _linear_scale(tech.rsi14, 70.0, 84.0, 2.0, 7.0)
 
         if bundle and bundle.days_to_earnings is not None and 0 <= bundle.days_to_earnings <= 5:
             dim1 -= 4.0
@@ -491,24 +507,42 @@ def score_candidate(
     if upside_pct is not None:
         dim3 += _linear_scale(upside_pct, -15.0, 25.0, -4.0, 5.0)
 
-    # v5.5.7 Invest forward R:R reachability soft gate: a name whose remaining upside cannot
-    # pay for the ATR noise-floor stop + friction is a low-odds ticket; ladder-penalize it so it
-    # cannot hog the Invest shortlist. RISK_ON leaders and no-analyst names are exempt.
+    # v5.5.7/v5.5.9 M2 Invest forward R:R reachability soft gate: shares the exact same
+    # resolve_invest_target_anchors helper as /pick and holding_eval. Confirmed RS leaders
+    # in non-RISK_OFF regimes are evaluated against the two-anchor ceiling instead of a
+    # stale sell-side mean; weak / non-RS / RISK_OFF names remain locked to analyst mean.
     if (
         track != "ISA_LONG_TERM"
         and not is_etf
         and upside_pct is not None
         and bundle is not None
         and (bundle.analyst_count or 0) >= 3
-        and not (reg_norm == "RISK-ON" and _is_right_side_leader(tech))
     ):
+        ref_price = (
+            float(bundle.current_price)
+            if (bundle.current_price is not None and float(bundle.current_price) > 0)
+            else float(tech.last_close)
+        )
+        anchors = resolve_invest_target_anchors(
+            ref_price=ref_price,
+            bundle=bundle,
+            tech=tech,
+            strategy=strategy,
+            regime=reg_norm,
+            symbol=sym_up,
+            rs_20d_pct=rs_20d,
+            rs_60d_pct=rs_60d,
+        )
+        eff_upside_pct = float(upside_pct)
+        if anchors["is_leader"] and anchors["llm_ceiling"] is not None and ref_price > 0:
+            eff_upside_pct = ((float(anchors["llm_ceiling"]) / ref_price) - 1.0) * 100.0
         atr_pct_val = float(tech.atr_pct) if (tech.atr_pct or 0.0) > 0 else 0.0
         atr_floor_pct = max(1.5 * atr_pct_val, 4.0) if atr_pct_val > 0 else 4.5
         est_friction_pct = _estimate_entry_friction_pct(
             sym_up, bundle, strategy, "INVEST", invest_wallet
         )
         est_rr = round(
-            (float(upside_pct) - est_friction_pct) / (atr_floor_pct + est_friction_pct), 2
+            (eff_upside_pct - est_friction_pct) / (atr_floor_pct + est_friction_pct), 2
         )
         min_rr_floor, rr_tier = resolve_invest_dynamic_rr_floor(
             reg_norm,
@@ -521,7 +555,7 @@ def score_candidate(
             deficit = reach_floor - est_rr
             score_penalty = min(15.0, max(8.0, 8.0 + 10.0 * deficit))
             cons.append(
-                f"预估R:R仅{est_rr:.2f}:1(目标空间{float(upside_pct):+.0f}%/门槛{min_rr_floor:.1f}:1 {rr_tier})"
+                f"预估R:R仅{est_rr:.2f}:1(目标空间{eff_upside_pct:+.0f}%/门槛{min_rr_floor:.1f}:1 {rr_tier})"
             )
 
     if bundle and not is_etf:

@@ -337,6 +337,13 @@ class WeeklyAuditJobMixin:
             previous_snapshot=previous_snapshot,
             now_ms=int(base.timestamp() * 1000),
         )
+        # v5.5.9 M6: shadow counterfactual scoreboard rides the weekly audit payload
+        # (read-only lane; gives the offline diagnosis the guardrail-miss context).
+        if hasattr(self.db, "get_shadow_rejection_stats"):
+            try:
+                audit["shadow_stats"] = await self.db.get_shadow_rejection_stats()
+            except Exception as exc:
+                logger.debug("Weekly shadow stats unavailable: %s", exc)
         diagnosis = await self._generate_weekly_diagnosis(audit, uk_date=uk_date)
         await self.db.save_quant_audit(
             audit_date=uk_date,

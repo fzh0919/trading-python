@@ -1758,7 +1758,7 @@ class TestPickGateEndToEnd(unittest.IsolatedAsyncioTestCase):
                 include_earnings=True,
                 include_info=True,
             )
-            text, picks = await _post_screen_validate_decision(
+            text, picks, _shadow = await _post_screen_validate_decision(
                 decision,
                 portfolio=portfolio,
                 macro=_neutral_macro(),
@@ -1957,7 +1957,7 @@ class TestPostAuditRegressions(unittest.IsolatedAsyncioTestCase):
                 include_earnings=True,
                 include_info=True,
             )
-            text, picks = await _post_screen_validate_decision(
+            text, picks, _shadow = await _post_screen_validate_decision(
                 decision,
                 portfolio=portfolio,
                 macro=_neutral_macro(),
@@ -3359,6 +3359,753 @@ class TestV557Wave6RenderAndAudit(unittest.TestCase):
         )
         self.assertIn("本次入选新标的现价锚点", baseline)
         self.assertIn("ISF.L | 现价 1,020.00 GBp", baseline)
+
+
+class TestV559M1FourStateRegimeAndBreadth(unittest.TestCase):
+    """v5.5.9 M1: four-state Regime 2.0 (RISK_ON/NEUTRAL/RECOVERY/RISK_OFF), breadth & pilot sizing."""
+
+    @staticmethod
+    def _spy_below_ma200_above_ma50() -> pd.DataFrame:
+        # 240 flat at 200 -> 30-day crash to 130 (-35%) -> 35-day rally to 158:
+        # price (~158) > MA50 (~144), still well below MA200 (~185).
+        closes = [200.0] * 240
+        closes += [round(200.0 - 70.0 * ((k + 1) / 30.0), 2) for k in range(30)]
+        closes += [round(130.0 + 28.0 * ((k + 1) / 35.0), 2) for k in range(35)]
+        return _make_hist(closes)
+
+    @staticmethod
+    def _spy_below_ma50_and_ma200() -> pd.DataFrame:
+        closes = [200.0] * 240
+        closes += [round(200.0 - 70.0 * ((k + 1) / 40.0), 2) for k in range(40)]
+        return _make_hist(closes)
+
+    @staticmethod
+    def _prev_from(info: dict) -> dict:
+        return {
+            "regime": info["regime"],
+            "raw_regime": info["raw_regime"],
+            "raw_streak_days": info["raw_streak_days"],
+            "ease_streak_days": info["ease_streak_days"],
+            "risk_on_exit_streak_days": info.get("risk_on_exit_streak_days", 0),
+            "recovery_streak_days": info.get("recovery_streak_days", 0),
+        }
+
+    def test_vix_18_to_20_enters_risk_on_and_two_day_exit_hysteresis(self) -> None:
+        strat = StrategySection()
+        spy = _spy_risk_on_hist()
+
+        # VIX 19.2 (<20.0) for 3 consecutive days enters RISK_ON.
+        prev = None
+        for expected in ("NEUTRAL", "NEUTRAL", "RISK_ON"):
+            info = evaluate_market_regime({"SPY": spy}, _neutral_macro(vix=19.2), strat, prev_gate_state=prev)
+            self.assertEqual(info["regime"], expected)
+            prev = self._prev_from(info)
+
+        # Single-day VIX=20.8 jitter stays RISK_ON (exit hysteresis day 1/2).
+        d_jit = evaluate_market_regime({"SPY": spy}, _neutral_macro(vix=20.8), strat, prev_gate_state=prev)
+        self.assertEqual(d_jit["regime"], "RISK_ON")
+        self.assertEqual(d_jit["risk_on_exit_streak_days"], 1)
+
+        # Returning to VIX=19.0 resets exit hysteresis to 0.
+        d_back = evaluate_market_regime(
+            {"SPY": spy}, _neutral_macro(vix=19.0), strat, prev_gate_state=self._prev_from(d_jit)
+        )
+        self.assertEqual(d_back["regime"], "RISK_ON")
+        self.assertEqual(d_back["risk_on_exit_streak_days"], 0)
+
+        # Two consecutive days of VIX=20.8 step down RISK_ON -> NEUTRAL.
+        d_e1 = evaluate_market_regime(
+            {"SPY": spy}, _neutral_macro(vix=20.8), strat, prev_gate_state=self._prev_from(d_back)
+        )
+        self.assertEqual(d_e1["regime"], "RISK_ON")
+        d_e2 = evaluate_market_regime(
+            {"SPY": spy}, _neutral_macro(vix=20.8), strat, prev_gate_state=self._prev_from(d_e1)
+        )
+        self.assertEqual(d_e2["regime"], "NEUTRAL")
+
+        # VIX >= 22.0 triggers immediate 1-day downgrade from RISK_ON -> NEUTRAL.
+        d_fast = evaluate_market_regime({"SPY": spy}, _neutral_macro(vix=22.5), strat, prev_gate_state=prev)
+        self.assertEqual(d_fast["regime"], "NEUTRAL")
+
+        # Crisis VIX >= 28 triggers immediate 1-day switch from RISK_ON -> RISK_OFF.
+        d_crash = evaluate_market_regime({"SPY": spy}, _neutral_macro(vix=28.5), strat, prev_gate_state=prev)
+        self.assertEqual(d_crash["regime"], "RISK_OFF")
+
+    def test_recovery_three_day_entry_filters_two_day_bounce_and_fast_relapse(self) -> None:
+        strat = StrategySection()
+        rebound_spy = self._spy_below_ma200_above_ma50()
+        weak_spy = self._spy_below_ma50_and_ma200()
+
+        # Start in RISK_OFF.
+        d0 = evaluate_market_regime({"SPY": weak_spy}, _neutral_macro(vix=32.0), strat)
+        self.assertEqual(d0["regime"], "RISK_OFF")
+        prev = self._prev_from(d0)
+
+        # Stale macro must block RISK_OFF -> RECOVERY.
+        stale_macro = _neutral_macro(vix=21.5)
+        stale_macro.is_stale = True
+        d_stale = evaluate_market_regime({"SPY": rebound_spy}, stale_macro, strat, prev_gate_state=prev)
+        self.assertEqual(d_stale["regime"], "RISK_OFF")
+        self.assertEqual(d_stale["recovery_streak_days"], 0)
+
+        # Days 1-2 above MA50 stay RISK_OFF (filters 2-day dead-cat bounces); Day 3 enters RECOVERY.
+        d1 = evaluate_market_regime({"SPY": rebound_spy}, _neutral_macro(vix=21.5), strat, prev_gate_state=prev)
+        self.assertEqual(d1["regime"], "RISK_OFF")
+        self.assertEqual(d1["recovery_streak_days"], 1)
+        d2 = evaluate_market_regime(
+            {"SPY": rebound_spy}, _neutral_macro(vix=21.5), strat, prev_gate_state=self._prev_from(d1)
+        )
+        self.assertEqual(d2["regime"], "RISK_OFF")
+        self.assertEqual(d2["recovery_streak_days"], 2)
+        d3 = evaluate_market_regime(
+            {"SPY": rebound_spy}, _neutral_macro(vix=21.5), strat, prev_gate_state=self._prev_from(d2)
+        )
+        self.assertEqual(d3["regime"], "RECOVERY")
+        rec_prev = self._prev_from(d3)
+
+        # 1-day fast relapse on VIX >= 26.0.
+        r_vix = evaluate_market_regime({"SPY": rebound_spy}, _neutral_macro(vix=26.2), strat, prev_gate_state=rec_prev)
+        self.assertEqual(r_vix["regime"], "RISK_OFF")
+
+        # 1-day fast relapse on losing MA50.
+        r_ma50 = evaluate_market_regime({"SPY": weak_spy}, _neutral_macro(vix=21.0), strat, prev_gate_state=rec_prev)
+        self.assertEqual(r_ma50["regime"], "RISK_OFF")
+
+        # Reclaiming MA200 for 3 consecutive days promotes RECOVERY -> NEUTRAL (no deadlock).
+        p = rec_prev
+        for expected in ("RECOVERY", "RECOVERY", "NEUTRAL"):
+            step = evaluate_market_regime(
+                {"SPY": _spy_neutral_hist()}, _neutral_macro(vix=21.0), strat, prev_gate_state=p
+            )
+            self.assertEqual(step["regime"], expected)
+            p = self._prev_from(step)
+        self.assertEqual(p["ease_streak_days"], 3)
+
+    def test_breadth_fusion_blocks_narrow_risk_on_and_degrades_neutrally(self) -> None:
+        from src.engine.deployment_gate import compute_regime_breadth
+
+        strat = StrategySection()
+        spy = _spy_risk_on_hist()
+
+        # 1) Pure SPY only -> breadth degrades neutrally (None), never synthesizes 50.0.
+        b_none = compute_regime_breadth({"SPY": spy})
+        self.assertIsNone(b_none["score"])
+        self.assertEqual(b_none["source"], "unavailable")
+        info_none = evaluate_market_regime({"SPY": spy}, _neutral_macro(vix=16.0), strat)
+        self.assertEqual(info_none["raw_regime"], "RISK_ON")
+
+        # 2) Narrow local cache breadth (20 equities, only 4 bullish) suppresses RISK_ON -> NEUTRAL.
+        up_df = _spy_risk_on_hist()
+        down_df = self._spy_below_ma50_and_ma200()
+        narrow_cache = {f"EQ{i}": (up_df if i < 4 else down_df) for i in range(20)}
+        info_narrow = evaluate_market_regime(
+            {"SPY": spy}, _neutral_macro(vix=16.0), strat, cached_breadth_histories=narrow_cache
+        )
+        self.assertEqual(info_narrow["raw_regime"], "NEUTRAL")
+        self.assertTrue(info_narrow["breadth_blocked_risk_on"])
+        self.assertIn("窄宽度背离", info_narrow["reason"])
+
+        # 3) Healthy local cache + multi-region benchmarks allows RISK_ON.
+        healthy_cache = {f"EQ{i}": (up_df if i < 16 else down_df) for i in range(20)}
+        b_healthy = compute_regime_breadth(
+            {"SPY": spy, "ISF.L": up_df, "VERG.L": up_df},
+            cached_histories=healthy_cache,
+        )
+        self.assertEqual(b_healthy["source"], "ohlcv_cache+benchmarks")
+        self.assertGreaterEqual(float(b_healthy["score"]), 55.0)
+        self.assertEqual(b_healthy["pool_count"], 20)
+        info_healthy = evaluate_market_regime(
+            {"SPY": spy, "ISF.L": up_df, "VERG.L": up_df},
+            _neutral_macro(vix=16.0),
+            strat,
+            cached_breadth_histories=healthy_cache,
+        )
+        self.assertEqual(info_healthy["raw_regime"], "RISK_ON")
+
+        # 4) Fallback to pool_snaps when ohlcv_cache is empty; uses unified MA200 > 0 parity.
+        snaps = {
+            f"S{i}": SimpleNamespace(
+                dist_ma50_pct=3.0 if i < 12 else -4.0,
+                dist_ma200_pct=5.0 if i < 12 else -6.0,
+                trend_regime="NEUTRAL" if i < 12 else "WEAK",
+            )
+            for i in range(16)
+        }
+        b_snaps = compute_regime_breadth({"SPY": spy}, pool_snaps=snaps)
+        self.assertEqual(b_snaps["source"], "pool_snaps")
+        self.assertAlmostEqual(float(b_snaps["score"]), 75.0, places=1)
+
+    def test_recovery_gate_slots_heat_scale_min_not_multiplied_and_pilot_min_order(self) -> None:
+        from src.agents.pick_agent import _format_gate_constraint_block
+        from src.agents.report_agent.morning_report import _build_regime_anchor_text
+        from src.engine.portfolio_rules import compute_risk_based_size_gbp, resolve_invest_dynamic_rr_floor
+
+        strat = StrategySection()
+        portfolio = _real_snapshot_portfolio()
+        portfolio.invest.positions = [p for p in portfolio.invest.positions if p.yahoo_symbol == "AMZN"]
+        portfolio.invest.pending_orders = [
+            o for o in portfolio.invest.pending_orders if o.yahoo_symbol == "AMZN"
+        ]
+        prev_rec = {
+            "cycle_date": "2026-11-19",
+            "regime": "RISK_OFF",
+            "raw_regime": "RISK_OFF",
+            "raw_streak_days": 5,
+            "ease_streak_days": 0,
+            "recovery_streak_days": 2,
+        }
+        gate = evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=strat,
+            bundles={},
+            histories={"SPY": self._spy_below_ma200_above_ma50()},
+            macro=_neutral_macro(vix=21.5),
+            candidates=[_up_candidate()],
+            prev_gate_states=[prev_rec],
+            now_uk=datetime(2026, 11, 20, 7, 30, tzinfo=LONDON),
+        )
+        self.assertEqual(gate["regime"], "RECOVERY")
+        inv = gate["invest"]
+        self.assertEqual(inv["slots_cap"], 1)
+        self.assertEqual(inv["heat_cap_pct"], 1.0)
+        self.assertEqual(inv["risk_budget_scale"], 0.6)
+        self.assertEqual(inv["risk_scale_reason"], "RECOVERY早春试探")
+        self.assertLessEqual(len(gate["banner"]), 110)
+        self.assertNotIn("#", gate["banner"])
+        self.assertNotIn("**", gate["banner"])
+
+        # Pick gate prompt distinguishes RECOVERY pilot from loss-streak recovery.
+        ctx_txt = _format_gate_constraint_block(gate)
+        self.assertIn("RECOVERY早春试探", ctx_txt)
+        self.assertNotIn("连损恢复首单", ctx_txt)
+
+        # Morning report regime anchor renders RECOVERY and breadth line.
+        anchor = _build_regime_anchor_text(AppConfig(env=EnvSettings(_env_file=None)), gate, "RECOVERY", vix=21.5)
+        self.assertIn("RECOVERY", anchor)
+        self.assertIn("市场宽度", anchor)
+
+        # Loss-streak (0.5R) + RECOVERY (0.6R) takes min = 0.5R (never 0.3R).
+        portfolio.invest.recent_orders = [
+            _buy_order("Invest", "CF", "CF", at_uk=datetime(2026, 11, 18, 10, 0, tzinfo=LONDON)),
+            _sell_order("Invest", "CF", "CF", at_uk=datetime(2026, 11, 18, 15, 0, tzinfo=LONDON), pnl=-35.0),
+            _buy_order("Invest", "PANW", "PANW", at_uk=datetime(2026, 11, 19, 10, 0, tzinfo=LONDON)),
+            _sell_order("Invest", "PANW", "PANW", at_uk=datetime(2026, 11, 19, 15, 0, tzinfo=LONDON), pnl=-40.0),
+        ]
+        gate_both = evaluate_deployment_gate(
+            portfolio=portfolio,
+            strategy=strat,
+            bundles={},
+            histories={"SPY": self._spy_below_ma200_above_ma50()},
+            macro=_neutral_macro(vix=21.5),
+            prev_gate_states=[prev_rec],
+            now_uk=datetime(2026, 11, 27, 7, 30, tzinfo=LONDON),
+        )
+        self.assertEqual(gate_both["regime"], "RECOVERY")
+        self.assertEqual(gate_both["invest"]["risk_budget_scale"], 0.5)
+        self.assertIn("连损恢复+RECOVERY", gate_both["invest"]["risk_scale_reason"])
+
+        # Pilot min order floor (£500) prevents 0.6R deadlock while keeping 1.0R at £700.
+        pilot_ok = compute_risk_based_size_gbp(
+            account="Invest", strategy=strat, effective_stop_pct=-10.0,
+            account_total_value_gbp=10000.0, risk_budget_scale=0.6,
+        )
+        self.assertAlmostEqual(pilot_ok["suggested_gbp"], 510.0, places=2)
+        self.assertAlmostEqual(pilot_ok["min_order_gbp"], 500.0, places=2)
+        self.assertFalse(pilot_ok["below_min_order"])
+
+        pilot_too_wide = compute_risk_based_size_gbp(
+            account="Invest", strategy=strat, effective_stop_pct=-15.0,
+            account_total_value_gbp=10000.0, risk_budget_scale=0.6,
+        )
+        self.assertTrue(pilot_too_wide["below_min_order"])
+
+        normal_blocked = compute_risk_based_size_gbp(
+            account="Invest", strategy=strat, effective_stop_pct=-14.0,
+            account_total_value_gbp=10000.0, risk_budget_scale=1.0,
+        )
+        self.assertAlmostEqual(normal_blocked["min_order_gbp"], 700.0, places=2)
+        self.assertTrue(normal_blocked["below_min_order"])
+
+        # Dynamic R:R in RECOVERY: 2.0 when VIX < 22, still tightens to 2.5 when VIX >= 22.
+        rr_low, lbl_low = resolve_invest_dynamic_rr_floor("RECOVERY", None, strat, vix=20.0)
+        self.assertEqual(rr_low, 2.0)
+        self.assertIn("RECOVERY", lbl_low)
+        rr_hi, lbl_hi = resolve_invest_dynamic_rr_floor("RECOVERY", None, strat, vix=22.5)
+        self.assertEqual(rr_hi, 2.5)
+        self.assertIn("VIX≥22", lbl_hi)
+
+    def test_legacy_prev_gate_state_without_new_streak_keys_is_backward_compatible(self) -> None:
+        strat = StrategySection()
+        legacy_prev = {
+            "regime": "RISK_ON",
+            "raw_regime": "RISK_ON",
+            "raw_streak_days": 5,
+            "ease_streak_days": 0,
+        }
+        info = evaluate_market_regime(
+            {"SPY": _spy_risk_on_hist()}, _neutral_macro(vix=20.5), strat, prev_gate_state=legacy_prev
+        )
+        self.assertEqual(info["regime"], "RISK_ON")
+        self.assertEqual(info["risk_on_exit_streak_days"], 1)
+
+    def test_replay_two_year_v_bottom_visits_all_four_states_without_deadlock(self) -> None:
+        closes: list[float] = []
+        closes += [round(100.0 * (1.0015**i), 2) for i in range(250)]
+        peak = closes[-1]
+        closes += [round(peak * (1.0 - 0.012 * (k + 1)), 2) for k in range(30)]
+        trough = closes[-1]
+        closes += [round(trough * (1.008**i), 2) for i in range(220)]
+        bench = _make_hist(closes)
+        vix_df = _make_hist([16.0] * 250 + [35.0] * 30 + [21.0] * 220)
+        hy_oas = pd.Series([3.0] * len(closes), index=bench.index)
+        summary = replay_deployment_gate_history(bench, vix_df, StrategySection(), hy_oas_series=hy_oas)
+        self.assertFalse(summary["deadlock_detected"], summary)
+        for state in ("RISK_ON", "RISK_OFF", "RECOVERY", "NEUTRAL"):
+            self.assertGreater(summary["state_days"][state], 0, summary)
+
+    def test_cached_breadth_freshness_rejects_stale_friday_cache_after_monday_bar(self) -> None:
+        from src.agents.report_agent.morning_report import _filter_fresh_cached_breadth_histories
+        from src.data_providers.market_data.models_and_parsing import _serialize_ohlcv_df
+
+        # Ref SPY printed Monday 2026-11-23; stale Sunday-night audition cache holds Friday 2026-11-20 (lag=3d > 2d).
+        spy_mon = pd.DataFrame(
+            {"Close": [500.0, 495.0]},
+            index=pd.to_datetime(["2026-11-20", "2026-11-23"]),
+        )
+        fri_df = pd.DataFrame(
+            {"Open": [100.0] * 5, "High": [101.0] * 5, "Low": [99.0] * 5, "Close": [100.0] * 5, "Volume": [1000] * 5},
+            index=pd.bdate_range("2026-11-16", periods=5),
+        )
+        mon_df = pd.DataFrame(
+            {"Open": [100.0] * 5, "High": [101.0] * 5, "Low": [99.0] * 5, "Close": [100.0] * 5, "Volume": [1000] * 5},
+            index=pd.bdate_range("2026-11-17", periods=5),
+        )
+        fri_row = _serialize_ohlcv_df("STALE", "2y", fri_df)
+        mon_row = _serialize_ohlcv_df("FRESH", "2y", mon_df)
+        self.assertIsNotNone(fri_row)
+        self.assertIsNotNone(mon_row)
+
+        filtered = _filter_fresh_cached_breadth_histories(
+            {"STALE": fri_row, "FRESH": mon_row},
+            spy_mon,
+            max_bar_lag_days=2,
+        )
+        self.assertNotIn("STALE", filtered)
+        self.assertIn("FRESH", filtered)
+
+        # On Monday morning (SPY latest bar = Friday 2026-11-20), Friday audition cache has lag=0 -> kept.
+        spy_fri = pd.DataFrame({"Close": [500.0]}, index=pd.to_datetime(["2026-11-20"]))
+        filtered_mon_am = _filter_fresh_cached_breadth_histories(
+            {"STALE": fri_row},
+            spy_fri,
+            max_bar_lag_days=2,
+        )
+        self.assertIn("STALE", filtered_mon_am)
+
+    def test_pilot_min_order_floor_reads_strategy_config_across_pick_and_prompts(self) -> None:
+        from src.agents.pick_agent import _format_gate_constraint_block
+        from src.agents.prompts import build_investor_profile
+
+        custom_strat = StrategySection(min_invest_pilot_order_gbp=550.0)
+        full_profile = build_investor_profile(custom_strat)
+        critic_profile = build_investor_profile(custom_strat, compact_for_pick_critic=True)
+        chat_profile = build_investor_profile(custom_strat, compact_for_chat=True)
+        for text in (full_profile, critic_profile, chat_profile):
+            self.assertIn("试探缩放期地板 £550", text)
+
+        gate = {
+            "regime": "RECOVERY",
+            "global_status": "RUN",
+            "isa": {},
+            "invest": {
+                "status": "RUN",
+                "slots_used": 0,
+                "slots_cap": 1,
+                "risk_budget_scale": 0.6,
+                "risk_scale_reason": "RECOVERY早春试探",
+                "min_invest_pilot_order_gbp": 550.0,
+            },
+        }
+        block = _format_gate_constraint_block(gate, strategy=custom_strat)
+        self.assertIn("试探最小单笔地板 £550", block)
+        self.assertNotIn("£500", block)
+
+    def test_recovery_hold_reason_reflects_vix_relapse_line_and_custom_params(self) -> None:
+        strat = StrategySection(
+            regime_benchmark_symbol="QQQ",
+            invest_slots_recovery=2,
+            invest_recovery_risk_scale=0.55,
+        )
+        rebound_qqq = self._spy_below_ma200_above_ma50()
+        rec_prev = {
+            "regime": "RECOVERY",
+            "raw_regime": "RISK_OFF",
+            "raw_streak_days": 5,
+            "ease_streak_days": 0,
+            "recovery_streak_days": 0,
+        }
+        # Day 4 in RECOVERY with VIX=24.8 (between 24 entry and 26 relapse): stays RECOVERY and must not print VIX<24.
+        held = evaluate_market_regime(
+            {"QQQ": rebound_qqq}, _neutral_macro(vix=24.8), strat, prev_gate_state=rec_prev
+        )
+        self.assertEqual(held["regime"], "RECOVERY")
+        self.assertIn("QQQ", held["reason"])
+        self.assertIn("2槽位/0.6R", held["reason"])
+        self.assertIn("VIX=24.8<急退线26", held["reason"])
+        self.assertNotIn("VIX<24", held["reason"])
+
+
+class TestV559M3DualChannel(unittest.TestCase):
+    """v5.5.9 M3: A1 pullback + A2 breakout dual channels with regime-linked policy gates."""
+
+    @staticmethod
+    def _vcp_hist() -> pd.DataFrame:
+        # 220-bar Stage-2 uptrend whose final contractions tighten with drying volume.
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        base = np.linspace(80.0, 130.0, 100)
+        seg1 = 130.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 12.0
+        seg2 = 132.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 5.5
+        seg3 = 133.5 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 2.0
+        closes = np.concatenate([base, seg1, seg2, seg3]).copy()
+        closes[-5:] = np.linspace(134.0, 136.5, 5)
+        vols = np.full(220, 2_000_000.0)
+        vols[-12:] = 850_000.0
+        return pd.DataFrame(
+            {"Open": closes * 0.997, "High": closes * 1.012, "Low": closes * 0.988,
+             "Close": closes, "Volume": vols},
+            index=dates,
+        )
+
+    @staticmethod
+    def _bench_hist() -> pd.DataFrame:
+        # Benchmark lagging the leader over the recent 60 days -> positive RS.
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        bench = np.linspace(100.0, 118.0, 160).tolist() + np.linspace(118.0, 114.0, 60).tolist()
+        return pd.DataFrame(
+            {"Open": np.array(bench) * 0.998, "High": np.array(bench) * 1.005,
+             "Low": np.array(bench) * 0.995, "Close": bench, "Volume": np.full(220, 5_000_000.0)},
+            index=dates,
+        )
+
+    @staticmethod
+    def _platform_hist() -> pd.DataFrame:
+        # 100-bar rise, 120-bar tight coil riding MA60, then a 2.5x-volume platform breakout.
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        closes = np.concatenate([
+            np.linspace(80.0, 125.0, 100),
+            125.0 + np.sin(np.linspace(0, 2 * np.pi * 1.7, 120)) * 0.6,
+        ]).copy()
+        closes[205] = 129.0
+        for j in range(206, 220):
+            closes[j] = 129.0 + (j - 206) * 0.15
+        vols = np.full(220, 2_000_000.0)
+        vols[205] = 5_000_000.0
+        opens = closes * 0.997
+        opens[205] = 124.0  # open below MA60, close reclaims it with volume
+        return pd.DataFrame(
+            {"Open": opens, "High": closes * 1.012, "Low": closes * 0.988,
+             "Close": closes, "Volume": vols},
+            index=dates,
+        )
+
+    @staticmethod
+    def _a2_tech(symbol: str = "AVGO", *, dist_ma50: float = 6.0, rsi: float = 75.0, **over) -> TechnicalSnapshot:
+        data = dict(
+            symbol=symbol, last_close=136.5, ma50=128.8, ma200=112.0,
+            dist_ma50_pct=dist_ma50, dist_ma200_pct=22.0, rsi14=rsi,
+            trend_regime="BULL", weekly_bullish=True,
+        )
+        data.update(over)
+        return TechnicalSnapshot(**data)
+
+    @staticmethod
+    def _a1_tech(symbol: str = "LLY", **over) -> TechnicalSnapshot:
+        data = dict(
+            symbol=symbol, last_close=300.0, ma50=295.0, ma200=270.0,
+            dist_ma50_pct=0.8, dist_ma200_pct=11.1, rsi14=60.0,
+            trend_regime="BULL", weekly_bullish=True,
+        )
+        data.update(over)
+        return TechnicalSnapshot(**data)
+
+    @staticmethod
+    def _clean_bundle(symbol: str = "AVGO", **over) -> TickerMarketBundle:
+        data = dict(symbol=symbol, quote_type="EQUITY", currency="USD")
+        data.update(over)
+        return TickerMarketBundle(**data)
+
+    def _scan(
+        self,
+        candidates: list[dict],
+        *,
+        regime: str | None = None,
+        benchmark: pd.DataFrame | None = None,
+        histories: dict[str, pd.DataFrame] | None = None,
+    ) -> list[dict]:
+        return _scan_a_equity_candidates(
+            candidates,
+            _real_snapshot_portfolio(),
+            StrategySection(),
+            histories or {},
+            regime=regime,
+            benchmark_hist=benchmark,
+        )
+
+    def test_regime_none_keeps_legacy_a1_only(self) -> None:
+        cands = [
+            {"symbol": "LLY", "tech": self._a1_tech("LLY"), "bundle": None, "account": "Invest"},
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        hits = self._scan(cands, histories={"AVGO": self._vcp_hist()})
+        self.assertEqual([h["symbol"] for h in hits], ["LLY"])
+        self.assertEqual(hits[0]["channel"], "A1")
+
+    def test_risk_on_surfaces_a2_vcp_breakout(self) -> None:
+        cands = [
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["symbol"], "AVGO")
+        self.assertEqual(hits[0]["channel"], "A2")
+        self.assertEqual(hits[0]["pattern"], "VCP")
+
+    def test_risk_on_surfaces_a2_platform_breakout(self) -> None:
+        cands = [
+            {"symbol": "PLTR", "tech": self._a2_tech("PLTR", dist_ma50=5.5, rsi=74.0),
+             "bundle": self._clean_bundle("PLTR"), "account": "Invest"},
+        ]
+        hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories={"PLTR": self._platform_hist()})
+        self.assertEqual([h["pattern"] for h in hits], ["PLATFORM"])
+        self.assertEqual(hits[0]["channel"], "A2")
+
+    def test_a2_without_bundle_fails_closed(self) -> None:
+        cands = [
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": None, "account": "Invest"},
+        ]
+        hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+        self.assertEqual(hits, [])
+
+    def test_a2_calendar_windows_match_a1_exclusions(self) -> None:
+        for bundle in (
+            self._clean_bundle("AVGO", days_to_earnings=2),
+            self._clean_bundle("AVGO", days_to_ex_dividend=1),
+        ):
+            cands = [{"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": bundle, "account": "Invest"}]
+            hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+            self.assertEqual(hits, [])
+
+    def test_a2_rsi_and_extension_bounds(self) -> None:
+        cases = [
+            (6.0, 81.9, True),    # below the 82 extreme line -> admitted
+            (6.0, 82.0, False),   # >=82 extreme blow-off -> rejected
+            (14.0, 75.0, True),   # extension cap inclusive
+            (14.01, 75.0, False), # beyond +14% -> chase guard
+            (1.5, 75.0, False),   # band edge belongs to A1, whose 72 cap rejects
+            (1.6, 75.0, True),    # first A2-band step admits RSI 75
+        ]
+        for dist, rsi, expected in cases:
+            cands = [
+                {"symbol": "AVGO", "tech": self._a2_tech("AVGO", dist_ma50=dist, rsi=rsi),
+                 "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+            ]
+            hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+            self.assertEqual([h["symbol"] for h in hits], ["AVGO"] if expected else [], msg=f"dist={dist} rsi={rsi}")
+
+    def test_neutral_admits_vcp_strong_rs_but_rejects_platform(self) -> None:
+        vcp_cands = [
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        hits = self._scan(vcp_cands, regime="NEUTRAL", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+        self.assertEqual([h["channel"] for h in hits], ["A2"])
+        self.assertEqual(hits[0]["pattern"], "VCP")
+        plat_cands = [
+            {"symbol": "PLTR", "tech": self._a2_tech("PLTR", dist_ma50=5.5, rsi=74.0),
+             "bundle": self._clean_bundle("PLTR"), "account": "Invest"},
+        ]
+        hits = self._scan(plat_cands, regime="NEUTRAL", benchmark=self._bench_hist(), histories={"PLTR": self._platform_hist()})
+        self.assertEqual(hits, [])
+
+    def test_recovery_a2_requires_strong_rs(self) -> None:
+        cands = [
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        hits = self._scan(cands, regime="RECOVERY", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+        self.assertEqual([h["channel"] for h in hits], ["A2"])
+        # Missing benchmark -> RS unconfirmed -> fail-closed in the pilot state.
+        hits = self._scan(cands, regime="RECOVERY", histories={"AVGO": self._vcp_hist()})
+        self.assertEqual(hits, [])
+
+    def test_risk_off_never_surfaces_a2(self) -> None:
+        cands = [
+            {"symbol": "LLY", "tech": self._a1_tech("LLY"), "bundle": None, "account": "Invest"},
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        hits = self._scan(cands, regime="RISK_OFF", benchmark=self._bench_hist(), histories={"AVGO": self._vcp_hist()})
+        self.assertEqual([(h["symbol"], h["channel"]) for h in hits], [("LLY", "A1")])
+
+    def test_regime_priority_ordering_and_cap(self) -> None:
+        cands = [
+            {"symbol": "LLY", "tech": self._a1_tech("LLY"), "bundle": None, "account": "Invest"},
+            {"symbol": "NFLX", "tech": self._a1_tech("NFLX"), "bundle": None, "account": "Invest"},
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+            {"symbol": "PANW", "tech": self._a2_tech("PANW"), "bundle": self._clean_bundle("PANW"), "account": "Invest"},
+        ]
+        hist_map = {"AVGO": self._vcp_hist(), "PANW": self._vcp_hist()}
+        # RISK_ON: A2 breakouts lead the 3-symbol board
+        hits = self._scan(cands, regime="RISK_ON", benchmark=self._bench_hist(), histories=hist_map)
+        self.assertEqual([h["symbol"] for h in hits], ["AVGO", "PANW", "LLY"])
+        self.assertEqual([h["channel"] for h in hits], ["A2", "A2", "A1"])
+        # NEUTRAL: A1 pullbacks lead; the 2nd A2 drops off the 3-symbol cap
+        hits = self._scan(cands, regime="NEUTRAL", benchmark=self._bench_hist(), histories=hist_map)
+        self.assertEqual([h["symbol"] for h in hits], ["LLY", "NFLX", "AVGO"])
+        self.assertEqual([h["channel"] for h in hits], ["A1", "A1", "A2"])
+
+    def test_gate_level_a2_unlocks_run_targeted_with_channel_tag(self) -> None:
+        candidates = [
+            {"symbol": "AVGO", "tech": self._a2_tech("AVGO"), "bundle": self._clean_bundle("AVGO"), "account": "Invest"},
+        ]
+        # Deterministic non-RISK_OFF tape: SPY above MA200, VIX 16, HY 3.0. Both the
+        # day-1 NEUTRAL (hysteresis) and a confirmed RISK_ON admit this strong-RS VCP hit.
+        spy_closes = np.concatenate([np.linspace(100.0, 130.0, 160), np.linspace(130.0, 126.0, 100)])
+        spy = pd.DataFrame(
+            {"Open": spy_closes * 0.998, "High": spy_closes * 1.005, "Low": spy_closes * 0.995,
+             "Close": spy_closes, "Volume": np.full(260, 5_000_000.0)},
+            index=pd.date_range("2025-09-01", periods=260, freq="B"),
+        )
+        gate = evaluate_deployment_gate(
+            portfolio=_real_snapshot_portfolio(),
+            strategy=StrategySection(),
+            bundles={"IBTA.L": TickerMarketBundle(symbol="IBTA.L", quote_type="ETF", currency="GBP")},
+            histories={"SPY": spy, "AVGO": self._vcp_hist()},
+            macro=_neutral_macro(vix=16.0),
+            candidates=candidates,
+            universe_etf_symbols=["VWRP.L", "VUAG.L"],
+        )
+        self.assertIn(gate["regime"], {"NEUTRAL", "RISK_ON"})
+        invest = gate["invest"]
+        self.assertEqual(invest["status"], "RUN")
+        self.assertEqual(invest["mode"], "targeted")
+        self.assertIn("AVGO·A2突破", invest["reason"])
+
+
+class TestV559M3P1BundlePrefilter(unittest.IsolatedAsyncioTestCase):
+    """v5.5.9 M3 P1: ordinary bull-tape risers must never eat the bundle batch cap.
+
+    Shape-only pre-filtering (dist_ma50 in (tol, +14%], BULL, RSI<82) matches dozens of
+    plain uptrends in RISK_ON; the batch cap then starves the genuine breakout names at
+    the back of pool_syms, and the scan's fail-closed silently drops them. The pre-filter
+    must pattern-confirm locally (0 network) before allocating a bundle slot.
+    """
+
+    @staticmethod
+    def _ordinary_hist() -> pd.DataFrame:
+        # Smooth linear rise with CONSTANT volume: passes the cheap A2 shape (and even
+        # the Minervini template) but never a VCP dry-up nor a platform volume cross.
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        closes = np.linspace(80.0, 130.0, 220)
+        return pd.DataFrame(
+            {"Open": closes * 0.997, "High": closes * 1.012, "Low": closes * 0.988,
+             "Close": closes, "Volume": np.full(220, 2_000_000.0)},
+            index=dates,
+        )
+
+    @staticmethod
+    def _ordinary_tech(symbol: str) -> TechnicalSnapshot:
+        return TechnicalSnapshot(
+            symbol=symbol, last_close=130.0, ma50=122.6, ma200=105.0,
+            dist_ma50_pct=6.0, dist_ma200_pct=22.0, rsi14=70.0,
+            trend_regime="BULL", weekly_bullish=True,
+        )
+
+    @staticmethod
+    def _pullback_tech(symbol: str, dist: float) -> TechnicalSnapshot:
+        return TechnicalSnapshot(
+            symbol=symbol, last_close=300.0, ma50=295.0, ma200=270.0,
+            dist_ma50_pct=dist, dist_ma200_pct=11.1, rsi14=55.0,
+            trend_regime="BULL", weekly_bullish=True,
+        )
+
+    class _RecordingMD:
+        def __init__(self, earnings: dict[str, int] | None = None) -> None:
+            self.calls: list[tuple[list[str], bool, bool]] = []
+            self._earnings = earnings or {}
+
+        async def get_bundles(self, symbols, include_news=True, include_earnings=True, **kwargs):
+            self.calls.append((list(symbols), include_news, include_earnings))
+            return {}, {
+                s: TickerMarketBundle(
+                    symbol=s, quote_type="EQUITY", currency="USD",
+                    days_to_earnings=self._earnings.get(s),
+                )
+                for s in symbols
+            }
+
+    async def test_bull_pool_bundles_go_only_to_pattern_confirmed_breakouts(self) -> None:
+        from src.agents.report_agent import _enrich_gate_candidate_bundles
+
+        vcp_hist = TestV559M3DualChannel._vcp_hist()
+        pool_syms: list[str] = [f"ORD{i}" for i in range(10)] + ["BRK1", "BRK2"]
+        snaps = {f"ORD{i}": self._ordinary_tech(f"ORD{i}") for i in range(10)}
+        snaps["BRK1"] = TestV559M3DualChannel._a2_tech("BRK1")
+        snaps["BRK2"] = TestV559M3DualChannel._a2_tech("BRK2")
+        hist_map = {sym: self._ordinary_hist() for sym in pool_syms[:10]}
+        hist_map["BRK1"] = vcp_hist
+        hist_map["BRK2"] = vcp_hist
+
+        md = self._RecordingMD()
+        out = await _enrich_gate_candidate_bundles(
+            md, pool_syms, snaps, {}, tolerance_pct=1.5, histories=hist_map
+        )
+        # Only the two pattern-confirmed breakouts at the BACK of the pool get the
+        # batch — the 10 front-row ordinary risers must not consume any slot.
+        self.assertEqual(md.calls, [(["BRK1", "BRK2"], False, True)])
+        self.assertIn("BRK1", out)
+        self.assertIn("BRK2", out)
+
+        # End-to-end: with these bundles the scan surfaces both breakouts — no starvation.
+        cands = [
+            {"symbol": s, "tech": snaps[s], "bundle": out.get(s), "account": "Invest"}
+            for s in pool_syms
+        ]
+        hits = _scan_a_equity_candidates(
+            cands, _real_snapshot_portfolio(), StrategySection(), hist_map,
+            regime="RISK_ON", benchmark_hist=TestV559M3DualChannel._bench_hist(),
+        )
+        self.assertEqual([h["symbol"] for h in hits], ["BRK1", "BRK2"])
+        self.assertTrue(all(h["channel"] == "A2" and h["pattern"] == "VCP" for h in hits))
+
+    async def test_a1_band_alignment_covers_the_minus_two_sub_band(self) -> None:
+        from src.agents.report_agent import _enrich_gate_candidate_bundles
+
+        snaps = {
+            "M18": self._pullback_tech("M18", -1.8),   # inside [-2.0, -1.5) sub-band
+            "M21": self._pullback_tech("M21", -2.1),   # below the A1 band
+        }
+        md = self._RecordingMD(earnings={"M18": 2})
+        out = await _enrich_gate_candidate_bundles(
+            md, ["M21", "M18"], snaps, {}, tolerance_pct=1.5, histories={}
+        )
+        self.assertEqual(md.calls, [(["M18"], False, True)])
+        self.assertEqual(out["M18"].days_to_earnings, 2)
+
+        # The previously-blind sub-band pullback now hits the earnings mine too.
+        cands = [{"symbol": "M18", "tech": snaps["M18"], "bundle": out["M18"], "account": "Invest"}]
+        hits = _scan_a_equity_candidates(
+            cands, _real_snapshot_portfolio(), StrategySection(), {}, regime="RISK_ON"
+        )
+        self.assertEqual(hits, [])
+
+    async def test_a2_shape_without_history_is_skipped_not_fetched(self) -> None:
+        from src.agents.report_agent import _enrich_gate_candidate_bundles
+
+        snaps = {"AVGO": TestV559M3DualChannel._a2_tech("AVGO")}
+        md = self._RecordingMD()
+        out = await _enrich_gate_candidate_bundles(
+            md, ["AVGO"], snaps, {}, tolerance_pct=1.5, histories=None
+        )
+        self.assertEqual(md.calls, [])
+        self.assertNotIn("AVGO", out)
 
 
 if __name__ == "__main__":

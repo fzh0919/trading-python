@@ -23,6 +23,7 @@ from src.data_providers.analytics import (
     compute_concentration_metrics,
     compute_core_policy_benchmark_comparison,
     compute_portfolio_performance,
+    compute_regime_attribution,
     compute_signal_quality,
     compute_trade_attribution,
 )
@@ -571,6 +572,27 @@ class AdvisorBot:
                 + _split_seg("Invest 右侧", split.get("invest"))
             )
 
+            # v5.5.9 M6: per-regime descriptive attribution (labels come from the
+            # morning context packs — the regime that actually governed each day).
+            regime_history: list[dict[str, Any]] = []
+            if hasattr(self.db, "get_regime_history"):
+                try:
+                    regime_history = await self.db.get_regime_history(limit=max(len(nav_rows), 420))
+                except Exception as exc:
+                    logger.warning("/perf regime history failed: %s", exc)
+            if regime_history:
+                regime_attr = compute_regime_attribution(nav_rows, regime_history)
+                if regime_attr.get("ok"):
+                    seg_bits = []
+                    for bucket_label, bucket in regime_attr["buckets"].items():
+                        seg_bits.append(
+                            f"{bucket_label} {bucket['days']}天 TWR{bucket['twr_pct']:+.2f}% "
+                            f"仓位{bucket['avg_position_pct']:.0f}%/现金{bucket['avg_cash_pct']:.0f}%"
+                        )
+                    unattr_days = int(regime_attr.get("unattributed_days") or 0)
+                    tail = f" | 未标记 {unattr_days}天" if unattr_days > 0 else ""
+                    lines.append("• 分形态归因: " + " | ".join(seg_bits) + tail)
+
             core_cmp = None
             try:
                 core_hist_map = await self.market_data.get_histories(
@@ -657,12 +679,22 @@ class AdvisorBot:
             self.db.get_recent_recommendations(limit=3, only_core_dca=True),
             audit_coro,
         )
+        # v5.5.9 M6: shadow counterfactual scoreboard — fetched before the
+        # empty-ledger guard so a shadow-only DB still shows its counterfactual
+        # evidence instead of the "no records" placeholder.
+        shadow_stats: dict[str, Any] | None = None
+        if hasattr(self.db, "get_shadow_rejection_stats"):
+            try:
+                shadow_stats = await self.db.get_shadow_rejection_stats()
+            except Exception as exc:
+                logger.warning("Shadow rejection stats failed: %s", exc)
         if (
             not rows
             and not core_rows
             and stats.get("total_count", 0) == 0
             and stats.get("core_dca_count", 0) == 0
             and not latest_audit
+            and not (shadow_stats and int(shadow_stats.get("settled") or 0) > 0)
         ):
             return "📭 暂无历史选股或调仓记录（运行一次 /pick 后会自动建档）。"
 
@@ -750,6 +782,24 @@ class AdvisorBot:
             lines.append(
                 f"• 实盘采纳: {adoption.get('filled_count', 0)}/{adoption.get('checked_count', 0)} 条命中真实成交 "
                 f"| 采纳率 {float(adoption.get('adoption_rate_pct') or 0.0):.1f}% | 平均执行滑点 {slip_s}"
+            )
+
+        # v5.5.9 M6: shadow counterfactual scoreboard — strictly isolated from the
+        # live win-rate above (SHADOW lane, never SETTLED). shadow_stats is fetched
+        # before the empty-ledger guard.
+        if shadow_stats and int(shadow_stats.get("settled") or 0) > 0:
+            settled_n = int(shadow_stats["settled"])
+            avoided_pct = shadow_stats.get("avoided_loser_rate_pct")
+            missed_pct = shadow_stats.get("missed_winner_rate_pct")
+            avg_t20 = shadow_stats.get("avg_t20_return_pct")
+            avoided_s = f"{float(avoided_pct):.1f}%" if avoided_pct is not None else "N/A"
+            missed_s = f"{float(missed_pct):.1f}%" if missed_pct is not None else "N/A"
+            avg_t20_s = f"{float(avg_t20):+.2f}%" if avg_t20 is not None else "N/A"
+            small_note = "（n<30 仅参考，不构成统计证据）" if shadow_stats.get("small_sample") else ""
+            lines.append(
+                f"• 影子拦截复盘(被拦候选反事实T+20): 已结 {settled_n} 条 "
+                f"| 护栏避雷正确 {avoided_s} | 错杀大牛 {missed_s} "
+                f"| 影子均T20收益 {avg_t20_s}{small_note}"
             )
 
         if lessons:

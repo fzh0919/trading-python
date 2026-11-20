@@ -117,14 +117,31 @@ def build_fact_baseline(
     if pending_text:
         lines.append("活动挂单（未成交仍计息）：\n" + pending_text[:1200])
     if scope == "pick" and candidate_bundles:
-        # v5.5.7: anchor this round's new picks so the linter can catch a GBp/GBP 100x slip.
+        # v5.5.7/v5.5.9 M2: anchor this round's new picks (price + calibrated sell-side mean/high)
+        # so the linter catches GBp/GBP 100x slips without false-flagging dual-anchor target citations.
+        from src.engine.portfolio_rules import _calibrate_target_price
+
         anchor_lines: list[str] = []
         for sym, bundle in list(candidate_bundles.items())[:12]:
             price = getattr(bundle, "current_price", None)
             if price is None or float(price) <= 0:
                 continue
             ccy = str(getattr(bundle, "currency", "") or "")
-            anchor_lines.append(f"• {sym} | 现价 {_fmt_num(price)} {ccy} | 币种 {ccy or '待核'}")
+            line = f"• {sym} | 现价 {_fmt_num(price)} {ccy} | 币种 {ccy or '待核'}"
+            if (getattr(bundle, "analyst_count", 0) or 0) >= 3:
+                mean_raw = getattr(bundle, "target_mean_price", None)
+                high_raw = getattr(bundle, "target_high_price", None)
+                if mean_raw is not None and float(mean_raw) > 0:
+                    mean_c = _calibrate_target_price(
+                        float(mean_raw), float(price), symbol=str(sym), currency=ccy
+                    )
+                    line += f" | 卖方均值 {_fmt_num(mean_c)}"
+                if high_raw is not None and float(high_raw) > 0:
+                    high_c = _calibrate_target_price(
+                        float(high_raw), float(price), symbol=str(sym), currency=ccy
+                    )
+                    line += f" | 卖方高位 {_fmt_num(high_c)}"
+            anchor_lines.append(line)
         if anchor_lines:
             lines.append("本次入选新标的现价锚点（含币种）：\n" + "\n".join(anchor_lines))
     if evals:

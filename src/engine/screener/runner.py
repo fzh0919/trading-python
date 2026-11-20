@@ -52,6 +52,7 @@ async def run_quant_screener(
     out_bundles: dict[str, TickerMarketBundle] | None = None,
     out_intel: dict[str, dict[str, Any]] | None = None,
     out_tech: dict[str, TechnicalSnapshot] | None = None,
+    out_bench_histories: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[list[ScreenerCandidate], list[ScreenerCandidate]]:
     """Two-stage quantitative pre-screener: 0-info OHLCV multi-bucket filter -> Stage 2 bundle enrichment.
 
@@ -153,6 +154,12 @@ async def run_quant_screener(
             if df is not None and not df.empty:
                 histories[k] = df
 
+    if out_bench_histories is not None:
+        for b_sym in benchmarks:
+            df_b = histories.get(b_sym)
+            if df_b is not None and not df_b.empty:
+                out_bench_histories[b_sym] = df_b
+
     corr_matrix = compute_correlation_matrix(
         histories,
         all_needed,
@@ -163,8 +170,15 @@ async def run_quant_screener(
         against_symbols=held_syms or None,
     )
 
+    def _bench_for(sym: str) -> pd.DataFrame | None:
+        for bench_sym in resolve_market_benchmark(sym):
+            df_b = histories.get(bench_sym)
+            if df_b is not None and not df_b.empty:
+                return df_b
+        return None
+
     stage1_tech: dict[str, TechnicalSnapshot | None] = {
-        sym: compute_technical_snapshot(sym, histories.get(sym))
+        sym: compute_technical_snapshot(sym, histories.get(sym), benchmark_hist=_bench_for(sym))
         for sym in all_needed
     }
 
@@ -190,10 +204,6 @@ async def run_quant_screener(
         all_needed,
         lookback_days=strategy.correlation_window_days,
     )
-
-    def _bench_for(sym: str) -> pd.DataFrame | None:
-        bench_sym = resolve_market_benchmark(sym)[0]
-        return histories.get(bench_sym)
 
     preselect_n = max(top_n_per_track * 2, top_n_per_track + 6)
 
@@ -379,7 +389,9 @@ async def run_quant_screener(
             out_intel.update(deep_intel_map)
 
     stage2_tech: dict[str, TechnicalSnapshot | None] = {
-        sym: compute_technical_snapshot(sym, histories.get(sym), bundle=bundles.get(sym))
+        sym: compute_technical_snapshot(
+            sym, histories.get(sym), bundle=bundles.get(sym), benchmark_hist=_bench_for(sym)
+        )
         for sym in top_syms
     }
     if out_tech is not None:

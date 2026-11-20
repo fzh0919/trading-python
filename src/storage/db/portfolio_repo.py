@@ -299,6 +299,44 @@ class PortfolioRepoMixin:
                 packs.append(parsed)
         return packs
 
+    async def get_regime_history(self, limit: int = 420) -> list[dict[str, Any]]:
+        """v5.5.9 M6: per-day regime labels from morning context packs (read-only).
+
+        The morning report is the only regime source of truth — the evening NAV job
+        never re-derives it (that would need extra VIX/HY fetches). Days without a
+        report simply carry no label and show up as unattributed in /perf.
+        Malformed packs are skipped, never guessed.
+        """
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT cycle_date, context_pack_json FROM morning_reports
+                WHERE context_pack_json IS NOT NULL AND TRIM(context_pack_json) != ''
+                ORDER BY cycle_date DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = await cur.fetchall()
+        history: list[dict[str, Any]] = []
+        for row in rows or []:
+            day = str(row[0] or "").strip()[:10]
+            if len(day) != 10:
+                continue
+            try:
+                parsed = json.loads(str(row[1] or "").strip())
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            gate_node = parsed.get("deployment_gate")
+            gate_regime = gate_node.get("regime") if isinstance(gate_node, dict) else ""
+            label = str(parsed.get("regime") or gate_regime or "").strip().upper()
+            if not label:
+                continue
+            history.append({"uk_date": day, "regime": label})
+        history.reverse()  # ascending by date for attribution joins
+        return history
+
     async def append_premarket_note(self, memo_text: str, cycle_date: str | None = None) -> None:
         cdate = cycle_date or self._cycle_id()
         now_ms = int(time.time() * 1000)

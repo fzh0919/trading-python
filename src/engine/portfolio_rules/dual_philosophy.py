@@ -30,6 +30,7 @@ from src.engine.portfolio_rules.models_and_friction import (
     ISA_QUALITY_MIN_REV_GROWTH_PCT,
     ISA_QUALITY_MIN_ROE_PCT,
     _LEVERAGE_EXEMPT_SECTOR_KEYWORDS,
+    _rescale_price_pair,
     _round_trip_friction_pct,
     _us_sell_settled_in_gbp,
     _usd_retention_active,
@@ -94,16 +95,154 @@ def _estimate_entry_friction_pct(
     return float(strategy.fx_fee_pct) * 2.0 + spread
 
 
-def _rescale_price_pair(price: float, ref: float) -> float:
-    """Fix the classic GBp/GBP 100x slip between LLM-supplied prices and the quote currency."""
+def _calibrate_target_price(
+    price: float,
+    ref: float,
+    *,
+    symbol: str = "",
+    currency: str = "",
+) -> float:
+    """Calibrate vendor/LLM target prices against ref_price with wider .L GBp/GBP 100x guard."""
     if price <= 0 or ref <= 0:
         return price
-    ratio = price / ref
-    if ratio >= 50.0:
-        return price / 100.0
-    if ratio <= 0.02:
-        return price * 100.0
-    return price
+    sym_up = str(symbol or "").strip().upper()
+    ccy_raw = str(currency or "").strip()
+    if sym_up.endswith(".L") or ccy_raw == "GBp" or ccy_raw.upper() == "GBX":
+        ratio = price / ref
+        if 0.005 <= ratio <= 0.05:
+            return price * 100.0
+        if 20.0 <= ratio <= 200.0:
+            return price / 100.0
+        return price
+    return _rescale_price_pair(price, ref)
+
+
+def is_strong_right_side_leader(
+    tech: TechnicalSnapshot | None,
+    *,
+    regime: str | None = "NEUTRAL",
+    rs_20d_pct: float | None = None,
+    rs_60d_pct: float | None = None,
+) -> bool:
+    """Single source of truth for unlocking the Invest dual-anchor target ceiling (v5.5.9 M2).
+
+    Unlocks ONLY when regime != RISK_OFF, structural Stage-2 leadership holds (Price > MA200,
+    BULL/PULLBACK, weekly not bearish), AND both 20d & 60d benchmark-relative strength are
+    strictly positive. Missing RS fails closed so weak/unverified names stay locked to mean.
+    """
+    reg = str(regime or "NEUTRAL").strip().upper().replace("-", "_")
+    if reg == "RISK_OFF":
+        return False
+    if not _is_right_side_leader(tech):
+        return False
+    rs20 = rs_20d_pct if rs_20d_pct is not None else getattr(tech, "rs_20d_pct", None)
+    rs60 = rs_60d_pct if rs_60d_pct is not None else getattr(tech, "rs_60d_pct", None)
+    return bool(
+        rs20 is not None
+        and float(rs20) > 0.0
+        and rs60 is not None
+        and float(rs60) > 0.0
+    )
+
+
+def resolve_invest_target_anchors(
+    *,
+    ref_price: float,
+    bundle: TickerMarketBundle | None,
+    tech: TechnicalSnapshot | None,
+    strategy: StrategySection,
+    regime: str | None = "NEUTRAL",
+    symbol: str = "",
+    rs_20d_pct: float | None = None,
+    rs_60d_pct: float | None = None,
+) -> dict[str, Any]:
+    """Unified Invest target-anchor resolver shared by scoring, /pick guardrail & holding eval.
+
+    Returns both:
+    - ``llm_ceiling``: upper bound on LLM-proposed targets (max of mean×1.15, high×0.90,
+      entry+4×ATR for confirmed leaders; mean×1.15 otherwise).
+    - ``deterministic_target``: target without synthetic 4×ATR (max of mean, high×0.90 for
+      confirmed leaders; mean otherwise), preserving forward R:R deterioration warnings.
+    """
+    sym = (
+        str(symbol or "").strip()
+        or (str(bundle.symbol or "").strip() if bundle is not None else "")
+        or (str(tech.symbol or "").strip() if tech is not None else "")
+    )
+    ccy = str(getattr(bundle, "currency", "") or "") if bundle is not None else ""
+    is_leader = is_strong_right_side_leader(
+        tech,
+        regime=regime,
+        rs_20d_pct=rs_20d_pct,
+        rs_60d_pct=rs_60d_pct,
+    )
+    has_coverage = bool(bundle is not None and (bundle.analyst_count or 0) >= 3)
+    analyst_mean: float | None = None
+    if (
+        has_coverage
+        and ref_price > 0
+        and bundle is not None
+        and bundle.target_mean_price is not None
+        and float(bundle.target_mean_price) > 0
+    ):
+        analyst_mean = _calibrate_target_price(
+            float(bundle.target_mean_price), ref_price, symbol=sym, currency=ccy
+        )
+
+    target_high_adj: float | None = None
+    haircut = float(
+        getattr(strategy, "invest_risk_on_target_high_haircut", INVEST_RISK_ON_TARGET_HIGH_HAIRCUT)
+    )
+    if (
+        has_coverage
+        and ref_price > 0
+        and bundle is not None
+        and bundle.target_high_price is not None
+        and float(bundle.target_high_price) > 0
+    ):
+        target_high_adj = (
+            _calibrate_target_price(
+                float(bundle.target_high_price), ref_price, symbol=sym, currency=ccy
+            )
+            * haircut
+        )
+
+    atr_anchor: float | None = None
+    if (
+        ref_price > 0
+        and tech is not None
+        and tech.atr_pct is not None
+        and float(tech.atr_pct) > 0
+    ):
+        atr_anchor = ref_price * (1.0 + 4.0 * float(tech.atr_pct) / 100.0)
+
+    if is_leader:
+        cand_ceilings: list[float] = []
+        if analyst_mean is not None and analyst_mean > 0:
+            cand_ceilings.append(analyst_mean * (1.0 + _PICK_RR_TARGET_TOLERANCE_PCT / 100.0))
+        if target_high_adj is not None and target_high_adj > 0:
+            cand_ceilings.append(target_high_adj)
+        if atr_anchor is not None and atr_anchor > 0:
+            cand_ceilings.append(atr_anchor)
+        llm_ceiling = max(cand_ceilings) if cand_ceilings else None
+        det_cands = [v for v in (analyst_mean, target_high_adj) if v is not None and v > 0]
+        deterministic_target = max(det_cands) if det_cands else None
+    else:
+        llm_ceiling = (
+            analyst_mean * (1.0 + _PICK_RR_TARGET_TOLERANCE_PCT / 100.0)
+            if (analyst_mean is not None and analyst_mean > 0)
+            else None
+        )
+        deterministic_target = analyst_mean
+
+    return {
+        "is_leader": is_leader,
+        "analyst_mean": analyst_mean,
+        "target_high_adj": target_high_adj,
+        "atr_anchor": atr_anchor,
+        "llm_ceiling": llm_ceiling,
+        "deterministic_target": deterministic_target,
+    }
 
 
 def _resolve_pick_rr(
@@ -174,32 +313,22 @@ def _resolve_pick_rr(
             entry = planned_entry
             out["entry_planned"] = True
 
-    analyst_target = 0.0
-    if (
-        bundle is not None
-        and (bundle.analyst_count or 0) >= 3
-        and bundle.target_mean_price is not None
-        and bundle.target_mean_price > 0
-    ):
-        analyst_target = _rescale_price_pair(float(bundle.target_mean_price), entry)
-
-    is_right_side = bool(
-        str(regime or "").upper() == "RISK_ON" and _is_right_side_leader(tech)
+    sym_resolved = symbol or str(getattr(item, "symbol", "") or "")
+    anchors = resolve_invest_target_anchors(
+        ref_price=entry,
+        bundle=bundle,
+        tech=tech,
+        strategy=strategy,
+        regime=regime,
+        symbol=sym_resolved,
     )
+    analyst_target = float(anchors["analyst_mean"] or 0.0)
+    is_right_side = bool(anchors["is_leader"])
+    out["is_right_side_leader"] = is_right_side
     if is_right_side:
-        # v5.5.1 bull-market two-anchor ceiling: never clamp a fresh RISK_ON leader back to a
-        # stale analyst mean, but still cap LLM fantasy targets at the highest sane anchor.
-        cand_ceilings: list[float] = []
-        if analyst_target > 0:
-            cand_ceilings.append(analyst_target * (1.0 + _PICK_RR_TARGET_TOLERANCE_PCT / 100.0))
-        if bundle is not None and bundle.target_high_price and bundle.target_high_price > 0:
-            th = _rescale_price_pair(float(bundle.target_high_price), entry)
-            cand_ceilings.append(
-                th * float(getattr(strategy, "invest_risk_on_target_high_haircut", INVEST_RISK_ON_TARGET_HIGH_HAIRCUT))
-            )
-        if tech is not None and tech.atr_pct is not None and tech.atr_pct > 0:
-            cand_ceilings.append(entry * (1.0 + 4.0 * float(tech.atr_pct) / 100.0))
-        ceiling = max(cand_ceilings) if cand_ceilings else 0.0
+        # v5.5.9 M2: non-RISK_OFF confirmed RS leaders use the unified two-anchor ceiling
+        # instead of being dragged back to a stale analyst mean, while still capping hallucinations.
+        ceiling = float(anchors["llm_ceiling"] or 0.0)
         if target <= 0 and analyst_target > 0:
             target = analyst_target
             out["target_replaced"] = True
@@ -529,7 +658,44 @@ def resolve_invest_dynamic_rr_floor(
         return rr_weak, "弱势/防御高赔率门槛"
     if reg == "RISK_ON" and _is_right_side_leader(tech):
         return min(rr_leader, base_neutral), "RISK_ON右侧强结构"
+    if reg == "RECOVERY":
+        return base_neutral, "RECOVERY早春试探门槛"
     return base_neutral, f"{reg or 'NEUTRAL'}标准门槛"
+
+
+def resolve_holding_target_upside_pct(
+    pos: PositionItem,
+    tech: TechnicalSnapshot | None,
+    bundle: TickerMarketBundle | None,
+    strategy: StrategySection,
+    *,
+    is_invest: bool,
+    regime: str = "NEUTRAL",
+    rs_20d_pct: float | None = None,
+    rs_60d_pct: float | None = None,
+) -> float | None:
+    """Resolve calibrated target upside % for a holding (Invest uses unified dual-anchor helper; ISA uses mean)."""
+    ref_cur = (
+        float(bundle.current_price)
+        if (bundle is not None and bundle.current_price and bundle.current_price > 0)
+        else (float(pos.cur_price) if is_invest else 0.0)
+    )
+    if ref_cur <= 0:
+        return None
+    anchors = resolve_invest_target_anchors(
+        ref_price=ref_cur,
+        bundle=bundle,
+        tech=tech,
+        strategy=strategy,
+        regime=regime,
+        symbol=pos.yahoo_symbol,
+        rs_20d_pct=rs_20d_pct,
+        rs_60d_pct=rs_60d_pct,
+    )
+    target = anchors["deterministic_target"] if is_invest else anchors["analyst_mean"]
+    if target is None or float(target) <= 0:
+        return None
+    return ((float(target) / ref_cur) - 1.0) * 100.0
 
 
 def compute_invest_forward_rr(
@@ -541,6 +707,8 @@ def compute_invest_forward_rr(
     effective_stop_pct: float | None,
     regime: str = "NEUTRAL",
     wallet: AccountSnapshot | None = None,
+    rs_20d_pct: float | None = None,
+    rs_60d_pct: float | None = None,
 ) -> float | None:
     """Forward R:R from *today's* price to the remaining target, per unit of stop risk.
 
@@ -556,26 +724,20 @@ def compute_invest_forward_rr(
     )
     if cur <= 0:
         return None
-    if (
-        bundle is None
-        or (bundle.analyst_count or 0) < 3
-        or bundle.target_mean_price is None
-        or bundle.target_mean_price <= 0
-    ):
+    anchors = resolve_invest_target_anchors(
+        ref_price=cur,
+        bundle=bundle,
+        tech=tech,
+        strategy=strategy,
+        regime=regime,
+        symbol=pos.yahoo_symbol,
+        rs_20d_pct=rs_20d_pct,
+        rs_60d_pct=rs_60d_pct,
+    )
+    target = anchors["deterministic_target"]
+    if target is None or float(target) <= 0:
         return None
-    mean_t = _rescale_price_pair(float(bundle.target_mean_price), cur)
-    target = mean_t
-    if (
-        str(regime or "").upper() == "RISK_ON"
-        and _is_right_side_leader(tech)
-        and bundle.target_high_price is not None
-        and bundle.target_high_price > 0
-    ):
-        high_t = _rescale_price_pair(float(bundle.target_high_price), cur) * float(
-            getattr(strategy, "invest_risk_on_target_high_haircut", INVEST_RISK_ON_TARGET_HIGH_HAIRCUT)
-        )
-        target = max(mean_t, high_t)
-    upside_pct = ((target / cur) - 1.0) * 100.0
+    upside_pct = ((float(target) / cur) - 1.0) * 100.0
     risk_pct = abs(float(effective_stop_pct))
     if risk_pct <= 0:
         return None

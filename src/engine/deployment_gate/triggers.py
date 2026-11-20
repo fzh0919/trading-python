@@ -8,13 +8,20 @@ from typing import Any
 import pandas as pd
 
 from src.config import StrategySection
-from src.data_providers.analytics import TechnicalSnapshot, normalize_issuer_root
+from src.data_providers.analytics import (
+    TechnicalSnapshot,
+    normalize_issuer_root,
+    resolve_market_benchmark,
+)
 from src.data_providers.market_data import TickerMarketBundle
 from src.data_providers.t212_client import PortfolioData
-from src.engine.portfolio_rules import ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT
+from src.engine.portfolio_rules import ISA_VALUE_CRISIS_BUY_ENABLED_DEFAULT, is_strong_right_side_leader
 from src.engine.deployment_gate.common import (
     ISA_EXTREME_LOW_CASH_PCT,
     LONDON_TZ,
+    TRIGGER_A1_MIN_DIST_MA50_PCT,
+    TRIGGER_A2_MAX_DIST_MA50_PCT,
+    TRIGGER_A2_RSI_EXCLUDE_ABOVE,
     TRIGGER_EARNINGS_EXCLUDE_DAYS,
     TRIGGER_EXDIV_EXCLUDE_DAYS,
     TRIGGER_RSI_EXCLUDE_ABOVE,
@@ -24,6 +31,12 @@ from src.engine.deployment_gate.common import (
     _sym_up,
 )
 from src.engine.deployment_gate.core_policy import _is_etf_symbol
+from src.engine.screener.patterns import (
+    compute_relative_strength,
+    detect_breakthrough_platform,
+    detect_minervini_stage2,
+    detect_vcp_contraction,
+)
 
 # ---------------------------------------------------------------------------
 # 4. Triggers and account-level decisions
@@ -78,6 +91,12 @@ def _core_etf_drawdown_step(
     return out
 
 
+def _hit_channel_label(hit: dict[str, Any]) -> str:
+    """Compact channel tag for the Invest RUN reason, e.g. ``NVDA·A2突破`` (v5.5.9 M3)."""
+    suffix = "A2突破" if str(hit.get("channel") or "") == "A2" else "A1回踩"
+    return f"{hit.get('symbol', '')}·{suffix}"
+
+
 def _scan_a_equity_candidates(
     candidates: list[dict[str, Any]] | None,
     portfolio: PortfolioData,
@@ -86,8 +105,26 @@ def _scan_a_equity_candidates(
     *,
     etf_set: set[str] | None = None,
     bundles: dict[str, TickerMarketBundle] | None = None,
+    regime: str | None = None,
+    benchmark_hist: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
-    """A-trigger: right-side uptrend equities pulling back to MA50, cross-account deduped."""
+    """A-trigger: right-side uptrend equities — A1 MA50 pullbacks + v5.5.9 M3 A2 breakouts.
+
+    With ``regime=None`` this reproduces the legacy A1-only scan semantics (direct
+    historical callers/tests stay pinned). With a regime supplied the A2 breakout
+    channel opens on top of the unchanged A1 gates:
+
+    - A2 band: ``tol < dist_ma50 <= +14%`` (chase guard) with RSI < 82 (only extreme
+      blow-offs rejected), Stage-2 Minervini template, and a VCP contraction or a
+      platform breakout whose volume confirmation is native to the detector
+      (VCP final-stage dry-up <=0.9x / platform breakout bar >=1.8x).
+    - Earnings/ex-dividend exclusion windows stay identical to A1; an A2 name with
+      no bundle is skipped fail-closed (never surface an unvetted breakout).
+    - Regime policy: RISK_ON/RECOVERY surface A2 first; NEUTRAL/UNKNOWN keep A1
+      first and only admit VCP coils with confirmed strong RS (the M2 leader
+      ruler); RECOVERY additionally requires strong RS for A2; RISK_OFF never
+      surfaces A2 (offense stays frozen in a crisis).
+    """
     held_or_pending = {
         _sym_up(p.yahoo_symbol) for p in portfolio.all_positions()
     } | {_sym_up(o.yahoo_symbol) for o in portfolio.all_pending_orders()}
@@ -95,6 +132,10 @@ def _scan_a_equity_candidates(
     known_etfs = etf_set or set()
     hits: list[dict[str, Any]] = []
     tol = float(strategy.trigger_ma_tolerance_pct)
+    eff_regime = str(regime or "").strip().upper().replace("-", "_")
+    legacy_mode = regime is None
+    a2_enabled = bool((not legacy_mode) and eff_regime != "RISK_OFF")
+    neutral_like = eff_regime in {"", "NEUTRAL", "UNKNOWN"}
     for cand in candidates or []:
         if not isinstance(cand, dict):
             continue
@@ -122,8 +163,16 @@ def _scan_a_equity_candidates(
             ex_days = 0
         if ex_days is not None and 0 <= ex_days <= TRIGGER_EXDIV_EXCLUDE_DAYS:
             continue
+        dist_ma50 = getattr(tech, "dist_ma50_pct", None)
+        if dist_ma50 is None:
+            continue
+        pullback = TRIGGER_A1_MIN_DIST_MA50_PCT <= float(dist_ma50) <= tol
+        a2_band = bool(a2_enabled and tol < float(dist_ma50) <= TRIGGER_A2_MAX_DIST_MA50_PCT)
+        if not pullback and not a2_band:
+            continue
         rsi = getattr(tech, "rsi14", None)
-        if rsi is not None and float(rsi) >= TRIGGER_RSI_EXCLUDE_ABOVE:
+        rsi_cap = TRIGGER_A2_RSI_EXCLUDE_ABOVE if a2_band else TRIGGER_RSI_EXCLUDE_ABOVE
+        if rsi is not None and float(rsi) >= rsi_cap:
             continue
         # v5.5.7: a real right-side pullback must still be above MA200 with a non-bearish
         # weekly structure — never surface weekly-downtrend names as "right-side prey".
@@ -131,10 +180,6 @@ def _scan_a_equity_candidates(
         if dist_ma200 is None or float(dist_ma200) <= 0.0:
             continue
         if getattr(tech, "weekly_bullish", None) is False:
-            continue
-        dist_ma50 = getattr(tech, "dist_ma50_pct", None)
-        pullback = dist_ma50 is not None and -2.0 <= float(dist_ma50) <= tol
-        if not pullback:
             continue
         ma50 = getattr(tech, "ma50", None)
         ma200 = getattr(tech, "ma200", None)
@@ -158,10 +203,71 @@ def _scan_a_equity_candidates(
             )
         if not uptrend:
             continue
-        hits.append({"symbol": sym, "dist_ma50_pct": _round2(dist_ma50), "account": str(cand.get("account") or "Invest")})
-        if len(hits) >= int(strategy.trigger_max_symbols):
-            break
-    return hits
+        if pullback:
+            hits.append(
+                {
+                    "symbol": sym,
+                    "dist_ma50_pct": _round2(dist_ma50),
+                    "account": str(cand.get("account") or "Invest"),
+                    "channel": "A1",
+                }
+            )
+            continue
+        # ---- A2 breakout channel (v5.5.9 M3) ----
+        if bundle is None:
+            # Fail-closed: without an earnings/ex-div bundle the calendar mines are blind.
+            continue
+        # v5.5.9 M3 P3: RS uses the candidate's regional benchmark when its history is
+        # already in the merged gate dict (ISF.L / EXS1.DE, matching the M2 screener
+        # ruler), falling back to the passed regime benchmark (SPY) — zero extra fetches.
+        rs_bench = benchmark_hist
+        if hist is not None:
+            for bench_key in resolve_market_benchmark(sym):
+                if bench_key in (histories or {}):
+                    rs_bench = (histories or {})[bench_key]
+                    break
+        rs20 = rs60 = None
+        if rs_bench is not None and hist is not None:
+            rs_info = compute_relative_strength(hist, rs_bench)
+            rs20 = rs_info.get("rs_20d_pct")
+            rs60 = rs_info.get("rs_60d_pct")
+        minervini = detect_minervini_stage2(hist, tech, rs_60d_pct=rs60)
+        if not minervini.get("passes"):
+            continue
+        pattern_tag = ""
+        if detect_vcp_contraction(hist, tech):
+            pattern_tag = "VCP"
+        elif detect_breakthrough_platform(hist):
+            # Semantics: the detector scans the last 60 bars, so PLATFORM marks a
+            # right-side continuation within the +14% extension cap after a volume
+            # platform cross — not strictly a same-day first break. /pick still runs the
+            # full Researcher/Critic/R:R chain, and NEUTRAL admits VCP coils only.
+            pattern_tag = "PLATFORM"
+        else:
+            continue
+        strong_leader = is_strong_right_side_leader(
+            tech, regime=eff_regime, rs_20d_pct=rs20, rs_60d_pct=rs60
+        )
+        if neutral_like:
+            # NEUTRAL/UNKNOWN only admit the tightest VCP coils with confirmed strong RS.
+            if pattern_tag != "VCP" or not strong_leader:
+                continue
+        elif eff_regime == "RECOVERY" and not strong_leader:
+            # Early-spring probe state only admits the strongest RS leaders.
+            continue
+        hits.append(
+            {
+                "symbol": sym,
+                "dist_ma50_pct": _round2(dist_ma50),
+                "account": str(cand.get("account") or "Invest"),
+                "channel": "A2",
+                "pattern": pattern_tag,
+            }
+        )
+    if a2_enabled and len(hits) > 1:
+        priority = "A2" if eff_regime in {"RISK_ON", "RECOVERY"} else "A1"
+        hits.sort(key=lambda h: 0 if h.get("channel") == priority else 1)
+    return hits[: int(strategy.trigger_max_symbols)]
 
 
 def _today_external_inflow(
@@ -210,6 +316,7 @@ def scan_triggers_and_decide(
     regime = regime_info.get("regime", "UNKNOWN")
 
     a_core = _core_etf_drawdown_step(histories, strategy)
+    bench_sym = str(regime_info.get("benchmark_symbol") or "").strip()
     a_equity = _scan_a_equity_candidates(
         candidates,
         portfolio,
@@ -217,6 +324,8 @@ def scan_triggers_and_decide(
         histories,
         etf_set=set(ledgers.get("etf_set") or []),
         bundles=bundles,
+        regime=regime,
+        benchmark_hist=(histories or {}).get(bench_sym) if bench_sym else None,
     )
 
     b_dca = bool(
@@ -303,6 +412,7 @@ def scan_triggers_and_decide(
     slots_cap = {
         "RISK_ON": int(strategy.invest_slots_risk_on),
         "NEUTRAL": int(strategy.invest_slots_neutral),
+        "RECOVERY": int(getattr(strategy, "invest_slots_recovery", 1)),
         "RISK_OFF": int(strategy.invest_slots_risk_off),
         "UNKNOWN": int(strategy.invest_slots_neutral),
     }.get(regime, int(strategy.invest_slots_neutral))
@@ -310,6 +420,7 @@ def scan_triggers_and_decide(
     heat_cap_pct = {
         "RISK_ON": float(strategy.invest_max_heat_risk_on_pct),
         "NEUTRAL": float(strategy.invest_max_heat_neutral_pct),
+        "RECOVERY": float(getattr(strategy, "invest_max_heat_recovery_pct", 1.0)),
         "RISK_OFF": float(strategy.invest_max_heat_risk_off_pct),
         "UNKNOWN": float(strategy.invest_max_heat_neutral_pct),
     }.get(regime, float(strategy.invest_max_heat_neutral_pct))
@@ -372,13 +483,98 @@ def scan_triggers_and_decide(
                 )
     elif a_equity:
         invest_status, invest_mode = "RUN", "targeted"
-        invest_reason = f"右侧猎物触发({','.join(h['symbol'] for h in a_equity)})，在险槽位 {invest['slots_used']}/{slots_cap}"
+        pilot_prefix = (
+            f"早春轻兵试探({float(invest.get('risk_budget_scale') or 0.6):.1f}R)："
+            if regime == "RECOVERY"
+            else ""
+        )
+        invest_reason = (
+            f"{pilot_prefix}右侧猎物触发({','.join(_hit_channel_label(h) for h in a_equity)})，"
+            f"在险槽位 {invest['slots_used']}/{slots_cap}"
+        )
     else:
         invest_status, invest_mode = "WAIT", "none"
         invest_reason = "无右侧猎物，现金吃息等待(绝不因现金多催买)"
     invest["status"] = invest_status
     invest["mode"] = invest_mode
     invest["reason"] = invest_reason
+
+    # ---------- v5.5.9 M5: Invest distributing-ETF beta reservoir (advisory only) ----------
+    # Admission locks (fail-closed, fully deterministic, zero network):
+    #   L1 regime in {RISK_ON, NEUTRAL} — RISK_OFF freezes new builds, RECOVERY keeps dry powder;
+    #   L2 ISA core funded (>= target) OR ISA deployable cash <= band high — tax-free ISA first;
+    #   L3 Invest idle cash share strictly > floor — the reservoir only parks genuinely idle money;
+    #   L4 DIST whitelist only (UK ERI red line; ACC classes are hard-blocked in /pick).
+    # Ticket = cash overflow beyond the liquid reserve band; sub-floor tickets never churn.
+    reservoir_held = [
+        {"symbol": str(r.get("symbol") or ""), "value_gbp": float(r.get("value_gbp") or 0.0)}
+        for r in (invest.get("reservoir_positions") or [])
+        if isinstance(r, dict)
+    ]
+    reservoir_advice: dict[str, Any] = {
+        "eligible": False,
+        "locks_failed": [],
+        "held_symbols": [str(r["symbol"]) for r in reservoir_held],
+        "ticket_symbol": "",
+        "ticket_gbp": 0.0,
+        "reserve_gbp": 0.0,
+    }
+    if not bool(getattr(strategy, "invest_reservoir_enabled", True)):
+        reservoir_advice["locks_failed"].append("reservoir_disabled")
+    elif not (isa["ok"] and invest["ok"]):
+        reservoir_advice["locks_failed"].append("snapshot_degraded")
+    else:
+        reserve_pct = float(getattr(strategy, "invest_reservoir_cash_reserve_pct", 30.0))
+        invest_val = float(invest.get("total_account_value_gbp") or 0.0)
+        # v5.5.9 M5 P2 fix: idle share and the overflow ticket both use AVAILABLE cash
+        # (the ISA deployable_pct convention) — resting BUY orders already reserved
+        # this money, so a ticket computed from total_cash would double-spend it and
+        # punch straight through the 30% liquid-ammunition band once filled.
+        invest_avail = float(invest.get("available_to_trade_gbp") or 0.0)
+        idle_pct = _round2((invest_avail / invest_val) * 100.0) if invest_val > 0 else 0.0
+        reservoir_advice["reserve_gbp"] = _round2(invest_val * reserve_pct / 100.0)
+        if regime not in {"RISK_ON", "NEUTRAL"}:
+            reservoir_advice["locks_failed"].append("regime_not_open")
+        isa_core_ok = float(isa.get("committed_core_etf_pct") or 0.0) >= float(
+            strategy.isa_core_etf_target_pct
+        )
+        isa_cash_low = float(isa.get("deployable_pct") or 0.0) <= float(
+            strategy.isa_cash_band_high_pct
+        )
+        if not (isa_core_ok or isa_cash_low):
+            reservoir_advice["locks_failed"].append("isa_core_gap_priority")
+        if idle_pct <= float(getattr(strategy, "invest_reservoir_min_idle_cash_pct", 50.0)):
+            reservoir_advice["locks_failed"].append("idle_cash_below_floor")
+        ticket_gbp = _round2(max(0.0, invest_avail - float(reservoir_advice["reserve_gbp"])))
+        if ticket_gbp < float(getattr(strategy, "invest_reservoir_min_ticket_gbp", 1000.0)):
+            reservoir_advice["locks_failed"].append("ticket_below_min")
+        if invest.get("pending_reservoir_buys"):
+            reservoir_advice["locks_failed"].append("reservoir_buy_pending")
+        if not reservoir_advice["locks_failed"]:
+            whitelist = [
+                str(s).strip().upper()
+                for s in (getattr(strategy, "invest_reservoir_etf_whitelist", None) or [])
+                if str(s).strip()
+            ]
+            ticket_sym = (
+                reservoir_held[0]["symbol"] if reservoir_held else (whitelist[0] if whitelist else "")
+            )
+            if ticket_sym:
+                reservoir_advice.update(
+                    {
+                        "eligible": True,
+                        "ticket_symbol": ticket_sym,
+                        "ticket_gbp": ticket_gbp,
+                    }
+                )
+    invest["reservoir_advice"] = reservoir_advice
+    if reservoir_advice["eligible"] and invest_status == "WAIT":
+        invest_reason = (
+            f"{invest_reason}；溢出现金可停泊派息宽基蓄水池 {reservoir_advice['ticket_symbol']} "
+            f"£{float(reservoir_advice['ticket_gbp']):,.0f}"
+            f"（保留{float(getattr(strategy, 'invest_reservoir_cash_reserve_pct', 30.0)):.0f}%流动弹药，零槽位零热力零Quota）"
+        )
+        invest["reason"] = invest_reason
 
     if d_defend or isa_extreme_low_cash:
         invest["defend_note"] = (

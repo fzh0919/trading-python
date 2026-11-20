@@ -18,12 +18,14 @@ from src.data_providers.market_data import normalize_history_index
 from src.data_providers.t212_client import PortfolioData
 
 def _normalize_regime_tag(value: str) -> str:
-    """Normalize screener breadth tags (RISK-ON) and gate regimes (RISK_ON) to one vocabulary."""
+    """Normalize screener breadth tags (RISK-ON) and gate regimes (RISK_ON/RECOVERY) to one vocabulary."""
     raw = str(value or "").strip().upper().replace("_", "-")
     if raw in {"RISK-ON", "RISKON"}:
         return "RISK-ON"
     if raw in {"RISK-OFF", "RISKOFF"}:
         return "RISK-OFF"
+    if raw == "RECOVERY":
+        return "RECOVERY"
     return "NEUTRAL"
 
 

@@ -43,6 +43,7 @@ from src.agents.tools import MarketToolkit, run_forced_market_grounding
 from src.config import AppConfig
 from src.data_providers.analytics import build_nav_row, compute_technical_snapshot
 from src.data_providers.market_data import MarketDataService
+from src.data_providers.market_data.models_and_parsing import _deserialize_ohlcv_json
 from src.data_providers.t212_client import (
     T212Client,
     build_trade_context,
@@ -97,6 +98,66 @@ async def _fetch_past_lessons(db: AdvisorDatabase, exclude_cycle_date: str | Non
         return await fetch(limit=5)
 
 
+def _filter_fresh_cached_breadth_histories(
+    cached_rows: dict[str, dict[str, Any]] | None,
+    ref_hist: pd.DataFrame | None,
+    *,
+    max_bar_lag_days: int = 2,
+    fallback_max_age_hours: int = 36,
+    now_ms: int | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Filter local SQLite ``ohlcv_cache`` rows against the latest benchmark bar date.
+
+    Rejects stale Sunday-night audition bars once a new weekday session has printed on SPY
+    (e.g. Tuesday morning with Monday SPY bar vs Friday cache = 3 calendar days > 2), so
+    breadth automatically falls back to today's freshly fetched ``pool_snaps`` instead of
+    masking a Monday-Wednesday crash/V-bottom with last Friday's 150-stock cache.
+    """
+    if not cached_rows:
+        return {}
+    ref_bar_date = None
+    if ref_hist is not None and not ref_hist.empty:
+        try:
+            ts = pd.Timestamp(ref_hist.index[-1])
+            if not pd.isna(ts):
+                ref_bar_date = ts.date()
+        except Exception:
+            ref_bar_date = None
+    cur_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    fallback_cutoff_ms = cur_ms - int(fallback_max_age_hours) * 3_600_000
+
+    out: dict[str, pd.DataFrame] = {}
+    for sym_c, row_c in cached_rows.items():
+        if not isinstance(row_c, dict):
+            continue
+        bar_date = None
+        raw_bar = str(row_c.get("last_bar_date") or "").strip()[:10]
+        if raw_bar:
+            try:
+                bar_date = datetime.strptime(raw_bar, "%Y-%m-%d").date()
+            except ValueError:
+                bar_date = None
+        if ref_bar_date is not None and bar_date is not None:
+            if (ref_bar_date - bar_date).days > int(max_bar_lag_days):
+                continue
+        elif ref_bar_date is None:
+            updated_ms = int(row_c.get("updated_at_ms") or 0)
+            if updated_ms <= 0 or updated_ms < fallback_cutoff_ms:
+                continue
+        df_c = _deserialize_ohlcv_json(str(row_c.get("payload_json") or ""))
+        if df_c is None or df_c.empty:
+            continue
+        if ref_bar_date is not None and bar_date is None:
+            try:
+                df_ts = pd.Timestamp(df_c.index[-1])
+                if pd.isna(df_ts) or (ref_bar_date - df_ts.date()).days > int(max_bar_lag_days):
+                    continue
+            except Exception:
+                continue
+        out[sym_c] = df_c
+    return out
+
+
 def _build_regime_anchor_text(
     cfg: AppConfig,
     gate_preview: dict[str, Any] | None,
@@ -109,10 +170,21 @@ def _build_regime_anchor_text(
         current_regime, None, cfg.strategy, vix=vix
     )
     regime_reason = ""
+    breadth_line = ""
     isa_status = "未启用门控"
     invest_status = "未启用门控"
     if isinstance(gate_preview, dict):
         regime_reason = str(gate_preview.get("regime_reason") or "").strip()
+        breadth = gate_preview.get("breadth") if isinstance(gate_preview.get("breadth"), dict) else {}
+        if breadth:
+            b_score = breadth.get("score")
+            b_src = str(breadth.get("source") or "unavailable")
+            b_cnt = int(breadth.get("pool_count") or 0)
+            if b_score is not None:
+                cnt_txt = f"，本地池{b_cnt}只" if b_cnt > 0 else ""
+                breadth_line = f"市场宽度 = {float(b_score):.1f}（来源 {b_src}{cnt_txt}）"
+            else:
+                breadth_line = "市场宽度 = 降级未计入（中性放行，零额外外网请求）"
         isa_g = gate_preview.get("isa") or {}
         inv_g = gate_preview.get("invest") or {}
         if isinstance(inv_g, dict):
@@ -125,19 +197,30 @@ def _build_regime_anchor_text(
             isa_status = f"{isa_g.get('status')}（{isa_g.get('reason') or '无补充理由'}）"
         if isinstance(inv_g, dict) and inv_g.get("status"):
             invest_status = f"{inv_g.get('status')}（{inv_g.get('reason') or '无补充理由'}）"
-    rr_note = "，RISK_ON 右侧领涨 ≥1.6:1 / 常规 ≥2.0:1" if current_regime == "RISK_ON" else ""
+    if current_regime == "RISK_ON":
+        rr_note = "，RISK_ON 右侧领涨 ≥1.6:1 / 常规 ≥2.0:1"
+    elif current_regime == "RECOVERY":
+        rr_note = "，RECOVERY 早春轻兵试探（仅 1 槽位/1.0%热力/0.6R，仅放行强 RS 领涨股）"
+    else:
+        rr_note = ""
     lines = [
         "=== 〇、Python 确定性市场状态与动态 R:R 门槛（唯一基准，禁止自行改判） ===",
         f"当日确定性市场状态 = {current_regime}（{regime_reason or '无补充理由'}）",
-        f"Invest 基础净 R:R 门槛 = ≥{rr_floor:.1f}:1（{rr_tier}{rr_note}）",
-        f"ISA 门控 = {isa_status}",
-        f"Invest 门控 = {invest_status}",
-        (
-            f"硬纪律：Bull/Bear/PM 必须以本段 Python 确定性 Regime（{current_regime}）为唯一基准，"
-            "不得自行改判 Regime；若因突发宏观/事件需更谨慎，仅可显式声明"
-            f"『在 {current_regime} 基础上主动收紧』，不得改称弱市或擅自抬高门槛。"
-        ),
     ]
+    if breadth_line:
+        lines.append(breadth_line)
+    lines.extend(
+        [
+            f"Invest 基础净 R:R 门槛 = ≥{rr_floor:.1f}:1（{rr_tier}{rr_note}）",
+            f"ISA 门控 = {isa_status}",
+            f"Invest 门控 = {invest_status}",
+            (
+                f"硬纪律：Bull/Bear/PM 必须以本段 Python 确定性 Regime（{current_regime}）为唯一基准，"
+                "不得自行改判 Regime；若因突发宏观/事件需更谨慎，仅可显式声明"
+                f"『在 {current_regime} 基础上主动收紧』，不得改称弱市或擅自抬高门槛。"
+            ),
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -359,11 +442,14 @@ async def generate_morning_report(
     gate_histories: dict[str, pd.DataFrame] = {}
     gate_candidates: list[dict[str, Any]] = []
     prev_gate_states: list[dict[str, Any]] = []
+    pool_snaps: dict[str, Any] = {}
+    cached_breadth_histories: dict[str, pd.DataFrame] = {}
     if gate_mode != "off":
         regime_bench = str(getattr(cfg.strategy, "regime_benchmark_symbol", "SPY") or "SPY").strip().upper()
         core_bench = str(getattr(cfg.strategy, "benchmark_symbol", "VWRP.L") or "VWRP.L").strip().upper()
         etf_upper = {s.strip().upper() for s in (cfg.universe.etf_symbols or []) if s} | {core_bench}
         active_pool_syms: list[str] = []
+        all_active_equity_syms: list[str] = []
         if callable(getattr(db, "get_active_universe_pool", None)):
             try:
                 active_rows = await db.get_active_universe_pool()
@@ -371,9 +457,9 @@ async def generate_morning_report(
                     if isinstance(row, dict) and not row.get("is_etf"):
                         sym_r = str(row.get("symbol") or "").strip()
                         if sym_r and sym_r.upper() not in etf_upper:
-                            active_pool_syms.append(sym_r)
-                            if len(active_pool_syms) >= 30:
-                                break
+                            all_active_equity_syms.append(sym_r)
+                            if len(active_pool_syms) < 30:
+                                active_pool_syms.append(sym_r)
             except Exception as exc:
                 logger.debug("Deployment-gate active universe lookup skipped: %s", exc)
         pool_syms = list(
@@ -398,7 +484,21 @@ async def generate_morning_report(
                     gate_histories = {k: v for k, v in fetched.items() if v is not None and not v.empty}
             except Exception as exc:
                 logger.debug("Deployment-gate history pre-fetch failed; continuing without A-trigger scan: %s", exc)
-        pool_snaps: dict[str, Any] = {}
+        # Zero-extra-network local breadth cache read, anchored on the latest benchmark bar date
+        # (<=2 calendar days lag; stale weekend audition bars fall back to today's fresh pool_snaps).
+        if all_active_equity_syms and callable(getattr(db, "get_cached_ohlcv", None)):
+            try:
+                cached_rows = await db.get_cached_ohlcv(all_active_equity_syms[:150], period="2y")
+                ref_hist = gate_histories.get(regime_bench)
+                if ref_hist is None or ref_hist.empty:
+                    ref_hist = histories.get(regime_bench)
+                cached_breadth_histories = _filter_fresh_cached_breadth_histories(
+                    cached_rows,
+                    ref_hist,
+                    max_bar_lag_days=2,
+                )
+            except Exception as exc:
+                logger.debug("Deployment-gate local breadth cache read skipped: %s", exc)
         for sym in pool_syms:
             hist = gate_histories.get(sym)
             if hist is None or hist.empty:
@@ -411,13 +511,16 @@ async def generate_morning_report(
             if snap is not None:
                 pool_snaps[sym] = snap
         # The 5-day earnings / ex-dividend mines only work when the un-held gate
-        # candidates carry a bundle; fetch one lightweight batch for the MA50 pullbacks.
+        # candidates carry a bundle; fetch one lightweight batch for A1 pullbacks and
+        # locally pattern-confirmed A2 breakouts (v5.5.9 M3 P1: gate_histories are
+        # already in memory, so ordinary bull-tape risers cannot eat the batch cap).
         cand_bundles = await _enrich_gate_candidate_bundles(
             market_data,
             pool_syms,
             pool_snaps,
             bundles,
             tolerance_pct=float(getattr(cfg.strategy, "trigger_ma_tolerance_pct", 1.5) or 1.5),
+            histories=gate_histories,
         )
         for sym in pool_syms:
             snap = pool_snaps.get(sym)
@@ -560,6 +663,8 @@ async def generate_morning_report(
             gate_histories,
             gate_candidates,
             prev_gate_states,
+            pool_snaps=pool_snaps,
+            cached_breadth_histories=cached_breadth_histories,
         )
     core_policy_context = _format_core_policy_ticket_block(
         gate_preview, bundles, histories
@@ -570,13 +675,14 @@ async def generate_morning_report(
     current_regime = "NEUTRAL"
     if isinstance(gate_preview, dict):
         current_regime = str(gate_preview.get("regime") or "NEUTRAL").strip().upper()
-    if current_regime in {"RISK_ON", "RISK_OFF"}:
+    if current_regime in {"RISK_ON", "RECOVERY", "RISK_OFF"} or bool(gate_histories):
+        eval_histories = {**gate_histories, **histories} if gate_histories else histories
         regime_evals = evaluate_portfolio(
             portfolio,
             tech_map,
             bundles,
             cfg.strategy,
-            histories=histories,
+            histories=eval_histories,
             regime=current_regime,
             macro=macro,
         )
@@ -767,6 +873,8 @@ async def generate_morning_report(
                 gate_histories,
                 gate_candidates,
                 prev_gate_states,
+                pool_snaps=pool_snaps,
+                cached_breadth_histories=cached_breadth_histories,
             )
             if gate_dict is not None:
                 pm_proposal = getattr(resolved_decision, "pick_gate", None)
@@ -820,7 +928,11 @@ async def generate_morning_report(
             max_chars=max_body_chars,
             risk_override=override_res,
             gate_banner=gate_banner,
-            size_notes=build_report_size_notes(resolved_decision.top_actions, portfolio),
+            size_notes=build_report_size_notes(
+                resolved_decision.top_actions,
+                portfolio,
+                strategy=cfg.strategy,
+            ),
         )
         guardrails = list(resolved_decision.daily_vetoes)
         actions_summary = "; ".join(

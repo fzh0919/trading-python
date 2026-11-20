@@ -294,6 +294,7 @@ class StrategySection(BaseModel):
     # Cash interest (4.0%/3.4%) is demoted to a parking-yield floor, NOT the investment goal.
     benchmark_symbol: str = "VWRP.L"
     min_invest_order_gbp: float = Field(default=700.0, gt=0.0)
+    min_invest_pilot_order_gbp: float = Field(default=500.0, gt=0.0)
     min_isa_equity_order_gbp: float = Field(default=1200.0, gt=0.0)
     min_isa_etf_order_gbp: float = Field(default=400.0, gt=0.0)
     invest_risk_budget_gbp: float = Field(default=85.0, gt=0.0)
@@ -302,6 +303,7 @@ class StrategySection(BaseModel):
     # Invest Portfolio Heat 主闸：组合承诺热力（含未成交新开买单 1R）占 Invest 净值上限（% NAV）
     invest_max_heat_risk_on_pct: float = Field(default=3.0, ge=0.0, le=10.0)
     invest_max_heat_neutral_pct: float = Field(default=2.0, ge=0.0, le=10.0)
+    invest_max_heat_recovery_pct: float = Field(default=1.0, ge=0.0, le=5.0)
     invest_max_heat_risk_off_pct: float = Field(default=0.0, ge=0.0, le=5.0)
     max_weekly_new_buys: int = Field(default=2, ge=0)
     max_monthly_new_buys: int = Field(default=6, ge=0)
@@ -342,23 +344,32 @@ class StrategySection(BaseModel):
     # 2) Invest 在险槽位与以盈解锁（仅核算 Invest 账户自身）
     invest_slots_risk_on: int = Field(default=3, ge=0, le=10)  # RISK_ON 最大同时未脱险个股槽位数
     invest_slots_neutral: int = Field(default=2, ge=0, le=10)  # NEUTRAL 最大同时未脱险个股槽位数
+    invest_slots_recovery: int = Field(default=1, ge=0, le=10)  # RECOVERY 早春试探最大同时未脱险个股槽位数
     invest_slots_risk_off: int = Field(default=0, ge=0, le=10)  # RISK_OFF 个股槽位数（0 = 冻结新开个股）
     max_new_equity_entries_per_day: int = Field(default=1, ge=1, le=10)  # 单日最多新开/新挂个股笔数（Best Idea Only）
     consecutive_loss_limit: int = Field(default=2, ge=1, le=10)  # gate_epoch_date 后近 14 天连续止损笔数阈值
     consecutive_loss_lookback_days: int = Field(default=14, ge=1, le=60)  # 连损回溯窗口（天）
     consecutive_loss_cooldown_days: int = Field(default=5, ge=1, le=30)  # 连损触发后的个股冷静观察天数（交易日/自然日折算 7 天）
-    recovery_pilot_risk_scale: float = Field(default=0.5, gt=0.0, le=1.0)  # 冷静期满首笔试探单风险缩放系数（0.5R = £42.5）
+    recovery_pilot_risk_scale: float = Field(default=0.5, gt=0.0, le=1.0)  # 冷静期满首笔试探单风险缩放系数（0.5R）
+    invest_recovery_risk_scale: float = Field(default=0.6, gt=0.0, le=1.0)  # RECOVERY 早春试探态风险缩放系数（0.6R，与连损取 min 不连乘）
 
-    # 3) 去汇率失真市场状态（Regime）与 A/C 触发器
+    # 3) 去汇率失真市场状态（Regime 2.0 四态）与 A/C 触发器
     regime_benchmark_symbol: str = "SPY"  # 美元原币种全球/美股核心趋势锚（防 GBP/USD 扭曲 VWRP.L）
-    regime_vix_risk_on: float = Field(default=18.0, gt=0.0, le=100.0)  # 进入 RISK_ON 的波动率上限
+    regime_vix_risk_on: float = Field(default=20.0, gt=0.0, le=100.0)  # 进入 RISK_ON 的波动率上限
+    regime_vix_risk_on_fast_exit: float = Field(default=22.0, gt=0.0, le=100.0)  # RISK_ON 当日急降 NEUTRAL 的波动率线
+    regime_risk_on_exit_days: int = Field(default=2, ge=1, le=10)  # RISK_ON 常规退回 NEUTRAL 滞回天数
+    regime_vix_recovery: float = Field(default=24.0, gt=0.0, le=100.0)  # RISK_OFF 转 RECOVERY 早春试探的波动率上限
+    regime_vix_recovery_relapse: float = Field(default=26.0, gt=0.0, le=100.0)  # RECOVERY 单日急退 RISK_OFF 的波动率线
+    regime_hy_oas_recovery_pct: float = Field(default=5.2, gt=0.0, le=50.0)  # RISK_OFF 转 RECOVERY 的高收益债利差上限（%）
+    regime_breadth_risk_on_min: float = Field(default=55.0, ge=0.0, le=100.0)  # RISK_ON 市场宽度下限（无缓存降级放行）
+    regime_breadth_recovery_min: float = Field(default=45.0, ge=0.0, le=100.0)  # RECOVERY 市场宽度下限（无缓存降级放行）
     regime_vix_exit_risk_off: float = Field(default=25.0, gt=0.0, le=100.0)  # 退出 RISK_OFF 回到 NEUTRAL 的波动率缓解线（严禁用 18.0 防死锁！）
     regime_ma200_band_pct: float = Field(default=3.0, gt=0.0, le=50.0)  # 实质跌破 MA200 的缓冲带（%）
     regime_drawdown_neutral_pct: float = Field(default=8.0, gt=0.0, le=100.0)  # 常规回调进入 NEUTRAL 阈值（%）
     regime_drawdown_risk_off_pct: float = Field(default=15.0, gt=0.0, le=100.0)  # 深度回撤进入 RISK_OFF 阈值（%）
     regime_hy_oas_risk_off_pct: float = Field(default=5.5, gt=0.0, le=50.0)  # 高收益债利差进入 RISK_OFF 阈值（%）
     regime_confirm_enter_days: int = Field(default=1, ge=1, le=10)  # 进入 RISK_OFF 快速确认天数
-    regime_confirm_exit_days: int = Field(default=3, ge=1, le=10)  # 退出 RISK_OFF / 进入 RISK_ON 稳定确认天数
+    regime_confirm_exit_days: int = Field(default=3, ge=1, le=10)  # 退出 RISK_OFF / 进入 RECOVERY / 进入 RISK_ON 稳定确认天数
     core_etf_drawdown_steps_pct: list[float] = Field(
         default_factory=lambda: [5.0, 10.0, 15.0, 20.0]
     )  # ISA 宽基距52周高点分档折扣触发阶梯
@@ -366,6 +377,19 @@ class StrategySection(BaseModel):
     trigger_max_symbols: int = Field(default=3, ge=1, le=10)  # A 触发器最多输出候选标的数
     inflow_trigger_pct: float = Field(default=2.0, gt=0.0, le=100.0)  # C 触发器单日外部净入金占账户比例（%）
     inflow_trigger_min_gbp: float = Field(default=400.0, ge=0.0)  # C 触发器最小净入金绝对额（£）
+
+    # --- v5.5.9 M5: Invest 派息宽基 Beta 蓄水池（严守英国 ERI 税规，仅 DIST 白名单）---
+    # 总开关只停用蓄水池推荐、清宽基配对指令与白名单旁路层；「Invest 核心宽基按 Beta
+    # 车辆评估」的家族分类层是分类事实，不受开关影响（行业/主题/债 ETF 恒保持战术处置）。
+    invest_reservoir_enabled: bool = True
+    invest_reservoir_etf_whitelist: list[str] = Field(
+        default_factory=lambda: ["VWRL.L", "ISF.L", "VERX.L", "VEUR.L"]
+    )  # 仅派息型 LSE 宽基（0%换汇/0%印花税/无 ERI 报税麻烦；应税 Invest 严禁累积型 ACC）
+    invest_reservoir_cash_reserve_pct: float = Field(default=30.0, ge=0.0, le=100.0)  # 流动现金预留带（% Invest NAV，蓄水池只吸收溢出）
+    invest_reservoir_min_idle_cash_pct: float = Field(default=50.0, ge=0.0, le=100.0)  # 闲置现金占比准入下限（严格大于才开）
+    invest_reservoir_min_ticket_gbp: float = Field(default=1000.0, gt=0.0)  # 蓄水池票据下限（防碎换手）
+    invest_reservoir_funding_buffer_pct: float = Field(default=2.0, ge=0.0, le=10.0)  # 清宽基换股缺口价差/汇率缓冲（%）
+    invest_reservoir_funding_min_need_gbp: float = Field(default=200.0, ge=0.0)  # 配对指令缺口噪声地板（低于此走常规换汇）
 
     @field_validator("benchmark_symbol")
     @classmethod

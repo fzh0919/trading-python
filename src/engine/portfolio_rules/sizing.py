@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -14,7 +15,12 @@ from src.engine.portfolio_rules.dual_philosophy import (
     evaluate_isa_value_gate,
     resolve_invest_dynamic_rr_floor,
 )
-from src.engine.portfolio_rules.models_and_friction import compute_risk_based_size_gbp
+from src.engine.portfolio_rules.models_and_friction import (
+    _estimate_pending_order_gbp,
+    compute_risk_based_size_gbp,
+    is_invest_core_beta_symbol,
+    is_invest_reservoir_symbol,
+)
 
 def _shares_from_gbp(
     gbp_amount: float,
@@ -97,8 +103,18 @@ def derive_action_size_note(action: str, size_hint: str, position: Any | None = 
     return ""
 
 
-def build_report_size_notes(top_actions: list[Any] | None, portfolio: Any | None) -> dict[tuple[str, str], str]:
-    """Map ``(ACCOUNT, SYMBOL)`` -> deterministic size note for :func:`render_morning_report`."""
+def build_report_size_notes(
+    top_actions: list[Any] | None,
+    portfolio: Any | None,
+    strategy: StrategySection | None = None,
+) -> dict[tuple[str, str], str]:
+    """Map ``(ACCOUNT, SYMBOL)`` -> deterministic size note for :func:`render_morning_report`.
+
+    v5.5.9 M5: with ``strategy`` supplied, an Invest equity BUY/ADD whose ``size_hint``
+    parses to a GBP amount exceeding the free liquid cash (while a distributing-ETF
+    reservoir is held) additionally carries the compact ETF-to-equity funding note.
+    Without ``strategy`` the behaviour is byte-identical to v5.5.8.
+    """
     notes: dict[tuple[str, str], str] = {}
     if portfolio is None:
         return notes
@@ -122,9 +138,241 @@ def build_report_size_notes(top_actions: list[Any] | None, portfolio: Any | None
             None,
         )
         note = derive_action_size_note(getattr(act, "action", ""), getattr(act, "size_hint", ""), pos)
+        if strategy is not None:
+            funding = _report_reservoir_funding_suffix(act, portfolio, strategy)
+            if funding:
+                note = f"{note}；{funding}" if note else funding
         if note:
             notes[(account, symbol)] = note
     return notes
+
+
+# ---------------------------------------------------------------------------
+# v5.5.9 M5: ETF-to-equity funding (清宽基换股) — deterministic, advisory, zero quota.
+# ---------------------------------------------------------------------------
+def _invest_reservoir_holdings(
+    portfolio: Any,
+    strategy: StrategySection,
+) -> list[tuple[str, float, Any]]:
+    """Invest reservoir ``(symbol, value_gbp, position)`` rows sorted by value desc."""
+    held: list[tuple[str, float, Any]] = []
+    invest_snap = getattr(portfolio, "invest", None)
+    for pos in getattr(invest_snap, "positions", None) or []:
+        sym = str(getattr(pos, "yahoo_symbol", "") or "").strip().upper()
+        if sym and is_invest_reservoir_symbol(sym, strategy):
+            held.append((sym, float(getattr(pos, "current_value", 0.0) or 0.0), pos))
+    held.sort(key=lambda r: -r[1])
+    return held
+
+
+def _reservoir_proceeds_per_share_gbp(pos: Any) -> float | None:
+    """GBP proceeds per reservoir share from the position's own price/currency mark.
+
+    LSE distributing ETFs quote either GBP (VWRL.L ≈ £1xx) or pence (ISF.L ≈ 1,0xx GBp);
+    mixing them up would fake a 100x share count, so unknown currencies return None
+    and the funding note simply drops the share estimate instead of guessing.
+    """
+    price = float(getattr(pos, "cur_price", 0.0) or 0.0)
+    ccy = str(getattr(pos, "inst_currency", "") or "").strip()
+    upper = ccy.upper()
+    if price <= 0:
+        return None
+    if ccy in {"GBp", "GBx"} or upper == "GBX":
+        return price / 100.0
+    if upper == "GBP":
+        return price
+    return None
+
+
+def _reservoir_funding_need_gbp(ticket_gbp: float, free_gbp: float, strategy: StrategySection) -> float:
+    """Gap between a ticket and free cash, grossed up by the spread/FX buffer (ceil)."""
+    gap = max(0.0, float(ticket_gbp) - float(free_gbp))
+    if gap <= 0:
+        return 0.0
+    buffer_pct = float(getattr(strategy, "invest_reservoir_funding_buffer_pct", 2.0) or 0.0)
+    return math.ceil(gap * (1.0 + buffer_pct / 100.0))
+
+
+def _reservoir_funding_min_need_gbp(strategy: StrategySection) -> float:
+    return float(getattr(strategy, "invest_reservoir_funding_min_need_gbp", 200.0) or 0.0)
+
+
+def _pick_funding_source(
+    need_gbp: float,
+    reservoir: list[tuple[str, float, Any]],
+) -> tuple[str, float, Any] | None:
+    """Largest reservoir holding that can fully cover the gap, else None."""
+    for cand_sym, cand_value, cand_pos in reservoir:
+        if cand_value + 1e-9 >= need_gbp:
+            return cand_sym, cand_value, cand_pos
+    return None
+
+
+def _reservoir_shares_txt(need_gbp: float, cand_pos: Any) -> str:
+    proceeds = _reservoir_proceeds_per_share_gbp(cand_pos)
+    if proceeds is None or proceeds <= 0:
+        return ""
+    shares = int(math.ceil(need_gbp / proceeds))
+    if shares <= 0:
+        return ""
+    return f"(≈{shares:,}股)"
+
+
+def _reservoir_fx_txt(target_symbol: str, strategy: StrategySection) -> str:
+    sym = str(target_symbol or "").strip().upper()
+    if sym.endswith(".L"):
+        return "同币种0%换汇"
+    fx = float(getattr(strategy, "fx_fee_pct", 0.15) or 0.15)
+    if sym.endswith((".DE", ".PA", ".AS", ".MC", ".MI", ".SW")):
+        return f"GBP→EUR单边{fx:.2f}%换汇"
+    return f"GBP→USD单边{fx:.2f}%换汇"
+
+
+def build_etf_to_equity_funding_note(
+    actions: list[Any] | None,
+    portfolio: Any | None,
+    *,
+    strategy: StrategySection,
+    sizing_map: dict[str, Any] | None = None,
+) -> str:
+    """v5.5.9 M5 deterministic paired pre-instruction for /pick kept actions.
+
+    Fires only when a kept Invest equity BUY/ADD ticket exceeds the free liquid cash
+    while a distributing-ETF reservoir is held: Python computes the gap (grossed up by
+    the 2% spread/FX buffer) and emits ``[资金腾挪·零Quota] 先卖蓄水池 → 再建仓``.
+    Free cash >= ticket never touches the reservoir (zero-churn); the £200 noise floor
+    leaves sub-floor gaps to the cheaper plain FX path; SWAP/ROTATE funding stays owned
+    by the weak-position replacement machinery. At most one note per /pick run.
+    """
+    if portfolio is None or not bool(getattr(strategy, "invest_reservoir_enabled", True)):
+        return ""
+    reservoir = _invest_reservoir_holdings(portfolio, strategy)
+    if not reservoir:
+        return ""
+    invest_snap = getattr(portfolio, "invest", None)
+    if invest_snap is None:
+        return ""
+    running_free = float(getattr(invest_snap, "available_to_trade", 0.0) or 0.0)
+    sizing_map = sizing_map or {}
+    pos_by_sym = {
+        str(getattr(p, "yahoo_symbol", "") or "").strip().upper(): p
+        for p in portfolio.all_positions()
+    }
+    pending_by_sym: dict[str, float] = {}
+    for order in getattr(invest_snap, "pending_orders", None) or []:
+        if str(getattr(order, "side", "") or "").strip().upper() != "BUY":
+            continue
+        sym = str(getattr(order, "yahoo_symbol", "") or "").strip().upper()
+        if not sym:
+            continue
+        pending_by_sym[sym] = pending_by_sym.get(sym, 0.0) + float(
+            _estimate_pending_order_gbp(order, pos_by_symbol=pos_by_sym) or 0.0
+        )
+
+    for item in actions or []:
+        act_up = str(getattr(item, "action", "") or "").strip().upper()
+        if act_up not in {"BUY", "ADD"}:
+            continue
+        acct = str(getattr(item, "account", "") or "").strip().upper()
+        if acct != "INVEST":
+            continue
+        sym = str(getattr(item, "symbol", "") or "").strip().upper()
+        if not sym or is_invest_core_beta_symbol(sym, strategy):
+            continue
+        size = sizing_map.get(f"{acct}|{sym}") or sizing_map.get(f"{acct}|{sym.split('.')[0]}")
+        if isinstance(size, dict) and bool(size.get("is_etf")):
+            continue  # core/themed ETF tickets never draw on the reservoir
+        suggested = float(size.get("suggested_gbp") or 0.0) if isinstance(size, dict) else 0.0
+        planned_raw = getattr(item, "planned_amount_gbp", None)
+        planned: float | None = None
+        if planned_raw is not None and float(planned_raw) > 0:
+            planned = float(planned_raw)
+            if suggested > 0:
+                planned = min(planned, suggested)
+        elif suggested > 0:
+            planned = suggested
+        else:
+            zone = str(getattr(item, "entry_zone", "") or "")
+            m = _SIZE_GBP_RE.search(zone)
+            if m:
+                try:
+                    planned = float(m.group(1).replace(",", ""))
+                except ValueError:
+                    planned = None
+        if planned is None or planned <= 0:
+            continue
+        existing = pending_by_sym.get(sym, 0.0) or pending_by_sym.get(sym.split(".")[0], 0.0)
+        effective_ticket = max(0.0, float(planned) - float(existing))
+        if effective_ticket <= 0:
+            continue
+        need = _reservoir_funding_need_gbp(effective_ticket, running_free, strategy)
+        if need >= _reservoir_funding_min_need_gbp(strategy):
+            source = _pick_funding_source(need, reservoir)
+            if source is not None:
+                cand_sym, _cand_value, cand_pos = source
+                buffer_pct = float(
+                    getattr(strategy, "invest_reservoir_funding_buffer_pct", 2.0) or 0.0
+                )
+                return (
+                    f"[资金腾挪·零Quota] 先卖出 Invest {cand_sym} £{need:,.0f}"
+                    f"{_reservoir_shares_txt(need, cand_pos)} 释放现金 → 再建仓 {sym} "
+                    f"£{effective_ticket:,.0f}"
+                    f"（含{buffer_pct:.0f}%价差/汇率缓冲；{_reservoir_fx_txt(sym, strategy)}；"
+                    "应税部分处置涉CGT自行核查）"
+                )
+        running_free = max(0.0, running_free - effective_ticket)
+    return ""
+
+
+def _report_reservoir_funding_suffix(
+    act: Any,
+    portfolio: Any,
+    strategy: StrategySection,
+) -> str:
+    """Compact /report funding suffix for one Invest equity BUY/ADD top action.
+
+    The /report PM only supplies ``size_hint`` text (no deterministic sizing map), so
+    the paired instruction is emitted ONLY when the hint parses to a GBP amount —
+    Python never invents a ticket size. Unparseable hints defer to the precise /pick run.
+    """
+    act_up = str(getattr(act, "action", "") or "").strip().upper()
+    if act_up not in {"BUY", "ADD"}:
+        return ""
+    # v5.5.9 M5 P1-2 fix: the paired instruction moves INVEST money only — an ISA
+    # ticket must never be told to sell the taxable Invest reservoir (cross-account,
+    # cross-tax-scheme funding is impossible by construction).
+    account = str(getattr(act, "account", "") or "").strip().upper()
+    if account != "INVEST":
+        return ""
+    symbol = str(getattr(act, "symbol", "") or "").strip().upper()
+    # Core broad-base ETF tickets (reservoir whitelist + curated core-family map)
+    # never draw on the reservoir either — they ARE the parking machinery.
+    if not symbol or is_invest_core_beta_symbol(symbol, strategy):
+        return ""
+    reservoir = _invest_reservoir_holdings(portfolio, strategy)
+    if not reservoir:
+        return ""
+    free = float(getattr(getattr(portfolio, "invest", None), "available_to_trade", 0.0) or 0.0)
+    m = _SIZE_GBP_RE.search(str(getattr(act, "size_hint", "") or ""))
+    if not m:
+        return ""
+    try:
+        amount = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return ""
+    if amount <= 0:
+        return ""
+    need = _reservoir_funding_need_gbp(amount, free, strategy)
+    if need < _reservoir_funding_min_need_gbp(strategy):
+        return ""
+    source = _pick_funding_source(need, reservoir)
+    if source is None:
+        return ""
+    cand_sym, _cand_value, cand_pos = source
+    return (
+        f"资金腾挪·零Quota：先卖Invest {cand_sym} £{need:,.0f}"
+        f"{_reservoir_shares_txt(need, cand_pos)}释放现金"
+    )
 
 
 def _resolve_pick_sizing(

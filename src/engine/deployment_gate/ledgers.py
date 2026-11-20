@@ -18,6 +18,7 @@ from src.engine.portfolio_rules import (
     _compute_adaptive_invest_stop_pct,
     _rescale_price_pair,
     _round_trip_friction_pct,
+    is_invest_reservoir_symbol,
 )
 from src.engine.deployment_gate.common import (
     LONDON_TZ,
@@ -242,6 +243,7 @@ def compute_account_ledgers(
     *,
     tech_map: dict[str, TechnicalSnapshot] | None = None,
     now_uk: datetime | None = None,
+    regime: str | None = None,
 ) -> dict[str, Any]:
     """Compute ISA core-satellite ledger and Invest Portfolio-Heat / financed-slot ledger."""
     by_class = classified["by_class"]
@@ -258,6 +260,7 @@ def compute_account_ledgers(
     held_equity_syms: list[str] = []
     crumb_count = 0
     min_crumb = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0) or 1200.0)
+    crumb_value_by_sym: dict[str, float] = {}
     for pos in isa.positions:
         sym = _sym_up(pos.yahoo_symbol)
         if sym in etf_set:
@@ -271,6 +274,7 @@ def compute_account_ledgers(
             held_equity_syms.append(sym)
             if 0 < float(pos.current_value) < min_crumb:
                 crumb_count += 1
+                crumb_value_by_sym[sym] = float(pos.current_value)
 
     isa_pending_core = [o for o in by_class[PENDING_CORE_ETF_BUY] if o.account.strip().upper() == "ISA"]
     isa_pending_equity = [o for o in by_class[PENDING_NEW_EQUITY_BUY] if o.account.strip().upper() == "ISA"]
@@ -285,7 +289,40 @@ def compute_account_ledgers(
     def _pct(gbp: float) -> float:
         return _round2((gbp / isa_val) * 100.0) if isa_val > 0 else 0.0
 
-    committed_satellite_count = len(held_equity_syms) + len(
+    # v5.5.9 M5: an ISA legacy crumb (< min_isa_equity_order_gbp) with a FULL sell limit
+    # resting no longer locks one of the `isa_satellite_max_count` seats — the position
+    # is already on its way out and must not block the crisis value channel. Cancelling
+    # the sell order re-locks the seat on the next run (recomputed from the live
+    # snapshot, zero persistence). The 30% committed_satellite_pct cap is untouched.
+    # v5.5.9 M5 P1-1 fix: the crumb's covering position MUST come from an ISA-only map —
+    # the all-portfolio ``pos_by_sym`` is keyed by yahoo_symbol with Invest appended last,
+    # so a cross-account duplicate name (live case: ISA AMZN crumb + Invest AMZN core
+    # holding) silently resolves to the Invest row and the seat never unlocks. Split sell
+    # tickets are aggregated per symbol first so a full exit executed in two partial
+    # SELL LIMITs still counts as a full-cover exit.
+    isa_pos_by_sym = {p.yahoo_symbol: p for p in isa.positions}
+    full_sell_limit_syms: set[str] = set()
+    sell_limit_qty_by_sym: dict[str, float] = {}
+    for order in isa.pending_orders:
+        side = str(order.side or "").strip().upper()
+        order_type = str(order.order_type or "").strip().upper()
+        if side != "SELL" or "STOP" in order_type or "LIMIT" not in order_type:
+            continue
+        sym = _sym_up(order.yahoo_symbol)
+        sell_limit_qty_by_sym[sym] = sell_limit_qty_by_sym.get(sym, 0.0) + float(order.quantity or 0.0)
+    for sym, sell_qty in sell_limit_qty_by_sym.items():
+        pos = _find_position(isa_pos_by_sym, sym)
+        if pos is None or float(pos.quantity or 0.0) <= 0:
+            continue
+        if sell_qty >= float(pos.quantity or 0.0) * 0.99:
+            full_sell_limit_syms.add(sym)
+    crumb_seat_released_syms = {
+        sym
+        for sym in held_equity_syms
+        if sym in full_sell_limit_syms and 0.0 < crumb_value_by_sym.get(sym, 0.0) < min_crumb
+    }
+
+    committed_satellite_count = len(held_equity_syms) - len(crumb_seat_released_syms) + len(
         {
             _sym_up(o.yahoo_symbol)
             for o in isa_pending_equity
@@ -326,6 +363,8 @@ def compute_account_ledgers(
         "committed_satellite_count": committed_satellite_count,
         "held_equity_count": len(held_equity_syms),
         "legacy_crumb_count": crumb_count,
+        "crumb_seat_released_count": len(crumb_seat_released_syms),
+        "crumb_seat_released_symbols": sorted(crumb_seat_released_syms),
         "isa_satellite_saturated": isa_satellite_saturated,
         "pending_core_etf_buys": [_sym_up(o.yahoo_symbol) for o in isa_pending_core],
         "pending_new_equity_buys": [_sym_up(o.yahoo_symbol) for o in isa_pending_equity],
@@ -431,6 +470,27 @@ def compute_account_ledgers(
     invest_pending_new = list(dict.fromkeys(invest_pending_new))
     invest_pending_add = list(dict.fromkeys(invest_pending_add))
     slots_used += len(invest_pending_new)
+
+    # v5.5.9 M5: distributing-ETF reservoir holdings in Invest (0 slots / 0 heat / 0
+    # quota by design — the loop above already skips ETFs). The admission ticket and
+    # the ETF-to-equity funding notes are computed downstream (triggers / sizing) from
+    # this zero-occupancy state.
+    reservoir_positions: list[dict[str, Any]] = []
+    for pos in invest.positions:
+        sym = _sym_up(pos.yahoo_symbol)
+        if sym and is_invest_reservoir_symbol(sym, strategy):
+            reservoir_positions.append(
+                {"symbol": sym, "value_gbp": _round2(float(pos.current_value or 0.0))}
+            )
+    reservoir_positions.sort(key=lambda r: -float(r["value_gbp"]))
+    pending_reservoir_buys = sorted(
+        {
+            _sym_up(o.yahoo_symbol)
+            for o in by_class[PENDING_CORE_ETF_BUY]
+            if o.account.strip().upper() == "INVEST"
+            and is_invest_reservoir_symbol(_sym_up(o.yahoo_symbol), strategy)
+        }
+    )
     invest_ledger = {
         "ok": invest_ok,
         "total_account_value_gbp": _round2(invest_val),
@@ -446,6 +506,11 @@ def compute_account_ledgers(
         "pending_new_equity_buys": invest_pending_new,
         "pending_add_equity_buys": invest_pending_add,
         "pending_protective_stops": sorted({_sym_up(o.yahoo_symbol) for o in by_class[PENDING_PROTECTIVE_SELL_STOP]}),
+        "reservoir_positions": reservoir_positions,
+        "reservoir_total_gbp": _round2(
+            sum(float(r["value_gbp"]) for r in reservoir_positions)
+        ),
+        "pending_reservoir_buys": pending_reservoir_buys,
     }
 
     guards = evaluate_tactical_quota_guards(
@@ -456,14 +521,42 @@ def compute_account_ledgers(
         invest_financed_positions=financed,
         now_uk=now_uk,
     )
+    loss_risk_scale = float(guards.get("risk_budget_scale") or 1.0)
+    reg_up = str(regime or "").strip().upper()
+    regime_risk_scale = (
+        float(getattr(strategy, "invest_recovery_risk_scale", 0.6) or 0.6)
+        if reg_up == "RECOVERY"
+        else 1.0
+    )
+    # Never multiply loss-streak scale and RECOVERY scale (avoids 0.5 x 0.6 = 0.3R micro-lock).
+    effective_risk_scale = _round2(min(loss_risk_scale, regime_risk_scale))
+    if loss_risk_scale < 1.0 and regime_risk_scale < 1.0:
+        risk_scale_reason = "连损恢复+RECOVERY早春试探(取较严)"
+    elif loss_risk_scale < 1.0:
+        risk_scale_reason = "连损恢复试探"
+    elif regime_risk_scale < 1.0:
+        risk_scale_reason = "RECOVERY早春试探"
+    else:
+        risk_scale_reason = ""
     invest_ledger.update(guards)
+    invest_ledger.update(
+        {
+            "loss_risk_scale": _round2(loss_risk_scale),
+            "regime_risk_scale": _round2(regime_risk_scale),
+            "risk_budget_scale": effective_risk_scale,
+            "risk_scale_reason": risk_scale_reason,
+            "min_invest_pilot_order_gbp": _round2(
+                float(getattr(strategy, "min_invest_pilot_order_gbp", 500.0) or 500.0)
+            ),
+        }
+    )
 
     # v5.5.5: Invest Portfolio Heat main gate — every unfilled new-equity BUY commits 1R of
     # forward heat so /pick can never re-lend the same risk budget twice.
     invest_pct = float(getattr(strategy, "invest_risk_budget_pct", 0.75) or 0.75) / 100.0
     unit_risk_gbp = _round2(
         max(float(strategy.invest_risk_budget_gbp), invest_val * invest_pct)
-        * float(guards.get("risk_budget_scale") or 1.0)
+        * float(effective_risk_scale)
     )
     pending_heat_gbp = _round2(len(invest_pending_new) * unit_risk_gbp)
     committed_heat_gbp = _round2(total_heat + pending_heat_gbp)

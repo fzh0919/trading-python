@@ -68,6 +68,36 @@ def _core_banner_label(isa: dict[str, Any]) -> str:
     return "ISF/VERG等低科技宽基" if isa.get("prefer_core_diversifier") else "VWRP"
 
 
+def _reservoir_tag(invest: dict[str, Any]) -> str:
+    """v5.5.9 M5 short advisory tag for the distributing-ETF beta reservoir.
+
+    Appended LAST in the default WAIT banner line so the 110-char truncator always
+    cuts it before anything else. The ISA RUN branch pins its own shorter line-1 tag
+    instead (line 1 is never truncated). Never rendered in DEFEND/ROTATE/RUN
+    branches, and RISK_OFF must never advertise new reservoir builds.
+    """
+    res = invest.get("reservoir_advice") if isinstance(invest.get("reservoir_advice"), dict) else {}
+    if not isinstance(res, dict) or not res.get("eligible"):
+        return ""
+    sym = str(res.get("ticket_symbol") or "")
+    ticket = float(res.get("ticket_gbp") or 0.0)
+    if not sym or ticket <= 0:
+        return ""
+    return f"；Invest溢出£{ticket / 1000.0:.1f}k可停泊{sym}蓄水池(零Quota)"
+
+
+def _reservoir_line1_tag(invest: dict[str, Any]) -> str:
+    """Compact reservoir tag for the ISA RUN branch's untruncated first line."""
+    res = invest.get("reservoir_advice") if isinstance(invest.get("reservoir_advice"), dict) else {}
+    if not isinstance(res, dict) or not res.get("eligible"):
+        return ""
+    sym = str(res.get("ticket_symbol") or "")
+    ticket = float(res.get("ticket_gbp") or 0.0)
+    if not sym or ticket <= 0:
+        return ""
+    return f"·{sym.split('.')[0]}蓄水池£{ticket / 1000.0:.1f}k"
+
+
 def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
     """Compose the <=110-char, <=2-line, pure-plain-text gate banner (no #, no **)."""
     isa = gate_dict.get("isa") or {}
@@ -94,11 +124,19 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
         unit_risk = float(invest.get("unit_risk_gbp") or 85.0)
         committed = float(invest.get("committed_heat_pct") or 0.0)
         heat_cap = float(invest.get("heat_cap_pct") or 0.0)
-        line1 = f"组合门控：RUN·右侧猎物｜Invest在险槽位 {used}/{cap}（{fin}已锁保本，本金在险£{heat:.0f}）｜可用{_gpb_k(avail)}"
-        line2 = (
-            f"→ 单笔风险£{unit_risk:.0f}·热力{committed:.1f}%/{heat_cap:.1f}%；"
-            "已解锁右侧槽位（单日限最优选1笔），可运行 /pick 扫描突破龙头"
-        )
+        scale = float(invest.get("risk_budget_scale") or 1.0)
+        if regime == "RECOVERY":
+            line1 = f"组合门控：RUN·早春试探｜Invest槽位 {used}/{cap}（{scale:.1f}R轻兵，在险£{heat:.0f}）｜可用{_gpb_k(avail)}"
+            line2 = (
+                f"→ 单笔风险£{unit_risk:.0f}·热力{committed:.1f}%/{heat_cap:.1f}%；"
+                "RECOVERY仅放行最强RS领涨股，可运行 /pick"
+            )
+        else:
+            line1 = f"组合门控：RUN·右侧猎物｜Invest在险槽位 {used}/{cap}（{fin}已锁保本，本金在险£{heat:.0f}）｜可用{_gpb_k(avail)}"
+            line2 = (
+                f"→ 单笔风险£{unit_risk:.0f}·热力{committed:.1f}%/{heat_cap:.1f}%；"
+                "已解锁右侧槽位（单日限最优选1笔），可运行 /pick 扫描突破龙头"
+            )
         return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
 
     if invest_status == "ROTATE":
@@ -141,13 +179,16 @@ def format_deployment_gate_banner(gate_dict: dict[str, Any]) -> str:
         d_pct = float(isa.get("deployable_pct") or 0.0)
         core_pct = float(isa.get("committed_core_etf_pct") or 0.0)
         mode = str(isa.get("mode") or "dca")
-        line1 = f"组合门控：ISA RUN·{mode} / Invest {invest_status}｜ISA可用 {d_pct:.1f}%（宽基{core_pct:.0f}%）"
+        line1 = (
+            f"组合门控：ISA RUN·{mode} / Invest {invest_status}"
+            f"{_reservoir_line1_tag(invest)}｜ISA可用 {d_pct:.1f}%（宽基{core_pct:.0f}%）"
+        )
         core_label = _core_banner_label(isa)
         line2 = f"→ 闲置现金分批归拢 {core_label}；Invest 无右侧猎物不催买（现金吃息仅作等待保底）"
         return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
 
     line1 = f"组合门控：ISA {isa_status} / Invest {invest_status}｜市场 {regime}"
-    line2 = f"→ {str(isa.get('reason') or '')}"
+    line2 = f"→ {str(isa.get('reason') or '')}" + _reservoir_tag(invest)
     return _fit_banner(line1, line2 + (f"({fx_note})" if fx_note else ""))
 
 
@@ -167,6 +208,8 @@ def evaluate_deployment_gate(
     prev_gate_states: list[dict[str, Any]] | None = None,
     gbp_usd: float | None = None,
     now_uk: datetime | None = None,
+    pool_snaps: dict[str, Any] | None = None,
+    cached_breadth_histories: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     """Full deterministic gate evaluation — 0 LLM calls, 0 network, 0 DB writes."""
     bundles = bundles or {}
@@ -187,10 +230,24 @@ def evaluate_deployment_gate(
         prev = state
         break
 
-    regime_info = evaluate_market_regime(histories, macro, strategy, prev)
+    regime_info = evaluate_market_regime(
+        histories,
+        macro,
+        strategy,
+        prev,
+        pool_snaps=pool_snaps,
+        cached_breadth_histories=cached_breadth_histories,
+    )
     classified = classify_pending_orders(portfolio, strategy, etf_set, bundles=bundles)
     ledgers = compute_account_ledgers(
-        portfolio, classified, bundles, strategy, etf_set, tech_map=tech_map, now_uk=eval_dt
+        portfolio,
+        classified,
+        bundles,
+        strategy,
+        etf_set,
+        tech_map=tech_map,
+        now_uk=eval_dt,
+        regime=regime_info["regime"],
     )
     decision = scan_triggers_and_decide(
         portfolio,
@@ -234,6 +291,9 @@ def evaluate_deployment_gate(
         "raw_regime": regime_info["raw_regime"],
         "raw_streak_days": int(regime_info.get("raw_streak_days") or 0),
         "ease_streak_days": int(regime_info.get("ease_streak_days") or 0),
+        "risk_on_exit_streak_days": int(regime_info.get("risk_on_exit_streak_days") or 0),
+        "recovery_streak_days": int(regime_info.get("recovery_streak_days") or 0),
+        "breadth": regime_info.get("breadth") or {},
         "regime_reason": regime_info["reason"],
         "regime_benchmark_symbol": regime_info["benchmark_symbol"],
         "regime_degraded_notes": regime_info["degraded_notes"],
@@ -279,7 +339,7 @@ def replay_deployment_gate_history(
 
     start = 200 if len(closes) > 200 else 0
     prev: dict[str, Any] | None = None
-    state_counts = {"RISK_OFF": 0, "NEUTRAL": 0, "RISK_ON": 0, "UNKNOWN": 0}
+    state_counts = {"RISK_OFF": 0, "RECOVERY": 0, "NEUTRAL": 0, "RISK_ON": 0, "UNKNOWN": 0}
     transitions = 0
     last_regime = None
     risk_off_run = 0
@@ -332,6 +392,8 @@ def replay_deployment_gate_history(
             "raw_regime": info["raw_regime"],
             "raw_streak_days": info["raw_streak_days"],
             "ease_streak_days": info["ease_streak_days"],
+            "risk_on_exit_streak_days": info.get("risk_on_exit_streak_days", 0),
+            "recovery_streak_days": info.get("recovery_streak_days", 0),
         }
 
     if risk_off_run > max_risk_off_run:

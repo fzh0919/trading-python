@@ -90,6 +90,7 @@ from src.engine.deployment_gate.ledgers import (
 )
 from src.engine.deployment_gate.regime import (
     _compute_raw_regime_metrics,
+    compute_regime_breadth,
     evaluate_market_regime,
 )
 from src.engine.deployment_gate.triggers import (
@@ -147,6 +148,7 @@ __all__ = [
     "classify_pending_orders",
     "evaluate_tactical_quota_guards",
     "compute_account_ledgers",
+    "compute_regime_breadth",
     "evaluate_market_regime",
     "scan_triggers_and_decide",
     "reconcile_pm_pick_gate",

@@ -70,6 +70,10 @@ class TechnicalSnapshot(BaseModel):
     is_ex_div_window: bool = False      # True when -3 <= days_to_ex_dividend <= 3
     is_ex_div_drop_guard: bool = False  # True when -3 <= days_to_ex_dividend <= 0 (just went ex-div)
 
+    # v5.5.9 M2: benchmark-relative strength (optional; populated when benchmark_hist is available)
+    rs_20d_pct: float | None = None
+    rs_60d_pct: float | None = None
+
 
 def compute_rsi_wilder(closes: pd.Series, period: int = 14) -> float | None:
     """Compute classic Wilder RSI(14) deterministically on closing prices."""
@@ -545,11 +549,39 @@ def _compute_ex_div_flags(
     return d, bool(-3 <= d <= 3), bool(-3 <= d <= 0)
 
 
+def compute_rs_20_60(
+    hist: pd.DataFrame | None,
+    benchmark_hist: pd.DataFrame | None,
+) -> tuple[float | None, float | None]:
+    """Compute stock-vs-benchmark excess return over 20d and 60d without cross-layer imports."""
+    s_close = _extract_close_series(hist, 100)
+    b_close = _extract_close_series(benchmark_hist, 100)
+    if s_close is None or b_close is None:
+        return None, None
+    aligned = pd.concat([s_close.rename("s"), b_close.rename("b")], axis=1, join="inner").dropna()
+    if len(aligned) < 21:
+        return None, None
+    ratio = (aligned["s"] / aligned["b"]) * 100.0
+    rs20: float | None = None
+    rs60: float | None = None
+    if len(ratio) >= 21:
+        base20 = float(ratio.iloc[-21])
+        if base20 > 0.0:
+            rs20 = round(((float(ratio.iloc[-1]) / base20) - 1.0) * 100.0, 2)
+    if len(ratio) >= 61:
+        base60 = float(ratio.iloc[-61])
+        if base60 > 0.0:
+            rs60 = round(((float(ratio.iloc[-1]) / base60) - 1.0) * 100.0, 2)
+    return rs20, rs60
+
+
 def compute_technical_snapshot(
     symbol: str,
     hist: pd.DataFrame | None,
     position_created_at: str | None = None,
     bundle: TickerMarketBundle | None = None,
+    *,
+    benchmark_hist: pd.DataFrame | None = None,
 ) -> TechnicalSnapshot | None:
     """Compute moving averages, RSI14, ATR14, weekly resonance, BB squeeze, ADX14, CYQ, and ex-div flags."""
     if hist is None or hist.empty:
@@ -665,6 +697,7 @@ def compute_technical_snapshot(
 
     raw_ex_days = getattr(bundle, "days_to_ex_dividend", None) if bundle else None
     ex_days, is_ex_win, is_ex_guard = _compute_ex_div_flags(raw_ex_days)
+    rs20, rs60 = compute_rs_20_60(norm_hist, benchmark_hist) if benchmark_hist is not None else (None, None)
 
     return TechnicalSnapshot(
         symbol=symbol,
@@ -707,6 +740,8 @@ def compute_technical_snapshot(
         days_to_ex_dividend=ex_days,
         is_ex_div_window=is_ex_win,
         is_ex_div_drop_guard=is_ex_guard,
+        rs_20d_pct=rs20,
+        rs_60d_pct=rs60,
     )
 
 

@@ -195,6 +195,15 @@ class SettlementJobMixin:
             if hasattr(self.db, "get_settled_recommendations_for_followup")
             else []
         )
+        # v5.5.9 M6: shadow counterfactual queue — hasattr guard keeps stub-DB tests
+        # and older DB objects fully functional when the lane is absent.
+        shadow_pending: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_pending_shadow_settlements"):
+            try:
+                shadow_pending = await self.db.get_pending_shadow_settlements(limit=50)
+            except Exception as exc:
+                logger.warning("Shadow settlement queue fetch failed: %s", exc)
+                shadow_pending = []
 
         skipped = 0
         not_due = 0
@@ -202,8 +211,10 @@ class SettlementJobMixin:
         not_filled = 0
         failed = 0
         followup_updated = 0
+        shadow_settled = 0
         mature_items: list[tuple[dict[str, Any], date, date, str, int, float, list[str]]] = []
         followup_items: list[tuple[dict[str, Any], date, str, float, list[str], date | None, date | None]] = []
+        shadow_items: list[tuple[dict[str, Any], date, str, float, list[str]]] = []
 
         for rec in pending:
             rec_id = int(rec["id"])
@@ -268,13 +279,33 @@ class SettlementJobMixin:
                     (rec, rec_date, market, entry_val, bench_candidates, t10_due_date, t20_due_date)
                 )
 
-        if mature_items or followup_items:
+        # v5.5.9 M6: shadow counterfactual T+20 pre-filter — same trading-day due
+        # convention as the live follow-up lane, but no fill reconciliation and
+        # zero LLM reflection (the shadow trade never executed).
+        for rec in shadow_pending:
+            symbol = str(rec.get("symbol") or "").strip().upper()
+            try:
+                entry_val = float(rec.get("entry_price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if symbol in ("", "CASH") or not math.isfinite(entry_val) or entry_val <= 0:
+                continue
+            rec_date = _parse_recommendation_date(rec)
+            market = infer_market_from_symbol(symbol)
+            t20_date = add_trading_days(rec_date, 20, market=market)
+            if not has_market_closed_on_date(t20_date, market=market, now_utc=base):
+                continue
+            shadow_items.append((rec, rec_date, market, entry_val, _resolve_benchmark_candidates(symbol, rec.get("benchmark_symbol"))))
+
+        if mature_items or followup_items or shadow_items:
             fetch_symbols = list(
                 dict.fromkeys(
                     [str(rec["symbol"]).strip().upper() for rec, *_ in mature_items]
                     + [b for *_, b_list in mature_items for b in b_list]
                     + [str(rec["symbol"]).strip().upper() for rec, *_ in followup_items]
                     + [b for _, _, _, _, b_list, _, _ in followup_items for b in b_list]
+                    + [str(rec["symbol"]).strip().upper() for rec, *_ in shadow_items]
+                    + [b for *_, b_list in shadow_items for b in b_list]
                 )
             )
             try:
@@ -285,6 +316,9 @@ class SettlementJobMixin:
                 failed += len(mature_items)
                 mature_items = []
                 followup_items = []
+                # Shadow rows stay pending when the shared history batch fails —
+                # settling them against empty OHLC would fabricate data.
+                shadow_items = []
 
             ohlc_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
@@ -548,6 +582,53 @@ class SettlementJobMixin:
                 if updated:
                     followup_updated += 1
 
+            # v5.5.9 M6: shadow counterfactual settlement (T+20, 0-token, no fills).
+            # Consumes the same already-fetched history batch — zero extra requests.
+            if shadow_items and hasattr(self.db, "settle_shadow_rejection"):
+                for rec, rec_date, market, entry_price, bench_candidates in shadow_items:
+                    rec_id = int(rec["id"])
+                    symbol = str(rec["symbol"]).strip().upper()
+                    stock_ohlc = _get_ohlc(symbol, market)
+                    if stock_ohlc.empty:
+                        continue
+                    stock_closes = stock_ohlc["Close"]
+                    t20_date = add_trading_days(rec_date, 20, market=market)
+                    exit_dates = [d for d in stock_closes.index if d >= t20_date]
+                    if not exit_dates:
+                        continue
+                    exit_date = exit_dates[0]
+                    exit_price = float(stock_closes.loc[exit_date])
+                    eff_entry = _align_entry_price_gbp_guard(symbol, entry_price, stock_closes, rec_date, exit_price)
+                    if eff_entry is None:
+                        logger.warning(
+                            "Shadow settlement skipped for %s (id=%s): unresolved GBp/GBP 100x mismatch",
+                            symbol,
+                            rec_id,
+                        )
+                        continue
+                    action = str(rec.get("action") or "BUY").strip().upper()
+                    raw_return_pct = _direction_adjusted_return_pct(action, eff_entry, exit_price)
+                    bench_res = _compute_benchmark_return_pct(bench_candidates, _get_closes, rec_date, exit_date)
+                    if bench_res is None:
+                        continue
+                    chosen_bench, bench_ret_pct = bench_res
+                    alpha_pct = _direction_adjusted_alpha_pct(action, eff_entry, exit_price, bench_ret_pct)
+                    mfe_pct, mae_pct = _compute_mfe_mae_pct(
+                        stock_ohlc, rec_date, exit_date, eff_entry, direction=_trade_direction(action)
+                    )
+                    saved = await self.db.settle_shadow_rejection(
+                        rec_id,
+                        benchmark_symbol=chosen_bench,
+                        settled_at_uk=uk_now_str,
+                        raw_return_pct=round(raw_return_pct, 2),
+                        t20_return_pct=round(raw_return_pct, 2),
+                        t20_alpha_pct=round(alpha_pct, 2),
+                        mfe_pct=mfe_pct,
+                        mae_pct=mae_pct,
+                    )
+                    if saved:
+                        shadow_settled += 1
+
         weekly_audit_ran = False
         if self._has_audit_universe() and hasattr(self.db, "get_latest_quant_audit"):
             iso_year, iso_week, _ = dt_uk.isocalendar()
@@ -589,6 +670,7 @@ class SettlementJobMixin:
             "not_due": not_due,
             "failed": failed,
             "followup_updated": followup_updated,
+            "shadow_settled": shadow_settled,
             "weekly_audit_ran": weekly_audit_ran,
             "nav_refreshed": nav_refreshed,
             "pruned": pruned,
@@ -647,4 +729,9 @@ class SettlementJobMixin:
             f"结算 {summary['settled']} 条 / 追评 {summary.get('followup_updated', 0)} / "
             f"未成交 {summary.get('not_filled', 0)} / 跳过 {summary['skipped']} / "
             f"未到期 {summary['not_due']} / 失败 {summary['failed']} / 清理 {pruned_total}"
+            + (
+                f" / 影子复盘 {summary.get('shadow_settled', 0)} 条"
+                if summary.get("shadow_settled", 0) > 0
+                else ""
+            )
         )

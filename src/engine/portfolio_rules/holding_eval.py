@@ -10,7 +10,9 @@ from src.config import StrategySection
 from src.data_providers.analytics import (
     TechnicalSnapshot,
     compute_drawdown_since_date,
+    compute_rs_20_60,
     normalize_issuer_root,
+    resolve_market_benchmark,
 )
 from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
 from src.data_providers.t212_client import (
@@ -22,11 +24,14 @@ from src.data_providers.t212_client import (
 from src.engine.portfolio_rules.dual_philosophy import (
     compute_invest_forward_rr,
     evaluate_isa_value_gate,
+    is_strong_right_side_leader,
+    resolve_holding_target_upside_pct,
     resolve_invest_dynamic_rr_floor,
 )
 from src.engine.portfolio_rules.models_and_friction import (
     INVEST_FORWARD_RR_EXIT_WARN,
     INVEST_RSI_OVERBOUGHT_RISK_ON,
+    INVEST_TRAILING_DD_NEUTRAL_LEADER_PCT,
     INVEST_TRAILING_DD_NEUTRAL_PCT,
     INVEST_TRAILING_DD_RISK_ON_PCT,
     ISA_VALUE_ADD_DRAWDOWN_PCT,
@@ -43,6 +48,8 @@ from src.engine.portfolio_rules.models_and_friction import (
     _round_trip_friction_pct,
     _wallet_cash_basis_pct,
     compute_risk_based_size_gbp,
+    emit_invest_core_beta_bypass_note,
+    emit_invest_ladder_advisories,
 )
 
 def _evaluate_holding_technicals(
@@ -242,6 +249,7 @@ def evaluate_holding(
     total_issuer_weight_pct: float | None = None,
     *,
     hist: pd.DataFrame | None = None,
+    benchmark_hist: pd.DataFrame | None = None,
     pending_orders: list[PendingOrderItem] | None = None,
     account_total_value: float | None = None,
     total_portfolio_value: float | None = None,
@@ -263,6 +271,8 @@ def evaluate_holding(
     is_invest = pos.account.upper() == "INVEST"
     is_etf = bool(bundle and bundle.quote_type.upper() == "ETF")
     reg_up = str(regime or "NEUTRAL").strip().upper()
+    is_reservoir = emit_invest_core_beta_bypass_note(pos, strategy, reg_up, reasons)
+    tactical = is_invest and not is_reservoir
     philosophy_tag = "INVEST_RIGHT_SIDE" if is_invest else "ISA_VALUE"
     val_gate: dict[str, Any] | None = None
     if not is_invest and not is_etf:
@@ -352,7 +362,7 @@ def evaluate_holding(
             )
 
     # Invest stop-loss check with ATR(14) adaptive threshold, ex-div guard, and FX distortion check
-    if is_invest and effective_stop is not None:
+    if tactical and effective_stop is not None:
         atr_note = f"[ATR自适应{tech.atr_pct:.1f}%]" if (tech is not None and tech.atr_pct) else ""
         if pos.return_pct <= effective_stop:
             if ex_div_guard and pos.return_pct > (effective_stop - ex_div_buf):
@@ -393,10 +403,6 @@ def evaluate_holding(
             f"ISA长线仓浮亏{pos.return_pct:.1f}%(≤深套复核线{strategy.isa_deep_drawdown_review_pct:.0f}%),须先核查基本面是否证伪而非死扛摊平"
         )
 
-    if is_invest and pos.return_pct >= strategy.invest_take_profit_review_pct:
-        trim_score += 1
-        reasons.append(f"Invest仓浮盈+{pos.return_pct:.1f}%,需评估催化剂是否已充分兑现以考虑分批止盈")
-
     if (
         native_ret is not None
         and pos.inst_currency.upper() not in {"GBP", "GBX"}
@@ -412,18 +418,54 @@ def evaluate_holding(
     if recent_dd is None and tech is not None:
         recent_dd = tech.drawdown_60d_pct if tech.drawdown_60d_pct is not None else tech.drawdown_20d_pct
 
+    # v5.5.9 M4: structure flags computed before the trailing block so the NEUTRAL
+    # leader tier (below) and the +25% ladder branch can gate on them. Pure reads only.
+    holding_above_ma20 = bool(tech is not None and tech.dist_ma20_pct is not None and tech.dist_ma20_pct >= 0.0)
+    heavy_down_vol = bool(
+        tech is not None
+        and tech.volume_ratio_20d is not None
+        and tech.volume_ratio_20d >= 1.8
+        and tech.ret_1d_pct is not None
+        and tech.ret_1d_pct <= -2.0
+        and not ex_div_guard
+    )
+
+    # v5.5.9 M4: benchmark-relative RS resolved early (tech field first, else hist calc)
+    # so the NEUTRAL leader trailing tier reuses the same M2 ruler as target anchors.
+    rs_20d = tech.rs_20d_pct if tech is not None else None
+    rs_60d = tech.rs_60d_pct if tech is not None else None
+    if (rs_20d is None or rs_60d is None) and hist is not None and benchmark_hist is not None:
+        calc_rs20, calc_rs60 = compute_rs_20_60(hist, benchmark_hist)
+        rs_20d = calc_rs20 if rs_20d is None else rs_20d
+        rs_60d = calc_rs60 if rs_60d is None else rs_60d
+
     # v5.5.1: trailing profit protection is an Invest (right-side) tool only. ISA value holdings
     # are never sold on short-term volatility; they exit on quality/bubble/concentration instead.
     trailing_triggered = False
     trailing_dd_thresh = float(strategy.trailing_drawdown_from_peak_pct)
     if is_invest:
-        trailing_dd_thresh = (
-            float(getattr(strategy, "invest_trailing_dd_risk_on_pct", INVEST_TRAILING_DD_RISK_ON_PCT))
-            if reg_up == "RISK_ON"
-            else float(getattr(strategy, "invest_trailing_dd_neutral_pct", INVEST_TRAILING_DD_NEUTRAL_PCT))
-        )
+        if reg_up == "RISK_ON":
+            trailing_dd_thresh = float(
+                getattr(strategy, "invest_trailing_dd_risk_on_pct", INVEST_TRAILING_DD_RISK_ON_PCT)
+            )
+        elif reg_up == "NEUTRAL" and holding_above_ma20 and is_strong_right_side_leader(
+            tech, regime=reg_up, rs_20d_pct=rs_20d, rs_60d_pct=rs_60d
+        ):
+            # v5.5.9 M4: a confirmed NEUTRAL leader standing on MA20 keeps a wider
+            # buffer (-11) against washouts; laggards / below-MA20 stay at -8.5.
+            trailing_dd_thresh = float(
+                getattr(
+                    strategy,
+                    "invest_trailing_dd_neutral_leader_pct",
+                    INVEST_TRAILING_DD_NEUTRAL_LEADER_PCT,
+                )
+            )
+        else:
+            trailing_dd_thresh = float(
+                getattr(strategy, "invest_trailing_dd_neutral_pct", INVEST_TRAILING_DD_NEUTRAL_PCT)
+            )
     if (
-        is_invest
+        tactical
         and pos.return_pct >= strategy.trailing_profit_activation_pct
         and recent_dd is not None
         and recent_dd <= trailing_dd_thresh
@@ -452,23 +494,12 @@ def evaluate_holding(
         price_hint = f"@{','.join(prices[:2])}" if prices else ""
         reasons.append(f"已有在途卖出/止损挂单保护{price_hint},请复核触发价是否充分")
 
-    holding_above_ma20 = bool(
-        tech is not None and tech.dist_ma20_pct is not None and tech.dist_ma20_pct >= 0.0
-    )
-    heavy_down_vol = bool(
-        tech is not None
-        and tech.volume_ratio_20d is not None
-        and tech.volume_ratio_20d >= 1.8
-        and tech.ret_1d_pct is not None
-        and tech.ret_1d_pct <= -2.0
-        and not ex_div_guard
-    )
     invest_bull_ride = bool(
         is_invest and reg_up == "RISK_ON" and holding_above_ma20 and not heavy_down_vol
     )
     isa_value_add = False
 
-    if tech is not None:
+    if tech is not None and not is_reservoir:
         add_score, trim_score, isa_value_add = _evaluate_holding_technicals(
             pos=pos,
             tech=tech,
@@ -512,21 +543,38 @@ def evaluate_holding(
                 "反弹接近回本/阻力窗，可顺势归拢至核心宽基(零Quota损耗)"
             )
 
-    # Hurdle gate v5.3.2: ISA judged on opportunity cost vs long-term trend, Invest on R:R.
+    # Hurdle gate v5.3.2 / v5.5.9 M2: ISA uses pure analyst mean, Invest uses unified dual-anchor helper.
     # Cash interest (4.0%/3.4%) is a parking-yield floor only — never a veto on long-term ISA holdings.
-    upside_pct = _compute_analyst_upside_pct(bundle)
+    upside_pct = resolve_holding_target_upside_pct(
+        pos, tech, bundle, strategy, is_invest=is_invest, regime=reg_up, rs_20d_pct=rs_20d, rs_60d_pct=rs_60d
+    )
     friction_pct = _round_trip_friction_pct(pos, bundle, strategy, wallet)
     cash_floor_pct = _wallet_cash_basis_pct(pos, strategy, wallet)
+
+    # v5.5.9 M4 right-tail ladder (models_and_friction.emit_invest_ladder_advisories):
+    # +15% -> breakeven/slot-unlock advisory; +25% on MA20 -> stop-lift advisory replaces
+    # the mechanical trim nudge. Weak names / breakdown / heavy volume keep the old nudge.
+    trim_score += emit_invest_ladder_advisories(
+        pos,
+        strategy,
+        reg_up=reg_up,
+        stop_flag=stop_flag,
+        trailing_triggered=trailing_triggered,
+        holding_above_ma20=holding_above_ma20,
+        heavy_down_vol=heavy_down_vol,
+        ex_div_guard=ex_div_guard,
+        same_acct_orders=same_acct_orders,
+        friction_pct=friction_pct,
+        reasons=reasons,
+    )
+
     rr_ratio: float | None = None
     forward_rr: float | None = None
-    if is_invest and effective_stop is not None and float(effective_stop) < 0 and upside_pct is not None:
+    if tactical and effective_stop is not None and float(effective_stop) < 0 and upside_pct is not None:
         risk_pct = abs(float(effective_stop))
         rr_ratio = (upside_pct - friction_pct) / risk_pct if risk_pct > 0 else None
         min_rr, rr_tier = resolve_invest_dynamic_rr_floor(
-            reg_up,
-            tech,
-            strategy,
-            vix=(macro.vix if (macro is not None and macro.vix is not None) else None),
+            reg_up, tech, strategy, vix=(macro.vix if (macro is not None and macro.vix is not None) else None)
         )
         if rr_ratio is not None and rr_ratio < min_rr:
             add_score = 0
@@ -536,26 +584,19 @@ def evaluate_holding(
             )
     elif not is_invest and upside_pct is not None:
         weak_long_trend = bool(
-            tech is not None
-            and tech.dist_ma200_pct is not None
-            and tech.dist_ma200_pct < 0.0
-            and tech.trend_regime == "WEAK"
+            tech is not None and tech.dist_ma200_pct is not None and tech.dist_ma200_pct < 0.0 and tech.trend_regime == "WEAK"
         )
         if weak_long_trend and (upside_pct - friction_pct) <= 0.0:
             reasons.append(
                 f"长期弱势(MA200下方)+目标空间{upside_pct:+.1f}%扣摩擦{friction_pct:.2f}%后不足,触发机会成本置换复核(不以现金利息否决)"
             )
 
-    # v5.5.1 Invest forward R:R: leftover upside vs remaining downside risk (<0.8:1 = 鸡肋).
-    if is_invest:
+    # v5.5.1/v5.5.9 M2 Invest forward R:R: leftover upside vs remaining downside risk (<0.8:1 = 鸡肋).
+    if tactical:
         forward_rr = compute_invest_forward_rr(
-            pos,
-            tech,
-            bundle,
-            strategy,
-            effective_stop_pct=effective_stop,
-            regime=reg_up,
-            wallet=wallet,
+            pos, tech, bundle, strategy,
+            effective_stop_pct=effective_stop, regime=reg_up, wallet=wallet,
+            rs_20d_pct=rs_20d, rs_60d_pct=rs_60d,
         )
         forward_rr_warn = float(
             getattr(strategy, "invest_forward_rr_exit_warn", INVEST_FORWARD_RR_EXIT_WARN)
@@ -661,6 +702,15 @@ def evaluate_portfolio(
         "INVEST": data.invest.total_account_value or sum(p.current_value for p in data.invest.positions),
     }
 
+    def _bench_hist_for(sym: str) -> pd.DataFrame | None:
+        if not histories:
+            return None
+        for b_sym in resolve_market_benchmark(sym):
+            df_b = histories.get(b_sym)
+            if df_b is not None and not df_b.empty:
+                return df_b
+        return None
+
     evals = [
         evaluate_holding(
             pos,
@@ -669,6 +719,7 @@ def evaluate_portfolio(
             strategy,
             total_issuer_weight_pct=issuer_weights.get(normalize_issuer_root(pos.ticker)),
             hist=histories.get(pos.yahoo_symbol) if histories else None,
+            benchmark_hist=_bench_hist_for(pos.yahoo_symbol),
             pending_orders=all_pending,
             account_total_value=account_totals.get(pos.account.upper()),
             total_portfolio_value=total_all,

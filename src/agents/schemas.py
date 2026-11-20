@@ -645,12 +645,14 @@ def render_pick_report(
     max_chars: int = 1000,
     *,
     risk_override: RiskOverrideResult | None = None,
+    funding_note: str = "",
 ) -> str:
     """Render PickDecision as inverted-pyramid Telegram pick brief strictly <= max_chars.
 
     Always renders the caller-supplied `decision` as the source of truth so post-override
     steps (such as deployment-gate channel filtering) are never clobbered; `risk_override`
-    is used solely to surface guardrail notes.
+    is used solely to surface guardrail notes. v5.5.9 M5: `funding_note` carries the
+    deterministic ETF-to-equity reservoir funding pre-instruction (empty = not applicable).
     """
     guardrail_notes = _extract_override_notes(risk_override)
     seen_guardrails = set(guardrail_notes)
@@ -687,6 +689,8 @@ def render_pick_report(
     sec2_lines = []
     if decision.consistency_and_cash_note:
         sec2_lines.append(f"• 基线与现金：{decision.consistency_and_cash_note}")
+    if str(funding_note or "").strip():
+        sec2_lines.append(f"• {str(funding_note).strip()}")
     sec2 = "【现金约束与风控基线】\n" + "\n".join(sec2_lines) if sec2_lines else ""
 
     return _sanitize_plain_output(_fit_max_chars([sec1, sec_guard, sec2], max_chars=max_chars))

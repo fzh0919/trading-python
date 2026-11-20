@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import unittest
 
+import numpy as np
 import pandas as pd
 
 from src.agents.schemas import (
@@ -26,12 +27,16 @@ from src.data_providers.market_data import (
     _compute_safe_fcf_yield_pct,
     apply_basic_financials,
 )
-from src.data_providers.t212_client import AccountSnapshot, PortfolioData, PositionItem
+from src.data_providers.t212_client import AccountSnapshot, PendingOrderItem, PortfolioData, PositionItem
 from src.engine.portfolio_rules import (
     _resolve_pick_rr,
     apply_risk_override_guardrail,
+    compute_invest_forward_rr,
     evaluate_holding,
+    evaluate_portfolio,
+    is_strong_right_side_leader,
     resolve_invest_dynamic_rr_floor,
+    resolve_invest_target_anchors,
 )
 
 
@@ -434,6 +439,8 @@ class TestV552InvestDynamicRR(unittest.TestCase):
             trend_regime="BULL",
             weekly_bullish=True,
             atr_pct=4.0,  # 4x ATR target ceiling = +16%; noise floor = 6%
+            rs_20d_pct=4.5,
+            rs_60d_pct=9.0,
         )
         data.update(overrides)
         return TechnicalSnapshot(**data)
@@ -532,17 +539,43 @@ class TestV552InvestDynamicRR(unittest.TestCase):
         self.assertLessEqual(hallucinated["target"], 122.0)
         self.assertGreaterEqual(hallucinated["target"], 120.0)
 
-        # NEUTRAL keeps the legacy ±15% analyst-mean clamp untouched
-        neutral = _resolve_pick_rr(
+        # v5.5.9 M2: confirmed RS leader also unlocks dual-anchor ceiling in NEUTRAL & RECOVERY
+        for non_crisis_regime in ("NEUTRAL", "RECOVERY"):
+            unlocked = _resolve_pick_rr(
+                _pick("Invest", "NVDA", stop=94.0, target=120.0).selected_actions[0],
+                bundle,
+                StrategySection(),
+                symbol="NVDA",
+                account="Invest",
+                tech=leader,
+                regime=non_crisis_regime,
+            )
+            self.assertAlmostEqual(unlocked["target"], 120.0, places=2)
+            self.assertFalse(unlocked["target_replaced"])
+
+        # RISK_OFF and weak/non-RS names remain deadlocked to the legacy ±15% analyst mean
+        risk_off = _resolve_pick_rr(
             _pick("Invest", "NVDA", stop=94.0, target=130.0).selected_actions[0],
             bundle,
             StrategySection(),
             symbol="NVDA",
             account="Invest",
             tech=leader,
+            regime="RISK_OFF",
+        )
+        self.assertAlmostEqual(risk_off["target"], 105.0, places=2)
+
+        laggard = self._leader(rs_20d_pct=-1.5, rs_60d_pct=3.0)
+        neutral_laggard = _resolve_pick_rr(
+            _pick("Invest", "NVDA", stop=94.0, target=130.0).selected_actions[0],
+            bundle,
+            StrategySection(),
+            symbol="NVDA",
+            account="Invest",
+            tech=laggard,
             regime="NEUTRAL",
         )
-        self.assertAlmostEqual(neutral["target"], 105.0, places=2)
+        self.assertAlmostEqual(neutral_laggard["target"], 105.0, places=2)
 
 
 class TestV552InvestHoldingBehaviour(unittest.TestCase):
@@ -970,6 +1003,823 @@ class TestV557Wave5UnifiedMath(unittest.TestCase):
         self.assertIsNone(info["risk_pct"])
         self.assertIsNone(info["rr"])
         self.assertAlmostEqual(info["entry"], 3860.0, places=2)
+
+
+class TestV559M2DualAnchorDecoupling(unittest.TestCase):
+    """v5.5.9 M2: shared right-side leader dual-anchor helper across scoring, /pick & holding_eval."""
+
+    @staticmethod
+    def _strong_tech(**overrides) -> TechnicalSnapshot:
+        data = dict(
+            symbol="NVDA",
+            last_close=100.0,
+            ret_5d_pct=2.0,
+            ret_20d_pct=8.0,
+            dist_ma20_pct=2.0,
+            dist_ma50_pct=4.5,
+            dist_ma200_pct=15.0,
+            rsi14=58.0,
+            drawdown_52w_pct=-3.0,
+            trend_regime="BULL",
+            weekly_bullish=True,
+            atr14=3.0,
+            atr_pct=3.0,
+            rs_20d_pct=4.0,
+            rs_60d_pct=11.0,
+        )
+        data.update(overrides)
+        return TechnicalSnapshot(**data)
+
+    @staticmethod
+    def _bundle(**overrides) -> TickerMarketBundle:
+        data = dict(
+            symbol="NVDA",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=100.0,
+            target_mean_price=103.0,
+            target_high_price=135.0,  # 135 * 0.90 = 121.5
+            analyst_count=12,
+        )
+        data.update(overrides)
+        return TickerMarketBundle(**data)
+
+    def test_shared_helper_unlocks_neutral_and_recovery_leaders_and_locks_weak_or_risk_off(self) -> None:
+        from src.engine.screener import score_candidate
+        from src.engine.screener.patterns import _normalize_regime_tag
+
+        self.assertEqual(_normalize_regime_tag("RECOVERY"), "RECOVERY")
+        strat = StrategySection(pick_rr_guard_mode="hard")
+        bundle = self._bundle()
+        leader = self._strong_tech()
+        pos = _pos("Invest", "NVDA", cur=100.0, avg=95.0, return_pct=5.26, weight_pct=8.0)
+
+        # Across NEUTRAL and RECOVERY, all three call sites unlock the dual-anchor ceiling/target
+        for reg in ("NEUTRAL", "RECOVERY"):
+            self.assertTrue(is_strong_right_side_leader(leader, regime=reg))
+            anchors = resolve_invest_target_anchors(
+                ref_price=100.0, bundle=bundle, tech=leader, strategy=strat, regime=reg, symbol="NVDA"
+            )
+            self.assertTrue(anchors["is_leader"])
+            self.assertAlmostEqual(float(anchors["llm_ceiling"]), 121.5, places=2)
+            self.assertAlmostEqual(float(anchors["deterministic_target"]), 121.5, places=2)
+
+            # 1) scoring.py: est_rr computed via llm_ceiling (+21.5% vs ~4.5% stop) -> NO penalty
+            cand = score_candidate(
+                "NVDA",
+                "INVEST_TACTICAL",
+                leader,
+                bundle,
+                0.25,
+                "MSFT",
+                False,
+                False,
+                strat,
+                regime_tag=reg,
+            )
+            self.assertNotIn("预估R:R", " ".join(cand.cons))
+            self.assertIsNotNone(cand.filter_metrics.get("est_rr"))
+            self.assertGreater(float(cand.filter_metrics["est_rr"]), 2.5)
+
+            # 2) dual_philosophy._resolve_pick_rr (/pick guardrail): 120 target accepted (not pulled to 103)
+            rr_info = _resolve_pick_rr(
+                _pick("Invest", "NVDA", stop=95.0, target=120.0).selected_actions[0],
+                bundle,
+                strat,
+                symbol="NVDA",
+                account="Invest",
+                tech=leader,
+                regime=reg,
+            )
+            self.assertTrue(rr_info["is_right_side_leader"])
+            self.assertAlmostEqual(rr_info["target"], 120.0, places=2)
+            self.assertGreater(float(rr_info["rr"]), 2.5)
+
+            # 3) holding_eval / compute_invest_forward_rr: uses target_high*0.90 (121.5) instead of 103
+            fwd = compute_invest_forward_rr(
+                pos, leader, bundle, strat, effective_stop_pct=-8.4, regime=reg
+            )
+            self.assertIsNotNone(fwd)
+            self.assertGreater(float(fwd), 2.0)
+
+            ev = evaluate_holding(pos, leader, bundle, strat, regime=reg)
+            self.assertIsNotNone(ev.forward_rr)
+            self.assertGreater(float(ev.forward_rr), 2.0)
+            self.assertIsNotNone(ev.rr_ratio)
+            self.assertGreater(float(ev.rr_ratio), 2.0)
+
+        # RISK_OFF locks even a strong RS leader back to analyst_target (103) in all 3 places
+        self.assertFalse(is_strong_right_side_leader(leader, regime="RISK_OFF"))
+        cand_off = score_candidate(
+            "NVDA", "INVEST_TACTICAL", leader, bundle, 0.25, "MSFT", False, False, strat, regime_tag="RISK_OFF"
+        )
+        self.assertIn("预估R:R", " ".join(cand_off.cons))
+        rr_off = _resolve_pick_rr(
+            _pick("Invest", "NVDA", stop=95.0, target=120.0).selected_actions[0],
+            bundle,
+            strat,
+            symbol="NVDA",
+            account="Invest",
+            tech=leader,
+            regime="RISK_OFF",
+        )
+        self.assertAlmostEqual(rr_off["target"], 103.0, places=2)
+        fwd_off = compute_invest_forward_rr(
+            pos, leader, bundle, strat, effective_stop_pct=-8.4, regime="RISK_OFF"
+        )
+        self.assertLess(float(fwd_off), 0.5)
+
+    def test_weak_or_unconfirmed_rs_stocks_stay_deadlocked_to_analyst_target(self) -> None:
+        from src.engine.screener import score_candidate
+
+        strat = StrategySection(pick_rr_guard_mode="hard")
+        bundle = self._bundle()
+        pos = _pos("Invest", "NVDA", cur=100.0, avg=95.0, return_pct=5.26, weight_pct=8.0)
+
+        non_leaders = [
+            ("neg_rs20", self._strong_tech(rs_20d_pct=-0.5)),
+            ("neg_rs60", self._strong_tech(rs_60d_pct=-1.0)),
+            ("missing_rs", self._strong_tech(rs_20d_pct=None, rs_60d_pct=None)),
+            ("below_ma200", self._strong_tech(dist_ma200_pct=-2.0)),
+            ("weak_regime", self._strong_tech(trend_regime="WEAK")),
+            ("bearish_weekly", self._strong_tech(weekly_bullish=False)),
+        ]
+        for label, bad_tech in non_leaders:
+            for reg in ("RISK_ON", "NEUTRAL", "RECOVERY"):
+                with self.subTest(case=label, regime=reg):
+                    self.assertFalse(is_strong_right_side_leader(bad_tech, regime=reg))
+                    rr_info = _resolve_pick_rr(
+                        _pick("Invest", "NVDA", stop=95.0, target=120.0).selected_actions[0],
+                        bundle,
+                        strat,
+                        symbol="NVDA",
+                        account="Invest",
+                        tech=bad_tech,
+                        regime=reg,
+                    )
+                    self.assertAlmostEqual(rr_info["target"], 103.0, places=2)
+                    self.assertTrue(rr_info["target_replaced"])
+
+                    cand = score_candidate(
+                        "NVDA",
+                        "INVEST_TACTICAL",
+                        bad_tech,
+                        bundle,
+                        0.25,
+                        "MSFT",
+                        False,
+                        False,
+                        strat,
+                        regime_tag=reg,
+                    )
+                    self.assertIn("预估R:R", " ".join(cand.cons))
+                    self.assertLess(float(cand.filter_metrics["est_rr"]), 1.0)
+
+                    fwd = compute_invest_forward_rr(
+                        pos, bad_tech, bundle, strat, effective_stop_pct=-8.4, regime=reg
+                    )
+                    self.assertLess(float(fwd), 0.5)
+
+    def test_forward_rr_does_not_fabricate_atr_upside_when_high_target_exhausted(self) -> None:
+        strat = StrategySection()
+        leader = self._strong_tech(
+            dist_ma20_pct=-1.0,
+            ret_20d_pct=1.0,
+            trend_regime="PULLBACK",
+            atr_pct=3.5,
+        )
+        # Even for a confirmed RS leader, if price is near target_high*0.90 (105*0.90=94.5 < 103 mean),
+        # deterministic_target must NOT invent +4*ATR (+14%) upside — forward R:R warning still fires.
+        exhausted = self._bundle(target_mean_price=103.0, target_high_price=105.0)
+        pos = _pos("Invest", "NVDA", cur=100.0, avg=98.0, return_pct=2.0, weight_pct=8.0)
+        ev = evaluate_holding(pos, leader, exhausted, strat, regime="NEUTRAL")
+        self.assertIsNotNone(ev.forward_rr)
+        self.assertLess(float(ev.forward_rr), 0.8)
+        self.assertIn("前瞻R:R恶化", " ".join(ev.reasons))
+
+    def test_uk_dot_l_gbp_100x_calibration_and_min_analyst_count(self) -> None:
+        from src.engine.screener import score_candidate
+
+        strat = StrategySection()
+        uk_tech = self._strong_tech(symbol="HSBA.L", last_close=700.0, atr14=21.0, atr_pct=3.0)
+        # ratio = 15.0 / 700.0 = 0.0214 (> 0.02 generic cutoff, caught by .L 0.005..0.05 guard!)
+        uk_bundle = TickerMarketBundle(
+            symbol="HSBA.L",
+            quote_type="EQUITY",
+            currency="GBp",
+            current_price=700.0,
+            target_mean_price=7.20,   # 720 GBp (+2.9%)
+            target_high_price=15.00,  # 1500 GBp -> *0.90 = 1350 GBp (+92.9%)
+            analyst_count=6,
+        )
+        anchors = resolve_invest_target_anchors(
+            ref_price=700.0,
+            bundle=uk_bundle,
+            tech=uk_tech,
+            strategy=strat,
+            regime="NEUTRAL",
+            symbol="HSBA.L",
+        )
+        self.assertAlmostEqual(float(anchors["analyst_mean"]), 720.0, places=2)
+        self.assertAlmostEqual(float(anchors["target_high_adj"]), 1350.0, places=2)
+        self.assertAlmostEqual(float(anchors["llm_ceiling"]), 1350.0, places=2)
+
+        rr_uk = _resolve_pick_rr(
+            _pick("Invest", "HSBA.L", entry=700.0, stop=660.0, target=920.0).selected_actions[0],
+            uk_bundle,
+            strat,
+            symbol="HSBA.L",
+            account="Invest",
+            tech=uk_tech,
+            regime="NEUTRAL",
+        )
+        self.assertAlmostEqual(rr_uk["target"], 920.0, places=2)
+        self.assertFalse(rr_uk["target_replaced"])
+
+        cand_uk = score_candidate(
+            "HSBA.L", "INVEST_TACTICAL", uk_tech, uk_bundle, 0.1, "MSFT", False, False, strat, regime_tag="NEUTRAL"
+        )
+        self.assertNotIn("预估R:R", " ".join(cand_uk.cons))
+
+        pos_uk = _pos("Invest", "HSBA.L", cur=700.0, avg=680.0, return_pct=2.9, weight_pct=8.0, ccy="GBp")
+        fwd_uk = compute_invest_forward_rr(
+            pos_uk, uk_tech, uk_bundle, strat, effective_stop_pct=-8.4, regime="NEUTRAL"
+        )
+        self.assertIsNotNone(fwd_uk)
+        self.assertGreater(float(fwd_uk), 5.0)
+
+        # Single-analyst coverage (<3) must not let an outlier target_high_price inflate anchors
+        thin_bundle = uk_bundle.model_copy(update={"analyst_count": 1})
+        thin_anchors = resolve_invest_target_anchors(
+            ref_price=700.0,
+            bundle=thin_bundle,
+            tech=uk_tech,
+            strategy=strat,
+            regime="NEUTRAL",
+            symbol="HSBA.L",
+        )
+        self.assertIsNone(thin_anchors["analyst_mean"])
+        self.assertIsNone(thin_anchors["target_high_adj"])
+        self.assertIsNone(thin_anchors["deterministic_target"])
+
+    def test_evaluate_portfolio_derives_benchmark_rs_from_histories_for_holding_eval(self) -> None:
+        dates = pd.date_range("2026-01-01", periods=100, freq="B")
+        spy_close = [100.0 + 0.05 * i for i in range(100)]
+        nvda_close = [100.0 + 0.40 * i for i in range(100)]
+
+        def _df(vals: list[float]) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "Open": vals,
+                    "High": [v * 1.01 for v in vals],
+                    "Low": [v * 0.99 for v in vals],
+                    "Close": vals,
+                    "Volume": [1_000_000.0] * len(vals),
+                },
+                index=dates,
+            )
+
+        # TechnicalSnapshot intentionally lacks pre-filled RS -> evaluate_portfolio derives it from SPY
+        tech_no_rs = self._strong_tech(rs_20d_pct=None, rs_60d_pct=None)
+        pos = _pos("Invest", "NVDA", cur=100.0, avg=95.0, return_pct=5.26, weight_pct=8.0)
+        port = _portfolio([pos])
+        evals = evaluate_portfolio(
+            port,
+            {"NVDA": tech_no_rs},
+            {"NVDA": self._bundle()},
+            StrategySection(),
+            histories={"NVDA": _df(nvda_close), "SPY": _df(spy_close)},
+            regime="RECOVERY",
+        )
+        self.assertEqual(len(evals), 1)
+        self.assertIsNotNone(evals[0].forward_rr)
+        self.assertGreater(float(evals[0].forward_rr), 2.0)
+
+    def test_pick_post_screen_uses_isolated_bench_histories_for_adhoc_and_held_add(self) -> None:
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from src.agents.pick_agent import _post_screen_validate_decision
+
+        import math
+
+        dates = pd.date_range("2025-06-01", periods=250, freq="B")
+        spy_vals = [100.0 + 0.05 * i for i in range(250)]
+        stock_vals = [80.0 + 0.40 * i + 2.0 * math.sin(i * 0.35) for i in range(250)]
+        adhoc_vals = [80.0 + 0.40 * i + 2.0 * math.cos(i * 0.57) for i in range(250)]
+        cur_p = round(stock_vals[-1], 2)
+        adhoc_p = round(adhoc_vals[-1], 2)
+
+        def _df(vals: list[float]) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "Open": [v * 0.995 for v in vals],
+                    "High": [v * 1.015 for v in vals],
+                    "Low": [v * 0.985 for v in vals],
+                    "Close": vals,
+                    "Volume": [2_000_000.0] * len(vals),
+                },
+                index=dates,
+            )
+
+        spy_df = _df(spy_vals)
+        amzn_df = _df(stock_vals)
+        adhoc_df = _df(adhoc_vals)
+
+        amzn_bundle = TickerMarketBundle(
+            symbol="AMZN",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=cur_p,
+            target_mean_price=round(cur_p * 1.03, 2),
+            target_high_price=round(cur_p * 1.35, 2),
+            analyst_count=12,
+        )
+        adhoc_bundle = TickerMarketBundle(
+            symbol="PLTR",
+            quote_type="EQUITY",
+            currency="USD",
+            current_price=adhoc_p,
+            target_mean_price=round(adhoc_p * 1.03, 2),
+            target_high_price=round(adhoc_p * 1.35, 2),
+            analyst_count=12,
+        )
+
+        class _FakeMD:
+            async def get_bundles(self, syms, **_kw):
+                out_h, out_b = {}, {}
+                for s in syms:
+                    if s.upper() == "PLTR":
+                        out_h["PLTR"] = adhoc_df
+                        out_b["PLTR"] = adhoc_bundle
+                return out_h, out_b
+
+            async def get_histories(self, syms, **_kw):
+                return {"SPY": spy_df} if "SPY" in syms else {}
+
+        cfg = SimpleNamespace(
+            strategy=StrategySection(
+                pick_rr_guard_mode="hard",
+                trade_cadence_guard_mode="off",
+                deployment_gate_mode="off",
+                overlap_correlation_threshold=1.0,
+            ),
+            models=SimpleNamespace(ds_semantic_audit_enabled=False),
+        )
+        held_pos = _pos("Invest", "AMZN", value=1200.0, cur=cur_p, avg=cur_p * 0.95, return_pct=5.26, weight_pct=7.5)
+        port = _portfolio([held_pos])
+        decision = PickDecision(
+            headline="右侧领涨精选",
+            selected_actions=[
+                PickActionItem(
+                    account="Invest",
+                    symbol="PLTR",
+                    action="BUY",
+                    thesis="非池临时强领涨标的",
+                    entry_zone=f"{adhoc_p:.2f}",
+                    stop_condition="跌破止损",
+                    target_window="4周",
+                    entry_price=adhoc_p,
+                    stop_price=round(adhoc_p * 0.94, 2),
+                    target_price=round(adhoc_p * 1.20, 2),
+                ),
+                PickActionItem(
+                    account="Invest",
+                    symbol="AMZN",
+                    action="ADD",
+                    thesis="已有持仓强领涨加码",
+                    entry_zone=f"{cur_p:.2f}",
+                    stop_condition="跌破止损",
+                    target_window="4周",
+                    entry_price=cur_p,
+                    stop_price=round(cur_p * 0.94, 2),
+                    target_price=round(cur_p * 1.20, 2),
+                ),
+            ],
+            rejected_or_frozen=[],
+            consistency_and_cash_note="遵循红线",
+        )
+
+        captured_tech_keys: list[set[str]] = []
+        orig_guardrail = apply_risk_override_guardrail
+
+        def _spy_guardrail(*args, **kwargs):
+            captured_tech_keys.append(set((kwargs.get("tech_map") or {}).keys()))
+            return orig_guardrail(*args, **kwargs)
+
+        async def _run(pass_bench: bool):
+            return await _post_screen_validate_decision(
+                decision,
+                portfolio=port,
+                macro=_macro(vix=17.0),
+                cfg=cfg,
+                market_data=_FakeMD(),
+                held_bundles={"AMZN": amzn_bundle},
+                held_histories={"AMZN": amzn_df},  # Intentionally NO SPY in held_histories
+                evals=[],
+                isa_cands=[],
+                invest_cands=[],
+                guardrails=[],
+                deployment_gate={"regime": "NEUTRAL"},
+                stage2_tech={},
+                bench_histories=({"SPY": spy_df} if pass_bench else None),
+            )
+
+        with patch("src.agents.pick_agent.apply_risk_override_guardrail", side_effect=_spy_guardrail):
+            # Case A: explicit bench_histories passed from screener
+            _, picks_a, _shadow_a = asyncio.run(_run(pass_bench=True))
+            # Case B: bench_histories omitted -> lazy cache fetch via market_data.get_histories
+            _, picks_b, _shadow_b = asyncio.run(_run(pass_bench=False))
+
+        for picks in (picks_a, picks_b):
+            syms = {p["symbol"] for p in picks}
+            self.assertEqual(syms, {"PLTR", "AMZN"})
+        # SPY must never pollute all_tech_map
+        for keys in captured_tech_keys:
+            self.assertNotIn("SPY", keys)
+
+    def test_screener_runner_falls_back_benchmark_chain_and_exports_bench_histories(self) -> None:
+        import asyncio
+
+        from src.config import UniverseSection
+        from src.engine.screener import run_quant_screener
+
+        dates = pd.date_range("2025-06-01", periods=250, freq="B")
+        bench_vals = [100.0 + 0.05 * i for i in range(250)]
+        eu_vals = [100.0 + 0.35 * i for i in range(250)]
+
+        def _df(vals: list[float]) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "Open": [v * 0.995 for v in vals],
+                    "High": [v * 1.015 for v in vals],
+                    "Low": [v * 0.985 for v in vals],
+                    "Close": vals,
+                    "Volume": [1_500_000.0] * len(vals),
+                },
+                index=dates,
+            )
+
+        spy_df = _df(bench_vals)
+        isf_df = _df(bench_vals)
+        asml_df = _df(eu_vals)
+
+        class _FakeScreenerMD:
+            async def get_histories(self, syms, **_kw):
+                # EXS1.DE intentionally fails/missing -> must fall back to ISF.L / SPY
+                out = {}
+                for s in syms:
+                    if s == "ASML.AS":
+                        out[s] = asml_df
+                    elif s == "ISF.L":
+                        out[s] = isf_df
+                    elif s == "SPY":
+                        out[s] = spy_df
+                return out
+
+            async def get_bundles(self, syms, **_kw):
+                out_h, out_b = {}, {}
+                for s in syms:
+                    if s == "ASML.AS":
+                        out_h[s] = asml_df
+                        out_b[s] = TickerMarketBundle(
+                            symbol="ASML.AS",
+                            quote_type="EQUITY",
+                            currency="EUR",
+                            current_price=float(eu_vals[-1]),
+                            target_mean_price=float(eu_vals[-1]) * 1.03,
+                            target_high_price=float(eu_vals[-1]) * 1.35,
+                            analyst_count=10,
+                        )
+                return out_h, out_b
+
+        out_tech: dict[str, TechnicalSnapshot] = {}
+        out_bench: dict[str, pd.DataFrame] = {}
+        _, inv_cands = asyncio.run(
+            run_quant_screener(
+                portfolio=_portfolio([]),
+                market_data=_FakeScreenerMD(),
+                universe=UniverseSection(isa_long_term=[], invest_tactical=["ASML.AS"]),
+                watchlist=[],
+                strategy=StrategySection(),
+                regime_tag="NEUTRAL",
+                enable_isa_equities=False,
+                enable_isa_etfs=False,
+                out_tech=out_tech,
+                out_bench_histories=out_bench,
+            )
+        )
+        self.assertIn("SPY", out_bench)
+        self.assertIn("ISF.L", out_bench)
+        self.assertIn("ASML.AS", out_tech)
+        self.assertIsNotNone(out_tech["ASML.AS"].rs_20d_pct)
+        self.assertIsNotNone(out_tech["ASML.AS"].rs_60d_pct)
+        self.assertGreater(float(out_tech["ASML.AS"].rs_20d_pct), 0.0)
+        self.assertGreater(float(out_tech["ASML.AS"].rs_60d_pct), 0.0)
+        self.assertEqual(len(inv_cands), 1)
+        self.assertNotIn("预估R:R", " ".join(inv_cands[0].cons))
+
+
+class TestV559M3ScreenerRsiBias(unittest.TestCase):
+    """v5.5.9 M3: Invest momentum track stops paying oversold bonuses / punishing Stage-2 leaders.
+
+    The ISA value track's own RSI rules (32-55 quiet entry +3 / >=72 bubble penalty) must
+    stay byte-identical — full dual-track isolation.
+    """
+
+    @staticmethod
+    def _leader_hist() -> pd.DataFrame:
+        # 220-bar Stage-2 uptrend with progressively tighter VCP contractions (passes
+        # detect_minervini_stage2 + gives positive 20d/60d RS + rising RS slope vs the bench).
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        base = np.linspace(80.0, 130.0, 100)
+        seg1 = 130.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 12.0
+        seg2 = 132.0 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 5.5
+        seg3 = 133.5 + np.sin(np.linspace(0, 2 * np.pi, 40)) * 2.0
+        closes = np.concatenate([base, seg1, seg2, seg3]).copy()
+        closes[-5:] = np.linspace(134.0, 136.5, 5)
+        vols = np.full(220, 2_000_000.0)
+        vols[-12:] = 850_000.0
+        return pd.DataFrame(
+            {"Open": closes * 0.997, "High": closes * 1.012, "Low": closes * 0.988,
+             "Close": closes, "Volume": vols},
+            index=dates,
+        )
+
+    @staticmethod
+    def _bench_hist() -> pd.DataFrame:
+        dates = pd.date_range("2025-09-01", periods=220, freq="B")
+        bench = np.linspace(100.0, 118.0, 160).tolist() + np.linspace(118.0, 114.0, 60).tolist()
+        return pd.DataFrame(
+            {"Open": np.array(bench) * 0.998, "High": np.array(bench) * 1.005,
+             "Low": np.array(bench) * 0.995, "Close": bench, "Volume": np.full(220, 5_000_000.0)},
+            index=dates,
+        )
+
+    @staticmethod
+    def _tech(**over) -> TechnicalSnapshot:
+        data = dict(
+            symbol="AVGO", last_close=136.5, ma50=128.8, ma200=112.0,
+            dist_ma50_pct=6.0, dist_ma200_pct=22.0, ret_60d_pct=3.4,
+            trend_regime="BULL", weekly_bullish=None,
+        )
+        data.update(over)
+        return TechnicalSnapshot(**data)
+
+    def _score(self, tech: TechnicalSnapshot, track: str = "INVEST_TACTICAL", **kwargs):
+        from src.engine.screener import score_candidate
+
+        return score_candidate(
+            "AVGO", track, tech, None, 0.30, "NVDA", False, False, StrategySection(), **kwargs
+        )
+
+    def test_invest_leader_rsi70_81_exempt_and_82plus_light_caution(self) -> None:
+        # Same Stage-2 leader (minervini passes + strong RS), only RSI varies.
+        hist, bench = self._leader_hist(), self._bench_hist()
+        kwargs = {"hist": hist, "benchmark_hist": bench}
+        c50 = self._score(self._tech(rsi14=50.0, ret_20d_pct=-1.0), **kwargs)
+        c76 = self._score(self._tech(rsi14=76.0), **kwargs)
+        c84 = self._score(self._tech(rsi14=84.0), **kwargs)
+        c92 = self._score(self._tech(rsi14=92.0), **kwargs)
+        # RSI 76 leader: zero penalty — identical dim1 to the RSI 50 no-bonus baseline.
+        self.assertAlmostEqual(
+            c76.dimension_scores["trend_rs"], c50.dimension_scores["trend_rs"], places=2
+        )
+        self.assertNotIn("极端超买", " ".join(c76.cons))
+        # RSI 84 leader: light caution only (linear 1.0->3.0 over 82->92 -> -1.4 at 84).
+        self.assertAlmostEqual(
+            c84.dimension_scores["trend_rs"], c76.dimension_scores["trend_rs"] - 1.4, places=1
+        )
+        self.assertIn("极端超买(≥82)轻提示", " ".join(c84.cons))
+        # RSI 92 leader: the light caution caps at -3.0.
+        self.assertAlmostEqual(
+            c92.dimension_scores["trend_rs"], c76.dimension_scores["trend_rs"] - 3.0, places=1
+        )
+
+    def test_invest_non_leader_keeps_the_old_70_84_penalty(self) -> None:
+        # Without hist/benchmark neither Stage-2 nor strong RS can be confirmed, so the
+        # classic overbought penalty stays fully intact (zero loosening for weak names).
+        c50 = self._score(self._tech(rsi14=50.0, ret_20d_pct=5.0))
+        c76 = self._score(self._tech(rsi14=76.0))
+        c34 = self._score(self._tech(rsi14=34.0))
+        # 50(+3.0 momentum-healthy) vs 76(-4.14 linear over 70->84): delta 7.14.
+        self.assertAlmostEqual(
+            c50.dimension_scores["trend_rs"] - c76.dimension_scores["trend_rs"], 7.14, places=1
+        )
+        # Oversold bonus cut 4.5 -> 1.5: momentum-healthy now BEATS deep oversold by 1.5
+        # (under the old code the oversold name scored 1.5 points HIGHER).
+        self.assertAlmostEqual(
+            c50.dimension_scores["trend_rs"] - c34.dimension_scores["trend_rs"], 1.5, places=1
+        )
+
+    def test_isa_value_track_rsi_rules_stay_byte_identical(self) -> None:
+        kw = {}
+        isa55 = self._score(self._tech(rsi14=55.0, ret_20d_pct=-1.0), track="ISA_LONG_TERM", **kw)
+        isa76 = self._score(self._tech(rsi14=76.0), track="ISA_LONG_TERM", **kw)
+        isa38 = self._score(self._tech(rsi14=38.0), track="ISA_LONG_TERM", **kw)
+        # ISA 32-55 quiet-entry bonus (+3.0) vs >=72 bubble penalty (-3.23 at 76): delta 6.23.
+        self.assertAlmostEqual(
+            isa55.dimension_scores["trend_rs"] - isa76.dimension_scores["trend_rs"], 6.23, places=1
+        )
+        # The oversold 38 sits inside the same 32-55 band as 55 — no +4.5 bonus ever existed
+        # on the ISA track and the M3 Invest-side change must not leak in.
+        self.assertAlmostEqual(
+            isa38.dimension_scores["trend_rs"], isa55.dimension_scores["trend_rs"], places=2
+        )
+
+
+class TestV559M4RightTail(unittest.TestCase):
+    """v5.5.9 M4: breakeven/slot-unlock ladder advisory, +25% structure-gated stop lift,
+    and the NEUTRAL leader trailing tier (-11 vs -8.5). Hard stops stay byte-identical."""
+
+    @staticmethod
+    def _leader_tech(**overrides) -> TechnicalSnapshot:
+        data = dict(
+            symbol="NVDA",
+            last_close=126.0,
+            dist_ma20_pct=2.5,
+            dist_ma50_pct=10.0,
+            dist_ma200_pct=30.0,
+            drawdown_60d_pct=-3.0,
+            rsi14=60.0,
+            trend_regime="BULL",
+            weekly_bullish=True,
+            atr_pct=3.0,
+            volume_ratio_20d=1.2,
+            ret_1d_pct=0.8,
+            ret_20d_pct=8.0,
+            rs_20d_pct=4.0,
+            rs_60d_pct=9.0,
+        )
+        data.update(overrides)
+        return TechnicalSnapshot(**data)
+
+    def _eval(self, pos: PositionItem, tech: TechnicalSnapshot, regime: str = "NEUTRAL", **kw):
+        return evaluate_holding(pos, tech, None, StrategySection(), regime=regime, **kw)
+
+    def test_breakeven_advisory_fires_in_plus15_band_and_keeps_hold_bias(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        ev = self._eval(pos, self._leader_tech())
+        joined = " ".join(ev.reasons)
+        self.assertIn("保本解锁线", joined)
+        self.assertIn("止损上移至成本×(1+往返摩擦", joined)
+        self.assertEqual(ev.action_bias, "HOLD")
+        self.assertNotIn("分批止盈", joined)
+
+    def test_breakeven_advisory_suppressed_when_breakeven_stop_already_placed(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        stop_order = PendingOrderItem(
+            id="ord-1",
+            account="Invest",
+            raw_ticker="NVDA_USD_EQ",
+            ticker="NVDA",
+            yahoo_symbol="NVDA",
+            name="NVDA Inc.",
+            side="SELL",
+            order_type="STOP",
+            quantity=24.0,
+            value=2832.0,
+            stop_price=105.0,
+            currency="USD",
+        )
+        ev = self._eval(pos, self._leader_tech(), pending_orders=[stop_order])
+        self.assertNotIn("保本解锁线", " ".join(ev.reasons))
+
+    def test_high_take_profit_limit_order_does_not_silence_breakeven_advisory(self) -> None:
+        # P2-1: a SELL LIMIT @ +40% is profit-taking, not downside protection.
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        tp_limit = PendingOrderItem(
+            id="ord-2",
+            account="Invest",
+            raw_ticker="NVDA_USD_EQ",
+            ticker="NVDA",
+            yahoo_symbol="NVDA",
+            name="NVDA Inc.",
+            side="SELL",
+            order_type="LIMIT",
+            quantity=24.0,
+            value=3360.0,
+            limit_price=140.0,
+            currency="USD",
+        )
+        ev = self._eval(pos, self._leader_tech(), pending_orders=[tp_limit])
+        self.assertIn("保本解锁线", " ".join(ev.reasons))
+
+    def test_partially_covered_stop_does_not_silence_breakeven_advisory(self) -> None:
+        # P2-1: a 12/24-share stop leaves 50% naked downside — not financed, not silenced.
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        half_stop = PendingOrderItem(
+            id="ord-3",
+            account="Invest",
+            raw_ticker="NVDA_USD_EQ",
+            ticker="NVDA",
+            yahoo_symbol="NVDA",
+            name="NVDA Inc.",
+            side="SELL",
+            order_type="STOP",
+            quantity=12.0,
+            value=1416.0,
+            stop_price=105.0,
+            currency="USD",
+        )
+        ev = self._eval(pos, self._leader_tech(), pending_orders=[half_stop])
+        self.assertIn("保本解锁线", " ".join(ev.reasons))
+
+    def test_risk_off_keeps_old_defensive_take_profit_nudge_at_plus25(self) -> None:
+        # P2-2: RISK_OFF freezes the offense ladder but must keep the v5.5.8
+        # defensive take-profit review — defence never gets looser in a crisis.
+        pos = _pos("Invest", "NVDA", cur=130.0, avg=100.0, return_pct=30.0)
+        ev = self._eval(pos, self._leader_tech(), regime="RISK_OFF")
+        joined = " ".join(ev.reasons)
+        self.assertIn("需评估催化剂", joined)
+        self.assertNotIn("锁盈地板", joined)
+        self.assertNotIn("让利润奔跑", joined)
+
+    def test_risk_off_never_emits_offense_ladder_advisories(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        ev = self._eval(pos, self._leader_tech(), regime="RISK_OFF")
+        joined = " ".join(ev.reasons)
+        self.assertNotIn("保本解锁线", joined)
+        self.assertNotIn("锁盈地板", joined)
+
+    def test_ex_div_window_appends_caution_note_to_breakeven_advisory(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        bundle = TickerMarketBundle(
+            symbol="NVDA", quote_type="EQUITY", currency="USD", days_to_ex_dividend=0
+        )
+        ev = evaluate_holding(pos, self._leader_tech(), bundle, StrategySection(), regime="NEUTRAL")
+        self.assertIn("防除权低开击穿保本止损", " ".join(ev.reasons))
+
+    def test_plus25_leader_on_ma20_gets_stop_lift_instead_of_trim_nudge(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=126.0, avg=100.0, return_pct=26.0)
+        ev = self._eval(pos, self._leader_tech())
+        joined = " ".join(ev.reasons)
+        self.assertIn("锁盈地板", joined)
+        self.assertIn("沿MA20跟踪", joined)
+        self.assertNotIn("需评估催化剂", joined)
+        self.assertEqual(ev.action_bias, "HOLD")
+
+    def test_plus25_below_ma20_keeps_old_take_profit_nudge(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=126.0, avg=100.0, return_pct=26.0)
+        ev = self._eval(pos, self._leader_tech(dist_ma20_pct=-1.5))
+        joined = " ".join(ev.reasons)
+        self.assertIn("需评估催化剂", joined)
+        self.assertNotIn("锁盈地板", joined)
+
+    def test_plus25_heavy_down_volume_re_arms_old_nudge(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=126.0, avg=100.0, return_pct=26.0)
+        ev = self._eval(pos, self._leader_tech(volume_ratio_20d=2.2, ret_1d_pct=-2.6))
+        joined = " ".join(ev.reasons)
+        self.assertIn("需评估催化剂", joined)
+        self.assertNotIn("锁盈地板", joined)
+        self.assertEqual(ev.action_bias, "TRIM_ALERT")
+
+    def test_neutral_leader_trailing_tier_minus11_bounds(self) -> None:
+        # dd -10.0 from peak: wider -11 leader buffer suppresses the old -8.5 warning...
+        pos = _pos("Invest", "NVDA", cur=121.0, avg=100.0, return_pct=21.0)
+        ev_ok = self._eval(pos, self._leader_tech(drawdown_60d_pct=-10.0))
+        self.assertNotIn("移动止盈", " ".join(ev_ok.reasons))
+        self.assertEqual(ev_ok.action_bias, "HOLD")
+        # ...but -11.5 breaches the leader tier and re-arms the protection warning.
+        ev_warn = self._eval(pos, self._leader_tech(drawdown_60d_pct=-11.5))
+        joined = " ".join(ev_warn.reasons)
+        self.assertIn("移动止盈", joined)
+        self.assertEqual(ev_warn.action_bias, "TRIM_ALERT")
+
+    def test_neutral_laggard_and_recovery_keep_minus85_tier(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=121.0, avg=100.0, return_pct=21.0)
+        # RS fail-closed (missing benchmark) -> not a leader -> old -8.5 fires at -10.
+        laggard = self._leader_tech(drawdown_60d_pct=-10.0, rs_20d_pct=None, rs_60d_pct=None)
+        ev_lag = self._eval(pos, laggard)
+        self.assertIn("移动止盈", " ".join(ev_lag.reasons))
+        # RECOVERY is scoped out of the leader tier by the M4 plan: -8.5 stays.
+        ev_rec = self._eval(pos, self._leader_tech(drawdown_60d_pct=-10.0), regime="RECOVERY")
+        self.assertIn("移动止盈", " ".join(ev_rec.reasons))
+
+    def test_risk_on_trailing_tier_stays_minus12(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=121.0, avg=100.0, return_pct=21.0)
+        ev_ok = self._eval(pos, self._leader_tech(drawdown_60d_pct=-10.5), regime="RISK_ON")
+        self.assertNotIn("移动止盈", " ".join(ev_ok.reasons))
+        ev_warn = self._eval(pos, self._leader_tech(drawdown_60d_pct=-12.5), regime="RISK_ON")
+        self.assertIn("移动止盈", " ".join(ev_warn.reasons))
+
+    def test_advisories_are_pct_only_no_absolute_prices(self) -> None:
+        pos = _pos("Invest", "NVDA", cur=126.0, avg=100.0, return_pct=26.0)
+        ev = self._eval(pos, self._leader_tech())
+        pos15 = _pos("Invest", "NVDA", cur=118.0, avg=100.0, return_pct=18.0)
+        ev15 = self._eval(pos15, self._leader_tech())
+        for joined in (" ".join(ev.reasons), " ".join(ev15.reasons)):
+            self.assertNotIn("£", joined)
+            self.assertNotIn("$", joined)
+        self.assertIn("成本+10%锁盈地板", " ".join(ev.reasons))
+
+    def test_investor_profile_prompts_carry_ladder_rules(self) -> None:
+        from src.agents.prompts import build_investor_profile
+
+        profile = build_investor_profile(StrategySection())
+        self.assertIn("浮盈+15%推保本", profile)
+        self.assertIn("max(成本+10%锁盈地板,沿MA20跟踪)", profile)
 
 
 if __name__ == "__main__":

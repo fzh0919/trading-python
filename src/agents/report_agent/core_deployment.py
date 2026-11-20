@@ -23,6 +23,16 @@ from src.engine.deployment_gate import (
     core_etf_universe_symbols,
     evaluate_deployment_gate,
 )
+from src.engine.deployment_gate.common import (
+    TRIGGER_A1_MIN_DIST_MA50_PCT,
+    TRIGGER_A2_MAX_DIST_MA50_PCT,
+    TRIGGER_A2_RSI_EXCLUDE_ABOVE,
+)
+from src.engine.screener.patterns import (
+    detect_breakthrough_platform,
+    detect_minervini_stage2,
+    detect_vcp_contraction,
+)
 
 logger = logging.getLogger("src.agents.report_agent")
 
@@ -36,6 +46,9 @@ def _evaluate_deployment_gate_safely(
     gate_histories: dict[str, pd.DataFrame],
     gate_candidates: list[dict[str, Any]],
     prev_gate_states: list[dict[str, Any]],
+    *,
+    pool_snaps: dict[str, Any] | None = None,
+    cached_breadth_histories: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any] | None:
     """Deterministic gate evaluation that must never break the /report pipeline."""
     try:
@@ -50,6 +63,8 @@ def _evaluate_deployment_gate_safely(
             universe_etf_symbols=cfg.universe.etf_symbols,
             prev_gate_states=prev_gate_states,
             gbp_usd=getattr(macro, "gbp_usd", None),
+            pool_snaps=pool_snaps,
+            cached_breadth_histories=cached_breadth_histories,
         )
     except Exception as exc:  # noqa: BLE001 - gate failure must never block the report
         logger.warning("Deployment gate evaluation failed, banner omitted: %s", exc)
@@ -441,6 +456,72 @@ def _validate_core_deployment(
     return decision.model_copy(update={"core_deployment": kept_legacy}), notes
 
 
+def _looks_like_a2_breakout(
+    snap: Any,
+    tolerance_pct: float,
+    a2_max_dist_pct: float,
+) -> bool:
+    """Cheap snapshot-shape test for the v5.5.9 M3 A2 breakout pre-filter.
+
+    Mirrors the A2 band gates cheaply (no pattern IO): above MA200, BULL/PULLBACK,
+    weekly not bearish, MA50 extension inside (tol, +14%], RSI below the 82 extreme
+    line. In a bull tape this shape alone can match dozens of ordinary risers, so the
+    caller MUST layer the local pattern confirmation on top before spending a bundle
+    slot — never let plain uptrends eat the batch cap (v5.5.9 M3 P1 starvation fix).
+    """
+    dist = getattr(snap, "dist_ma50_pct", None)
+    if dist is None:
+        return False
+    d200 = getattr(snap, "dist_ma200_pct", None)
+    if d200 is None or float(d200) <= 0.0:
+        return False
+    if not (float(tolerance_pct) < float(dist) <= float(a2_max_dist_pct)):
+        return False
+    if str(getattr(snap, "trend_regime", "") or "") not in {"BULL", "PULLBACK"}:
+        return False
+    if getattr(snap, "weekly_bullish", None) is False:
+        return False
+    rsi = getattr(snap, "rsi14", None)
+    if rsi is not None and float(rsi) >= TRIGGER_A2_RSI_EXCLUDE_ABOVE:
+        return False
+    return True
+
+
+def _gate_candidate_needs_bundle(
+    snap: Any,
+    sym: str,
+    tolerance_pct: float,
+    a2_max_dist_pct: float,
+    histories: dict[str, pd.DataFrame] | None,
+) -> bool:
+    """Bundle-allocation policy for un-held A-trigger candidates (v5.5.9 M3 P1).
+
+    - A1 pullback band (TRIGGER_A1_MIN_DIST_MA50_PCT .. tol): always covered, matching
+      the scan's band byte-for-byte so the earnings/ex-div mines see the full range.
+    - A2 shape: only admitted when the LOCAL 0-network pattern confirmation passes —
+      Minervini Stage-2 plus a VCP contraction or a platform breakout. The pre-filter's
+      minervini call omits RS, which is a strict superset of the scan's with-RS call
+      (>=6 of 7 vs >=7 of 8 criteria), so a scan-admitted A2 name can never be starved
+      here; the shape-only false positives are what get cut instead.
+    - A2 shape without a local history is skipped: the scan's A2 gates are unsatisfiable
+      without hist anyway (fail-closed there, no bundle wasted here).
+    """
+    dist = getattr(snap, "dist_ma50_pct", None)
+    if dist is None:
+        return False
+    d = float(dist)
+    if TRIGGER_A1_MIN_DIST_MA50_PCT <= d <= float(tolerance_pct):
+        return True
+    if not _looks_like_a2_breakout(snap, float(tolerance_pct), float(a2_max_dist_pct)):
+        return False
+    hist = (histories or {}).get(sym)
+    if hist is None or hist.empty:
+        return False
+    if not detect_minervini_stage2(hist, snap).get("passes"):
+        return False
+    return bool(detect_vcp_contraction(hist, snap) or detect_breakthrough_platform(hist))
+
+
 async def _enrich_gate_candidate_bundles(
     market_data: MarketDataService,
     pool_syms: list[str],
@@ -448,12 +529,18 @@ async def _enrich_gate_candidate_bundles(
     bundles: dict[str, TickerMarketBundle],
     *,
     tolerance_pct: float = 1.5,
-    max_symbols: int = 6,
+    a2_max_dist_pct: float = TRIGGER_A2_MAX_DIST_MA50_PCT,
+    histories: dict[str, pd.DataFrame] | None = None,
+    max_symbols: int = 8,
 ) -> dict[str, TickerMarketBundle]:
-    """Attach lightweight earnings/ex-div bundles to un-held MA50 pullback candidates.
+    """Attach lightweight earnings/ex-div bundles to un-held A1 pullback / A2 breakout candidates.
 
     Deployment-gate A-trigger scans un-held candidates only, so they normally have no
     bundle; without this the 5-day earnings and ex-dividend exclusion windows are blind.
+    v5.5.9 M3 P1: the A2 lane is pattern-confirmed locally (0 network, using the caller's
+    in-memory gate histories) so ordinary bull-tape risers can never consume the batch
+    cap and starve genuine breakout names — the scan stays fail-closed on missing
+    bundles, so bundle allocation IS the A2 channel's availability.
     One batched call, news disabled (0 LLM, earnings calendar only).
     """
     cand_bundles: dict[str, TickerMarketBundle] = dict(bundles)
@@ -461,9 +548,10 @@ async def _enrich_gate_candidate_bundles(
         sym
         for sym in pool_syms
         if sym in pool_snaps
-        and getattr(pool_snaps[sym], "dist_ma50_pct", None) is not None
-        and abs(float(pool_snaps[sym].dist_ma50_pct)) <= float(tolerance_pct)
         and sym not in bundles
+        and _gate_candidate_needs_bundle(
+            pool_snaps[sym], sym, float(tolerance_pct), float(a2_max_dist_pct), histories
+        )
     ][: max(0, int(max_symbols))]
     if not hit_syms or not callable(getattr(market_data, "get_bundles", None)):
         return cand_bundles

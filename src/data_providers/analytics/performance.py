@@ -576,3 +576,101 @@ def compute_core_policy_benchmark_comparison(
         "tracking_error_pct": round(tracking_error, 2) if tracking_error is not None else None,
         "benchmark_symbol": bench_sym,
     }
+
+
+_REGIME_BUCKET_ORDER: tuple[str, ...] = ("RISK_ON", "NEUTRAL", "RECOVERY", "RISK_OFF")
+
+
+def compute_regime_attribution(
+    nav_rows: list[dict[str, Any]],
+    regime_rows: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """v5.5.9 M6: descriptive per-regime attribution over the persisted daily NAV series.
+
+    Each day's label comes from the morning report's context pack (the regime that
+    actually governed that day's positioning — never a hindsight reconstruction).
+    Daily TWR uses the exact same flow-adjusted formula as
+    ``compute_portfolio_performance``; a regime bucket's compounded return is the
+    product of its own daily returns, so the buckets multiply back into the whole
+    window's TWR. Descriptive only — no significance claims, no annualisation.
+    Days without a recorded regime stay visible as ``unattributed_days``.
+    """
+    empty = {"ok": False, "buckets": {}, "unattributed_days": 0, "attributed_days": 0}
+    if not nav_rows:
+        return empty
+
+    regime_by_date: dict[str, str] = {}
+    for row in regime_rows or []:
+        day = str(row.get("uk_date") or "").strip()[:10]
+        label = str(row.get("regime") or "").strip().upper()
+        if len(day) == 10 and label:
+            regime_by_date[day] = label
+
+    records: list[dict[str, Any]] = []
+    for row in nav_rows:
+        raw_date = str(row.get("uk_date") or "").strip()[:10]
+        if len(raw_date) < 10:
+            continue
+        try:
+            nav = float(row.get("total_value_gbp"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(nav) or nav <= 0.0:
+            continue
+        try:
+            flow = float(row.get("net_flow_gbp") or 0.0)
+        except (TypeError, ValueError):
+            flow = 0.0
+        try:
+            cash = max(float(row.get("cash_gbp") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            cash = 0.0
+        records.append({"date": raw_date, "nav": nav, "flow": flow, "cash": cash})
+
+    if len(records) < 2:
+        return empty
+
+    # Drop the first record for return math parity with compute_portfolio_performance.
+    daily: list[dict[str, Any]] = []
+    for prev, cur in zip(records, records[1:]):
+        if prev["nav"] <= 0:
+            continue
+        r = (cur["nav"] - cur["flow"]) / prev["nav"] - 1.0
+        label = regime_by_date.get(cur["date"], "")
+        daily.append(
+            {
+                "date": cur["date"],
+                "ret": r,
+                "cash_pct": (cur["cash"] / cur["nav"]) * 100.0,
+                "regime": label,
+            }
+        )
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for label in _REGIME_BUCKET_ORDER:
+        rows = [d for d in daily if d["regime"] == label]
+        if not rows:
+            continue
+        twr = float(np.prod([1.0 + d["ret"] for d in rows]) - 1.0)
+        avg_cash = float(np.mean([d["cash_pct"] for d in rows]))
+        buckets[label] = {
+            "days": len(rows),
+            "twr_pct": round(twr * 100.0, 2),
+            "avg_cash_pct": round(avg_cash, 1),
+            "avg_position_pct": round(100.0 - avg_cash, 1),
+        }
+
+    attributed = [d for d in daily if d["regime"]]
+    if len(attributed) < 2:
+        return {
+            "ok": False,
+            "buckets": buckets,
+            "unattributed_days": len(daily) - len(attributed),
+            "attributed_days": len(attributed),
+        }
+    return {
+        "ok": True,
+        "buckets": buckets,
+        "unattributed_days": len(daily) - len(attributed),
+        "attributed_days": len(attributed),
+    }

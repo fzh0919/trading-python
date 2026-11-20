@@ -14,6 +14,7 @@ from src.data_providers.analytics.technical import (
     _compute_bollinger_squeeze,
     compute_drawdown_since_date,
     _compute_ex_div_flags,
+    compute_rs_20_60,
     compute_technical_snapshot,
     _extract_close_series,
     _extract_daily_returns,
@@ -63,6 +64,7 @@ from src.data_providers.analytics.performance import (
     compute_concentration_metrics,
     _CORE_POLICY_BENCHMARK_WEIGHTS,
     compute_core_policy_benchmark_comparison,
+    compute_regime_attribution,
 )
 
 __all__ = [
@@ -71,6 +73,7 @@ __all__ = [
     "compute_rsi_wilder",
     "compute_cyq_metrics",
     "compute_drawdown_since_date",
+    "compute_rs_20_60",
     "compute_technical_snapshot",
     "format_technical_line",
     "normalize_issuer_root",
@@ -91,4 +94,5 @@ __all__ = [
     "compute_signal_quality",
     "compute_concentration_metrics",
     "compute_core_policy_benchmark_comparison",
+    "compute_regime_attribution",
 ]

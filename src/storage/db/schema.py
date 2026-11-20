@@ -88,7 +88,10 @@ class SchemaMixin:
                     fill_status TEXT DEFAULT '',
                     actual_filled INTEGER DEFAULT NULL,
                     actual_fill_price REAL DEFAULT NULL,
-                    execution_slippage_pct REAL DEFAULT NULL
+                    execution_slippage_pct REAL DEFAULT NULL,
+                    regime TEXT DEFAULT '',
+                    shadow_trigger TEXT DEFAULT '',
+                    shadow_reason TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -327,6 +330,11 @@ class SchemaMixin:
                     "actual_filled": "INTEGER DEFAULT NULL",
                     "actual_fill_price": "REAL DEFAULT NULL",
                     "execution_slippage_pct": "REAL DEFAULT NULL",
+                    # v5.5.9 M6: regime label at creation time (morning gate snapshot)
+                    # and shadow-counterfactual provenance (trigger + short reason).
+                    "regime": "TEXT DEFAULT ''",
+                    "shadow_trigger": "TEXT DEFAULT ''",
+                    "shadow_reason": "TEXT DEFAULT ''",
                 },
             )
             await _ensure_columns(

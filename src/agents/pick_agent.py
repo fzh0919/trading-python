@@ -46,10 +46,12 @@ from src.data_providers.t212_client import (
 from src.engine.calendar_utils import get_market_calendar_alerts, get_us_market_schedule_uk
 from src.engine.portfolio_rules import (
     HoldingEvaluation,
+    _calibrate_target_price,
     _estimate_entry_friction_pct,
     _estimate_pending_order_gbp,
     _rescale_price_pair,
     apply_risk_override_guardrail,
+    build_etf_to_equity_funding_note,
     evaluate_isa_value_gate,
     evaluate_portfolio,
     format_evaluations_text,
@@ -80,6 +82,8 @@ _DISTRIBUTING_CORE_ETFS = {
 def _format_gate_constraint_block(
     gate_ctx: dict[str, Any],
     portfolio: PortfolioData | None = None,
+    *,
+    strategy: StrategySection | None = None,
 ) -> str:
     """Render the deterministic deployment-gate constraints for Researcher/Critic prompts."""
     isa_g = gate_ctx.get("isa") if isinstance(gate_ctx.get("isa"), dict) else {}
@@ -137,6 +141,25 @@ def _format_gate_constraint_block(
         f"• Invest 状态 {inv_g.get('status')}：在险槽位 {inv_g.get('slots_used')}/{inv_g.get('slots_cap')}；"
         f"{inv_g.get('reason') or ''}"
     )
+    # v5.5.9 M5: Invest distributing-ETF beta reservoir — admission ticket and the
+    # zero-quota funding source, both Python-owned so the LLM never invents amounts.
+    res = inv_g.get("reservoir_advice") if isinstance(inv_g.get("reservoir_advice"), dict) else {}
+    reservoir_held_syms = [str(s) for s in (res.get("held_symbols") or []) if str(s).strip()]
+    if res.get("eligible"):
+        reserve_pct = float(
+            getattr(strategy, "invest_reservoir_cash_reserve_pct", 30.0) if strategy else 30.0
+        )
+        lines.append(
+            f"• Invest 派息宽基蓄水池票据：{res.get('ticket_symbol')} £{float(res.get('ticket_gbp') or 0.0):,.0f}"
+            f"（仅吸收超出{reserve_pct:.0f}%流动预留带的溢出现金，零槽位零热力零Quota；"
+            "严禁自行更换宽基代码或买入累积型 ETF）"
+        )
+    elif reservoir_held_syms:
+        reservoir_total = float(inv_g.get("reservoir_total_gbp") or 0.0)
+        lines.append(
+            f"• Invest 持有派息宽基蓄水池 {','.join(reservoir_held_syms[:2])} £{reservoir_total:,.0f}"
+            "（零Quota资金源：若建议建仓金额>可用现金，Python 将生成清宽基配对指令，严禁自行口算股数）"
+        )
     if inv_g.get("invest_min_rr_floor") is not None:
         lines.append(
             f"• Invest 当日动态净 R:R 门槛 ≥{float(inv_g.get('invest_min_rr_floor') or 0.0):.1f}:1"
@@ -158,7 +181,15 @@ def _format_gate_constraint_block(
         )
     scale = float(inv_g.get("risk_budget_scale") or 1.0)
     if 0.0 < scale < 1.0:
-        lines.append(f"• 连损恢复首单：Invest 单笔风险预算按 {scale:.1f}R 半仓试探执行。")
+        scale_reason = str(inv_g.get("risk_scale_reason") or "").strip() or "连损恢复试探"
+        pilot_floor = float(
+            inv_g.get("min_invest_pilot_order_gbp")
+            or getattr(strategy, "min_invest_pilot_order_gbp", 500.0)
+            or 500.0
+        )
+        lines.append(
+            f"• {scale_reason}：Invest 单笔风险预算按 {scale:.1f}R 轻兵试探执行（试探最小单笔地板 £{pilot_floor:,.0f}）。"
+        )
     lines.append(f"• 市场状态 {gate_ctx.get('regime')}，全局门控 {gate_ctx.get('global_status')}。")
     return "\n".join(lines) + "\n"
 
@@ -832,8 +863,21 @@ def _build_proposal_fact_card(
             and bundle.target_mean_price > 0
             and price > 0
         ):
-            mean_t = _rescale_price_pair(float(bundle.target_mean_price), price)
-            sell_txt = f"{mean_t:.2f}({int(bundle.analyst_count)}家)"
+            mean_t = _calibrate_target_price(
+                float(bundle.target_mean_price), price, symbol=sym, currency=ccy
+            )
+            if bundle.target_high_price is not None and float(bundle.target_high_price) > 0:
+                high_t = _calibrate_target_price(
+                    float(bundle.target_high_price), price, symbol=sym, currency=ccy
+                )
+                sell_txt = f"{mean_t:.2f}/高位{high_t:.2f}({int(bundle.analyst_count)}家)"
+            else:
+                sell_txt = f"{mean_t:.2f}({int(bundle.analyst_count)}家)"
+        rs_txt = ""
+        if tech is not None and (tech.rs_20d_pct is not None or tech.rs_60d_pct is not None):
+            r20 = f"{float(tech.rs_20d_pct):+.1f}%" if tech.rs_20d_pct is not None else "N/A"
+            r60 = f"{float(tech.rs_60d_pct):+.1f}%" if tech.rs_60d_pct is not None else "N/A"
+            rs_txt = f" | RS20/60 {r20}/{r60}"
         isa_fric = _estimate_entry_friction_pct(sym, bundle, cfg.strategy, "ISA", None)
         inv_fric = _estimate_entry_friction_pct(
             sym, bundle, cfg.strategy, "INVEST", portfolio.invest
@@ -845,7 +889,7 @@ def _build_proposal_fact_card(
         )
         line = (
             f"• {sym} [{sector or '-'}/{region}] | 现价 {price:.2f} {ccy} | ATR14 {atr_txt} | RSI14 {rsi_txt}"
-            f" | 距MA50/MA200 {ma50_txt}/{ma200_txt} | 60日最大持仓相关 {corr_txt}"
+            f" | 距MA50/MA200 {ma50_txt}/{ma200_txt}{rs_txt} | 60日最大持仓相关 {corr_txt}"
             f" | 财报 {earn_txt} | 除息 {ex_txt} | 卖方均值 {sell_txt} | 摩擦 {fric_txt}"
         )
         if sym.endswith(".L") and not str(getattr(bundle, "quote_type", "") or "").upper() == "ETF":
@@ -1114,6 +1158,170 @@ def _reconcile_pick_headline(
     return decision.model_copy(update={"headline": rebuilt})
 
 
+# v5.5.9 M6: shadow counterfactual triggers worth tracking (R:R floor family).
+# RR_BELOW_FLOOR = computed R:R under the regime floor; RR_UNVERIFIED = LLM failed
+# to give numeric stop/target so the floor could not even be verified — both are
+# the same "R:R 门槛拦截" population for the avoided-loser / missed-winner study.
+_SHADOW_RR_TRIGGERS: tuple[str, ...] = ("RR_BELOW_FLOOR", "RR_UNVERIFIED")
+_SHADOW_TRIGGER_PRIORITY: tuple[str, ...] = ("RR_BELOW_FLOOR", "RR_UNVERIFIED", "CRITIC")
+_SHADOW_MAX_ROWS_PER_PICK: int = 2
+
+
+def _collect_guardrail_shadow_rows(
+    hydrated_actions: list[Any],
+    override_res: Any,
+    kept_symbols: set[str],
+    bundles: dict[str, Any],
+    regime: str,
+) -> list[dict[str, Any]]:
+    """Build shadow-counterfactual rows for R:R-floor hard rejections (pure, offline-testable).
+
+    Isolation guards:
+    - ``kept_symbols`` (post-gate final selected actions) filters advise-mode
+      advisories — only actions actually REMOVED from the ticket become shadows,
+      so an advise-mode ticket that survives can never be double-counted.
+    - Rows without a positive price anchor are skipped (no anchor -> no T+20).
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    overrides = list(getattr(override_res, "overrides", None) or [])
+    by_key: dict[tuple[str, str], Any] = {}
+    for rec in overrides:
+        trigger = str(getattr(rec, "trigger_type", "") or "").strip().upper()
+        if trigger not in _SHADOW_RR_TRIGGERS:
+            continue
+        key = (str(getattr(rec, "account", "") or "").strip().upper(), str(getattr(rec, "symbol", "") or "").strip().upper())
+        if key in by_key:
+            continue
+        by_key[key] = rec
+    for item in hydrated_actions:
+        sym = str(item.symbol or "").strip().upper()
+        acct = str(item.account or "").strip().upper()
+        if not sym or sym == "CASH" or (acct, sym) not in by_key:
+            continue
+        if sym in kept_symbols:
+            # advise/gate lanes kept the ticket alive — it is a REAL pick, not a shadow.
+            continue
+        rec = by_key[(acct, sym)]
+        from_action = str(getattr(rec, "from_action", "") or "BUY").strip().upper()
+        if from_action not in {"BUY", "ADD"}:
+            continue
+        bundle = _lookup_ci(bundles, sym)
+        anchor = (
+            float(bundle.current_price)
+            if (
+                bundle is not None
+                and getattr(bundle, "current_price", None) is not None
+                and float(bundle.current_price) > 0
+            )
+            else (float(item.entry_price) if item.entry_price and item.entry_price > 0 else None)
+        )
+        if anchor is None or anchor <= 0:
+            continue
+        if (acct, sym) in seen:
+            continue
+        seen.add((acct, sym))
+        rows.append(
+            {
+                "account": item.account,
+                "symbol": sym,
+                "action": from_action,
+                "entry_price": round(anchor, 4),
+                "thesis": str(item.thesis or "")[:300],
+                "horizon_days": 20,
+                "benchmark_symbol": resolve_market_benchmark(sym)[0],
+                "shadow_trigger": str(getattr(rec, "trigger_type", "") or "").strip().upper(),
+                "shadow_reason": str(getattr(rec, "reason", "") or "").strip()[:200],
+                "regime": str(regime or "").strip().upper()[:16],
+            }
+        )
+    return rows
+
+
+def _collect_critic_shadow_rows(
+    proposal_syms: set[str],
+    kept_symbols: set[str],
+    held_symbols: set[str],
+    isa_cands: list[Any],
+    invest_cands: list[Any],
+    bundles: dict[str, Any],
+    regime: str,
+) -> list[dict[str, Any]]:
+    """Build shadow rows for Top candidates the Risk Critic dropped (pure, offline-testable).
+
+    Only formal screener candidates count (not inspect-cache mentions or held
+    symbols — a held-symbol mention is never a rejected new pick).
+    """
+    candidate_accounts: dict[str, str] = {}
+    for cand in (*isa_cands, *invest_cands):
+        sym_up = str(getattr(cand, "symbol", "") or "").strip().upper()
+        if sym_up and sym_up not in candidate_accounts:
+            # ScreenerCandidate carries a track tag, not an account label; derive
+            # the account so ISA candidates never get misfiled into Invest.
+            track = str(getattr(cand, "track", "") or "").strip().upper()
+            candidate_accounts[sym_up] = "ISA" if track == "ISA_LONG_TERM" else "Invest"
+    rows: list[dict[str, Any]] = []
+    for sym in sorted(proposal_syms):
+        sym_up = str(sym or "").strip().upper()
+        if not sym_up or sym_up in kept_symbols or sym_up in held_symbols:
+            continue
+        if sym_up not in candidate_accounts:
+            continue
+        bundle = _lookup_ci(bundles, sym_up)
+        anchor = (
+            float(bundle.current_price)
+            if (
+                bundle is not None
+                and getattr(bundle, "current_price", None) is not None
+                and float(bundle.current_price) > 0
+            )
+            else None
+        )
+        if anchor is None or anchor <= 0:
+            continue
+        rows.append(
+            {
+                "account": candidate_accounts[sym_up],
+                "symbol": sym_up,
+                "action": "BUY",
+                "entry_price": round(anchor, 4),
+                "thesis": "",
+                "horizon_days": 20,
+                "benchmark_symbol": resolve_market_benchmark(sym_up)[0],
+                "shadow_trigger": "CRITIC",
+                "shadow_reason": "Critic终审未入选selected_actions(影子对照,不影响实盘)",
+                "regime": str(regime or "").strip().upper()[:16],
+            }
+        )
+    return rows
+
+
+def _merge_shadow_rows_cap(
+    guardrail_rows: list[dict[str, Any]],
+    critic_rows: list[dict[str, Any]],
+    cap: int = _SHADOW_MAX_ROWS_PER_PICK,
+) -> list[dict[str, Any]]:
+    """Merge the two shadow families by trigger priority and cap per-/pick sample size."""
+    trigger_rank = {t: i for i, t in enumerate(_SHADOW_TRIGGER_PRIORITY)}
+    for row in guardrail_rows + critic_rows:
+        row.setdefault("shadow_trigger", "CRITIC")
+    merged = sorted(
+        guardrail_rows + critic_rows,
+        key=lambda r: (trigger_rank.get(str(r.get("shadow_trigger")), 99), str(r.get("symbol", ""))),
+    )
+    seen: set[tuple[str, str]] = set()
+    capped: list[dict[str, Any]] = []
+    for row in merged:
+        key = (str(row.get("account", "")).strip().upper(), str(row.get("symbol", "")).strip().upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        capped.append(row)
+        if len(capped) >= max(1, int(cap)):
+            break
+    return capped
+
+
 async def _post_screen_validate_decision(
     decision: PickDecision,
     *,
@@ -1132,8 +1340,14 @@ async def _post_screen_validate_decision(
     ops_notifier: OpsNotifier | None = None,
     trade_ctx: dict[str, str] | None = None,
     deployment_gate: dict[str, Any] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
-    """Backfill native entry_price, apply deterministic risk override guardrail, and render."""
+    stage2_tech: dict[str, TechnicalSnapshot] | None = None,
+    bench_histories: dict[str, pd.DataFrame] | None = None,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Backfill native entry_price, apply deterministic risk override guardrail, and render.
+
+    v5.5.9 M6 third return element: shadow-counterfactual rows for R:R-floor hard
+    rejections (kept strictly out of the live pick ledger by the caller).
+    """
     all_bundles = dict(held_bundles)
     all_histories = dict(held_histories)
 
@@ -1187,14 +1401,93 @@ async def _post_screen_validate_decision(
             "rejected_or_frozen": [],
         }
     )
-    # v5.5.1 排雷: new candidates have no held tech snapshot, so ISA value / Invest dynamic R:R
-    # checks would otherwise run blind. Build one unified tech map (held + this round's picks).
+    # v5.5.1/v5.5.9 M2 排雷: new candidates have no held tech snapshot, and guardrail RS checks
+    # must share the exact same RS20/RS60 computed during screening so screener and /pick never split.
+    rs_lookup: dict[str, tuple[float | None, float | None]] = {}
+    for cand in (*isa_cands, *invest_cands):
+        c_sym = str(getattr(cand, "symbol", "") or "").strip().upper()
+        if not c_sym:
+            continue
+        c_rs20 = getattr(cand, "rs_20d_pct", None)
+        c_metrics = getattr(cand, "filter_metrics", None) or {}
+        c_rs60 = c_metrics.get("rs_60d_pct") if isinstance(c_metrics, dict) else None
+        if c_rs20 is not None or c_rs60 is not None:
+            rs_lookup[c_sym] = (
+                float(c_rs20) if c_rs20 is not None else None,
+                float(c_rs60) if c_rs60 is not None else None,
+            )
+    if stage2_tech:
+        for s_sym, s_snap in stage2_tech.items():
+            if s_snap is None:
+                continue
+            s_up = str(s_sym or "").strip().upper()
+            if s_up and (s_snap.rs_20d_pct is not None or s_snap.rs_60d_pct is not None):
+                prev20, prev60 = rs_lookup.get(s_up, (None, None))
+                rs_lookup[s_up] = (
+                    s_snap.rs_20d_pct if s_snap.rs_20d_pct is not None else prev20,
+                    s_snap.rs_60d_pct if s_snap.rs_60d_pct is not None else prev60,
+                )
+
+    bench_lookup: dict[str, pd.DataFrame] = {
+        k: df
+        for k, df in (bench_histories or {}).items()
+        if df is not None and not df.empty
+    }
+    missing_benches: list[str] = []
+    for item in decision.selected_actions:
+        sym_clean = item.symbol.strip()
+        if not sym_clean or sym_clean.upper() == "CASH":
+            continue
+        cands_b = resolve_market_benchmark(sym_clean)
+        if not any(
+            (_lookup_ci(bench_lookup, b_sym) is not None and not _lookup_ci(bench_lookup, b_sym).empty)
+            or (_lookup_ci(all_histories, b_sym) is not None and not _lookup_ci(all_histories, b_sym).empty)
+            for b_sym in cands_b
+        ):
+            if cands_b:
+                missing_benches.append(cands_b[0])
+    if missing_benches and callable(getattr(market_data, "get_histories", None)):
+        unique_benches = list(dict.fromkeys(missing_benches))
+        try:
+            fetched_benches = await market_data.get_histories(unique_benches, period="1y")
+            if isinstance(fetched_benches, dict):
+                for b_k, b_df in fetched_benches.items():
+                    if b_df is not None and not b_df.empty:
+                        bench_lookup[b_k] = b_df
+        except Exception as exc:
+            logger.debug("Post-screen benchmark history lookup skipped for %s: %s", unique_benches, exc)
+
+    def _bench_hist_for(sym_k: str) -> pd.DataFrame | None:
+        for b_sym in resolve_market_benchmark(sym_k):
+            b_df = _lookup_ci(bench_lookup, b_sym)
+            if b_df is not None and not b_df.empty:
+                return b_df
+            b_df = _lookup_ci(all_histories, b_sym)
+            if b_df is not None and not b_df.empty:
+                return b_df
+        return None
+
     all_tech_map: dict[str, TechnicalSnapshot] = {}
+    if stage2_tech:
+        for s_sym, s_snap in stage2_tech.items():
+            if s_snap is not None:
+                all_tech_map[s_sym] = s_snap
     for sym_k, hist_df in all_histories.items():
         snap_k = compute_technical_snapshot(
-            sym_k, hist_df, bundle=_lookup_ci(all_bundles, sym_k)
+            sym_k,
+            hist_df,
+            bundle=_lookup_ci(all_bundles, sym_k),
+            benchmark_hist=_bench_hist_for(sym_k),
         )
         if snap_k is not None:
+            fb20, fb60 = rs_lookup.get(sym_k.strip().upper(), (None, None))
+            upd: dict[str, Any] = {}
+            if snap_k.rs_20d_pct is None and fb20 is not None:
+                upd["rs_20d_pct"] = fb20
+            if snap_k.rs_60d_pct is None and fb60 is not None:
+                upd["rs_60d_pct"] = fb60
+            if upd:
+                snap_k = snap_k.model_copy(update=upd)
             all_tech_map[sym_k] = snap_k
     high_corr_syms = _collect_high_correlation_symbols(
         isa_cands,
@@ -1268,10 +1561,20 @@ async def _post_screen_validate_decision(
             )
         }
     )
+    # v5.5.9 M5: deterministic ETF-to-equity funding pre-instruction (清宽基换股).
+    # Computed AFTER every guard so only fully vetted tickets can draw on the reservoir;
+    # free cash >= ticket never touches it and sub-floor gaps defer to the plain FX path.
+    reservoir_funding_note = build_etf_to_equity_funding_note(
+        final_decision.selected_actions,
+        portfolio,
+        strategy=cfg.strategy,
+        sizing_map=override_res.sizing_map,
+    )
     final_text = render_pick_report(
         final_decision,
         max_chars=1000,
         risk_override=override_res,
+        funding_note=reservoir_funding_note,
     )
     core_etf_set = {
         str(s).strip().upper()
@@ -1292,6 +1595,7 @@ async def _post_screen_validate_decision(
         )
 
     parsed_picks = []
+    regime_label = str((gate_ctx or {}).get("regime") or "").strip().upper()
     for item in final_decision.selected_actions:
         is_core_dca = _is_core_etf_symbol(item.symbol) and str(item.action or "").strip().upper() in {
             "BUY",
@@ -1320,8 +1624,24 @@ async def _post_screen_validate_decision(
                 "benchmark_symbol": resolve_market_benchmark(item.symbol)[0],
                 "source": "core_dca" if is_core_dca else "pick",
                 "fill_status": "ASSUMED" if is_core_dca else "",
+                "regime": regime_label[:16],
             }
         )
+    # v5.5.9 M6: shadow counterfactual rows for R:R-floor hard rejections. These are
+    # advisory-lane telemetry only — the caller logs them through the isolated
+    # shadow lane, never through log_recommendations.
+    kept_symbols = {
+        str(item.symbol or "").strip().upper()
+        for item in final_decision.selected_actions
+        if str(item.symbol or "").strip()
+    }
+    guardrail_shadow_rows = _collect_guardrail_shadow_rows(
+        hydrated_actions,
+        override_res,
+        kept_symbols,
+        all_bundles,
+        regime_label,
+    )
     if llm is not None and not final_text.startswith("⚠️"):
         selected_syms = {
             item.symbol.strip().upper()
@@ -1351,7 +1671,7 @@ async def _post_screen_validate_decision(
             selected_symbols=selected_syms,
             known_symbols=rejected_syms,
         )
-    return final_text, parsed_picks
+    return final_text, parsed_picks, guardrail_shadow_rows
 
 
 async def generate_pick_radar(
@@ -1490,9 +1810,11 @@ async def generate_pick_radar(
     stage2_bundles: dict[str, TickerMarketBundle] = {}
     stage2_intel: dict[str, dict[str, Any]] = {}
     stage2_tech: dict[str, TechnicalSnapshot] = {}
+    bench_histories: dict[str, pd.DataFrame] = {}
     screener_kwargs["out_bundles"] = stage2_bundles
     screener_kwargs["out_intel"] = stage2_intel
     screener_kwargs["out_tech"] = stage2_tech
+    screener_kwargs["out_bench_histories"] = bench_histories
     isa_cands, invest_cands = await run_quant_screener(**screener_kwargs)
     # Wide funnel -> DeepSeek ID filter: only tickers are selected; the raw candidate objects stay untouched.
     isa_cands, invest_cands = await _prefilter_candidates_with_ds(cfg, llm, isa_cands, invest_cands)
@@ -1505,11 +1827,21 @@ async def generate_pick_radar(
     # v5.4.0: the deterministic deployment gate was parsed above before the screener.
     gate_block = ""
     if gate_ctx is not None and gate_mode == "advise":
-        gate_block = _format_gate_constraint_block(gate_ctx, portfolio)
+        gate_block = _format_gate_constraint_block(gate_ctx, portfolio, strategy=cfg.strategy)
     if not recent_lessons and isinstance(context_pack, dict):
         pack_recent = context_pack.get("recent_lessons")
         if isinstance(pack_recent, list):
             recent_lessons = pack_recent
+
+    def _held_bench_for(sym_h: str) -> pd.DataFrame | None:
+        for b_sym in resolve_market_benchmark(sym_h):
+            b_df = _lookup_ci(bench_histories, b_sym)
+            if b_df is not None and not b_df.empty:
+                return b_df
+            b_df = _lookup_ci(held_histories, b_sym)
+            if b_df is not None and not b_df.empty:
+                return b_df
+        return None
 
     tech_map = {}
     for sym in tracked_syms:
@@ -1518,6 +1850,7 @@ async def generate_pick_radar(
             held_histories.get(sym),
             position_created_at=created_at_map.get(sym),
             bundle=held_bundles.get(sym),
+            benchmark_hist=_held_bench_for(sym),
         )
         if snap is not None:
             tech_map[sym] = snap
@@ -1527,7 +1860,7 @@ async def generate_pick_radar(
         tech_map,
         held_bundles,
         cfg.strategy,
-        histories=held_histories,
+        histories=({**bench_histories, **held_histories} if bench_histories else held_histories),
         regime=str((gate_ctx or {}).get("regime") or "NEUTRAL"),
         macro=macro,
     )
@@ -1704,6 +2037,8 @@ async def generate_pick_radar(
         "但 `stop_condition` 必须写明基本面/护城河证伪条件，`target_price` 填保守合理估值锚；"
         "Invest 右侧轨核查当日 Regime 动态 R:R（以【今日组合门控约束】印出的 Python 确定性门槛为准）"
         "与止损幅≥max(1.5×ATR, 4%)，必填数值 `stop_price>0` 与 `target_price>0`；"
+        "仅非 RISK_OFF 下确认强领涨股（MA200上方+BULL/PULLBACK+周线不空+RS20>0且RS60>0）可按双锚上限"
+        "`max(卖方均值×1.15, 卖方高位×0.90, 入场+4×ATR)` 设目标，非领涨/弱势股及 RISK_OFF 仍死锁卖方均值 ±15%；"
         "若上文初筛候选与实时 Google Search 摘要已提供充分事实，禁止无故重复调用工具；仅当用户指定新方向不在预设列表或核心数据缺失时，才调用 `inspect_ticker`、`check_portfolio_correlation` 或 `search_market_news`。",
         cfg.strategy,
         include_order_audit_rule=False,
@@ -1776,6 +2111,8 @@ async def generate_pick_radar(
         "【六重护栏（精炼版）】：\n"
         "1. 盈亏比与摩擦：Invest 必须给出标的本地货币的数值 `stop_price>0` 与 `target_price>0`；"
         "Python 会按含摩擦止损分母独立复算净 R:R，并以【今日组合门控约束】印出的当日确定性门槛与 ATR 噪声地板裁决；"
+        "非 RISK_OFF 下的确认强领涨股（MA200上方+BULL/PULLBACK+周线不空+RS20>0且RS60>0）按双锚上限"
+        "`max(卖方均值×1.15, 卖方高位×0.90, 入场+4×ATR)` 核验，非领涨/弱势/RISK_OFF 标的仍严锁卖方均值 ±15%；"
         "ISA 长线价值个股可填 `stop_price=0`，但必须在 `stop_condition` 写明基本面/护城河证伪条件，改核「质量门 + 安全边际（常规≥12% / 危机≥20%）」。\n"
         "2. 独立核验：必须对照【提案标的一手事实卡（Python 独立真源）】交叉核验投研员引用的现价/ATR/RSI/均线/财报/除息/卖方均值；"
         "发现事实冲突即降级或否决，事实卡未覆盖的标的不允许凭空补充数字。\n"
@@ -1843,7 +2180,7 @@ async def generate_pick_radar(
     now_uk = datetime.now(timezone.utc).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
 
     if decision is not None:
-        final_text, parsed_picks = await _post_screen_validate_decision(
+        final_text, parsed_picks, guardrail_shadow_rows = await _post_screen_validate_decision(
             decision,
             portfolio=portfolio,
             macro=macro,
@@ -1860,6 +2197,8 @@ async def generate_pick_radar(
             ops_notifier=ops_notifier,
             trade_ctx=trade_ctx,
             deployment_gate=gate_ctx,
+            stage2_tech=stage2_tech,
+            bench_histories=bench_histories,
         )
     else:
         logger.warning("Pick Critic structured parse failed; refusing to emit unguarded raw text.")
@@ -1885,5 +2224,30 @@ async def generate_pick_radar(
                     source="core_dca",
                     dedupe_same_day=True,
                 )
+        # v5.5.9 M6: shadow counterfactual lane — /pick Top candidates killed by the
+        # R:R floor (deterministic guardrail) or dropped by the Critic, logged to a
+        # status-isolated lane for the T+20 avoided-loser / missed-winner study.
+        # Failure here must never affect the live pick flow.
+        try:
+            kept_syms = {
+                str(item.symbol or "").strip().upper()
+                for item in decision.selected_actions
+                if str(item.symbol or "").strip()
+            }
+            held_syms_shadow = {s.strip().upper() for s in portfolio.unique_yahoo_symbols()}
+            critic_shadow_rows = _collect_critic_shadow_rows(
+                proposal_syms,
+                kept_syms,
+                held_syms_shadow,
+                isa_cands,
+                invest_cands,
+                merged_cand_bundles,
+                str((gate_ctx or {}).get("regime") or ""),
+            )
+            shadow_rows = _merge_shadow_rows_cap(guardrail_shadow_rows, critic_shadow_rows)
+            if shadow_rows and hasattr(db, "log_shadow_rejections"):
+                await db.log_shadow_rejections(shadow_rows)
+        except Exception as exc:
+            logger.warning("Shadow rejection logging skipped: %s", exc)
 
     return final_text

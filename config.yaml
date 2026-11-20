@@ -120,12 +120,14 @@ strategy:
   # 基准相对收益 + 对称攻防纪律（VWRP.L = 全球宽基基准；现金利息仅作等待期保底，不再是投资终点）
   benchmark_symbol: "VWRP.L"
   min_invest_order_gbp: 700.0             # Invest 单笔最小建仓额（防碎单）
+  min_invest_pilot_order_gbp: 500.0       # Invest 试探缩放态（RECOVERY/连损恢复）最小建仓地板
   min_isa_equity_order_gbp: 1200.0        # ISA 个股单笔最小建仓额
   min_isa_etf_order_gbp: 400.0            # ISA 宽基/主题 ETF 单笔最小建仓额
   invest_risk_budget_gbp: 85.0            # 单笔最大可承受亏损（以损定仓）；兼作 £85 地板
   invest_risk_budget_pct: 0.75            # Invest 单笔净值风险比例（% NAV，仅 Invest；ISA 仍锁 0.5%）
   invest_max_heat_risk_on_pct: 3.0        # RISK_ON 组合承诺热力上限（% Invest 净值）
   invest_max_heat_neutral_pct: 2.0        # NEUTRAL 组合承诺热力上限（% Invest 净值）
+  invest_max_heat_recovery_pct: 1.0       # RECOVERY 早春试探组合承诺热力上限（% Invest 净值）
   invest_max_heat_risk_off_pct: 0.0       # RISK_OFF 组合承诺热力上限（0 = 冻结新开个股）
   max_weekly_new_buys: 2                  # 近 7 天新开仓笔数硬上限
   max_monthly_new_buys: 6                 # 近 30 天新开仓笔数硬上限
@@ -157,27 +159,50 @@ strategy:
   # 2) Invest 在险槽位与以盈解锁（仅核算 Invest 账户自身）
   invest_slots_risk_on: 3                 # RISK_ON 最大同时未脱险个股槽位数
   invest_slots_neutral: 2                 # NEUTRAL 最大同时未脱险个股槽位数
+  invest_slots_recovery: 1                # RECOVERY 早春试探最大同时未脱险个股槽位数
   invest_slots_risk_off: 0                # RISK_OFF 个股槽位数（0 = 冻结新开个股）
   max_new_equity_entries_per_day: 1       # 单日最多新开/新挂个股笔数（Best Idea Only）
   consecutive_loss_limit: 2               # gate_epoch_date 后近 14 天连续止损笔数阈值
   consecutive_loss_lookback_days: 14      # 连损回溯窗口（天）
   consecutive_loss_cooldown_days: 5       # 连损触发后的个股冷静观察天数（交易日/自然日折算 7 天）
-  recovery_pilot_risk_scale: 0.5          # 冷静期满首笔试探单风险缩放系数（0.5R = £42.5）
-  # 3) 去汇率失真市场状态（Regime）与 A/C 触发器
+  recovery_pilot_risk_scale: 0.5          # 冷静期满首笔试探单风险缩放系数（0.5R）
+  invest_recovery_risk_scale: 0.6         # RECOVERY 早春试探风险缩放系数（0.6R，与连损取 min 不连乘）
+  # 3) 去汇率失真市场状态（Regime 2.0 四态）与 A/C 触发器
   regime_benchmark_symbol: "SPY"          # 美元原币种全球/美股核心趋势锚（防 GBP/USD 扭曲 VWRP.L）
-  regime_vix_risk_on: 18.0                # 进入 RISK_ON 的波动率上限
+  regime_vix_risk_on: 20.0                # 进入 RISK_ON 的波动率上限
+  regime_vix_risk_on_fast_exit: 22.0      # RISK_ON 当日急降 NEUTRAL 的波动率线
+  regime_risk_on_exit_days: 2             # RISK_ON 常规退回 NEUTRAL 滞回天数
+  regime_vix_recovery: 24.0               # RISK_OFF 转 RECOVERY 的波动率上限
+  regime_vix_recovery_relapse: 26.0       # RECOVERY 单日急退 RISK_OFF 的波动率线
+  regime_hy_oas_recovery_pct: 5.2         # RISK_OFF 转 RECOVERY 的高收益债利差上限（%）
+  regime_breadth_risk_on_min: 55.0        # RISK_ON 市场宽度下限（无缓存降级放行）
+  regime_breadth_recovery_min: 45.0       # RECOVERY 市场宽度下限（无缓存降级放行）
   regime_vix_exit_risk_off: 25.0          # 退出 RISK_OFF 回到 NEUTRAL 的波动率缓解线（严禁用 18.0 防死锁！）
   regime_ma200_band_pct: 3.0              # 实质跌破 MA200 的缓冲带（%）
   regime_drawdown_neutral_pct: 8.0        # 常规回调进入 NEUTRAL 阈值（%）
   regime_drawdown_risk_off_pct: 15.0      # 深度回撤进入 RISK_OFF 阈值（%）
   regime_hy_oas_risk_off_pct: 5.5         # 高收益债利差进入 RISK_OFF 阈值（%）
   regime_confirm_enter_days: 1            # 进入 RISK_OFF 快速确认天数
-  regime_confirm_exit_days: 3             # 退出 RISK_OFF / 进入 RISK_ON 稳定确认天数
+  regime_confirm_exit_days: 3             # 退出 RISK_OFF / 进入 RECOVERY / 进入 RISK_ON 稳定确认天数
   core_etf_drawdown_steps_pct: [5.0, 10.0, 15.0, 20.0]  # ISA 宽基距52周高点分档折扣触发阶梯
   trigger_ma_tolerance_pct: 1.5           # 右侧趋势个股回踩 MA50 容差带（%）
   trigger_max_symbols: 3                  # A 触发器最多输出候选标的数
   inflow_trigger_pct: 2.0                 # C 触发器单日外部净入金占账户比例（%）
   inflow_trigger_min_gbp: 400.0           # C 触发器最小净入金绝对额（£）
+
+  # --- v5.5.9 M5: Invest 派息宽基 Beta 蓄水池（严守英国 ERI 税规，仅 DIST 白名单）---
+  invest_reservoir_enabled: true           # 总开关：关闭停用蓄水池推荐/清宽基配对/白名单旁路层
+                                           # （核心宽基家族分类旁路属分类事实，不受此开关影响）
+  invest_reservoir_etf_whitelist:           # 仅派息型 LSE 宽基（0%换汇/0%印花税/无 ERI 报税麻烦）
+    - "VWRL.L"
+    - "ISF.L"
+    - "VERX.L"
+    - "VEUR.L"
+  invest_reservoir_cash_reserve_pct: 30.0  # 蓄水池只吸收超出该流动现金预留带的溢出资金（~3笔右侧弹药）
+  invest_reservoir_min_idle_cash_pct: 50.0  # Invest 闲置现金占净值须高于此值才允许新建蓄水池
+  invest_reservoir_min_ticket_gbp: 1000.0   # 蓄水池票据下限（低于此不推荐，防碎换手）
+  invest_reservoir_funding_buffer_pct: 2.0  # 清宽基换股缺口的价差/汇率缓冲（need = ceil(gap × 1.02)）
+  invest_reservoir_funding_min_need_gbp: 200.0  # 配对指令缺口噪声地板（低于此由常规换汇路径兜底）
 
   # /us intraday anomaly gate & T+N settlement horizon (IMP-12 / IMP-16)
   us_anomaly_move_pct: 1.8
@@ -256,6 +281,7 @@ universe:
     - "IWMO.L"
     - "VWRL.L"
     - "VERX.L"
+    - "VEUR.L"
 
   isa_long_term:
     # Broad & factor LSE GBP ETFs (0% FX fee, 0% UK stamp duty)

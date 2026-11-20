@@ -20,12 +20,29 @@ LONDON_TZ = ZoneInfo("Europe/London")
 # Regime constants (design doc §5.2: RISK_ON requires HY OAS < 4.5%; RISK_OFF at >= 5.5%)
 REGIME_HY_OAS_RISK_ON_PCT = 4.5
 REGIME_HY_OAS_RISK_OFF_PCT_DEFAULT = 5.5
+# Zero-extra-network regional breadth anchors (non-redundant regions; excludes GBP-distorted VWRP.L)
+REGIME_BREADTH_REGIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("US", ("SPY", "QQQ")),
+    ("UK", ("ISF.L",)),
+    ("EU", ("EXS1.DE", "VERG.L")),
+)
+REGIME_BREADTH_MIN_CACHED_EQUITIES = 20
+REGIME_BREADTH_MIN_POOL_SNAPS = 15
+REGIME_BREADTH_MIN_REGIONS = 2
 # ISA extreme low-cash defence line (design doc §6.1 D trigger)
 ISA_EXTREME_LOW_CASH_PCT = 2.0
 # A-trigger exclusion windows (calendar days)
 TRIGGER_EARNINGS_EXCLUDE_DAYS = 5
 TRIGGER_EXDIV_EXCLUDE_DAYS = 5
 TRIGGER_RSI_EXCLUDE_ABOVE = 72.0
+# v5.5.9 M3: A2 breakout channel bounds — leaders firing with volume typically carry
+# RSI 70~80, so A2 only rejects extreme blow-offs (>=82); chase risk is bounded instead
+# by the +14% MA50 extension cap (holding_eval warns at >=+18%, leaving a 4pt buffer).
+TRIGGER_A2_RSI_EXCLUDE_ABOVE = 82.0
+TRIGGER_A2_MAX_DIST_MA50_PCT = 14.0
+# v5.5.9 M3 P1: A1 pullback band lower bound — shared by the scan and the bundle
+# pre-filter so the earnings/ex-div health check covers the full A1 band.
+TRIGGER_A1_MIN_DIST_MA50_PCT = -2.0
 # Consecutive-loss: how far a sell may trail the matching BUY fill (ms)
 GATE_EPOCH_PARSE_FAIL_NOTE = "gate_epoch_date 解析失败，按当日零点保守起算"
 
