@@ -40,6 +40,74 @@ _DEFAULT_PERSIST_TTL_SECONDS = 10800
 _INSPECT_TOOL_MAX_CHARS = 3800
 _TICKER_TOKEN_RE = re.compile(r"\b([A-Z]{1,6}(?:\.[A-Z]{1,3}|-[A-Z])?)\b")
 
+# v5.5.8: broad "sym/company news" lookups may reuse the per-symbol day cache even
+# when the query is long (Hydrogen pads 8+ words with quotes/dates that used to
+# punch through the <=5-word guard and re-search what /us had just fetched).
+_GENERIC_NEWS_STOPWORDS = frozenset(
+    {
+        "stock", "stocks", "share", "shares", "equity", "news", "headline", "headlines",
+        "latest", "today", "todays", "premarket", "pre", "market", "markets", "afterhours",
+        "after", "hours", "earnings", "price", "prices", "move", "moves", "mover", "movers",
+        "update", "updates", "or", "and", "the", "a", "an", "for", "of", "on", "in", "at",
+        "to", "vs", "us", "usa", "watch", "out", "what", "happened", "happening", "any",
+        "about", "is", "there", "this", "that", "week", "daily", "trading", "trade",
+    }
+)
+_MONTH_NAMES = frozenset(
+    {
+        "january", "february", "march", "april", "may", "june", "july",
+        "august", "september", "october", "november", "december",
+        "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    }
+)
+# Concrete event qualifiers force a live search even for short queries — a stale
+# generic-news cache entry must never mask fresh subpoena/guidance/FDA developments.
+_EVENT_HINT_WORDS = (
+    "subpoena", "lawsuit", "litigation", "sec", "guidance", "downgrade", "upgrade",
+    "fda", "merger", "acquisition", "layoff", "layoffs", "recall", "bankruptcy",
+    "fraud", "criminal", "indictment", "investigation", "probe", "warning", "short",
+    "squeeze", "buyback", "repurchase", "split", "dividend", "cut", "raise", "raises",
+    "lowers", "lowered", "target", "analyst", "halt", "halted", "outage", "strike",
+    "contract", "deal", "approval", "rejects", "rejected",
+)
+
+
+def _query_has_event_hint(query: str) -> bool:
+    """True when the query names a concrete event (subpoena/guidance/FDA/...).
+
+    Such directed lookups must pierce the per-symbol day cache at ANY word count so
+    fresh one-source developments are never masked by a generic-news cache entry.
+    """
+    cleaned = re.sub(r"[\"'“”‘’()\[\]{}:,;!?。；，！？]+", " ", str(query or "").lower())
+    joined = " ".join(cleaned.split())
+    return any(word in joined for word in _EVENT_HINT_WORDS)
+
+
+def _is_generic_symbol_news_query(query: str, sym_tok: str) -> bool:
+    """True when a query only pairs the ticker with generic news words / dates.
+
+    Such broad lookups (e.g. `"AVGO" OR "Broadcom" stock news November 20 2026`)
+    reuse the per-symbol day cache regardless of word count; queries carrying a
+    concrete event word (`subpoena`, `guidance`, `FDA`, ...) always pierce the cache.
+    """
+    if not sym_tok:
+        return False
+    cleaned = re.sub(r"[\"'“”‘’()\[\]{}:,;!?。；，！？]+", " ", str(query or "").lower())
+    sym_lower = sym_tok.strip().lower()
+    kept: list[str] = []
+    for tok in cleaned.split():
+        if not tok or tok == sym_lower or tok.rstrip(".") == sym_lower:
+            continue
+        if re.fullmatch(r"(19|20)\d{2}", tok) or re.fullmatch(r"\d{1,2}(st|nd|rd|th)?", tok):
+            continue
+        if tok in _MONTH_NAMES or tok in _GENERIC_NEWS_STOPWORDS:
+            continue
+        kept.append(tok)
+    if not kept:
+        return True
+    joined = " ".join(kept)
+    return not any(word in joined for word in _EVENT_HINT_WORDS)
+
 
 def _monotonic() -> float:
     return time.monotonic()
@@ -497,7 +565,7 @@ class MarketToolkit:
                 return isin, created_at
         return None, None
 
-    def declarations(self) -> list[types.FunctionDeclaration]:
+    def declarations(self, allowed_tools: set[str] | None = None) -> list[types.FunctionDeclaration]:
         decls = [
             types.FunctionDeclaration(
                 name="inspect_ticker",
@@ -505,14 +573,15 @@ class MarketToolkit:
                     "Fetch deterministic market data, CYQ chip profit/concentration, weekly trend, MA20/50/200, RSI14, "
                     "52-week drawdown, PE valuation, earnings/ex-dividend dates, past reflection lessons, and recent news for a stock or ETF. "
                     "Pass US tickers directly (e.g. 'NVDA'), append '.L' for UK/LSE ETFs (e.g. 'AZN.L', 'VWRP.L'), "
-                    "and append '.DE'/'.AS'/'.PA' for European tickers."
+                    "and append '.DE'/'.AS'/'.PA' for European tickers. "
+                    "Also supports major Yahoo index symbols for intraday index quotes, e.g. '^FTSE', '^STOXX', '^GDAXI', '^GSPC'."
                 ),
                 parameters={
                     "type": "OBJECT",
                     "properties": {
                         "symbol": {
                             "type": "STRING",
-                            "description": "Yahoo Finance ticker symbol, e.g. AAPL, RR.L, VWRP.L, ASML.AS",
+                            "description": "Yahoo Finance ticker symbol, e.g. AAPL, RR.L, VWRP.L, ASML.AS, or index ^FTSE / ^GSPC",
                         }
                     },
                     "required": ["symbol"],
@@ -553,7 +622,8 @@ class MarketToolkit:
                     name="search_market_news",
                     description=(
                         "Run a live Google Search for breaking news, regulatory filings (RNS/SEC/EU), earnings guidance revisions, "
-                        "or institutional rating changes for US, UK (.L), European (.DE/.AS/.PA), LSE ETFs, or macro events. "
+                        "institutional rating changes, or intraday index/market moves (e.g. 'FTSE 100 today', 'S&P 500 intraday') "
+                        "for US, UK (.L), European (.DE/.AS/.PA), LSE ETFs, or macro events. "
                         "Always formulate the query in concise English financial keywords."
                     ),
                     parameters={
@@ -568,6 +638,11 @@ class MarketToolkit:
                     },
                 )
             )
+        # v5.5.8: optional whitelist filter — /us anomaly days expose only
+        # search_market_news; default None returns every tool (100% compatible
+        # with /report, /pick, and daily chat).
+        if allowed_tools is not None:
+            decls = [d for d in decls if d.name in allowed_tools]
         return decls
 
     async def execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -704,7 +779,13 @@ class MarketToolkit:
             tok_match = _TICKER_TOKEN_RE.search(query)
             sym_tok = tok_match.group(1) if tok_match else ""
             db_keys = [f"tool_search:{uk_date}:{norm_q}"]
-            if sym_tok and len(query.split()) <= 5:
+            # v5.5.8: per-symbol day-cache reuse is now *event-aware*: concrete-event
+            # queries (subpoena/guidance/FDA/...) pierce the cache at any word count,
+            # while broad "sym/company news" lookups hit it even at 8+ words (the old
+            # <=5-word guard let Hydrogen's padded queries punch straight through).
+            if sym_tok and not _query_has_event_hint(query) and (
+                len(query.split()) <= 5 or _is_generic_symbol_news_query(query, sym_tok)
+            ):
                 db_keys.extend(
                     [
                         f"grounding:{uk_date}:prio:{sym_tok}",

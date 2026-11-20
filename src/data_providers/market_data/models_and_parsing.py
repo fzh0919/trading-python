@@ -457,6 +457,11 @@ class MacroSnapshot(BaseModel):
     spy_5d_pct: float | None = None
     qqq_5d_pct: float | None = None
     ftse_5d_pct: float | None = None
+    # v5.5.8: same-day index moves computed from the already-fetched SPY/QQQ/ISF.L
+    # history frames — zero extra network requests.
+    spy_1d_pct: float | None = None
+    qqq_1d_pct: float | None = None
+    ftse_1d_pct: float | None = None
     is_stale: bool = False
 
     def to_text(self) -> str:
@@ -494,10 +499,16 @@ class MacroSnapshot(BaseModel):
         if self.us_unemployment_pct is not None:
             parts.append(f"美失业率: {self.us_unemployment_pct:.1f}%")
         idx_parts = []
+        if self.spy_1d_pct is not None:
+            idx_parts.append(f"标普(SPY)当日 {self.spy_1d_pct:+.2f}%")
         if self.spy_5d_pct is not None:
             idx_parts.append(f"标普(SPY)5日 {self.spy_5d_pct:+.2f}%")
+        if self.qqq_1d_pct is not None:
+            idx_parts.append(f"纳指(QQQ)当日 {self.qqq_1d_pct:+.2f}%")
         if self.qqq_5d_pct is not None:
             idx_parts.append(f"纳指(QQQ)5日 {self.qqq_5d_pct:+.2f}%")
+        if self.ftse_1d_pct is not None:
+            idx_parts.append(f"富时(ISF.L)当日 {self.ftse_1d_pct:+.2f}%")
         if self.ftse_5d_pct is not None:
             idx_parts.append(f"富时(ISF.L)5日 {self.ftse_5d_pct:+.2f}%")
         if idx_parts:

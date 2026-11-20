@@ -7,6 +7,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -19,6 +20,8 @@ from src.data_providers.market_data.models_and_parsing import (
 )
 
 logger = logging.getLogger("src.data_providers.market_data")
+
+_NY_TZ = ZoneInfo("America/New_York")
 
 class FinnhubClient:
     """Optional free Finnhub client (60 calls/min) for US earnings, news, quotes & intel.
@@ -251,7 +254,7 @@ class FinnhubClient:
             if price is None or price <= 0:
                 return None
             self.last_error = None
-            return {
+            quote_payload: dict[str, Any] = {
                 "symbol": symbol.strip().upper(),
                 "current_price": price,
                 "change": _safe_float(data.get("d")),
@@ -261,6 +264,18 @@ class FinnhubClient:
                 "open": _safe_float(data.get("o")),
                 "prev_close": _safe_float(data.get("pc")),
             }
+            # v5.5.8: Finnhub /quote natively carries a Unix-seconds timestamp `t`.
+            # Convert it to America/New_York session metadata so the /us anomaly gate
+            # can reject stale (yesterday's) dp moves; when `t` is missing (legacy
+            # stubs / older fixtures) no bar_date_et is written and callers keep
+            # treating the quote as session-fresh for backward compatibility.
+            t_val = _safe_float(data.get("t"))
+            if t_val is not None and t_val > 0:
+                ts_et = datetime.fromtimestamp(float(t_val), tz=_NY_TZ)
+                quote_payload["bar_date_et"] = ts_et.strftime("%Y-%m-%d")
+                quote_payload["quote_time_et"] = ts_et.strftime("%H:%M")
+                quote_payload["source"] = "finnhub_quote"
+            return quote_payload
         except Exception as exc:
             self.last_error = f"quote {_safe_exc(exc)}"
             logger.debug("Finnhub quote error for %s: %s", symbol, exc)

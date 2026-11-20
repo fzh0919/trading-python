@@ -629,9 +629,14 @@ class YahooHistoryMixin:
 
         dates = [ts.date() for ts in et_idx]
         unique_dates = sorted(set(dates))
+        last_ts = et_idx[-1]
+        minute_of_day = int(last_ts.hour) * 60 + int(last_ts.minute)
+        session_tag = "PRE" if minute_of_day < 570 else ("REG" if minute_of_day <= 960 else "POST")
         prev_close: float | None = None
+        prev_close_date_et: str | None = None
         if len(unique_dates) >= 2:
             prev_date = unique_dates[-2]
+            prev_close_date_et = prev_date.isoformat()
             prev_mask = [d == prev_date for d in dates]
             prev_bars = closes[prev_mask]
             prev_et = [ts for ts, m in zip(et_idx, prev_mask) if m]
@@ -650,11 +655,13 @@ class YahooHistoryMixin:
                 d_closes = pd.to_numeric(daily_df["Close"], errors="coerce").dropna()
                 if not d_closes.empty:
                     d_dates = [pd.Timestamp(ts).date() for ts in d_closes.index]
-                    prior = [float(v) for v, d in zip(d_closes, d_dates) if d < unique_dates[0]]
+                    prior = [(float(v), d) for v, d in zip(d_closes, d_dates) if d < unique_dates[0]]
                     if prior:
-                        prev_close = prior[-1]
+                        prev_close = prior[-1][0]
+                        prev_close_date_et = prior[-1][1].isoformat()
                     elif len(d_closes) >= 2:
                         prev_close = float(d_closes.iloc[-2])
+                        prev_close_date_et = pd.Timestamp(d_closes.index[-2]).date().isoformat()
             if prev_close is None:
                 prev_close = float(closes.iloc[0])
 
@@ -668,6 +675,13 @@ class YahooHistoryMixin:
             "prev_close": prev_close,
             "change": round(change, 4),
             "change_pct": round(change_pct, 4),
+            # v5.5.8: America/New_York session metadata so the /us anomaly gate can
+            # reject stale (yesterday's) 15m bars instead of mis-reading their
+            # day-over-day move as today's pre-market gap.
+            "bar_date_et": last_ts.date().isoformat(),
+            "quote_time_et": f"{int(last_ts.hour):02d}:{int(last_ts.minute):02d}",
+            "session_tag": session_tag,
+            "prev_close_date_et": prev_close_date_et,
             "source": "yfinance_prepost_15m",
         }
 

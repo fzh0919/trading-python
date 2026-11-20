@@ -387,6 +387,19 @@ def build_analysis_context_pack(
             "deep_intel": intel_lookup.get(sym.upper()) or intel_lookup.get(sym) or {},
         }
 
+    # v5.5.8 /us: lightweight pending-order ledger for the post-morning-report
+    # order reconciliation block (account / symbol / side / limit / stop only).
+    pending_orders_pack: list[dict[str, Any]] = [
+        {
+            "account": order.account,
+            "yahoo_symbol": order.yahoo_symbol,
+            "side": order.side,
+            "limit_price": order.limit_price,
+            "stop_price": order.stop_price,
+        }
+        for order in portfolio.all_pending_orders()
+    ]
+
     return {
         "pack_version": CONTEXT_PACK_VERSION,
         "cycle_date": resolved_cycle,
@@ -395,6 +408,7 @@ def build_analysis_context_pack(
         "calendar_alerts": list(calendar_alerts),
         "macro": macro.model_dump() | {"summary": macro.to_text()},
         "exposure_summary": exposure_text,
+        "pending_orders": pending_orders_pack,
         "cash_flow_summary": cash_flow_summary,
         "portfolio_diff": portfolio_diff,
         "disagreements": [d.model_dump() for d in disagreements],

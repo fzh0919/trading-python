@@ -361,6 +361,32 @@ class PortfolioRepoMixin:
             combined = f"{combined}\n\n【今日美股开盘前哨补充】\n{pre_note}".strip()
         return combined, (conclusion or ""), stale
 
+    async def get_morning_context_meta(
+        self, cycle_date: str | None = None
+    ) -> tuple[str, str, str, bool, str]:
+        """v5.5.8: single-query morning context -> (static_report, premarket_note, conclusion, stale, cycle_date).
+
+        ``stale=True`` means the requested cycle has no row and the latest available report
+        (previous cycle) was returned so callers can label it as outdated.
+        """
+        cdate = cycle_date or self._cycle_id()
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT report_text, conclusion_text, premarket_note FROM morning_reports WHERE cycle_date = ?",
+                (cdate,),
+            )
+            row = await cur.fetchone()
+            stale = False
+            if not row:
+                cur = await db.execute(
+                    "SELECT report_text, conclusion_text, premarket_note FROM morning_reports ORDER BY updated_at_ms DESC LIMIT 1"
+                )
+                row = await cur.fetchone()
+                stale = row is not None
+        if not row:
+            return "", "", "", False, cdate
+        return str(row[0] or ""), str(row[2] or ""), str(row[1] or ""), stale, cdate
+
     async def get_daily_guardrails(self, cycle_date: str | None = None) -> list[str]:
         """Return audited daily risk vetoes / guardrails from /report for current cycle or latest."""
         guardrails, _stale = await self.get_daily_guardrails_with_status(cycle_date)
@@ -444,3 +470,14 @@ class PortfolioRepoMixin:
         if not row:
             return "", ""
         return str(row[0]), str(row[1])
+
+    async def get_latest_pick_radar_with_ts(self) -> tuple[str, str, int]:
+        """v5.5.8: latest pick radar plus ``created_at_ms`` so callers can gate by trading cycle."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT created_at_uk, final_text, created_at_ms FROM pick_radars ORDER BY created_at_ms DESC, id DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+        if not row:
+            return "", "", 0
+        return str(row[0]), str(row[1]), int(row[2] or 0)

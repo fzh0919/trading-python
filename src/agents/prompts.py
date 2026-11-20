@@ -2,8 +2,76 @@
 
 from __future__ import annotations
 
+import re
+from typing import Any
+
 from src.config import StrategySection
 from src.data_providers.t212_client import PortfolioData
+
+
+# v5.5.8: plain-text helpers shared by chat_agent and report_agent/sentinels.
+# They live here (the common upstream of both) so sentinels.py never has to
+# reverse-import chat_agent.py.
+_MD_HEADING_RE = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
+
+
+def _normalize_redline_text(text: str) -> str:
+    """v5.5.8: strip trailing sentence punctuation (。；.;) per line for redline comparison.
+
+    The morning report joins vetoes with `；` and drops trailing `。`, while DB guardrails
+    keep theirs — a strict substring compare therefore always failed and the redlines were
+    injected twice (~180 wasted tokens).
+    """
+    normalized: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        while line and line[-1] in "。；.;":
+            line = line[:-1].rstrip()
+        normalized.append(line)
+    return "\n".join(normalized)
+
+
+def _all_guardrails_embedded(morning_block: str, guardrails: list[str]) -> bool:
+    if not guardrails:
+        return True
+    morning_norm = _normalize_redline_text(morning_block)
+    return all(
+        bool(_normalize_redline_text(g)) and _normalize_redline_text(g) in morning_norm
+        for g in guardrails
+    )
+
+
+def has_complete_embedded_vetoes(morning_block: str, guardrails: list[str]) -> bool:
+    """Check whether morning_block already includes the complete daily redlines without truncation."""
+    if not morning_block:
+        return False
+    lines = morning_block.splitlines()
+    for idx, ln in enumerate(lines):
+        stripped = ln.strip()
+        if "今日风控红线" not in stripped:
+            continue
+        if stripped.endswith(("…", "...")):
+            return False
+        if not stripped.startswith("【") and ("：" in stripped or ":" in stripped):
+            return _all_guardrails_embedded(morning_block, guardrails)
+        if stripped.startswith("【今日风控红线") and idx + 1 < len(lines):
+            next_ln = lines[idx + 1].strip()
+            if next_ln and not next_ln.endswith(("…", "...")):
+                return _all_guardrails_embedded(morning_block, guardrails)
+    return False
+
+
+def clean_telegram_plain_text(text: str) -> str:
+    """v5.5.8: strip Telegram-hostile Markdown (** pairs, leading # headings) only.
+
+    Never touches single `*` (protects 3*ATR math), preserves newlines / • lists / 【】
+    sections, and never truncates.
+    """
+    if not text:
+        return text
+    cleaned = text.replace("**", "")
+    cleaned = _MD_HEADING_RE.sub("", cleaned)
+    return cleaned
 
 
 def build_wallet_context_text(
@@ -88,7 +156,18 @@ def build_investor_profile(
     *,
     include_order_audit_rule: bool = True,
     compact_for_pick_critic: bool = False,
+    compact_for_chat: bool = False,
+    compact_for_us_sentinel: bool = False,
 ) -> str:
+    if compact_for_us_sentinel:
+        # v5.5.8: /us only does incremental verification against the morning report;
+        # it must not re-adjudicate /report /pick machinery (cuts ~1,850 -> ~450 tokens
+        # and stops inviting order re-audits the morning report already settled).
+        return _build_compact_us_sentinel_profile(strategy)
+    if compact_for_chat:
+        # v5.5.8: daily chat only needs the Q&A-critical discipline, not the full
+        # /report & /pick machinery (cuts systemInstruction from ~1,900 to ~1,000 tokens).
+        return _build_compact_chat_profile(strategy, include_order_audit_rule=include_order_audit_rule)
     if compact_for_pick_critic:
         return _build_compact_pick_critic_profile(strategy)
     benchmark = getattr(strategy, "benchmark_symbol", "VWRP.L")
@@ -201,17 +280,99 @@ def _build_compact_pick_critic_profile(strategy: StrategySection) -> str:
     )
 
 
+def _build_compact_us_sentinel_profile(strategy: StrategySection) -> str:
+    """v5.5.8: /us Delta-Sentinel condensed profile (~450 tokens vs ~1,850 full profile).
+
+    Keeps only what a pre-open incremental verification needs: dual-account identity,
+    the ISA-value vs Invest-momentum philosophies, wallet/pending-order interest
+    semantics, and the "morning report is the sole baseline" discipline. Drops the
+    ISA four-bucket policy ticket, cash-deployment proposals, order sizing quotas,
+    loss-streak recovery rules, and the anti-pandering order re-audit paragraph
+    (the latter would invite /us to re-adjudicate orders /report already settled).
+    """
+    gbp_rate = float(strategy.cash_interest_rate_pct)
+    usd_rate = float(getattr(strategy, "usd_cash_interest_rate_pct", 3.4))
+    fx = float(strategy.fx_fee_pct)
+    return (
+        "【投资者画像与硬性规则（美股增量哨兵精简版）】：\n"
+        "• 英国个人投资者，持有 Trading 212 Stocks ISA 与 Invest 双账户，不使用杠杆/期权/做空。\n"
+        "• ISA（长线稳健仓，巴菲特价值流派）：核心宽基 + 优质护城河个股；"
+        "不把盘前短期波动当风险，严禁仅因跳空、RSI 超买或短期回撤卖飞好公司；"
+        "ISA 卖出/减仓仅限 4 情形：基本面/护城河证伪、极端估值泡沫、显著更优机会成本置换、集中度超限/边角料归核。\n"
+        "• Invest（短线机动仓，右侧动量战术流派）：严守硬止损与当日 Regime 动态 R:R 门槛，按以损定仓、绝不摊平；"
+        "趋势未破坏时上移移动止损而非恐慌卖出，破位则不犹豫。\n"
+        f"• 双钱包与挂单计息：ISA 仅 GBP 钱包（{gbp_rate:.1f}%）；Invest 为 GBP（{gbp_rate:.1f}%）+ USD（{usd_rate:.1f}%）双钱包，"
+        f"跨币种买入计单边 {fx:.2f}% 换汇费；买入限价挂单占用资金在未成交前照常计息，"
+        "严禁以「释放挂单资金吃息」为由建议撤单。\n"
+        "• 唯一职责边界：以今日 /report 全文为绝对基线做增量核验与修正，"
+        "严禁另起炉灶、新增开仓/配置提案，或重审早报已审计过的挂单。\n"
+    )
+
+
+def _build_compact_chat_profile(strategy: StrategySection, *, include_order_audit_rule: bool = True) -> str:
+    """v5.5.8: daily-chat condensed profile — drops /report /pick-only rules, keeps Q&A discipline.
+
+    Each previously duplicated clause (cash interest, dynamic R:R, zero quota, never
+    push buys) is stated exactly once; the loss-streak recovery and four-bucket ticket
+    wording lives in /report & /pick prompts only.
+    """
+    benchmark = getattr(strategy, "benchmark_symbol", "VWRP.L")
+    gbp_rate = float(strategy.cash_interest_rate_pct)
+    usd_rate = float(getattr(strategy, "usd_cash_interest_rate_pct", 3.4))
+    fx = float(strategy.fx_fee_pct)
+    stamp = float(strategy.uk_stamp_duty_pct)
+    min_invest = float(getattr(strategy, "min_invest_order_gbp", 700.0))
+    min_isa_eq = float(getattr(strategy, "min_isa_equity_order_gbp", 1200.0))
+    min_isa_etf = float(getattr(strategy, "min_isa_etf_order_gbp", 400.0))
+    risk_budget = float(getattr(strategy, "invest_risk_budget_gbp", 85.0))
+    risk_pct = float(getattr(strategy, "invest_risk_budget_pct", 0.75) or 0.75)
+    audit_rule = (
+        "• 反迎合审计：对任何已有挂单或前序 AI 结论，一律按挂单限价核算成本、目标空间与盈亏比；"
+        "距现价 -3%~-12% 且基本面未坏的回踩埋伏单属于有效等待，严禁以“现价空间不足”或“释放现金吃息”为由建议撤单；"
+        "只有当按限价成交后扣摩擦的盈亏比仍 <2:1、或基本面/趋势已证伪时，才给出 CANCEL 或带具体数字的 MODIFY。\n"
+        if include_order_audit_rule
+        else ""
+    )
+    return (
+        "【投资者画像与硬性规则（日常聊天精简版）】：\n"
+        "• 英国个人投资者，持有 Trading 212 Stocks ISA 与 Invest 双账户，不使用杠杆/期权/做空。\n"
+        f"• 核心宗旨：双账户合计净值长期跑赢全球宽基基准 {benchmark}；"
+        f"{gbp_rate:.1f}%/{usd_rate:.1f}% 现金利息只是等待期保底收益，不是投资终点，严禁把“守住现金吃息”当默认结论。\n"
+        f"• ISA（长线稳健仓，巴菲特价值流派，核心-卫星结构）：核心宽基目标占比 ≥{strategy.isa_core_etf_target_pct:.0f}%"
+        f"（按全球/美股/欧洲/英国四桶宽基政策配置，以 Python 政策票据为准），"
+        f"个股卫星硬上限 ≤{strategy.isa_satellite_max_total_pct:.0f}% 且 ≤{strategy.isa_satellite_max_count} 只（含未成交个股买单），"
+        "一旦超限即锁死 ISA 新开个股通道，只准审撤个股买单并把闲钱分批归拢核心宽基；"
+        "优质股下跌若基本面与护城河未证伪、且估值安全边际扩大，反而是分批左侧加仓机会，严禁仅因浮盈、RSI 超买或短期回撤卖飞好公司；"
+        "ISA 卖出/减仓仅限 4 情形：基本面/护城河证伪、极端估值泡沫、显著更优机会成本置换、集中度超限/边角料归核。\n"
+        "• Invest（短线机动仓，右侧动量战术流派）：Invest 现金再多也绝不催买，只有右侧突破猎物才触发开仓；"
+        "严守当日市场状态（Regime）动态适配 R:R（RISK_ON 右侧领涨 ≥1.6:1 / NEUTRAL ≥2.0:1 / 弱势 ≥2.5:1，以当日注入门槛为准）"
+        "与止损 ATR 噪声地板，按以损定仓、绝不摊平；"
+        "已挂保本止损（止损价≥成本+摩擦）的仓位占用 0 槽位并立即释放新开仓额度，未脱险仓位与未成交个股买单各占 1 槽位。\n"
+        f"• 开仓硬纪律：单笔金额 Invest ≥ £{min_invest:,.0f}、ISA 个股 ≥ £{min_isa_eq:,.0f}、ISA ETF ≥ £{min_isa_etf:,.0f}，严禁碎单；"
+        f"Invest 单笔最大可承受亏损 = max(£{risk_budget:,.0f} 地板, Invest 净值×{risk_pct:.2f}%)（仓位 ≈ 该风险预算 ÷ 止损百分比）。\n"
+        f"• 钱包与摩擦：ISA 仅 GBP 钱包（{gbp_rate:.1f}%）；Invest 为 GBP（{gbp_rate:.1f}%）+ USD（{usd_rate:.1f}%）双钱包，"
+        f"复用同币种钱包 0% 换汇，跨币种买入计单边 {fx:.2f}% 换汇费（英股买入另收 {stamp:.1f}% 印花税），卖出所得默认留存原币种钱包；"
+        "买入限价挂单所占用的资金在未成交前照常产生同等日息，严禁以“释放挂单资金吃息”为由阻止低位限价挂单；"
+        "若按风险算出的美股金额大于 USD 钱包可用余额，正常由 GBP 换汇补足，严禁为省换汇费人为缩仓。\n"
+        "• 零 Quota 豁免：卖出任何存量仓位/清理边角料，以及买入核心宽基 ETF，永远不消耗周/月开仓次数配额，也不占用在险槽位。\n"
+        f"{audit_rule}"
+        "• Invest 为应税账户，低赔率频繁换仓会侵蚀净收益；回答须写明资金路径与摩擦影响。"
+    )
+
+
 def build_agent_system_instruction(
     role_instruction: str,
     strategy: StrategySection,
     *,
     include_order_audit_rule: bool = True,
     compact_for_pick_critic: bool = False,
+    compact_for_chat: bool = False,
+    compact_for_us_sentinel: bool = False,
 ) -> str:
     """Combine stable role instructions and investor profile for Gemini `system_instruction`."""
     return (
         f"{role_instruction.strip()}\n\n"
-        f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule, compact_for_pick_critic=compact_for_pick_critic)}"
+        f"{build_investor_profile(strategy, include_order_audit_rule=include_order_audit_rule, compact_for_pick_critic=compact_for_pick_critic, compact_for_chat=compact_for_chat, compact_for_us_sentinel=compact_for_us_sentinel)}"
     )
 
 

@@ -625,6 +625,18 @@ class MarketDataService(YahooHistoryMixin):
                     return None
                 return ((float(closes.iloc[-1]) / prev) - 1.0) * 100.0
 
+            def _ret_1d(df: pd.DataFrame) -> float | None:
+                # v5.5.8: same-day move from the last two cached closes (zero extra requests).
+                if df.empty or "Close" not in df.columns:
+                    return None
+                closes = df["Close"].dropna()
+                if len(closes) < 2:
+                    return None
+                prev = float(closes.iloc[-2])
+                if prev <= 0:
+                    return None
+                return ((float(closes.iloc[-1]) / prev) - 1.0) * 100.0
+
             def _last_close(df: pd.DataFrame) -> float | None:
                 if df.empty or "Close" not in df.columns:
                     return None
@@ -715,6 +727,9 @@ class MarketDataService(YahooHistoryMixin):
                 spy_5d_pct=_ret_5d(h_map.get("SPY", pd.DataFrame())),
                 qqq_5d_pct=_ret_5d(h_map.get("QQQ", pd.DataFrame())),
                 ftse_5d_pct=_ret_5d(h_map.get("ISF.L", pd.DataFrame())),
+                spy_1d_pct=_ret_1d(h_map.get("SPY", pd.DataFrame())),
+                qqq_1d_pct=_ret_1d(h_map.get("QQQ", pd.DataFrame())),
+                ftse_1d_pct=_ret_1d(h_map.get("ISF.L", pd.DataFrame())),
             )
             if snap.gbp_usd is None and snap.vix is None and snap.spy_5d_pct is None:
                 await self._notify_ops(

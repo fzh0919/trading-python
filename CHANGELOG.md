@@ -2,6 +2,50 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.8`（2026-11-20）
+
+日常聊天全链路瘦身、纠偏与实时校准（普通单聊 DeepSeek + `/deep` Gemini；施工总计划见 [`docs/plans/2026-11-20-5.5.8-daily-chat-plan.md`](./docs/plans/2026-11-20-5.5.8-daily-chat-plan.md)）。零新存储文件、零新增出网域名、风控护栏开关全部不动。
+
+#### 增量合入（2026-11-20）：美股增量哨兵（`/us`）全链路真源校准、去重瘦身与防重搜
+
+> 施工计划见 [`docs/plans/2026-11-20-5.5.8-us-sentinel-plan.md`](./docs/plans/2026-11-20-5.5.8-us-sentinel-plan.md)；同版本增量补齐 `/us` 链路（`src/version.py` 与 `pyproject.toml` 维持 `5.5.8`）。
+
+1. **Wave 1 — 真源校准、真 Delta 门控与 0-Token 挂单对账**：
+   - `market_data/yahoo_mixin.py`：`_extract_intraday_15m_quote` 新增 `bar_date_et / quote_time_et / session_tag（PRE|REG|POST）/ prev_close_date_et` 美东时效元数据；`market_data/external_clients.py`：Finnhub `/quote` 读取原生 Unix 秒级 `t` 换算美东 `bar_date_et` 并标 `source="finnhub_quote"`（`t` 缺失时不写，100% 兼容旧单测桩），双源堵死「隔日旧 `dp`/旧 15m K 线误报为今日盘前异动」。
+   - `report_agent/sentinels.py`：`_evaluate_us_anomaly_gate` 升级为真 Delta 门控——休市/周末熔断（`WEEKEND/HOLIDAY` 直接平稳并跳过全部实时行情拉取）；`PRE/OPEN` 阶段仅采信 `bar_date_et == ny_date`（或无元数据桩）的新鲜报价，PRE 阶段早报已覆盖的昨收旧跌幅不再二次报警；VIX 改为相对早报基线增量（达 ±4% 或**新突破** 28 才触发，早报已 ≥28 的高位静默不再天天破门控），无早报包时完整保留日线变动 + 静态 28 兜底。
+   - 补齐 `t212.refresh_portfolio_fx` 兜底（Invest 汇率缺失时零网络原位刷新）；`append_premarket_note` 增加空壳防护——仅当日确有早报正文/结论才回写，杜绝无早报日插入 `report_text=''` 空壳行抹掉上一周期兜底早报。
+   - 注入两大 0-Token 实盘真源块：`【美股盘前/盘中实时快照（唯一实时价真源）】`（实时价、较昨收、时段与美东时刻；无当日成交显式写「沿用昨收」）与 `【早报后美股挂单变动对账】`（`fact_sheet.build_analysis_context_pack` 增补轻量 `pending_orders` 列表；旧包无该字段时回退比对 `symbols` 非持仓标的），显式区分「已撤销/已成交消失（无需再操作）」「新增挂单」「当前仍有效挂单（附距实时价距离）」，终结三套价格口径打架与喊撤空气单。
+2. **Wave 2 — 轻量事实组装与上下文深度瘦身（Token 直降 ~55%–65%）**：
+   - `prompts.py`：新增 `_build_compact_us_sentinel_profile`（`compact_for_us_sentinel=True`，~450 tokens 替代 ~1,850 全量画像），删除 ISA 四桶票据、现金催配提案、单笔金额/周月配额、连损冷静恢复与「一律按挂单限价核算」重审长段；`_has_complete_embedded_vetoes` 与 `_clean_chat_plain_text` 下沉为通用 `has_complete_embedded_vetoes / clean_telegram_plain_text`（`chat_agent.py` 保留原名别名，严禁 `sentinels.py` 反向导入 `chat_agent.py`）。
+   - `sentinels.py`：以专用 `_fetch_us_sentinel_facts_data + build_us_sentinel_facts` 取代全量 `_assemble_fact_sheet_bundle`——只拉美股 `get_bundles(include_news=False, include_earnings=True)`，不再拉 `.L`/欧股行情、Yahoo RSS 新闻、最高 30 次 Finnhub 深度接口与历史教训；宏观块显式加注「HH:MM UTC 已最新拉取，禁止重复调 get_macro_snapshot」；仅对异动 ∪ 活动挂单 ∪ 7 日财报/±3 日除息标的打印紧凑技术锚点，其余合并 1 行；彻底移除跨账户暴露、`🟢 [加仓候选]` 规则引擎、Disagreement Matrix、静态评级/EPS/内部人与身份锚定块；早报已内嵌完整红线时不再重复注入 `=== 今日风控红线 ===`；System 提示改写为「仅 7 天内财报或 3 天内除息才提醒，严禁拿 15 天以上远期财报硬凑静默期」。
+3. **Wave 3 — 止血重复搜索、收紧工具集、修字数上限与输出护栏**：
+   - `tools.py`：`search_market_news` 缓存修复为事件感知——含 `subpoena/guidance/FDA/downgrade` 等具体事件词的定向检索在任何词数下穿透缓存，泛新闻查询（如 8 词 `"AVGO" OR "Broadcom" stock news November 20 2026`）无视词数命中当日 `sym` 级缓存；`MarketToolkit.declarations(allowed_tools=None)` 新增可选白名单（默认返回全量 4 工具，`/report`/`/pick`/单聊零改动）。
+   - `/us` 异动日仅暴露 `{"search_market_news"}` 单工具 + `max_tool_rounds=1`（90% 异动日 1 轮 Hydrogen 直出，保留极端突发逃生通道），工具缓存窗口对齐 `min(grounding_cache_ttl_seconds, 1800)`；前置搜索去掉硬编码 `bypass_cache=True`，改 `ttl_seconds=900 / persist_ttl_seconds=1800`（30 分钟窗口防连敲重烧额度），Top 2 真异动票（涨跌 ≥3% 或挂单逼近 ≤1.5%）1-to-1 提纯深搜、其余 3-in-1 合并批搜、总目标 ≤6 只，活动美股挂单标的自动并入检索目标。
+   - 字数契约严格兑现：`600 if 🚨 else 450`（与门控状态解耦，兼容 `test_authorized_length_ceilings`）；输出过 `clean_telegram_plain_text` 轻度纯文本清洗；打 1 行 `us_sentinel completed [phase/gate/reasons/model/prompt_chars/search_targets/reply_chars]` 标准遥测。
+   - 单测：修补 `test_imp12` 显式 patch `get_us_market_schedule_uk` 为确定性工作日 `OPEN` 时段（防周六日/假日 CI 误挂）；新增 `tests/test_v558_us_sentinel.py` 10 例覆盖盘前双源时效、VIX 增量门控、休市熔断、挂单对账与检索并入、空壳行防护、事件感知缓存穿透、单工具收紧与 I/O 隔离、红线去重、字数契约与纯文本清洗、精简画像；全量 `560/560` 通过，`scripts/audit_egress.py` `RESULT: CLEAN`。
+
+1. **Wave 1 — 逻辑纠偏、跨周期隔离与 0-Token 盘中实时结构校准**：
+   - `storage/db/portfolio_repo.py`：新增向后兼容 `get_morning_context_meta()`（单查询返回 `static_report/premarket_note/conclusion/stale/cycle_date`，替代旧的双次 `get_morning_context`）与 `get_latest_pick_radar_with_ts()`（带 `created_at_ms`）；原方法签名 100% 保持。
+   - `chat_agent`：`/pick` 时效改用统一交易周期判定（`created_at_ms → db._cycle_id` 与当前 07:30 UK 周期比对），跨周期旧提案一律跳过；严禁用 `pick_created_at_ms < morning_updated_at_ms` 误杀当日 `/pick`（下午 `/us` 的 `append_premarket_note` 会覆写 `updated_at_ms`）。`stale=True` 时早报标题显式改为「【上一周期陈旧早报（今日晨报尚未生成，仅作参考）】」。
+   - 修复 `【今日风控红线】` 100% 重复注入：`_has_complete_embedded_vetoes` 对早报正文与每条 guardrail 做统一标点规范化（去除末尾 `。；.;` 与空白）后再比对，消除「早报 `；` 拼接 vs guardrail 句号」导致的恒 False。
+   - 单标的误标修复：`_COMPARE_HINT_RE` 移除口语高频词「还是」，`decision_kind="compare"` 仅在解析出 ≥2 只标的时触发；`_build_symbol_alias_index` 内置轻量高频中文别名表（微软/英伟达/亚马逊/谷歌/博通/联合健康/摩根大通/优步/特斯拉/苹果/台积电/阿斯麦/阿斯利康/联合利华/先锋全球等），仅注册 portfolio ∪ ContextPack 实际存在的标的；「标普/富时/纳指/欧股」泛指大盘词严格不绑定任何单只 ETF。
+   - `/deep` 前缀剥离（含可选 `@botname`）与空参保护：`clean_query` 用于标的解析、Prompt 末尾与 `chat_history` 落库；空 `/deep` 直接返回用法提示（0 次 LLM 调用、不写库）。
+   - 注入 0-Token `【盘中实时结构校准（HH:MM UK…）】`：严格复用 `deployment_gate/ledgers.py` 的 `classify_pending_orders + compute_account_ledgers`（与 `/report`、`/pick` 同口径），用 `context_pack.symbols + 持仓名` 零网络构造 `lite_bundles`（防 `IBTA.L` 等非核心短债 ETF 误计入 ISA 个股卫星），输出 ISA 核心宽基（含挂单后）/个股卫星/现金 + Invest 在险槽/保本/现金 1–2 行实盘真相；整段包在 try/except 内静默降级。
+   - 零网络 `refresh_portfolio_fx` 兜底：仅当 Invest 汇率缺失时，从内存 `_macro_cache` 或 ContextPack macro 提取 `gbp_usd>0` 原位刷新，严禁聊天热路径新增阻塞外网请求；ContextPack 切片标题加注「早报静态快照，现价与挂单状态以实盘为准」，ETF 切片过滤不含标的/指数关键词的雅虎杂讯新闻（如 Kenya oil rig）。
+2. **Wave 2 — 上下文瘦身、前缀缓存重排与长回复防失忆**：
+   - `prompts.py` 新增 `_build_compact_chat_profile`（`compact_for_chat=True`）：日常聊天专属精简画像，利息/动态 R:R/零 Quota/不催买各收束为唯一 1 句，剔除连损冷静恢复半仓与 4 桶政策票据长句等 `/report`/`/pick` 专属细则（`systemInstruction` ~1,900 → ~1,000 tokens）；「一律按挂单限价核算」反迎合审计原则保留。
+   - 消除重复：移除动态区顶部 `build_wallet_context_text(compact=True)` 现金行（双账户块已完整含现金/挂单占用/双钱包拆解），顶部仅补标 `GBP/USD 实时汇率`；`【本周期组合基线】` 在早报正文已含集中度/敞口摘要时不再重复打印底层敞口，并过滤 `[SUPPORT_VS_WEAK_TREND 合并 xN]` 纯占位泛化行（仅保留 STOP_VS_EX_DIV 等具体冲突与 T+N 反思）。
+   - 跨周期过渡记忆移入 `dynamic_tail`：仅当今日对话轮数 == 0 时保留最近 1 条「[上一周期]」问答作为桥梁（放【今日对话记录】开头），保缓存前缀逐字节稳定且上午多轮后不再夹带昨晚过期问答。
+   - `/deep` 非焦点持仓紧凑化：新增 `_format_compact_positions_table`，焦点标的 + 权重 ≥15% 或浮亏 ≤-10% 异动仓保留完整明细，其余常规仓一行速览（`• CODE [占比% | 浮盈% | 现价 CCY]`），省 ~550–700 tokens；普通单聊维持原「异动保留 + 其余合并 1 行」行为。
+   - Prefix Cache 重排：静态前缀顺序改为 早报 → 去重红线 → 本周期基线 → 本周期 `【今日选股雷达】`（置于静态前缀末尾，下午 `/pick` 重跑只击穿该段之后的缓存）；前哨补充维持 dynamic_tail 前沿。
+   - 长回复「首尾保留（Head+Tail）」：`_format_chat_history_compact` 最近 1 轮回复 ≤550 字全文保留，超长回复保留前 300 字（结论）+ `…（中略）…` + 后 300 字（执行预案/价位/股数），更早轮次 320 字精简、早期轮次单行摘要。
+3. **Wave 3 — 工具边界松绑、纯文本护栏与轻量遥测**：
+   - `chat_sys` 工具许可补充：盘中实时大盘/指数涨跌幅可直接调用 `inspect_ticker`（支持 Yahoo 指数代码 `^FTSE`/`^STOXX`/`^GDAXI`/`^GSPC`）或 `search_market_news`；`tools.py` 同步补 `inspect_ticker`/`search_market_news` 描述与参数示例。
+   - `MacroSnapshot` 零额外网络请求增补 `spy_1d_pct/qqq_1d_pct/ftse_1d_pct`（直接从已拉取的 SPY/QQQ/ISF.L DataFrame 最近两根 Close 计算）并输出到 `to_text()`。
+   - 聊天出口轻量纯文本护栏 `_clean_chat_plain_text`：仅剥离 `**` 与行首 `#{1,6}\s+` 标题符（保留单个 `*` 如 `3*ATR`、换行、`•` 与【】），绝不截断。
+   - 每轮聊天后打一行结构化 `logger.info`（mode/model/target/prompt_chars/static_chars/reply_chars），不新增任何磁盘文件或配置项。
+   - 单测：新增 `tests/test_v558_daily_chat.py` 共 23 例（红线去重、还是/中文别名/泛指大盘不绑定、跨周期 `/pick` 隔离与当日 `/us` 后存活、陈旧早报标牌、`get_morning_context_meta`、IBTA.L 不误计卫星、无 `refresh_portfolio_fx` 容错、空 `/deep` 零消耗、首尾保留、纯文本清洗、前缀逐字节稳定、1d 零请求）；`test_db_and_end_to_end.py` 顺序断言同步为 `早报 < 红线 < 基线 < 选股雷达 < 时间`；全量 `550/550` 通过，`scripts/audit_egress.py` `RESULT: CLEAN`。
+
 ### `v5.5.7`（2026-11-19）
 
 `/pick` 全链路重构（Researcher + Critic + 确定性风控闭环），施工总计划见 [`docs/plans/2026-11-19-5.5.7-pick-pipeline-plan.md`](./docs/plans/2026-11-19-5.5.7-pick-pipeline-plan.md)。

@@ -1050,7 +1050,10 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIn("回踩MA20", nvda_pack["lessons"][0]["reflection_lesson"])
 
     async def test_imp12_us_sentinel_anomaly_gate_calm_vs_anomaly(self) -> None:
+        from unittest.mock import patch
+
         from src.agents.report_agent import generate_us_sentinel
+        from src.engine.calendar_utils import UsMarketSchedule
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db = AdvisorDatabase(Path(tmpdir) / "imp12_us_gate.db")
@@ -1099,10 +1102,34 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             cfg = AppConfig(env=EnvSettings(_env_file=None, telegram_chat_id="999"))
             t212 = _FakeT212(_sample_portfolio())
 
+            # v5.5.8: pin a deterministic weekday OPEN session so this gate test never
+            # depends on the real wall-clock weekday (WEEKEND/HOLIDAY would now trip
+            # the closed-market fuse and silently neutralize the anomaly scenarios).
+            open_sched = UsMarketSchedule(
+                ny_date="2026-11-13",
+                uk_date="2026-11-13",
+                uk_weekday_label="周五",
+                open_time_uk="14:30",
+                macro_time_uk="13:30",
+                mid_morning_time_uk="15:00",
+                fomc_time_uk="19:00",
+                close_time_uk="21:00",
+                is_dst_mismatch=False,
+                is_us_trading_day=True,
+                is_us_holiday=False,
+                is_us_early_close=False,
+                close_time_et="16:00",
+                phase="OPEN",
+                minutes_to_open=-30,
+                minutes_since_open=30,
+                minutes_to_close=390,
+            )
+
             # 1) Calm gate: NVDA 0% move, VIX 0% move -> skips grounding, uses deepseek-flash HIGH, no tools, trims <= 450
             clear_grounding_cache()
             calm_llm = _GateLLM("✅ 维持早报计划\n• 观察1：盘前平稳。\n• 观察2：" + ("细节" * 240))
-            calm_out = await generate_us_sentinel(cfg, t212, _GateMarketData(), calm_llm, db)
+            with patch("src.agents.report_agent.get_us_market_schedule_uk", return_value=open_sched):
+                calm_out = await generate_us_sentinel(cfg, t212, _GateMarketData(), calm_llm, db)
             self.assertLessEqual(len(calm_out), 450)
             self.assertEqual(len(calm_llm.calls), 1)
             self.assertEqual(calm_llm.calls[0]["model"], "deepseek-flash")
@@ -1114,7 +1141,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             clear_grounding_cache()
             anom_text = "🚨 盘前增量修正\n• NVDA 大幅异动，按规则重新核验。\n• " + ("归因分析" * 120)
             anom_llm = _GateLLM(anom_text)
-            anom_out = await generate_us_sentinel(cfg, t212, _GateMarketData(nvda_jump_pct=4.5), anom_llm, db)
+            with patch("src.agents.report_agent.get_us_market_schedule_uk", return_value=open_sched):
+                anom_out = await generate_us_sentinel(cfg, t212, _GateMarketData(nvda_jump_pct=4.5), anom_llm, db)
             self.assertLessEqual(len(anom_out), 600)
             self.assertGreater(len(anom_out), 450)
             grounding_calls = [c for c in anom_llm.calls if c.get("usage_label") == "us_grounding"]
@@ -1129,7 +1157,8 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
             # 3) VIX spike anomaly (+8.0% >= 4.0%) even with 0% stock move: triggers anomaly gate + gemini-4-hydrogen HIGH
             clear_grounding_cache()
             vix_llm = _GateLLM("🚨 盘前增量修正\n• VIX 急升，暂停追高。")
-            vix_out = await generate_us_sentinel(cfg, t212, _GateMarketData(vix_jump_pct=8.0), vix_llm, db)
+            with patch("src.agents.report_agent.get_us_market_schedule_uk", return_value=open_sched):
+                vix_out = await generate_us_sentinel(cfg, t212, _GateMarketData(vix_jump_pct=8.0), vix_llm, db)
             self.assertTrue(vix_out.startswith("🚨"))
             sentinel_vix = next(c for c in vix_llm.calls if c.get("usage_label") == "us_sentinel")
             self.assertEqual(sentinel_vix["model"], "gemini-4-hydrogen")
@@ -1721,17 +1750,18 @@ class TestDbAndEndToEnd(unittest.IsolatedAsyncioTestCase):
                 # Normal targeted query compacts non-target routine holdings
                 self.assertIn("其余 1 只常规持仓", p1)
 
-                # Static prefix order: morning report & guardrails & pick & baseline BEFORE live time / ISA / current query
+                # Static prefix order (v5.5.8): morning report -> deduped redlines -> cycle baseline
+                # -> same-cycle /pick radar at the static-prefix tail, all BEFORE live time / ISA / query.
                 idx_report = p1.index("【今日早报及美股哨兵纪要】")
                 idx_veto = p1.index("【今日风控红线】")
-                idx_pick = p1.index("【最近一次选股雷达")
-                idx_base = p1.index("【本周期组合基线与跨周期摘要】")
+                idx_base = p1.index("【本周期组合基线】")
+                idx_pick = p1.index("【今日选股雷达")
                 idx_time = p1.index("当前英国时间 ")
                 idx_isa = p1.index("【ISA 账户】")
                 idx_slice = p1.index("【提问标的本地快照切片")
                 idx_hist = p1.index("【今日对话记录")
                 idx_query = p1.index("【用户当前问题】")
-                self.assertTrue(idx_report < idx_veto < idx_pick < idx_base < idx_time < idx_isa < idx_slice < idx_hist < idx_query)
+                self.assertTrue(idx_report < idx_veto < idx_base < idx_pick < idx_time < idx_isa < idx_slice < idx_hist < idx_query)
 
                 # Local ContextPack slice injected ONLY for NVDA (not ULVR.L slice)
                 self.assertIn("NVDA | NVIDIA Corp | NASDAQ", p1)
