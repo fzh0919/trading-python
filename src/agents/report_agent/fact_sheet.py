@@ -236,8 +236,40 @@ def _compact_lesson_record(row: dict[str, Any]) -> dict[str, Any]:
         "action": str(row.get("action") or ""),
         "raw_return_pct": row.get("raw_return_pct"),
         "alpha_pct": row.get("alpha_pct"),
+        "mfe_pct": row.get("mfe_pct"),
+        "mae_pct": row.get("mae_pct"),
+        "regime": str(row.get("regime") or ""),
+        "process_quadrant": str(row.get("process_quadrant") or ""),
         "reflection_lesson": str(row.get("reflection_lesson") or "").strip()[:240],
     }
+
+
+def _format_lesson_entry(symbol: str, item: dict[str, Any]) -> str:
+    """Render one compact lesson line with regime / MFE-MAE / 2x2 tags when present."""
+    tag_parts: list[str] = []
+    action = str(item.get("action") or "").strip().upper()
+    if action:
+        tag_parts.append(action)
+    regime = str(item.get("regime") or "").strip().upper()
+    if regime:
+        tag_parts.append(regime)
+    alpha = item.get("alpha_pct")
+    if alpha is not None:
+        tag_parts.append(f"Alpha {float(alpha):+.1f}%")
+    mfe = item.get("mfe_pct")
+    mae = item.get("mae_pct")
+    if mfe is not None or mae is not None:
+        mfe_txt = f"{float(mfe):+.1f}%" if mfe is not None else "N/A"
+        mae_txt = f"{float(mae):+.1f}%" if mae is not None else "N/A"
+        tag_parts.append(f"MFE{mfe_txt}/MAE{mae_txt}")
+    quadrant = str(item.get("process_quadrant") or "").strip().upper()
+    if quadrant:
+        tag_parts.append(quadrant)
+    tag = " | ".join(tag_parts) if tag_parts else "已结算"
+    return (
+        f"• {symbol} [{item.get('created_at_uk')} {tag}]: "
+        f"{item.get('reflection_lesson')}"
+    )
 
 
 async def _fetch_symbol_lessons(
@@ -525,10 +557,7 @@ async def _assemble_fact_sheet_bundle(
     lesson_lines: list[str] = []
     for sym in tracked_syms:
         for item in lessons_by_sym.get(sym, []):
-            alpha_str = f"Alpha {item['alpha_pct']:+.1f}%" if item.get("alpha_pct") is not None else "已结算"
-            lesson_lines.append(
-                f"• {sym} [{item['created_at_uk']} {item['action']} | {alpha_str}]: {item['reflection_lesson']}"
-            )
+            lesson_lines.append(_format_lesson_entry(sym, item))
 
     deep_intel_lines: list[str] = []
     for sym in tracked_syms:

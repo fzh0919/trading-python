@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -35,62 +37,102 @@ def _event_uk_date(item: Any) -> str:
     return ""
 
 
+def _account_flow_label(account: Any) -> str:
+    return "ISA" if str(getattr(account, "account_label", "") or "").strip().upper() == "ISA" else "invest"
+
+
+def _collect_external_flows_gbp(
+    portfolio: PortfolioData,
+    *,
+    after_ms: int | None = None,
+    until_ms: int | None = None,
+    uk_date: str | None = None,
+) -> dict[str, Any]:
+    """Sum genuine external cash movements (DEPOSIT / WITHDRAW) in GBP.
+
+    Sign convention is immune to the T212 raw-sign quirks: ``DEPOSIT`` is always
+    ``+abs(amount)`` and ``WITHDRAW`` / ``WITHDRAWAL`` is always ``-abs(amount)``.
+    With ``after_ms`` the window is ``(after_ms, until_ms]`` so weekend, holiday
+    and after-close flows roll into the next persisted NAV row; without it, only
+    transactions whose UK date equals ``uk_date`` are counted (first-row path).
+    Cash interest, lending interest and platform fees are internal P&L / drag and
+    never external flows.
+    """
+    fx = float(getattr(portfolio, "gbp_usd_rate", None) or 0.0)
+    lower = int(after_ms) if after_ms is not None else None
+    upper = int(until_ms) if until_ms is not None else None
+    day = str(uk_date or "").strip()[:10]
+    flows: dict[str, Any] = {"total": 0.0, "ISA": 0.0, "invest": 0.0, "unconverted": 0}
+    for acc in (portfolio.isa, portfolio.invest):
+        label = _account_flow_label(acc)
+        acc_flow = 0.0
+        for tx in getattr(acc, "recent_transactions", []) or []:
+            sign = _EXTERNAL_FLOW_SIGNS.get(str(getattr(tx, "tx_type", "") or "").strip().upper())
+            if sign is None:
+                continue
+            if lower is not None:
+                tx_ms = int(getattr(tx, "date_time_ms", 0) or 0)
+                if tx_ms <= lower or (upper is not None and tx_ms > upper):
+                    continue
+            elif _event_uk_date(tx) != day:
+                continue
+            ccy = str(getattr(tx, "currency", "GBP") or "GBP").strip().upper()
+            amount = abs(float(getattr(tx, "amount", 0.0) or 0.0))
+            if ccy == "USD":
+                if fx <= 0:
+                    flows["unconverted"] += 1
+                    continue  # cannot convert safely -> never fabricate a GBP flow
+                amount = amount / fx
+            elif ccy not in ("GBP", ""):
+                flows["unconverted"] += 1
+                continue  # keep the NAV series strictly GBP-denominated
+            acc_flow += sign * amount
+        flows[label] += acc_flow
+        flows["total"] += acc_flow
+    return flows
+
+
 def build_nav_row(
     portfolio: PortfolioData,
     benchmark_close: float | None = None,
     uk_date: str | None = None,
+    *,
+    prev_snapshot_ms: int | None = None,
+    prev_uk_date: str | None = None,
 ) -> dict[str, Any]:
     """Build one lightweight daily NAV row (GBP-only scalars) for ``nav_history``.
 
-    Only genuine external cash movements (DEPOSIT / WITHDRAW) count as flows.
-    Cash interest, lending interest and platform fees are internal investment
-    P&L / drag and must stay inside the TWR numerator; dividends likewise already
-    sit inside NAV, so treating any of them as inflow would understate returns.
+    When ``prev_snapshot_ms`` is the strictly-earlier persisted row, external flows
+    are summed over ``(prev_snapshot_ms, fetched_at_ms]``. That catches deposits and
+    withdrawals made after the previous close (weekend, holidays, 22:00+) and keeps
+    same-day 07:30 -> 21:40 rewrites idempotent because the row is replaced with the
+    full-day flow stream, never accumulated.
     """
     day = (uk_date or str(getattr(portfolio, "fetched_at_uk", "") or "").strip()[:10]).strip()[:10]
     total = float(getattr(portfolio, "total_combined_value", 0.0) or 0.0)
     cash = float(getattr(portfolio, "total_combined_cash", 0.0) or 0.0)
+    fetched_ms = int(getattr(portfolio, "fetched_at_ms", 0) or 0)
+    prev_ms = int(prev_snapshot_ms or 0)
+    prev_day = str(prev_uk_date or "").strip()[:10]
 
-    net_flow = 0.0
-    isa_net_flow = 0.0
-    invest_net_flow = 0.0
-    for acc in (portfolio.isa, portfolio.invest):
-        acc_flow = 0.0
-        for tx in getattr(acc, "recent_transactions", []) or []:
-            if _event_uk_date(tx) != day:
-                continue
-            ccy = str(getattr(tx, "currency", "GBP") or "GBP").strip().upper()
-            amount = float(getattr(tx, "amount", 0.0) or 0.0)
-            if ccy == "USD":
-                fx = float(getattr(portfolio, "gbp_usd_rate", None) or 0.0)
-                if fx <= 0:
-                    continue  # cannot convert safely -> never fabricate a GBP flow
-                amount = amount / fx
-            elif ccy not in ("GBP", ""):
-                continue  # keep the NAV series strictly GBP-denominated
-            sign = _EXTERNAL_FLOW_SIGNS.get(str(getattr(tx, "tx_type", "") or "").strip().upper())
-            if sign is None:
-                continue
-            acc_flow += sign * amount
-        net_flow += acc_flow
-        # v5.5.3: split the same external-flow stream per philosophical account for split TWR.
-        if str(getattr(acc, "account_label", "") or "").strip().upper() == "ISA":
-            isa_net_flow += acc_flow
-        else:
-            invest_net_flow += acc_flow
+    if prev_ms > 0 and fetched_ms > prev_ms and (not prev_day or prev_day < day):
+        flow = _collect_external_flows_gbp(portfolio, after_ms=prev_ms, until_ms=fetched_ms)
+    else:
+        flow = _collect_external_flows_gbp(portfolio, uk_date=day)
 
     return {
         "uk_date": day,
         "total_value_gbp": round(total, 2),
         "cash_gbp": round(cash, 2),
         "invested_gbp": round(max(total - cash, 0.0), 2),
-        "net_flow_gbp": round(net_flow, 2),
+        "net_flow_gbp": round(float(flow["total"]), 2),
         "isa_value_gbp": round(float(getattr(portfolio.isa, "total_account_value", 0.0) or 0.0), 2),
         "invest_value_gbp": round(float(getattr(portfolio.invest, "total_account_value", 0.0) or 0.0), 2),
-        "isa_net_flow_gbp": round(isa_net_flow, 2),
-        "invest_net_flow_gbp": round(invest_net_flow, 2),
+        "isa_net_flow_gbp": round(float(flow["ISA"]), 2),
+        "invest_net_flow_gbp": round(float(flow["invest"]), 2),
         "benchmark_close": round(float(benchmark_close), 6) if benchmark_close else None,
         "cash_rate_pct": float(getattr(portfolio, "cash_interest_rate_pct", 0.0) or 0.0),
+        "created_at_ms": fetched_ms if fetched_ms > 0 else int(time.time() * 1000),
     }
 
 
@@ -293,8 +335,10 @@ def compute_account_split_performance(
     """Per-philosophy TWR: ISA value book vs Invest momentum book on the same math.
 
     Each account reuses ``compute_portfolio_performance`` with its own NAV leg
-    (``*_value_gbp + *_net_flow_gbp``) and its own external-flow stream, so ISA
-    capital injections never masquerade as Invest alpha (or vice versa).
+    (``*_value_gbp``) and its own external-flow stream, so ISA capital injections
+    never masquerade as Invest alpha (or vice versa). T212's per-account value
+    already contains that day's external flow, so adding ``flow`` back would
+    double-count deposits and fabricate a spike followed by a fake drawdown.
     """
     out: dict[str, Any] = {"ok": False, "isa": None, "invest": None}
     if not nav_rows:
@@ -311,7 +355,7 @@ def compute_account_split_performance(
             rows.append(
                 {
                     "uk_date": row.get("uk_date"),
-                    "total_value_gbp": value + flow,
+                    "total_value_gbp": value,
                     "net_flow_gbp": flow,
                     "cash_gbp": 0.0,
                     "benchmark_close": row.get("benchmark_close"),
@@ -328,6 +372,252 @@ def compute_account_split_performance(
     out["isa"] = isa_perf
     out["invest"] = invest_perf
     out["ok"] = bool(isa_perf.get("ok") or invest_perf.get("ok"))
+    return out
+
+
+_TX_PAGE_SIZE = 50  # T212 history endpoint page size used by the client
+
+
+def reconcile_recent_nav_flows(
+    nav_rows: list[dict[str, Any]],
+    portfolio: PortfolioData,
+    *,
+    history_days: int = 30,
+    max_pages: int = 3,
+    now_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return idempotent ``*_net_flow_gbp`` corrections for the last ~30 days.
+
+    Only the three flow columns are ever proposed; NAV, cash, benchmark and
+    timestamps are never touched. The transaction API covers ``history_days`` and
+    a one-day safety margin is left before the oldest usable row pair. Accounts
+    whose transaction feed is unsupported (403) or looks truncated by the paging
+    cap are skipped, so an existing legitimate flow is never overwritten with 0.
+    """
+    if not nav_rows or portfolio is None or getattr(portfolio, "is_fallback", False):
+        return []
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    cutoff_ms = now - max(1, int(history_days)) * 86_400_000
+    safe_start_ms = cutoff_ms + 86_400_000
+    page_cap = max(1, int(max_pages)) * _TX_PAGE_SIZE
+
+    active = [acc for acc in (portfolio.isa, portfolio.invest) if getattr(acc, "ok", False)]
+    if not active:
+        return []
+    eligible: dict[str, bool] = {}
+    for acc in active:
+        label = _account_flow_label(acc)
+        txs = list(getattr(acc, "recent_transactions", []) or [])
+        eligible[label] = bool(getattr(acc, "transactions_supported", False)) and len(txs) < page_cap
+    if not any(eligible.values()):
+        return []
+
+    rows = [
+        dict(row)
+        for row in nav_rows
+        if int(row.get("created_at_ms") or 0) > 0 and str(row.get("uk_date") or "").strip()
+    ]
+    rows.sort(key=lambda r: (str(r.get("uk_date") or ""), int(r.get("created_at_ms") or 0)))
+    total_reconcilable = bool(eligible.get("ISA")) and bool(eligible.get("invest"))
+    active_labels = {_account_flow_label(acc) for acc in active}
+
+    updates: list[dict[str, Any]] = []
+    for prev_row, cur_row in zip(rows, rows[1:]):
+        prev_ms = int(prev_row.get("created_at_ms") or 0)
+        cur_ms = int(cur_row.get("created_at_ms") or 0)
+        if prev_ms < safe_start_ms or cur_ms <= prev_ms:
+            continue
+        flows = _collect_external_flows_gbp(portfolio, after_ms=prev_ms, until_ms=cur_ms)
+        if flows["unconverted"]:
+            continue  # missing FX rate -> never fabricate a correction
+
+        old_total = float(cur_row.get("net_flow_gbp") or 0.0)
+        old_isa = float(cur_row.get("isa_net_flow_gbp") or 0.0)
+        old_invest = float(cur_row.get("invest_net_flow_gbp") or 0.0)
+        new_isa = float(flows["ISA"]) if eligible.get("ISA") else old_isa
+        new_invest = float(flows["invest"]) if eligible.get("invest") else old_invest
+        new_total = old_total
+        if total_reconcilable and active_labels == {"ISA", "invest"}:
+            new_total = new_isa + new_invest
+
+        changed = (
+            abs(new_isa - old_isa) >= 0.01
+            or abs(new_invest - old_invest) >= 0.01
+            or abs(new_total - old_total) >= 0.01
+        )
+        if not changed:
+            continue
+        updates.append(
+            {
+                "uk_date": str(cur_row.get("uk_date")),
+                "net_flow_gbp": round(new_total, 2),
+                "isa_net_flow_gbp": round(new_isa, 2),
+                "invest_net_flow_gbp": round(new_invest, 2),
+            }
+        )
+    return updates
+
+
+def compute_window_nav_performance(
+    nav_rows: list[dict[str, Any]],
+    portfolio: PortfolioData,
+    *,
+    lookback_days: int = 7,
+    previous_snapshot: PortfolioData | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Flow-adjusted window return for the weekly audit (TWR first, Dietz fallback).
+
+    Primary path appends the live portfolio as the tail point, so external flows
+    after the latest stored row are captured exactly. When the transaction feed
+    cannot be verified (403 / unsupported), only already-persisted NAV rows are
+    used; with fewer than two points the result is explicitly ``unverified`` so
+    the report can never print a fake Alpha.
+    """
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    lookback = max(1, int(lookback_days))
+    start_date = (
+        datetime.fromtimestamp(now / 1000.0, tz=timezone.utc) - timedelta(days=lookback)
+    ).date().isoformat()
+    out: dict[str, Any] = {
+        "ok": False,
+        "method": "insufficient",
+        "account_change_pct": None,
+        "net_flow_gbp": 0.0,
+        "net_pnl_gbp": None,
+        "flows_unverified": False,
+        "samples": 0,
+        "first_date": "",
+        "last_date": "",
+        "reason": "净值样本不足",
+    }
+
+    by_day: dict[str, dict[str, Any]] = {}
+    anchor_before: dict[str, Any] | None = None
+    for row in nav_rows or []:
+        day = str(row.get("uk_date") or "").strip()[:10]
+        if len(day) < 10:
+            continue
+        try:
+            nav = float(row.get("total_value_gbp") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if nav <= 0.0:
+            continue
+        normalized = {**row, "uk_date": day, "total_value_gbp": nav}
+        if day < start_date:
+            if anchor_before is None or day > str(anchor_before["uk_date"]):
+                anchor_before = normalized
+        else:
+            by_day[day] = normalized
+    # Bridge a weekend/holiday start_date (e.g. Saturday weekly audit where start_date is
+    # last Saturday) to Friday's close within 3 calendar days so the TWR window matches
+    # VWRP's 5-trading-bar return (including Monday's opening gap).
+    if start_date not in by_day and anchor_before is not None:
+        anchor_cutoff = (
+            datetime.fromtimestamp(now / 1000.0, tz=timezone.utc) - timedelta(days=lookback + 3)
+        ).date().isoformat()
+        if str(anchor_before["uk_date"]) >= anchor_cutoff:
+            by_day[str(anchor_before["uk_date"])] = anchor_before
+    rows = [by_day[d] for d in sorted(by_day)]
+
+    isa = getattr(portfolio, "isa", None) if portfolio is not None else None
+    invest = getattr(portfolio, "invest", None) if portfolio is not None else None
+    both_ok = bool(
+        portfolio is not None
+        and not getattr(portfolio, "is_fallback", False)
+        and isa is not None
+        and invest is not None
+        and getattr(isa, "ok", False)
+        and getattr(invest, "ok", False)
+    )
+    flows_verified = both_ok and all(
+        bool(getattr(acc, "transactions_supported", False)) for acc in (isa, invest)
+    )
+    can_use_live = both_ok and float(getattr(portfolio, "total_combined_value", 0.0) or 0.0) > 0.0
+
+    tail_day = str(getattr(portfolio, "fetched_at_uk", "") or "").strip()[:10] or datetime.fromtimestamp(
+        now / 1000.0, tz=timezone.utc
+    ).date().isoformat()
+    # A stale cached portfolio must never be inserted behind newer persisted rows.
+    tail_is_fresh = not rows or tail_day >= str(rows[-1].get("uk_date") or "")
+    if can_use_live and flows_verified and tail_is_fresh:
+        # If the latest stored row is already today's 07:30 report, anchor the tail
+        # to the strictly-earlier day so the whole day's flows stay in the window.
+        replace_same_day = bool(rows and str(rows[-1].get("uk_date") or "") == tail_day)
+        if replace_same_day:
+            base_row = rows[-2] if len(rows) >= 2 else None
+        else:
+            base_row = rows[-1] if rows else None
+        tail = build_nav_row(
+            portfolio,
+            uk_date=tail_day,
+            prev_snapshot_ms=int(base_row.get("created_at_ms") or 0) if base_row else 0,
+            prev_uk_date=str(base_row.get("uk_date") or "") if base_row else "",
+        )
+        if replace_same_day:
+            rows = rows[:-1] + [tail]
+        else:
+            rows.append(tail)
+
+    if len(rows) >= 2:
+        perf = compute_portfolio_performance(rows)
+        if perf.get("ok"):
+            start_nav = float(rows[0]["total_value_gbp"])
+            end_nav = float(rows[-1]["total_value_gbp"])
+            net_flow = sum(float(r.get("net_flow_gbp") or 0.0) for r in rows[1:])
+            out.update(
+                {
+                    "ok": True,
+                    "method": "twr_7d" if lookback == 7 else f"twr_{lookback}d",
+                    "account_change_pct": round(float(perf["total_return_pct"]), 2),
+                    "net_flow_gbp": round(net_flow, 2),
+                    "net_pnl_gbp": round(end_nav - start_nav - net_flow, 2),
+                    "samples": int(perf.get("samples") or len(rows)),
+                    "first_date": str(rows[0]["uk_date"]),
+                    "last_date": str(rows[-1]["uk_date"]),
+                    "reason": "",
+                }
+            )
+            return out
+
+    if can_use_live and flows_verified and previous_snapshot is not None:
+        prev_val = float(getattr(previous_snapshot, "total_combined_value", 0.0) or 0.0)
+        prev_ms = int(getattr(previous_snapshot, "fetched_at_ms", 0) or 0)
+        cur_val = float(getattr(portfolio, "total_combined_value", 0.0) or 0.0)
+        if prev_val > 0.0 and cur_val > 0.0 and prev_ms > 0:
+            until_ms = now if now > prev_ms else None
+            flows = _collect_external_flows_gbp(portfolio, after_ms=prev_ms, until_ms=until_ms)
+            if not flows["unconverted"]:
+                net_flow = float(flows["total"])
+                denominator = prev_val + 0.5 * net_flow
+                if denominator > 0.0:
+                    change = (cur_val - prev_val - net_flow) / denominator * 100.0
+                    out.update(
+                        {
+                            "ok": True,
+                            "method": "modified_dietz",
+                            "account_change_pct": round(change, 2),
+                            "net_flow_gbp": round(net_flow, 2),
+                            "net_pnl_gbp": round(cur_val - prev_val - net_flow, 2),
+                            "samples": 2,
+                            "first_date": str(getattr(previous_snapshot, "fetched_at_uk", "") or "")[:10],
+                            "last_date": str(getattr(portfolio, "fetched_at_uk", "") or "")[:10],
+                            "reason": "",
+                        }
+                    )
+                    return out
+
+    if both_ok and not flows_verified:
+        out.update(
+            {
+                "method": "unverified",
+                "flows_unverified": True,
+                "reason": "出入金流水不可用",
+            }
+        )
+    elif len(rows) == 1:
+        out["reason"] = "窗口内仅 1 个净值样本"
     return out
 
 

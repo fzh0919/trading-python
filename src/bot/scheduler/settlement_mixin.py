@@ -11,6 +11,7 @@ import pandas as pd
 
 from src.agents.ds_sidecar import call_ds_json, ds_helper_available, sanitize_plain_text
 from src.bot.scheduler.fill_receipts import _normalize_account_label
+from src.bot.scheduler.postmarket_mixin import PostmarketReviewMixin
 from src.bot.scheduler.settlement_math import (
     LONDON_TZ,
     NAV_SNAPSHOT_START_MINUTES,
@@ -28,7 +29,11 @@ from src.bot.scheduler.settlement_math import (
     _resolve_benchmark_candidates,
     _trade_direction,
 )
-from src.data_providers.analytics import build_nav_row
+from src.data_providers.analytics import (
+    build_nav_row,
+    classify_process_quadrant,
+    reconcile_recent_nav_flows,
+)
 from src.engine.calendar_utils import (
     add_trading_days,
     has_market_closed_on_date,
@@ -38,7 +43,7 @@ from src.engine.calendar_utils import (
 logger = logging.getLogger("src.bot.scheduler")
 
 
-class SettlementJobMixin:
+class SettlementJobMixin(PostmarketReviewMixin):
     async def _generate_settlement_reflection(
         self,
         *,
@@ -53,6 +58,14 @@ class SettlementJobMixin:
         bench_return_pct: float,
         alpha_pct: float,
         direction: int = 1,
+        mfe_pct: float | None = None,
+        mae_pct: float | None = None,
+        actual_filled: int | None = None,
+        actual_fill_price: float | None = None,
+        execution_slippage_pct: float | None = None,
+        regime: str = "",
+        process_quadrant: str = "",
+        holding_catalyst: str = "",
     ) -> str:
         """Generate a concise 2-4 sentence (<80 tokens) T+N post-mortem lesson using Hydrogen LOW."""
         symbol = str(rec.get("symbol") or "").upper()
@@ -61,6 +74,29 @@ class SettlementJobMixin:
         thesis = str(rec.get("thesis") or "").strip()[:220] or "未记录"
         direction_label = "多头买入（价格涨=正确）" if direction >= 0 else "减仓/止损（价格跌=正确，避损口径）"
 
+        extra_lines: list[str] = []
+        if str(regime or "").strip():
+            extra_lines.append(f"市场状态: {str(regime).strip().upper()}")
+        if mfe_pct is not None or mae_pct is not None:
+            mfe_txt = f"{float(mfe_pct):+.2f}%" if mfe_pct is not None else "N/A"
+            mae_txt = f"{float(mae_pct):+.2f}%" if mae_pct is not None else "N/A"
+            extra_lines.append(f"持有期 MFE / MAE: {mfe_txt} / {mae_txt}")
+        if actual_filled is not None or execution_slippage_pct is not None:
+            filled_txt = "是" if actual_filled == 1 else ("否" if actual_filled == 0 else "未核对")
+            fill_price_txt = f"{float(actual_fill_price):.4g}" if actual_fill_price is not None else "N/A"
+            slip_txt = (
+                f"{float(execution_slippage_pct):+.2f}%"
+                if execution_slippage_pct is not None
+                else "N/A"
+            )
+            extra_lines.append(f"实盘成交与滑点: 成交 {filled_txt} | 成交价 {fill_price_txt} | 滑点 {slip_txt}")
+        quadrant_txt = str(process_quadrant or "").strip().upper()
+        if quadrant_txt:
+            extra_lines.append(f"2×2 过程象限: {quadrant_txt}")
+        catalyst_txt = str(holding_catalyst or "").strip()
+        if catalyst_txt:
+            extra_lines.append(f"持有期客观催化: {catalyst_txt[:160]}")
+
         system_instruction = (
             f"你是冷静客观的量化投研复盘教练。现在已知历史推荐在 T+{holding_days} 个交易日后的真实表现。\n"
             f"注意 T+{holding_days} 窗口可能短于中长线逻辑本身，不能仅凭短期波动全盘否定长线逻辑，但要直面短期择时或催化偏差。\n"
@@ -68,7 +104,12 @@ class SettlementJobMixin:
             "严禁使用 #、**、列表符号或换行标题）：\n"
             f"1. 点明 T+{holding_days} 收益与相对 {benchmark_symbol} 的超额 Alpha 表现；\n"
             "2. 指出原推荐逻辑中哪部分被验证或证伪；\n"
-            "3. 提炼 1 条下次同类选股或择时可直接复用的具体纪律。"
+            "3. 提炼 1 条下次同类选股或择时可直接复用的具体纪律。\n"
+            "反后视纪律：\n"
+            "- 用 MFE/MAE 诊断是方向判断错误，还是止损过紧/止盈过早；\n"
+            "- 若过程象限为 GOOD_LOSS，严禁建议放宽止损或扛单；\n"
+            "- 若为 BAD_WIN，必须明确警示这是运气陷阱，不可复制；\n"
+            "- 持仓期有客观催化时只引用已给出的事实，无催化不得编故事。"
         )
         prompt = (
             f"标的: {symbol} ({account} | {action})\n"
@@ -79,6 +120,7 @@ class SettlementJobMixin:
             f"真实收益率: {raw_return_pct:+.2f}%\n"
             f"基准({benchmark_symbol})同期: {bench_return_pct:+.2f}%\n"
             f"超额 Alpha: {alpha_pct:+.2f}%"
+            + ("\n" + "\n".join(extra_lines) if extra_lines else "")
         )
         raw_reply = await self.llm.generate(
             model=self.cfg.models.chat_model,
@@ -189,6 +231,8 @@ class SettlementJobMixin:
         uk_now_str = dt_uk.strftime("%Y-%m-%d %H:%M")
         # Read-only fill ledger: matching real fills never rewrites wallets, only annotates the pick.
         fills_by_account, fills_available = await self._load_recent_fills_by_account()
+        # v5.5.10 Phase 2: one shared Flash Lite budget for the whole night (T+5/T+20 + EOD anomalies).
+        search_budget = self._postmarket_search_budget()
         pending = await self.db.get_pending_settlements(limit=50, only_with_entry_price=False)
         followups = (
             await self.db.get_settled_recommendations_for_followup(limit=50)
@@ -433,13 +477,45 @@ class SettlementJobMixin:
                     stock_ohlc, rec_date, exit_date, eff_entry, direction=direction
                 )
 
-                # v5.5.3 dual-philosophy layering: an ISA value BUY/ADD at T+5 is noise, not a lesson.
-                # Keep the T+5 outcome numeric only; the real post-mortem lands on the T+20 follow-up.
                 isa_value_entry = (
                     _normalize_account_label(account_label) == "ISA"
                     and action in {"BUY", "ADD"}
                     and holding_days <= 5
                 )
+                process_quadrant = classify_process_quadrant(
+                    action=action,
+                    raw_return_pct=raw_return_pct,
+                    alpha_pct=alpha_pct,
+                    fill_status=fill_status,
+                    actual_filled=actual_filled,
+                    execution_slippage_pct=execution_slippage_pct,
+                )
+                holding_catalyst = ""
+                catalyst_needed = (
+                    abs(float(raw_return_pct)) >= 8.0
+                    or abs(float(alpha_pct)) >= 6.0
+                    or (mae_pct is not None and float(mae_pct) <= -8.0)
+                )
+                if (
+                    not isa_value_entry
+                    and search_budget > 0
+                    and catalyst_needed
+                ):
+                    search_budget -= 1
+                    holding_catalyst = await self._fetch_catalyst_with_flash_lite(
+                        symbol,
+                        window_label=f"T+{holding_days} settlement ({rec_date.isoformat()} to {exit_date.isoformat()})",
+                        reason_hint=(
+                            f"T+{holding_days} raw return {raw_return_pct:+.1f}% | "
+                            f"alpha {alpha_pct:+.1f}% | MAE {mae_pct if mae_pct is not None else 'N/A'}"
+                        ),
+                        db=self.db,
+                        cache_scope=f"settle_t{holding_days}_{rec_date.isoformat()}",
+                        uk_date=dt_uk.date().isoformat(),
+                    )
+
+                # v5.5.3 dual-philosophy layering: an ISA value BUY/ADD at T+5 is noise, not a lesson.
+                # Keep the T+5 outcome numeric only; the real post-mortem lands on the T+20 follow-up.
                 if isa_value_entry:
                     lesson = ""
                 else:
@@ -456,11 +532,25 @@ class SettlementJobMixin:
                             bench_return_pct=bench_ret_pct,
                             alpha_pct=alpha_pct,
                             direction=direction,
+                            mfe_pct=mfe_pct,
+                            mae_pct=mae_pct,
+                            actual_filled=actual_filled,
+                            actual_fill_price=actual_fill_price,
+                            execution_slippage_pct=execution_slippage_pct,
+                            regime=str(rec.get("regime") or ""),
+                            process_quadrant=process_quadrant,
+                            holding_catalyst=holding_catalyst,
                         )
                     except Exception as exc:
-                        logger.warning("Settlement reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
-                        failed += 1
-                        continue
+                        # v5.5.10 Phase 2: a transient LLM failure must not keep a numeric
+                        # settlement PENDING forever; T+20 can still append the lesson later.
+                        logger.warning(
+                            "Settlement reflection failed for %s (id=%s), settling numerically: %s",
+                            symbol,
+                            rec_id,
+                            exc,
+                        )
+                        lesson = ""
 
                 saved = await self.db.settle_recommendation(
                     rec_id,
@@ -476,6 +566,8 @@ class SettlementJobMixin:
                     actual_filled=actual_filled,
                     actual_fill_price=actual_fill_price,
                     execution_slippage_pct=execution_slippage_pct,
+                    process_quadrant=process_quadrant,
+                    holding_catalyst=holding_catalyst,
                 )
                 if saved:
                     settled += 1
@@ -543,14 +635,45 @@ class SettlementJobMixin:
                         if mae_new is not None and prev_mae is not None:
                             mae_new = min(float(prev_mae), mae_new)
 
+                t20_quadrant = ""
+                if t20_alpha is not None:
+                    t20_quadrant = classify_process_quadrant(
+                        action=action,
+                        raw_return_pct=t20_ret,
+                        alpha_pct=t20_alpha,
+                        fill_status=str(rec.get("fill_status") or ""),
+                        actual_filled=rec.get("actual_filled"),
+                        execution_slippage_pct=rec.get("execution_slippage_pct"),
+                    )
+
                 # T+20 补写：ISA 价值仓 T+5 刻意不写短期反思，在这里用 20 日真实表现补一条。
                 t20_lesson: str | None = None
+                t20_catalyst = ""
                 if (
                     t20_alpha is not None
                     and t20_ctx is not None
                     and not str(rec.get("reflection_lesson") or "").strip()
                 ):
                     b_sym, b_ret, t20_exit_price, t20_exit_date, t20_eff_entry = t20_ctx
+                    catalyst_needed = (
+                        abs(float(t20_ret or 0.0)) >= 8.0
+                        or abs(float(t20_alpha)) >= 6.0
+                        or (mae_new is not None and float(mae_new) <= -8.0)
+                    )
+                    if search_budget > 0 and catalyst_needed:
+                        search_budget -= 1
+                        t20_catalyst = await self._fetch_catalyst_with_flash_lite(
+                            symbol,
+                            window_label=f"T+20 follow-up ({rec_date.isoformat()} to {t20_exit_date.isoformat()})",
+                            reason_hint=(
+                                f"T+20 raw return {float(t20_ret or 0.0):+.1f}% | "
+                                f"alpha {float(t20_alpha):+.1f}% | "
+                                f"MAE {mae_new if mae_new is not None else 'N/A'}"
+                            ),
+                            db=self.db,
+                            cache_scope=f"settle_t20_{rec_date.isoformat()}",
+                            uk_date=dt_uk.date().isoformat(),
+                        )
                     try:
                         t20_lesson = await self._generate_settlement_reflection(
                             rec=rec,
@@ -564,6 +687,14 @@ class SettlementJobMixin:
                             bench_return_pct=b_ret,
                             alpha_pct=float(t20_alpha),
                             direction=direction,
+                            mfe_pct=mfe_new,
+                            mae_pct=mae_new,
+                            actual_filled=rec.get("actual_filled"),
+                            actual_fill_price=rec.get("actual_fill_price"),
+                            execution_slippage_pct=rec.get("execution_slippage_pct"),
+                            regime=str(rec.get("regime") or ""),
+                            process_quadrant=t20_quadrant,
+                            holding_catalyst=t20_catalyst,
                         )
                     except Exception as exc:
                         logger.warning("T+20 reflection failed for %s (id=%s): %s", symbol, rec_id, exc)
@@ -578,6 +709,8 @@ class SettlementJobMixin:
                     mfe_pct=mfe_new,
                     mae_pct=mae_new,
                     reflection_lesson=t20_lesson,
+                    process_quadrant=t20_quadrant or None,
+                    holding_catalyst=t20_catalyst or None,
                 )
                 if updated:
                     followup_updated += 1
@@ -655,6 +788,20 @@ class SettlementJobMixin:
             except Exception as exc:
                 logger.warning("Post-close NAV catch-up failed: %s", exc)
 
+        # v5.5.10 Phase 2: 0-Token post-close execution ledger. Runs after the NAV
+        # anchor and before the 90-day prune; every failure stays silent and never
+        # blocks settlement or cleanup.
+        postmarket_alert_text = ""
+        if bool(getattr(self.cfg.strategy, "postmarket_review_enabled", True)) and dt_uk.weekday() < 5:
+            try:
+                postmarket_alert_text = await self._run_postmarket_review(
+                    now_utc=base,
+                    uk_date=dt_uk.date().isoformat(),
+                    search_budget=search_budget,
+                )
+            except Exception as exc:
+                logger.warning("Postmarket review failed: %s", exc)
+
         pruned = await self.db.prune_old_records(retention_days=90, now_utc=base)
         preferences_saved = 0
         if self.cfg.strategy.user_preference_memory_enabled:
@@ -673,6 +820,7 @@ class SettlementJobMixin:
             "shadow_settled": shadow_settled,
             "weekly_audit_ran": weekly_audit_ran,
             "nav_refreshed": nav_refreshed,
+            "postmarket_alert_text": postmarket_alert_text,
             "pruned": pruned,
             "preferences_saved": preferences_saved,
         }
@@ -713,12 +861,46 @@ class SettlementJobMixin:
             logger.debug("NAV snapshot benchmark close unavailable: %s", exc)
 
         row = build_nav_row(portfolio, benchmark_close=bench_close)
+        today_uk = str(row.get("uk_date") or "")
+        try:
+            prev_row = await self.db.get_previous_nav_row(today_uk) if today_uk else None
+        except Exception as exc:
+            logger.debug("NAV previous row lookup skipped: %s", exc)
+            prev_row = None
+        if prev_row is not None:
+            row = build_nav_row(
+                portfolio,
+                benchmark_close=bench_close,
+                prev_snapshot_ms=int(prev_row.get("created_at_ms") or 0),
+                prev_uk_date=str(prev_row.get("uk_date") or ""),
+            )
         await self.db.upsert_nav_history(row)
+        # v5.5.10: idempotently repair only the flow columns of the recent curve
+        # (weekend / after-close omissions and sign flips). Never blocks the job.
+        try:
+            recent_rows = await self.db.get_nav_history(limit=35)
+            updates = reconcile_recent_nav_flows(
+                recent_rows,
+                portfolio,
+                history_days=int(getattr(self.cfg.strategy, "order_history_days", 30) or 30),
+                max_pages=int(getattr(self.cfg.strategy, "order_history_max_pages", 3) or 3),
+            )
+            if updates:
+                changed = await self.db.update_nav_history_flows(updates)
+                logger.info("NAV flow reconciliation updated %d row(s)", changed)
+        except Exception as exc:
+            logger.debug("NAV flow reconciliation skipped: %s", exc)
         logger.info("NAV snapshot persisted: %s £%.2f", row.get("uk_date"), row.get("total_value_gbp", 0.0))
         return f"nav {row.get('uk_date')} £{row.get('total_value_gbp', 0.0):,.2f}"
 
-    async def _run_daily_settlement_job(self, now_utc: datetime) -> str:
+    async def _run_daily_settlement_job(self, now_utc: datetime, *, alert_chat_id: str = "") -> str:
         summary = await self._run_daily_settlement_impl(now_utc=now_utc)
+        alert_text = str(summary.get("postmarket_alert_text") or "").strip()
+        if alert_text and alert_chat_id:
+            try:
+                await self.tg.send_message(alert_chat_id, alert_text)
+            except Exception as exc:
+                logger.warning("Postmarket alert push failed: %s", exc)
         pruned_total = sum(summary["pruned"].values())
         if summary["settled"] == 0 and summary["failed"] > 0:
             return (

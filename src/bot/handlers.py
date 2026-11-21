@@ -178,6 +178,7 @@ class AdvisorBot:
             "• /us — 美股盘前/盘中/收盘/休市自适应增量盯盘简报（平稳≤450字，异动≤600字）\n"
             "• /deep <问题> — 深度单聊升级版（1000~1200字、最多4轮工具的多维推演，Token 消耗更高）\n"
             "• /stats — 历史推荐 T+5/10/20 胜率与 Alpha、MFE/MAE 极值、近期教训与量化体检\n"
+            "• /review — 0-Token 查看最近盘后执行账单（股价/FX 拆解、纪律核对、2x2 过程复盘）\n"
             "• /perf — 实盘绩效看板（TWR 剔入金收益、Sortino/最大回撤与修复天数、相对基准 Alpha-Beta-IR、\n"
             "  实盘胜率盈亏比期望、集中度 HHI、信号 t 值与衰减；0 Token 纯本地计算）\n"
 
@@ -421,6 +422,10 @@ class AdvisorBot:
             await self._send_reply(chat_id, await self._build_stats_message())
             return
 
+        if lower.startswith("/review"):
+            await self._send_reply(chat_id, await self._build_review_message())
+            return
+
         if lower.startswith("/perf"):
             await self._send_reply(chat_id, await self._build_perf_message())
             return
@@ -462,6 +467,7 @@ class AdvisorBot:
             or lower.startswith("/heath")
             or lower.startswith("/wallet")
             or lower.startswith("/usd")
+            or lower.startswith("/review")
         )
 
     @staticmethod
@@ -663,6 +669,53 @@ class AdvisorBot:
 
         return "\n".join(lines)
 
+    async def _build_review_message(self) -> str:
+        """0-Token, lock-free latest post-close ledger + recent 2x2 lessons."""
+        latest = None
+        lessons: list[dict[str, Any]] = []
+        if hasattr(self.db, "get_latest_postmarket_review"):
+            try:
+                latest = await self.db.get_latest_postmarket_review()
+            except Exception as exc:
+                logger.warning("/review postmarket ledger failed: %s", exc)
+        try:
+            lessons = await self.db.get_recent_lessons(limit=3)
+        except Exception as exc:
+            logger.warning("/review recent lessons failed: %s", exc)
+        if latest is None:
+            if lessons:
+                head = "📭 暂无盘后执行账单，先看近期已结算复盘："
+            else:
+                return "📭 暂无盘后执行账单（工作日 22:00 UK 结算后自动生成）。"
+        else:
+            head = str(latest.get("summary_text") or "").strip() or (
+                f"🧾 盘后执行账单 {latest.get('uk_date')} | {latest.get('regime') or 'UNKNOWN'}"
+            )
+            latest_date = str(latest.get("uk_date") or "").strip()
+            if latest_date and latest_date not in head:
+                head = f"🧾 最近盘后账单 {latest_date}\n{head}"
+        lines = [head.replace("#", "").replace("**", "")]
+        if lessons:
+            lines.append("近期 2x2 过程复盘:")
+            for row in lessons:
+                sym = str(row.get("symbol") or "").strip().upper()
+                action = str(row.get("action") or "").strip().upper()
+                regime = str(row.get("regime") or "").strip().upper()
+                quadrant = str(row.get("process_quadrant") or "").strip().upper()
+                mfe = row.get("mfe_pct")
+                mae = row.get("mae_pct")
+                tags = [t for t in (action, regime, quadrant) if t]
+                if mfe is not None or mae is not None:
+                    mfe_txt = f"{float(mfe):+.1f}%" if mfe is not None else "N/A"
+                    mae_txt = f"{float(mae):+.1f}%" if mae is not None else "N/A"
+                    tags.append(f"MFE{mfe_txt}/MAE{mae_txt}")
+                lesson = str(row.get("reflection_lesson") or "").strip()[:120]
+                if not lesson:
+                    continue
+                tag = " | ".join(tags) or "已结算"
+                lines.append(f"• {sym} [{tag}]: {lesson}")
+        return "\n".join(lines).replace("#", "").replace("**", "")
+
     async def _build_stats_message(self) -> str:
         async def _empty_audit() -> dict[str, Any] | None:
             return None
@@ -782,6 +835,16 @@ class AdvisorBot:
             lines.append(
                 f"• 实盘采纳: {adoption.get('filled_count', 0)}/{adoption.get('checked_count', 0)} 条命中真实成交 "
                 f"| 采纳率 {float(adoption.get('adoption_rate_pct') or 0.0):.1f}% | 平均执行滑点 {slip_s}"
+            )
+        quadrant = stats.get("quadrant_counts") or {}
+        classified = sum(int(quadrant.get(label) or 0) for label in ("GOOD_WIN", "GOOD_LOSS", "BAD_WIN", "BAD_LOSS"))
+        if classified > 0:
+            lines.append(
+                "• 过程 2x2: "
+                + " | ".join(
+                    f"{label} {int(quadrant.get(label) or 0)}"
+                    for label in ("GOOD_WIN", "GOOD_LOSS", "BAD_WIN", "BAD_LOSS")
+                )
             )
 
         # v5.5.9 M6: shadow counterfactual scoreboard — strictly isolated from the

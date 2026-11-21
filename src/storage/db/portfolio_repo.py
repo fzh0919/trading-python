@@ -90,6 +90,29 @@ class PortfolioRepoMixin:
             logger.warning("Failed to parse latest portfolio snapshot JSON: %s", exc)
             return None
 
+    async def get_snapshot_for_cycle_date(self, cycle_date: str) -> PortfolioData | None:
+        """Return the earliest persisted snapshot for one trading cycle (the 07:30 morning baseline)."""
+        cdate = str(cycle_date or "").strip()[:10]
+        if not cdate:
+            return None
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT payload_json FROM portfolio_snapshots
+                WHERE cycle_date = ?
+                ORDER BY fetched_at_ms ASC, id ASC LIMIT 1
+                """,
+                (cdate,),
+            )
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return PortfolioData.model_validate_json(row[0])
+        except Exception as exc:
+            logger.warning("Failed to parse cycle-date portfolio snapshot JSON: %s", exc)
+            return None
+
     async def upsert_nav_history(self, row: dict[str, Any]) -> None:
         """Idempotently persist one day's NAV scalar row (GBP-only) for TWR performance.
 
@@ -99,7 +122,7 @@ class PortfolioRepoMixin:
         uk_date = str(row.get("uk_date") or "").strip()[:10]
         if not uk_date:
             return
-        now_ms = int(time.time() * 1000)
+        now_ms = int(row.get("created_at_ms") or 0) or int(time.time() * 1000)
         payload = (
             uk_date,
             float(row.get("total_value_gbp") or 0.0),
@@ -148,7 +171,7 @@ class PortfolioRepoMixin:
                 """
                 SELECT uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
                        isa_value_gbp, invest_value_gbp, isa_net_flow_gbp, invest_net_flow_gbp,
-                       benchmark_close, cash_rate_pct
+                       benchmark_close, cash_rate_pct, created_at_ms
                 FROM nav_history
                 ORDER BY uk_date DESC
                 LIMIT ?
@@ -168,6 +191,7 @@ class PortfolioRepoMixin:
             "invest_net_flow_gbp",
             "benchmark_close",
             "cash_rate_pct",
+            "created_at_ms",
         )
         out: list[dict[str, Any]] = []
         for row in rows:
@@ -178,6 +202,77 @@ class PortfolioRepoMixin:
             out.append(item)
         out.reverse()
         return out
+
+    async def get_previous_nav_row(self, before_uk_date: str) -> dict[str, Any] | None:
+        """Return the latest NAV row strictly older than ``before_uk_date`` (for windowed flows)."""
+        day = str(before_uk_date or "").strip()[:10]
+        if not day:
+            return None
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT uk_date, total_value_gbp, cash_gbp, invested_gbp, net_flow_gbp,
+                       isa_value_gbp, invest_value_gbp, isa_net_flow_gbp, invest_net_flow_gbp,
+                       benchmark_close, cash_rate_pct, created_at_ms
+                FROM nav_history
+                WHERE uk_date < ?
+                ORDER BY uk_date DESC
+                LIMIT 1
+                """,
+                (day,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        cols = (
+            "uk_date",
+            "total_value_gbp",
+            "cash_gbp",
+            "invested_gbp",
+            "net_flow_gbp",
+            "isa_value_gbp",
+            "invest_value_gbp",
+            "isa_net_flow_gbp",
+            "invest_net_flow_gbp",
+            "benchmark_close",
+            "cash_rate_pct",
+            "created_at_ms",
+        )
+        item = dict(zip(cols, row))
+        item["created_at_ms"] = int(item.get("created_at_ms") or 0)
+        return item
+
+    async def update_nav_history_flows(self, updates: list[dict[str, Any]]) -> int:
+        """Update only the three external-flow columns, inside the single write lock.
+
+        NAV / cash / invested / benchmark / ``created_at_ms`` are never touched, so
+        a flow reconciliation can never rewrite the persisted equity curve.
+        """
+        if not updates:
+            return 0
+        changed = 0
+        async with self._connect(write=True) as db:
+            for item in updates:
+                uk_date = str(item.get("uk_date") or "").strip()[:10]
+                if not uk_date:
+                    continue
+                cur = await db.execute(
+                    """
+                    UPDATE nav_history
+                    SET net_flow_gbp = ?, isa_net_flow_gbp = ?, invest_net_flow_gbp = ?
+                    WHERE uk_date = ?
+                    """,
+                    (
+                        float(item.get("net_flow_gbp") or 0.0),
+                        float(item.get("isa_net_flow_gbp") or 0.0),
+                        float(item.get("invest_net_flow_gbp") or 0.0),
+                        uk_date,
+                    ),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    changed += int(cur.rowcount)
+            await db.commit()
+        return changed
 
     async def save_morning_report(
         self,

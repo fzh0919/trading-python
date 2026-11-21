@@ -494,6 +494,19 @@ class OpsAndChatRepoMixin:
                 "DELETE FROM grounding_news_cache WHERE fetched_at_ms < ?",
                 (cutoff_ms,),
             )
+            # Post-close ledgers follow the same 90-day window but always keep the latest row.
+            cur_postmarket = await db.execute(
+                """
+                DELETE FROM daily_postmarket_reviews
+                WHERE created_at_ms < ?
+                  AND uk_date != COALESCE(
+                      (SELECT uk_date FROM daily_postmarket_reviews
+                       ORDER BY created_at_ms DESC, uk_date DESC LIMIT 1),
+                      ''
+                  )
+                """,
+                (cutoff_ms,),
+            )
             # Pending-order snapshots are a short-lived diff anchor: keep 3 days only.
             cur_pending = await db.execute(
                 "DELETE FROM pending_order_snapshots WHERE last_seen_ms < ?",
@@ -507,6 +520,7 @@ class OpsAndChatRepoMixin:
                 "ohlcv_cache": int(cur_ohlcv.rowcount or 0),
                 "grounding_news_cache": int(cur_grounding.rowcount or 0),
                 "pending_order_snapshots": int(cur_pending.rowcount or 0),
+                "daily_postmarket_reviews": int(cur_postmarket.rowcount or 0),
             }
 
     async def has_scheduler_job_fired(self, job_name: str, uk_date: str) -> bool:

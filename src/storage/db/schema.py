@@ -91,7 +91,9 @@ class SchemaMixin:
                     execution_slippage_pct REAL DEFAULT NULL,
                     regime TEXT DEFAULT '',
                     shadow_trigger TEXT DEFAULT '',
-                    shadow_reason TEXT DEFAULT ''
+                    shadow_reason TEXT DEFAULT '',
+                    process_quadrant TEXT DEFAULT '',
+                    holding_catalyst TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_history (
@@ -251,6 +253,20 @@ class SchemaMixin:
                 );
                 CREATE INDEX IF NOT EXISTS idx_grounding_news_fetched ON grounding_news_cache(fetched_at_ms);
 
+                CREATE TABLE IF NOT EXISTS daily_postmarket_reviews (
+                    uk_date TEXT PRIMARY KEY,
+                    created_at_uk TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    regime TEXT DEFAULT '',
+                    local_pnl_gbp REAL DEFAULT 0,
+                    fx_pnl_gbp REAL DEFAULT 0,
+                    total_mark_pnl_gbp REAL DEFAULT 0,
+                    discipline_alert_count INTEGER DEFAULT 0,
+                    summary_text TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_postmarket_reviews_ms ON daily_postmarket_reviews(created_at_ms);
+
                 CREATE TABLE IF NOT EXISTS wallet_balances (
                     account_label TEXT NOT NULL,
                     currency TEXT NOT NULL,
@@ -335,6 +351,8 @@ class SchemaMixin:
                     "regime": "TEXT DEFAULT ''",
                     "shadow_trigger": "TEXT DEFAULT ''",
                     "shadow_reason": "TEXT DEFAULT ''",
+                    "process_quadrant": "TEXT DEFAULT ''",
+                    "holding_catalyst": "TEXT DEFAULT ''",
                 },
             )
             await _ensure_columns(

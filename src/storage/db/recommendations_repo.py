@@ -17,7 +17,7 @@ _RECOMMENDATION_SELECT_COLS = (
     "outcome_status, reflection_lesson, "
     "t10_return_pct, t10_alpha_pct, t20_return_pct, t20_alpha_pct, mfe_pct, mae_pct, "
     "source, fill_status, actual_filled, actual_fill_price, execution_slippage_pct, "
-    "regime, shadow_trigger, shadow_reason"
+    "regime, shadow_trigger, shadow_reason, process_quadrant, holding_catalyst"
 )
 
 
@@ -53,6 +53,8 @@ def _row_to_recommendation(row: tuple[Any, ...]) -> dict[str, Any]:
         "regime": str(row[26] or ""),
         "shadow_trigger": str(row[27] or ""),
         "shadow_reason": str(row[28] or ""),
+        "process_quadrant": str(row[29] or ""),
+        "holding_catalyst": str(row[30] or ""),
     }
 
 
@@ -300,12 +302,16 @@ class RecommendationsRepoMixin:
         actual_filled: int | None = None,
         actual_fill_price: float | None = None,
         execution_slippage_pct: float | None = None,
+        process_quadrant: str | None = None,
+        holding_catalyst: str | None = None,
     ) -> bool:
         """Idempotently settle a PENDING recommendation; returns False if already settled."""
         status = str(outcome_status or "SETTLED").strip().upper()
         bench = str(benchmark_symbol or "").strip().upper()
         lesson = str(reflection_lesson or "").strip()[:600]
         fill = str(fill_status or "").strip().upper()
+        quadrant = None if process_quadrant is None else str(process_quadrant or "").strip().upper()[:24]
+        catalyst = None if holding_catalyst is None else str(holding_catalyst or "").strip()[:200]
         async with self._connect(write=True) as db:
             cur = await db.execute(
                 """
@@ -321,7 +327,9 @@ class RecommendationsRepoMixin:
                     fill_status = CASE WHEN ? = '' THEN fill_status ELSE ? END,
                     actual_filled = COALESCE(?, actual_filled),
                     actual_fill_price = COALESCE(?, actual_fill_price),
-                    execution_slippage_pct = COALESCE(?, execution_slippage_pct)
+                    execution_slippage_pct = COALESCE(?, execution_slippage_pct),
+                    process_quadrant = COALESCE(?, process_quadrant),
+                    holding_catalyst = COALESCE(?, holding_catalyst)
                 WHERE id = ? AND (outcome_status IS NULL OR outcome_status = 'PENDING')
                 """,
                 (
@@ -338,6 +346,8 @@ class RecommendationsRepoMixin:
                     (None if actual_filled is None else int(actual_filled)),
                     actual_fill_price,
                     execution_slippage_pct,
+                    quadrant,
+                    catalyst,
                     int(rec_id),
                 ),
             )
@@ -369,6 +379,8 @@ class RecommendationsRepoMixin:
         mfe_pct: float | None = None,
         mae_pct: float | None = None,
         reflection_lesson: str | None = None,
+        process_quadrant: str | None = None,
+        holding_catalyst: str | None = None,
     ) -> bool:
         """Update non-null T+10/T+20 follow-up returns and MFE/MAE metrics on a SETTLED recommendation."""
         updates: list[str] = []
@@ -389,6 +401,12 @@ class RecommendationsRepoMixin:
         if lesson_txt:
             updates.append("reflection_lesson = ?")
             params.append(lesson_txt)
+        if process_quadrant is not None:
+            updates.append("process_quadrant = ?")
+            params.append(str(process_quadrant or "").strip().upper()[:24])
+        if holding_catalyst is not None:
+            updates.append("holding_catalyst = ?")
+            params.append(str(holding_catalyst or "").strip()[:200])
         if not updates:
             return False
 
@@ -491,6 +509,27 @@ class RecommendationsRepoMixin:
                 """
             )
             adopt_row = await adopt_cur.fetchone()
+            quadrant_cur = await db.execute(
+                """
+                SELECT UPPER(COALESCE(NULLIF(TRIM(process_quadrant), ''), '')), COUNT(*)
+                FROM pick_recommendations
+                WHERE outcome_status = 'SETTLED'
+                  AND COALESCE(source, 'pick') != 'core_dca'
+                GROUP BY 1
+                """
+            )
+            quadrant_rows = await quadrant_cur.fetchall()
+
+        quadrant_counts: dict[str, int] = {
+            "GOOD_WIN": 0,
+            "GOOD_LOSS": 0,
+            "BAD_WIN": 0,
+            "BAD_LOSS": 0,
+        }
+        for q_row in quadrant_rows or []:
+            label = str(q_row[0] or "").strip().upper()
+            if label in quadrant_counts:
+                quadrant_counts[label] = int(q_row[1] or 0)
 
         by_account: dict[str, dict[str, Any]] = {
             "ISA": {
@@ -553,6 +592,7 @@ class RecommendationsRepoMixin:
                 "shadow_count": 0,
                 "by_account": by_account,
                 "adoption_stats": adoption_stats,
+                "quadrant_counts": quadrant_counts,
             }
         settled = int(row[4] or 0)
         win_cnt = int(row[5] or 0)
@@ -579,6 +619,7 @@ class RecommendationsRepoMixin:
             "shadow_count": int(row[13] or 0),
             "by_account": by_account,
             "adoption_stats": adoption_stats,
+            "quadrant_counts": quadrant_counts,
         }
 
     async def get_settled_outcome_series(self, limit: int = 400) -> list[dict[str, Any]]:

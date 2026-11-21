@@ -727,6 +727,18 @@ def _format_lessons_section(
             perf_parts.append(f"收益 {float(raw_ret):+.1f}%")
         if alpha is not None:
             perf_parts.append(f"Alpha {float(alpha):+.1f}%")
+        regime = str(row.get("regime") or "").strip().upper()
+        if regime:
+            perf_parts.append(regime)
+        mfe = row.get("mfe_pct")
+        mae = row.get("mae_pct")
+        if mfe is not None or mae is not None:
+            mfe_txt = f"{float(mfe):+.1f}%" if mfe is not None else "N/A"
+            mae_txt = f"{float(mae):+.1f}%" if mae is not None else "N/A"
+            perf_parts.append(f"MFE{mfe_txt}/MAE{mae_txt}")
+        quadrant = str(row.get("process_quadrant") or "").strip().upper()
+        if quadrant:
+            perf_parts.append(quadrant)
         perf = " / ".join(perf_parts) or "已结算"
         lines.append(f"• [{dt} {acct}] {act} {sym} ({perf}): {lesson[:180]}")
 

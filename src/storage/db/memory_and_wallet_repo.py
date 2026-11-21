@@ -226,6 +226,101 @@ class MemoryAndWalletRepoMixin:
             await db.commit()
         return len(rows)
 
+    @staticmethod
+    def _postmarket_row_dict(row: tuple[Any, ...]) -> dict[str, Any]:
+        raw_payload = str(row[9] or "{}")
+        try:
+            parsed = json.loads(raw_payload)
+            if not isinstance(parsed, dict):
+                parsed = {}
+        except json.JSONDecodeError:
+            parsed = {}
+        return {
+            "uk_date": str(row[0] or ""),
+            "created_at_uk": str(row[1] or ""),
+            "created_at_ms": int(row[2] or 0),
+            "regime": str(row[3] or ""),
+            "local_pnl_gbp": float(row[4] or 0.0),
+            "fx_pnl_gbp": float(row[5] or 0.0),
+            "total_mark_pnl_gbp": float(row[6] or 0.0),
+            "discipline_alert_count": int(row[7] or 0),
+            "summary_text": str(row[8] or ""),
+            "payload_json": raw_payload,
+            "payload": parsed,
+        }
+
+    async def upsert_daily_postmarket_review(self, row: dict[str, Any]) -> None:
+        """Idempotently persist one UK-date post-close execution ledger (0-Token, GBP scalars)."""
+        uk_date = str(row.get("uk_date") or "").strip()[:10]
+        if not uk_date:
+            return
+        now_ms = int(row.get("created_at_ms") or 0) or int(time.time() * 1000)
+        created_at_uk = str(row.get("created_at_uk") or "").strip() or datetime.now(
+            timezone.utc
+        ).astimezone(LONDON_TZ).strftime("%Y-%m-%d %H:%M")
+        payload_raw = row.get("payload_json")
+        if isinstance(payload_raw, str) and payload_raw.strip():
+            payload_json = payload_raw
+        else:
+            payload_json = json.dumps(row.get("payload") or {}, ensure_ascii=False, default=str)
+        summary_text = str(row.get("summary_text") or "").strip()
+        async with self._connect(write=True) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO daily_postmarket_reviews (
+                    uk_date, created_at_uk, created_at_ms, regime,
+                    local_pnl_gbp, fx_pnl_gbp, total_mark_pnl_gbp,
+                    discipline_alert_count, summary_text, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uk_date,
+                    created_at_uk,
+                    now_ms,
+                    str(row.get("regime") or "").strip().upper()[:16],
+                    float(row.get("local_pnl_gbp") or 0.0),
+                    float(row.get("fx_pnl_gbp") or 0.0),
+                    float(row.get("total_mark_pnl_gbp") or 0.0),
+                    int(row.get("discipline_alert_count") or 0),
+                    summary_text,
+                    payload_json,
+                ),
+            )
+            await db.commit()
+
+    async def get_latest_postmarket_review(self) -> dict[str, Any] | None:
+        """Return the most recent post-close execution ledger, if any."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT uk_date, created_at_uk, created_at_ms, regime,
+                       local_pnl_gbp, fx_pnl_gbp, total_mark_pnl_gbp,
+                       discipline_alert_count, summary_text, payload_json
+                FROM daily_postmarket_reviews
+                ORDER BY uk_date DESC, created_at_ms DESC
+                LIMIT 1
+                """
+            )
+            row = await cur.fetchone()
+        return self._postmarket_row_dict(row) if row else None
+
+    async def get_recent_postmarket_reviews(self, limit: int = 7) -> list[dict[str, Any]]:
+        """Return the most recent N post-close execution ledgers, newest first."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT uk_date, created_at_uk, created_at_ms, regime,
+                       local_pnl_gbp, fx_pnl_gbp, total_mark_pnl_gbp,
+                       discipline_alert_count, summary_text, payload_json
+                FROM daily_postmarket_reviews
+                ORDER BY uk_date DESC, created_at_ms DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = await cur.fetchall()
+        return [self._postmarket_row_dict(r) for r in rows]
+
     async def get_wallet_balances(self, account_label: str = "Invest") -> dict[str, dict[str, Any]]:
         """Return local per-currency wallet anchors for one account keyed by upper-case currency."""
         label = str(account_label or "Invest").strip()

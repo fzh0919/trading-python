@@ -84,7 +84,7 @@ schedule:
   morning_report_hour: 7
   morning_report_minute: 30
   premarket_lead_minutes: 15
-  enable_weekly_radar: true
+  enable_weekly_radar: false      # v5.5.10: 关闭周五收盘后自动 /pick（手动 /pick 不受影响）
   weekly_radar_after_close_minutes: 30
 
 strategy:
@@ -99,6 +99,12 @@ strategy:
   order_history_days: 30
   order_history_max_pages: 3
   max_daily_chat_turns: 12
+  # v5.5.10 Phase 2: 0-Token 盘后执行账单与异常单催化检索
+  postmarket_review_enabled: true          # 盘后 0-Token 账单总开关
+  postmarket_push_on_alert_only: true      # 仅纪律偏离/重大公告异动才推送（<=250字），平静日零打扰
+  postmarket_event_search_enabled: true    # 是否启用 Flash Lite 异常单/重仓公告检索（false=全流程0搜索）
+  postmarket_anomaly_min_move_pct: 3.5     # 盘后异动本地货币涨跌下限（还须 >=2*ATR% 且超额 >=2.5%）
+  postmarket_max_search_symbols: 3         # 单晚全盘后任务 Flash Lite 联网检索总硬上限
 
   # Deterministic Add/Trim/Stop/Correlation guardrails (portfolio_rules.py & screener.py)
   max_isa_single_weight_pct: 30.0

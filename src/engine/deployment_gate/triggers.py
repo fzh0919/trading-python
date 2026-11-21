@@ -283,10 +283,12 @@ def _today_external_inflow(
         for tx in acct.recent_transactions:
             if tx.date_time_ms < today_start_ms:
                 continue
+            # T212 normalises WITHDRAW to a negative amount; abs() keeps a real
+            # outflow negative instead of flipping it back into an inflow.
             if tx.tx_type == "DEPOSIT":
-                net += float(tx.amount)
-            elif tx.tx_type == "WITHDRAW":
-                net -= float(tx.amount)
+                net += abs(float(tx.amount))
+            elif tx.tx_type in ("WITHDRAW", "WITHDRAWAL"):
+                net -= abs(float(tx.amount))
         per_acct[acct.account_label.upper()] = _round2(net)
     triggered: list[str] = []
     for label, net in per_acct.items():

@@ -511,6 +511,51 @@ class TestNavSplitAttribution(_DbCase):
         self.assertAlmostEqual(row["isa_net_flow_gbp"], 500.0, places=2)
         self.assertAlmostEqual(row["invest_net_flow_gbp"], -100.0, places=2)
 
+    async def test_negative_withdraw_is_never_flipped_into_an_inflow(self) -> None:
+        # Production T212 payload: WITHDRAW amount is already -abs().
+        tx = HistoricalTransactionItem(
+            id="tx-wd-neg",
+            account="ISA",
+            tx_type="WITHDRAW",
+            amount=-750.0,
+            currency="GBP",
+            date_time="2026-11-17T09:00:00Z",
+            date_time_ms=1794900000000,
+            uk_time_str="2026-11-17 09:00",
+        )
+        portfolio = _portfolio(isa_transactions=[tx])
+        row = build_nav_row(portfolio, uk_date="2026-11-17")
+        self.assertAlmostEqual(row["net_flow_gbp"], -750.0, places=2)
+
+    def test_split_twr_smooths_a_large_invest_deposit(self) -> None:
+        rows = [
+            {
+                "uk_date": "2026-11-10",
+                "isa_value_gbp": 6000.0,
+                "invest_value_gbp": 4000.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+            },
+            {
+                "uk_date": "2026-11-11",
+                "isa_value_gbp": 6000.0,
+                "invest_value_gbp": 6000.0,  # 2000 deposit already included
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 2000.0,
+            },
+            {
+                "uk_date": "2026-11-12",
+                "isa_value_gbp": 6000.0,
+                "invest_value_gbp": 6030.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+            },
+        ]
+        split = compute_account_split_performance(rows)
+        self.assertTrue(split["invest"]["ok"])
+        self.assertAlmostEqual(split["invest"]["total_return_pct"], 0.5, places=2)
+        self.assertAlmostEqual(split["invest"]["max_drawdown_pct"], 0.0, places=2)
+
     async def test_perf_message_includes_split_and_core_policy(self) -> None:
         for idx in range(8):
             day = (datetime(2026, 11, 10) + timedelta(days=idx)).strftime("%Y-%m-%d")

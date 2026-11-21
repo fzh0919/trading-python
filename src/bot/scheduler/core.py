@@ -425,7 +425,7 @@ class TradingScheduler(SettlementJobMixin, WeeklyAuditJobMixin, IntradaySentinel
                     job_name="daily_settlement",
                     chat_id=chat_id,
                     uk_now_str=uk_now_str,
-                    coro=self._run_daily_settlement_job(base),
+                    coro=self._run_daily_settlement_job(base, alert_chat_id=chat_id),
                     send_to_tg=False,
                 )
 

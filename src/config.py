@@ -232,7 +232,7 @@ class ScheduleSection(BaseModel):
     morning_report_hour: int = 7
     morning_report_minute: int = 30
     premarket_lead_minutes: int = 15
-    enable_weekly_radar: bool = True
+    enable_weekly_radar: bool = False
     weekly_radar_after_close_minutes: int = 30
 
 
@@ -248,6 +248,12 @@ class StrategySection(BaseModel):
     order_history_days: int = 30
     order_history_max_pages: int = 3
     max_daily_chat_turns: int = 12
+    # v5.5.10 Phase 2: deterministic post-close execution ledger and catalyst search budget.
+    postmarket_review_enabled: bool = True
+    postmarket_push_on_alert_only: bool = True
+    postmarket_event_search_enabled: bool = True
+    postmarket_anomaly_min_move_pct: float = Field(default=3.5, gt=0.0, le=20.0)
+    postmarket_max_search_symbols: int = Field(default=3, ge=0, le=10)
     # Deterministic Add/Trim/Stop/Correlation guardrails (used by portfolio_rules.py & screener.py)
     max_isa_single_weight_pct: float = 30.0
     max_invest_single_weight_pct: float = 25.0

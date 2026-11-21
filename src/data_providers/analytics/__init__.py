@@ -56,15 +56,25 @@ from src.data_providers.analytics.correlation import (
 from src.data_providers.analytics.performance import (
     _EXTERNAL_FLOW_SIGNS,
     _event_uk_date,
+    _collect_external_flows_gbp,
     build_nav_row,
     compute_portfolio_performance,
     compute_account_split_performance,
+    reconcile_recent_nav_flows,
+    compute_window_nav_performance,
     compute_trade_attribution,
     compute_signal_quality,
     compute_concentration_metrics,
     _CORE_POLICY_BENCHMARK_WEIGHTS,
     compute_core_policy_benchmark_comparison,
     compute_regime_attribution,
+)
+from src.data_providers.analytics.postmarket_review import (
+    classify_process_quadrant,
+    build_eod_attribution_ledger,
+    format_postmarket_review_text,
+    format_postmarket_alert_text,
+    is_substantive_catalyst,
 )
 
 __all__ = [
@@ -90,9 +100,16 @@ __all__ = [
     "build_nav_row",
     "compute_portfolio_performance",
     "compute_account_split_performance",
+    "reconcile_recent_nav_flows",
+    "compute_window_nav_performance",
     "compute_trade_attribution",
     "compute_signal_quality",
     "compute_concentration_metrics",
     "compute_core_policy_benchmark_comparison",
     "compute_regime_attribution",
+    "classify_process_quadrant",
+    "build_eod_attribution_ledger",
+    "format_postmarket_review_text",
+    "format_postmarket_alert_text",
+    "is_substantive_catalyst",
 ]

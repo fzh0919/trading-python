@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.data_providers.analytics import (
     build_nav_row,
+    compute_account_split_performance,
     compute_concentration_metrics,
     compute_portfolio_performance,
     compute_signal_quality,
     compute_trade_attribution,
+    compute_window_nav_performance,
+    reconcile_recent_nav_flows,
 )
 from src.data_providers.t212_client import (
     AccountSnapshot,
@@ -24,17 +28,27 @@ from src.data_providers.t212_client import (
 from src.storage.db import AdvisorDatabase
 
 
-def _tx(amount: float, tx_type: str = "DEPOSIT", ccy: str = "GBP", day: str = "2026-11-17") -> HistoricalTransactionItem:
+def _tx(
+    amount: float,
+    tx_type: str = "DEPOSIT",
+    ccy: str = "GBP",
+    day: str = "2026-11-17",
+    ms: int = 1,
+) -> HistoricalTransactionItem:
     return HistoricalTransactionItem(
-        id=f"tx-{tx_type}-{amount}",
+        id=f"tx-{tx_type}-{amount}-{ms}",
         account="ISA",
         tx_type=tx_type,
         amount=amount,
         currency=ccy,
         date_time=f"{day} 09:00:00",
-        date_time_ms=1,
+        date_time_ms=ms,
         uk_time_str=f"{day} 09:00",
     )
+
+
+def _ms(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> int:
+    return int(datetime(year, month, day, hour, minute, tzinfo=timezone.utc).timestamp() * 1000)
 
 
 def _order(side: str, pnl: float, filled_ms: int, ticker: str = "NVDA", ccy: str = "GBP") -> HistoricalOrderItem:
@@ -127,6 +141,163 @@ class TestNavRowAndPerformance(unittest.TestCase):
         portfolio.gbp_usd_rate = 1.25
         row = build_nav_row(portfolio)
         self.assertAlmostEqual(row["net_flow_gbp"], 100.0, places=2)
+
+    def test_negative_withdraw_amount_stays_a_negative_flow(self) -> None:
+        # Real T212 payloads arrive with WITHDRAW already normalised to a negative
+        # amount; the flow helper must never flip it back into an inflow.
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            total_account_value=600.0,
+            recent_transactions=[_tx(-250.0, "WITHDRAW")],
+        )
+        row = build_nav_row(_portfolio(total=1000.0, cash=400.0, isa=isa))
+        self.assertAlmostEqual(row["net_flow_gbp"], -250.0, places=2)
+        self.assertAlmostEqual(row["isa_net_flow_gbp"], -250.0, places=2)
+
+    def test_weekend_and_after_close_flows_roll_into_next_row(self) -> None:
+        prev_ms = _ms(2026, 11, 13, 21, 40)  # Friday post-close row
+        now_ms = _ms(2026, 11, 16, 21, 40)  # Monday post-close row
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            total_account_value=11600.0,
+            recent_transactions=[
+                _tx(900.0, "DEPOSIT", day="2026-11-13", ms=_ms(2026, 11, 13, 20, 0)),  # before prev row
+                _tx(500.0, "DEPOSIT", day="2026-11-13", ms=_ms(2026, 11, 13, 22, 30)),  # Friday after close
+                _tx(200.0, "DEPOSIT", day="2026-11-14", ms=_ms(2026, 11, 14, 12, 0)),  # Saturday
+                _tx(300.0, "DEPOSIT", day="2026-11-16", ms=_ms(2026, 11, 16, 9, 0)),  # Monday
+            ],
+        )
+        portfolio = _portfolio(total=11600.0, cash=1600.0, isa=isa)
+        portfolio.fetched_at_uk = "2026-11-16 21:40"
+        portfolio.fetched_at_ms = now_ms
+
+        row = build_nav_row(
+            portfolio,
+            uk_date="2026-11-16",
+            prev_snapshot_ms=prev_ms,
+            prev_uk_date="2026-11-13",
+        )
+        # Friday 20:00 flow is already inside the previous row; the other 3 sum to 1000.
+        self.assertAlmostEqual(row["net_flow_gbp"], 1000.0, places=2)
+        self.assertAlmostEqual(row["isa_net_flow_gbp"], 1000.0, places=2)
+        self.assertEqual(row["created_at_ms"], now_ms)
+
+        # Rebuilding the same row is strictly idempotent (same-day rewrite).
+        again = build_nav_row(
+            portfolio,
+            uk_date="2026-11-16",
+            prev_snapshot_ms=prev_ms,
+            prev_uk_date="2026-11-13",
+        )
+        self.assertEqual(row, again)
+
+    def test_split_twr_is_not_inflated_by_a_large_deposit(self) -> None:
+        rows = [
+            {
+                "uk_date": "2026-11-10",
+                "total_value_gbp": 10000.0,
+                "isa_value_gbp": 10000.0,
+                "invest_value_gbp": 0.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+            },
+            {
+                "uk_date": "2026-11-11",
+                "total_value_gbp": 12000.0,
+                "isa_value_gbp": 12000.0,  # 2000 deposit already inside the value
+                "invest_value_gbp": 0.0,
+                "isa_net_flow_gbp": 2000.0,
+                "invest_net_flow_gbp": 0.0,
+            },
+            {
+                "uk_date": "2026-11-12",
+                "total_value_gbp": 12050.0,
+                "isa_value_gbp": 12050.0,
+                "invest_value_gbp": 0.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+            },
+        ]
+        split = compute_account_split_performance(rows)
+        self.assertTrue(split["isa"]["ok"])
+        self.assertAlmostEqual(split["isa"]["total_return_pct"], 0.42, places=2)
+        self.assertAlmostEqual(split["isa"]["max_drawdown_pct"], 0.0, places=2)
+
+    def test_window_twr_uses_tail_flows_and_excludes_deposit(self) -> None:
+        now_ms = _ms(2026, 11, 17, 12, 0)
+        rows = [
+            {
+                "uk_date": "2026-11-10",
+                "total_value_gbp": 10000.0,
+                "cash_gbp": 1000.0,
+                "net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 10, 21, 40),
+            },
+            {
+                "uk_date": "2026-11-14",
+                "total_value_gbp": 12000.0,
+                "cash_gbp": 3000.0,
+                "net_flow_gbp": 2000.0,
+                "created_at_ms": _ms(2026, 11, 14, 21, 40),
+            },
+        ]
+        portfolio = _portfolio(
+            total=12060.0,
+            cash=3060.0,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=12060.0, transactions_supported=True),
+            invest=AccountSnapshot(ok=True, account_label="Invest", transactions_supported=True),
+        )
+        portfolio.fetched_at_uk = "2026-11-17 12:00"
+        portfolio.fetched_at_ms = now_ms
+        window = compute_window_nav_performance(rows, portfolio, lookback_days=7, now_ms=now_ms)
+        self.assertTrue(window["ok"])
+        self.assertEqual(window["method"], "twr_7d")
+        self.assertAlmostEqual(window["account_change_pct"], 0.5, places=2)
+        self.assertAlmostEqual(window["net_flow_gbp"], 2000.0, places=2)
+        self.assertAlmostEqual(window["net_pnl_gbp"], 60.0, places=2)
+
+    def test_saturday_window_twr_bridges_to_previous_friday_anchor(self) -> None:
+        # Saturday 2026-11-21 with lookback_days=7 has start_date=2026-11-14 (Sat).
+        # Friday 2026-11-13 close must be bridged in so Monday's gap (+2%) is captured.
+        now_ms = _ms(2026, 11, 21, 9, 0)
+        rows = [
+            {
+                "uk_date": "2026-11-13",
+                "total_value_gbp": 10000.0,
+                "cash_gbp": 1000.0,
+                "net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 13, 21, 40),
+            },
+            {
+                "uk_date": "2026-11-16",
+                "total_value_gbp": 10200.0,
+                "cash_gbp": 1000.0,
+                "net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 16, 21, 40),
+            },
+            {
+                "uk_date": "2026-11-20",
+                "total_value_gbp": 10302.0,
+                "cash_gbp": 1000.0,
+                "net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 20, 21, 40),
+            },
+        ]
+        portfolio = _portfolio(
+            total=10302.0,
+            cash=1000.0,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=10302.0, transactions_supported=True),
+            invest=AccountSnapshot(ok=True, account_label="Invest", transactions_supported=True),
+        )
+        portfolio.fetched_at_uk = "2026-11-21 09:00"
+        portfolio.fetched_at_ms = now_ms
+        window = compute_window_nav_performance(rows, portfolio, lookback_days=7, now_ms=now_ms)
+        self.assertTrue(window["ok"])
+        self.assertEqual(window["first_date"], "2026-11-13")
+        self.assertAlmostEqual(window["account_change_pct"], 3.02, places=2)
+        self.assertAlmostEqual(window["net_pnl_gbp"], 302.0, places=2)
 
     def test_cash_interest_counts_as_twr_return_not_external_deposit(self) -> None:
         interest_row = build_nav_row(
@@ -320,6 +491,228 @@ class TestTradeAttributionAndSignalQuality(unittest.TestCase):
 
 
 class TestNavHistoryStorage(unittest.IsolatedAsyncioTestCase):
+    async def test_reconcile_repairs_flows_without_touching_nav_columns(self) -> None:
+        now_ms = _ms(2026, 11, 17, 21, 40)
+        rows = [
+            {
+                "uk_date": "2026-11-10",
+                "total_value_gbp": 10000.0,
+                "cash_gbp": 1000.0,
+                "invested_gbp": 9000.0,
+                "net_flow_gbp": 0.0,
+                "isa_value_gbp": 6000.0,
+                "invest_value_gbp": 4000.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 10, 21, 40),
+            },
+            {
+                "uk_date": "2026-11-13",
+                "total_value_gbp": 10500.0,
+                "cash_gbp": 1500.0,
+                "invested_gbp": 9000.0,
+                "net_flow_gbp": 0.0,  # omitted 500 deposit
+                "isa_value_gbp": 6300.0,
+                "invest_value_gbp": 4200.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 13, 21, 40),
+            },
+            {
+                "uk_date": "2026-11-16",
+                "total_value_gbp": 10300.0,
+                "cash_gbp": 1300.0,
+                "invested_gbp": 9000.0,
+                "net_flow_gbp": 200.0,  # sign-flipped withdrawal
+                "isa_value_gbp": 6100.0,
+                "invest_value_gbp": 4200.0,
+                "isa_net_flow_gbp": 200.0,
+                "invest_net_flow_gbp": 0.0,
+                "created_at_ms": _ms(2026, 11, 16, 21, 40),
+            },
+        ]
+        portfolio = _portfolio(
+            total=10300.0,
+            cash=1300.0,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=6100.0,
+                transactions_supported=True,
+                recent_transactions=[
+                    _tx(300.0, "DEPOSIT", day="2026-11-11", ms=_ms(2026, 11, 11, 10, 0)),
+                    _tx(-200.0, "WITHDRAW", day="2026-11-15", ms=_ms(2026, 11, 15, 10, 0)),
+                ],
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                total_account_value=4200.0,
+                transactions_supported=True,
+                recent_transactions=[
+                    _tx(200.0, "DEPOSIT", day="2026-11-12", ms=_ms(2026, 11, 12, 10, 0)),
+                ],
+            ),
+        )
+
+        updates = reconcile_recent_nav_flows(rows, portfolio, now_ms=now_ms)
+        by_date = {u["uk_date"]: u for u in updates}
+        self.assertEqual(set(by_date), {"2026-11-13", "2026-11-16"})
+        self.assertAlmostEqual(by_date["2026-11-13"]["net_flow_gbp"], 500.0, places=2)
+        self.assertAlmostEqual(by_date["2026-11-16"]["net_flow_gbp"], -200.0, places=2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "reconcile.db")
+            await db.init()
+            for row in rows:
+                await db.upsert_nav_history(row)
+            changed = await db.update_nav_history_flows(updates)
+            self.assertEqual(changed, 2)
+
+            stored = {r["uk_date"]: r for r in await db.get_nav_history(limit=10)}
+            self.assertAlmostEqual(stored["2026-11-13"]["total_value_gbp"], 10500.0, places=2)
+            self.assertAlmostEqual(stored["2026-11-16"]["total_value_gbp"], 10300.0, places=2)
+            self.assertAlmostEqual(stored["2026-11-13"]["net_flow_gbp"], 500.0, places=2)
+            self.assertAlmostEqual(stored["2026-11-16"]["net_flow_gbp"], -200.0, places=2)
+
+            # Second pass over the repaired rows must be a strict no-op.
+            self.assertEqual(
+                reconcile_recent_nav_flows(list(stored.values()), portfolio, now_ms=now_ms),
+                [],
+            )
+
+    async def test_same_day_morning_and_close_rows_replace_not_accumulate(self) -> None:
+        prev_ms = _ms(2026, 11, 13, 21, 40)
+        weekend_deposits = [
+            _tx(500.0, "DEPOSIT", day="2026-11-13", ms=_ms(2026, 11, 13, 22, 30)),
+            _tx(200.0, "DEPOSIT", day="2026-11-14", ms=_ms(2026, 11, 14, 12, 0)),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "same_day.db")
+            await db.init()
+            await db.upsert_nav_history(
+                {"uk_date": "2026-11-13", "total_value_gbp": 10000.0, "created_at_ms": prev_ms}
+            )
+            prev = await db.get_previous_nav_row("2026-11-16")
+            assert prev is not None
+
+            morning = _portfolio(
+                total=10700.0,
+                cash=700.0,
+                isa=AccountSnapshot(
+                    ok=True,
+                    account_label="ISA",
+                    total_account_value=10700.0,
+                    recent_transactions=list(weekend_deposits),
+                ),
+            )
+            morning.fetched_at_uk = "2026-11-16 07:30"
+            morning.fetched_at_ms = _ms(2026, 11, 16, 7, 30)
+            await db.upsert_nav_history(
+                build_nav_row(
+                    morning,
+                    uk_date="2026-11-16",
+                    prev_snapshot_ms=int(prev["created_at_ms"]),
+                    prev_uk_date=str(prev["uk_date"]),
+                )
+            )
+
+            evening = _portfolio(
+                total=11000.0,
+                cash=1000.0,
+                isa=AccountSnapshot(
+                    ok=True,
+                    account_label="ISA",
+                    total_account_value=11000.0,
+                    recent_transactions=[
+                        *weekend_deposits,
+                        _tx(300.0, "DEPOSIT", day="2026-11-16", ms=_ms(2026, 11, 16, 9, 0)),
+                    ],
+                ),
+            )
+            evening.fetched_at_uk = "2026-11-16 21:40"
+            evening.fetched_at_ms = _ms(2026, 11, 16, 21, 40)
+            await db.upsert_nav_history(
+                build_nav_row(
+                    evening,
+                    uk_date="2026-11-16",
+                    prev_snapshot_ms=int(prev["created_at_ms"]),
+                    prev_uk_date=str(prev["uk_date"]),
+                )
+            )
+
+            rows = {r["uk_date"]: r for r in await db.get_nav_history(limit=10)}
+            self.assertAlmostEqual(rows["2026-11-16"]["total_value_gbp"], 11000.0, places=2)
+            # The close row replaces the morning row's flow instead of adding to it.
+            self.assertAlmostEqual(rows["2026-11-16"]["net_flow_gbp"], 1000.0, places=2)
+
+    async def test_reconcile_skips_accounts_without_transaction_permission(self) -> None:
+        now_ms = _ms(2026, 11, 17, 21, 40)
+        rows = [
+            {"uk_date": "2026-11-10", "total_value_gbp": 1000.0, "created_at_ms": _ms(2026, 11, 10, 21, 40)},
+            {"uk_date": "2026-11-13", "total_value_gbp": 1000.0, "created_at_ms": _ms(2026, 11, 13, 21, 40)},
+        ]
+        portfolio = _portfolio(
+            total=1000.0,
+            cash=100.0,
+            isa=AccountSnapshot(ok=True, account_label="ISA", transactions_supported=False),
+            invest=AccountSnapshot(ok=True, account_label="Invest", transactions_supported=False),
+        )
+        self.assertEqual(reconcile_recent_nav_flows(rows, portfolio, now_ms=now_ms), [])
+
+    async def test_reconcile_preserves_the_unsupported_account_flow(self) -> None:
+        now_ms = _ms(2026, 11, 17, 21, 40)
+        rows = [
+            {"uk_date": "2026-11-10", "total_value_gbp": 1000.0, "created_at_ms": _ms(2026, 11, 10, 21, 40)},
+            {
+                "uk_date": "2026-11-13",
+                "total_value_gbp": 1700.0,
+                "net_flow_gbp": 700.0,
+                "isa_net_flow_gbp": 0.0,
+                "invest_net_flow_gbp": 700.0,
+                "created_at_ms": _ms(2026, 11, 13, 21, 40),
+            },
+        ]
+        portfolio = _portfolio(
+            total=1700.0,
+            cash=700.0,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                transactions_supported=True,
+                recent_transactions=[_tx(500.0, "DEPOSIT", day="2026-11-11", ms=_ms(2026, 11, 11, 10, 0))],
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                transactions_supported=False,
+                recent_transactions=[_tx(200.0, "DEPOSIT", day="2026-11-12", ms=_ms(2026, 11, 12, 10, 0))],
+            ),
+        )
+        updates = reconcile_recent_nav_flows(rows, portfolio, now_ms=now_ms)
+        self.assertEqual(len(updates), 1)
+        # ISA is corrected; the 403 Invest flow and the combined total are preserved.
+        self.assertAlmostEqual(updates[0]["isa_net_flow_gbp"], 500.0, places=2)
+        self.assertAlmostEqual(updates[0]["invest_net_flow_gbp"], 700.0, places=2)
+        self.assertAlmostEqual(updates[0]["net_flow_gbp"], 700.0, places=2)
+
+    async def test_get_previous_nav_row_and_created_at_ms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "prev.db")
+            await db.init()
+            created = _ms(2026, 11, 13, 21, 40)
+            await db.upsert_nav_history(
+                {"uk_date": "2026-11-13", "total_value_gbp": 1000.0, "created_at_ms": created}
+            )
+            await db.upsert_nav_history(
+                {"uk_date": "2026-11-16", "total_value_gbp": 1100.0, "created_at_ms": created + 3 * 86_400_000}
+            )
+            prev = await db.get_previous_nav_row("2026-11-16")
+            assert prev is not None
+            self.assertEqual(prev["uk_date"], "2026-11-13")
+            self.assertEqual(prev["created_at_ms"], created)
+            self.assertIsNone(await db.get_previous_nav_row("2026-11-13"))
+
     async def test_upsert_is_idempotent_and_survives_prune(self) -> None:
         from datetime import datetime, timedelta, timezone
 

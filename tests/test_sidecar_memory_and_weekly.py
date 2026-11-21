@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -232,10 +233,23 @@ class TestWeeklyDiagnosis(_DbTestCase):
         self.assertIn("T+20 回撤大", diagnosis)
         self.assertNotIn("**", diagnosis)
         self.assertNotIn("#", diagnosis)
-        self.assertLessEqual(len(diagnosis), 450)
+        self.assertLessEqual(len(diagnosis), 600)
         self.assertEqual(self.llm.calls[0]["usage_label"], "weekly_quant_diagnosis")
         self.assertIn("T+20 Alpha", self.llm.calls[0]["prompt"])
         self.assertIn("阈值回测原始数字", self.llm.calls[0]["prompt"])
+
+    async def test_451_to_600_char_diagnosis_is_kept_intact(self) -> None:
+        core = "参数建议：维持核心宽基仓位，现金优先补 ISA 核心缺口，等待财报确认后再逐步加仓。"
+        long_text = (core * 12)[:500] + "结尾完整句子。"
+        self.assertGreater(len(long_text), 450)
+        self.assertLessEqual(len(long_text), 600)
+        self.llm.replies["weekly_quant_diagnosis"] = json.dumps(
+            {"diagnosis": long_text}, ensure_ascii=False
+        )
+        diagnosis = await self.sched._generate_weekly_diagnosis({}, uk_date="2026-11-14")
+        self.assertEqual(diagnosis, long_text)
+        self.assertTrue(diagnosis.endswith("结尾完整句子。"))
+        self.assertIn("<=600", self.llm.calls[0]["system_instruction"])
 
     async def test_too_short_diagnosis_degrades_to_empty(self) -> None:
         self.llm.replies["weekly_quant_diagnosis"] = '{"diagnosis": "太短"}'
@@ -409,8 +423,9 @@ class TestBenchmarkDashboard(unittest.IsolatedAsyncioTestCase):
                 total_account_value=10000.0,
                 total_cash=2500.0,
                 recent_orders=[sell],
+                transactions_supported=True,
             ),
-            invest=AccountSnapshot(ok=True, account_label="Invest"),
+            invest=AccountSnapshot(ok=True, account_label="Invest", transactions_supported=True),
         )
         previous = PortfolioData(
             fetched_at_uk="2026-11-10 09:00",
@@ -433,6 +448,116 @@ class TestBenchmarkDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("跑输基准", dash["verdict"])
         self.assertEqual(dash["realized_pnl_by_currency"], {"GBP": 120.0})
         self.assertAlmostEqual(dash["fees_pct_of_turnover_30d"], 0.444, places=3)
+        self.assertEqual(dash["account_change_method"], "modified_dietz")
+
+    async def test_weekly_dashboard_uses_twr_after_a_2000_deposit(self) -> None:
+        import pandas as pd
+
+        cfg = _cfg()
+        db = AdvisorDatabase(Path(tempfile.mkdtemp()) / "advisor.db")
+        await db.init()
+        sched = TradingScheduler(cfg, _StubT212(), _StubMarketData(), _DsStubLLM(), db, _StubTg())
+
+        now_ms = int(datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        rows = [
+            {
+                "uk_date": "2026-11-10",
+                "total_value_gbp": 10000.0,
+                "cash_gbp": 1000.0,
+                "net_flow_gbp": 0.0,
+                "created_at_ms": int(datetime(2026, 11, 10, 21, 40, tzinfo=timezone.utc).timestamp() * 1000),
+            },
+            {
+                "uk_date": "2026-11-14",
+                "total_value_gbp": 12000.0,
+                "cash_gbp": 3000.0,
+                "net_flow_gbp": 2000.0,  # the £2,000 deposit must be excluded from return
+                "created_at_ms": int(datetime(2026, 11, 14, 21, 40, tzinfo=timezone.utc).timestamp() * 1000),
+            },
+        ]
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 12:00",
+            fetched_at_ms=now_ms,
+            total_combined_value=12060.0,
+            total_combined_cash=3060.0,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=12060.0,
+                total_cash=3060.0,
+                transactions_supported=True,
+            ),
+            invest=AccountSnapshot(ok=True, account_label="Invest", transactions_supported=True),
+        )
+        dates = pd.date_range("2026-09-01", periods=40, freq="B")
+        bench = pd.DataFrame({"Close": [100.0 + i for i in range(40)]}, index=dates)
+
+        dash = sched._build_benchmark_dashboard(
+            portfolio,
+            {"VWRP.L": bench},
+            nav_rows=rows,
+            now_ms=now_ms,
+        )
+        self.assertEqual(dash["account_change_method"], "twr_7d")
+        self.assertAlmostEqual(dash["account_change_pct"], 0.5, places=2)
+        self.assertAlmostEqual(dash["net_flow_7d_gbp"], 2000.0, places=2)
+        self.assertAlmostEqual(dash["net_pnl_7d_gbp"], 60.0, places=2)
+        self.assertFalse(dash["flows_unverified"])
+        self.assertIn("跑输基准", dash["verdict"])
+        self.assertIn("账户7日TWR +0.5%", dash["summary_text"])
+        self.assertIn("净盈亏 £+60", dash["summary_text"])
+        self.assertIn("剔净入金 £+2000", dash["summary_text"])
+
+    async def test_weekly_dashboard_never_fakes_alpha_when_flows_are_403(self) -> None:
+        import pandas as pd
+
+        cfg = _cfg()
+        db = AdvisorDatabase(Path(tempfile.mkdtemp()) / "advisor.db")
+        await db.init()
+        sched = TradingScheduler(cfg, _StubT212(), _StubMarketData(), _DsStubLLM(), db, _StubTg())
+
+        now_ms = int(datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 12:00",
+            fetched_at_ms=now_ms,
+            total_combined_value=12060.0,
+            isa=AccountSnapshot(
+                ok=True,
+                account_label="ISA",
+                total_account_value=12060.0,
+                transactions_supported=False,
+            ),
+            invest=AccountSnapshot(
+                ok=True,
+                account_label="Invest",
+                transactions_supported=False,
+            ),
+        )
+        previous = PortfolioData(
+            fetched_at_uk="2026-11-10 09:00",
+            fetched_at_ms=now_ms - 7 * 86_400_000,
+            total_combined_value=12000.0,
+            isa=AccountSnapshot(ok=True, account_label="ISA", total_account_value=12000.0),
+            invest=AccountSnapshot(ok=True, account_label="Invest"),
+        )
+        dates = pd.date_range("2026-09-01", periods=40, freq="B")
+        bench = pd.DataFrame({"Close": [100.0 + i for i in range(40)]}, index=dates)
+
+        dash = sched._build_benchmark_dashboard(
+            portfolio,
+            {"VWRP.L": bench},
+            previous_snapshot=previous,
+            nav_rows=[],
+            now_ms=now_ms,
+        )
+        self.assertTrue(dash["flows_unverified"])
+        self.assertIsNone(dash["account_change_pct"])
+        self.assertNotIn("近7天跑赢", dash["verdict"])
+        self.assertNotIn("近7天跑输", dash["verdict"])
+        self.assertIn("出入金流水不可用", dash["verdict"])
+        self.assertIn("流水不可验证", dash["summary_text"])
+        self.assertNotIn("**", dash["summary_text"])
+        self.assertNotIn("#", dash["summary_text"])
 
     async def test_weekly_job_message_carries_benchmark_line(self) -> None:
         cfg = _cfg()

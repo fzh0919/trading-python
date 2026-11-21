@@ -2,6 +2,22 @@
 
 > **冷文档说明**：本文件收纳全量模块签名字典与 `_ref/` 算法源映射，供跨模块重构或深度排查时按需查阅；日常开发热启动入口见 [`AGENTS.md`](../AGENTS.md) 与 [`DEVELOPER_GUIDE.md`](../DEVELOPER_GUIDE.md)。
 
+### 3.2.1 包拆分目录速查（`__init__.py` 门面 ↔ 子模块实现映射）
+
+> `v5.5.4+` 将原大文件拆分为子包，`__init__.py` 保持向后兼容导出。**改动实现时直接按子模块路径定位，不必通读门面或全部子文件**：
+
+| 原单文件门面 (`__init__.py`) | 子模块拆分 (`*.py`) 与职责定位 |
+| :--- | :--- |
+| `src/data_providers/t212_client/` | `models`（数据结构）· `wallets_and_tickers`（双钱包/代码映射）· `http_mixin`（限流退避）· `client`（`T212Client`）· `context_formatting`（交易上下文/行为统计） |
+| `src/data_providers/market_data/` | `models_and_parsing`（`TickerMarketBundle`/`MacroSnapshot`）· `external_clients`（Finnhub/FRED）· `yahoo_mixin`（2y 缓存/盘前跳空）· `service`（`MarketDataService`） |
+| `src/data_providers/analytics/` | `technical`（CYQ/ATR/ADX/RS/周线）· `exposure`（穿透暴露）· `correlation`（相关性/CVaR）· `performance`（NAV/TWR/外部流水自愈）· `postmarket_review`（`v5.5.10` 盘后 0-Token 账单/2×2 象限） |
+| `src/engine/deployment_gate/` | `common`（常量/工具）· `core_policy`（四桶核心政策/蓄水池准入）· `ledgers`（账户账本/槽位/热力）· `regime`（四态状态机/宽度）· `triggers`（A1+A2/C 触发器）· `banner`（横幅与回放） |
+| `src/engine/portfolio_rules/` | `models_and_friction`（摩擦/试点地板）· `dual_philosophy`（ISA 价值门/Invest 动态 R:R/右尾双锚）· `sizing`（以损定仓）· `holding_eval`（逐仓审计）· `risk_override`（护栏与蓄水池旁路/配对） |
+| `src/engine/screener/` | `patterns`（Stage2/VCP/平台/VPVR）· `scoring`（四维双轨打分）· `runner`（漏斗调度）· `audit`（离线阈值审计）· `audition`（150 只底池海选） |
+| `src/storage/db/` | `core`（单写锁 `_connect`）· `schema`（19 表与幂等迁移）· `portfolio_repo`（快照/NAV/晨报/Regime）· `recommendations_repo`（推荐/结算/影子样本）· `ops_and_chat_repo`（告警/调度锁/对话/用量）· `market_cache_repo`（OHLCV/T212 元数据/股息/底池）· `memory_and_wallet_repo`（体检/偏好/新闻缓存/盘后账单/双钱包） |
+| `src/agents/report_agent/` | `fact_sheet`（FactSheet/`ContextPack`）· `debate`（Step 2 三轮辩论）· `core_deployment`（核心宽基部署与预筛）· `morning_report`（`generate_morning_report`）· `sentinels`（`/us` 与盘中快报） |
+| `src/bot/scheduler/` | `core`（`TradingScheduler` 主循环与锁）· `settlement_math`（T+N 方向收益/触价/MFE-MAE）· `fill_receipts`（挂单快照比对）· `settlement_mixin`（每日结算与催化）· `weekly_audit_mixin`（周六体检与 TWR 周报）· `intraday_mixin`（盘中扫描）· `postmarket_mixin`（`v5.5.10` 盘后账单调度） |
+
 ### 3.3 核心模块接口字典（精确签名与字段契约速查，随 `IMP` 滚动更新）
 
 > 💡 下游窗口直接按本字典接线，**不必通读千行上游源码**；后续新增公共函数/字段后，须在对应小节同步补齐 1~2 行契约。
@@ -127,18 +143,44 @@
   - `AdvisorBot._deliver(chat_id, text, *, remove_keyboard=False) -> bool`：统一回复出口，`send_message` 返回 `False` 或抛异常时写 `ERROR` 日志并 `ops.notify(severity="CRITICAL", source="telegram:delivery", alert_key="telegram_reply_undelivered")`；`_send_reply` 为其薄封装
   - `await run_app(stop_event=None)`（注入 `T212Client(..., snapshot_loader=db.get_latest_snapshot)`，启动就绪后执行 `await ops.flush_pending()`，`finally` 依次容错释放 `t212`/`market_data`/`ops`/`tg`/`db`）
 
-### 3.4 模块 ↔ 测试文件 ↔ 共享 Mock 桩映射表（改哪块跑哪个文件）
+### 3.3.1 `v5.5.9` (M1~M6) & `v5.5.10` 新增契约增补
+- **`config.yaml` / `src/config.py`**：
+  - `ScheduleSection`：`enable_weekly_radar: bool = False`（`v5.5.10` 默认关闭周五自动 `/pick`）。
+  - `StrategySection`：`v5.5.9` 四态与蓄水池参数（`invest_slots_recovery=1`, `invest_recovery_risk_scale=0.6`, `invest_max_heat_recovery_pct=1.0`, `min_invest_pilot_order_gbp=500.0`, `regime_vix_risk_on=20.0`, `regime_vix_risk_on_fast_exit=22.0`, `regime_risk_on_exit_days=2`, `regime_vix_recovery=24.0`, `regime_vix_recovery_relapse=26.0`, `regime_hy_oas_recovery_pct=5.2`, `regime_breadth_risk_on_min=55.0`, `regime_breadth_recovery_min=45.0`, `invest_reservoir_enabled=True`, `invest_reservoir_etf_whitelist=["VWRL.L","ISF.L","VERX.L","VEUR.L"]`, `invest_reservoir_cash_reserve_pct=30.0`, `invest_reservoir_min_idle_cash_pct=50.0`, `invest_reservoir_min_ticket_gbp=1000.0`, `invest_reservoir_funding_buffer_pct=2.0`, `invest_reservoir_funding_min_need_gbp=200.0`）；`v5.5.10` 盘后账单参数（`postmarket_review_enabled=True`, `postmarket_push_on_alert_only=True`, `postmarket_event_search_enabled=True`, `postmarket_anomaly_min_move_pct=3.5`, `postmarket_max_search_symbols=3`）。
+- **`src/engine/deployment_gate/`（`common.py`, `regime.py`, `triggers.py`, `core_policy.py`）**：
+  - 四态 `RISK_ON / NEUTRAL / RECOVERY / RISK_OFF` + `compute_regime_breadth`（65% 本地池 + 35% 多地基准；双空返回 `None` 中性放行）；
+  - `TRIGGER_A2_RSI_EXCLUDE_ABOVE=82.0` / `TRIGGER_A2_MAX_DIST_MA50_PCT=14.0`，`_scan_a_equity_candidates` 支持 A1 回踩 + A2 突破双通道（A2 无 bundle 一律 fail-closed）；M5 Invest 派息宽基蓄水池准入与清宽基换股配对。
+- **`src/engine/portfolio_rules/`（`dual_philosophy.py`, `holding_eval.py`, `risk_override.py`）**：
+  - `is_strong_right_side_leader` & `resolve_invest_target_anchors`：选股/开仓 `llm_ceiling` 与持仓 `deterministic_target` 双锚拆轨；M5 蓄水池白名单旁路与 `ROTATE` 配对指令。
+- **`src/data_providers/analytics/performance.py` & `postmarket_review.py`（`v5.5.10`）**：
+  - `performance.py`：`_collect_external_flows_gbp`（`DEPOSIT` 恒 `+abs`、`WITHDRAW/WITHDRAWAL` 恒 `-abs`，含 `(after_ms, until_ms]` 与非交易时段滚入下交易日）、`build_nav_row`（接收前序行边界与 `created_at_ms`）、`reconcile_recent_nav_flows`（近 30 天流水自愈，403/分页截断跳过）、`compute_window_nav_performance`（`twr_7d` 优先 + Dietz 兜底 + 周末桥接周五锚点）、`compute_core_policy_benchmark_comparison`、`compute_regime_attribution`。
+  - `postmarket_review.py`：`is_substantive_catalyst`、`classify_process_quadrant`（`GOOD_WIN`/`BAD_WIN`/`GOOD_LOSS`/`BAD_LOSS`）、`build_eod_attribution_ledger`（本地股价/FX 拆解、`intraday_traded` 隔离、Plan vs Actual 四类告警、三重异动门控）、`format_postmarket_review_text`（`<=900` 字）、`format_postmarket_alert_text`（`<=250` 字）。
+- **`src/storage/db/`（`portfolio_repo.py`, `recommendations_repo.py`, `memory_and_wallet_repo.py`）**：
+  - `portfolio_repo.py`：`get_snapshot_for_cycle_date`、`get_previous_nav_row`、`update_nav_history_flows`、`get_regime_history`。
+  - `recommendations_repo.py`：`log_shadow_rejections`、`get_pending_shadow_settlements`、`settle_shadow_rejection`、`get_shadow_rejection_stats`（M6 影子反事实，严格排除出 `get_recommendation_stats` 胜率；`get_recommendation_stats` 增补 `quadrant_counts`）。
+  - `memory_and_wallet_repo.py`：`upsert_daily_postmarket_review`、`get_latest_postmarket_review`、`get_recent_postmarket_reviews`。
+- **`src/bot/scheduler/postmarket_mixin.py` & `src/bot/handlers.py`（`v5.5.10`）**：
+  - `PostmarketReviewMixin`：工作日 `weekday() < 5` 门控执行盘后账单、复用 `gemini-3.5-flash-lite` + `grounding_news_cache`（按 `uk_date + cache_scope + symbol` 隔离）做催化检索；`handlers.py` 新增 0-Token 无锁 `/review` 指令并在 `/stats` 展示 2×2 过程分布。
+
+### 3.4 模块 ↔ 测试文件 ↔ 共享 Mock 桩映射表（改哪块跑哪个文件，共 26 组）
 | 源码模块 (`src/`) | 对应单元测试 (`tests/`) | 共用 Mock / 桩对象（变更上游接口时须同步检查） |
 | :--- | :--- | :--- |
-| `config.py`, `llm_client.py` | `test_llm_pricing_and_usage.py` | Fake GenAI Client |
-| `calendar_utils.py`, `scheduler.py` | `test_calendar_and_scheduler.py` | `_MockT212`, `_MockMarketData`, `_StubLLM`, `_StubTg` |
-| `storage/db.py` | `test_db_storage.py` | 临时目录 SQLite 真实建库 |
-| `t212_client.py` | `test_t212_client.py` | `httpx.MockTransport` |
-| `market_data.py` | `test_market_data.py` | `_DummyOps`, Fake `httpx`/yfinance |
-| `analytics.py`, `portfolio_rules.py`, `screener.py` | `test_analytics_and_rules.py` | 纯离线 `pd.DataFrame` 构造器（须含 `Open/High/Low/Close/Volume`） |
-| `deployment_gate.py` & `/report`→`/pick` 门控闭环 | `test_report_pick_gate.py` | 2026-11-17 实盘镜像桩、500 日合成 Regime 回放桩、临时库 E2E 桩 |
+| `config.py`, `agents/llm_client.py` | `test_llm_pricing_and_usage.py` | Fake GenAI Client |
+| `engine/calendar_utils.py`, `bot/scheduler/` | `test_calendar_and_scheduler.py` | `_MockT212`, `_MockMarketData`, `_StubLLM`, `_StubTg` |
+| `storage/db/` (全仓 CRUD/锁/迁移) | `test_db_storage.py`, `test_v554_module_facades.py` | 临时目录 SQLite 真实建库、包门面导出校验 |
+| `data_providers/t212_client/` | `test_t212_client.py` | `httpx.MockTransport` |
+| `data_providers/market_data/` | `test_market_data.py` | `_DummyOps`, Fake `httpx`/yfinance |
+| `data_providers/analytics/`, `engine/portfolio_rules/`, `engine/screener/` | `test_analytics_and_rules.py`, `test_universe_audition.py` | 纯离线 `pd.DataFrame` 构造器（须含 `Open/High/Low/Close/Volume`） |
+| `data_providers/analytics/performance.py`, `/perf` | `test_nav_performance.py`, `test_v553_observability_and_attribution.py` | NAV 净值与外部流合成桩 |
+| `data_providers/analytics/postmarket_review.py`, `bot/scheduler/postmarket_mixin.py`, `/review` | `test_v5510_phase2_postmarket_review.py` | 早盘/EOD 快照对、Flash Lite 桩、临时库 |
+| `engine/deployment_gate/`, `engine/portfolio_rules/` (双哲学/蓄水池/门控) | `test_report_pick_gate.py`, `test_v551_dual_philosophy.py`, `test_v559_m5_capital_efficiency.py` | 实盘镜像桩、500 日 Regime 回放桩、蓄水池白名单桩 |
+| `t212_client/` & `portfolio_rules/` (双钱包与 `/wallet`/`/usd`) | `test_invest_wallet_split.py`, `test_wallet_rules_and_commands.py` | Invest 双钱包账本桩 |
+| `agents/ds_sidecar.py`, `agents/semantic_auditor.py`, `agents/pick_agent.py` | `test_ds_pick_prefilter_and_auditor.py` | DeepSeek 侧车响应桩 |
+| `agents/report_agent/` (辩论/预算/`/us`/盘中哨兵) | `test_report_step2_budget.py`, `test_report_debate_round2.py`, `test_intraday_sentinel.py`, `test_v558_us_sentinel.py` | 分段超时协程桩、盘前/盘中行情桩 |
+| `agents/chat_agent.py` | `test_v558_daily_chat.py` | 单聊切片与缓存前缀桩 |
+| `bot/scheduler/` (周六体检/记忆/M6 可观测性) | `test_sidecar_memory_and_weekly.py`, `test_v559_m6_observability.py` | 影子反事实样本与周报诊断桩 |
 | `ops_notifier.py`, `healthcheck.py`, `main.py`, `telegram_client.py`, `tools.py`, `handlers.py(/health)` | `test_v504_ops_and_grounding.py` | `_StubTelegram`, `_FakeT212Healthy`, `_FakeMarketHealthy` |
-| `schemas.py` & 全链路端到端 (`/pos`/`report`/`pick`/`us`/`stats`) | `test_db_and_end_to_end.py` | `_FakeT212`, `_FakeMarketData`, `_RecordingLLM`, `_RecordingTg` |
+| `agents/schemas.py` & 全链路端到端 (`/pos`/`report`/`pick`/`us`/`stats`) | `test_db_and_end_to_end.py` | `_FakeT212`, `_FakeMarketData`, `_RecordingLLM`, `_RecordingTg` |
 
 > ⚡ 单文件秒测：`python -m unittest tests.<模块名>`；改完收口必跑全量 `python -m tests.run_tests tests`。
 

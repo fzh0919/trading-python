@@ -20,7 +20,7 @@ from src.bot.scheduler import (
     _trade_direction,
 )
 from src.bot.telegram_client import TelegramClient
-from src.config import AppConfig, EnvSettings, UniverseSection
+from src.config import AppConfig, EnvSettings, ScheduleSection, UniverseSection
 from src.data_providers.market_data import MacroSnapshot, MarketDataService, TickerMarketBundle
 from src.data_providers.t212_client import AccountSnapshot, PortfolioData, PositionItem, T212Client
 from src.engine.calendar_utils import (
@@ -201,6 +201,7 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
                 cfg = AppConfig(
                     env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
                     universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["NVDA"]),
+                    schedule=ScheduleSection(enable_weekly_radar=True),
                 )
                 tg = _StubTg()
                 sched = TradingScheduler(cfg, _MockT212(), _MockMarketData(), _StubLLM(), db, tg)
@@ -243,6 +244,27 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
                 )
 
         await asyncio.wait_for(_run(), timeout=15.0)
+
+    async def test_weekly_radar_is_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = AdvisorDatabase(Path(tmpdir) / "radar_off.db")
+            await db.init()
+            cfg = AppConfig(
+                env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
+                universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["NVDA"]),
+            )
+            self.assertFalse(cfg.schedule.enable_weekly_radar)
+            sched = TradingScheduler(cfg, _MockT212(), _MockMarketData(), _StubLLM(), db, _StubTg())
+
+            # v5.5.10: the -10m silent prewarm and the post-close /pick must both stay dark.
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 21, 20, tzinfo=timezone.utc)),
+                [],
+            )
+            self.assertEqual(
+                await sched.check_and_run_due_jobs(datetime(2026, 11, 13, 21, 30, tzinfo=timezone.utc)),
+                [],
+            )
 
     def test_early_close_eu_holidays_and_trading_day_math(self) -> None:
         # 1. US Early Closes (13:00 ET): Black Friday 2026, Xmas Eve 2026, Jul 3 2028
@@ -580,7 +602,9 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await db.has_scheduler_job_fired("daily_settlement", "2026-11-13"))
             self.assertEqual(len(tg.sent), 0)  # background settlement must not spam Telegram chat
 
-            # NVDA settled (+10.0% vs SPY +2.0% -> Alpha +8.0%), AMD failed reflection so stayed PENDING, newer NVDA not due
+            # NVDA settled (+10.0% vs SPY +2.0% -> Alpha +8.0%); AMD reflection failed but
+            # v5.5.10 Phase 2 now settles it numerically instead of leaving it PENDING;
+            # newer NVDA is not due yet.
             nvda_lessons = await db.get_symbol_lessons("NVDA", limit=1)
             self.assertEqual(len(nvda_lessons), 1)
             self.assertAlmostEqual(nvda_lessons[0]["raw_return_pct"], 10.0, places=2)
@@ -589,8 +613,17 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(llm.calls[-1]["thinking_level"], cfg.models.chat_thinking_level)
             self.assertEqual(llm.calls[-1]["usage_label"], "settlement_reflection")
 
+            amd_rows = [r for r in await db.get_recent_recommendations(limit=10) if r["symbol"] == "AMD"]
+            self.assertEqual(len(amd_rows), 1)
+            self.assertEqual(amd_rows[0]["outcome_status"], "SETTLED")
+            self.assertEqual(amd_rows[0]["reflection_lesson"], "")
+            self.assertIn(
+                amd_rows[0]["process_quadrant"],
+                {"GOOD_WIN", "GOOD_LOSS", "BAD_WIN", "BAD_LOSS"},
+            )
+
             still_pending = await db.get_pending_settlements()
-            self.assertEqual([r["symbol"] for r in still_pending], ["AMD", "NVDA"])
+            self.assertEqual([r["symbol"] for r in still_pending], ["NVDA"])
 
             # Re-running check_and_run_due_jobs at 22:15 UTC does not re-fire
             self.assertEqual(
@@ -648,6 +681,7 @@ class TestCalendarAndScheduler(unittest.IsolatedAsyncioTestCase):
                 env=EnvSettings(_env_file=None, telegram_chat_id="12345"),
                 watchlist=["AAPL"],
                 universe=UniverseSection(isa_long_term=["VWRP.L"], invest_tactical=["AMD"]),
+                schedule=ScheduleSection(enable_weekly_radar=True),
             )
             tg = _StubTg()
 

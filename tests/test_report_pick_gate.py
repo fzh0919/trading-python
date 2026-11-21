@@ -44,10 +44,12 @@ from src.data_providers.market_data import MacroSnapshot, TickerMarketBundle
 from src.data_providers.t212_client import (
     AccountSnapshot,
     HistoricalOrderItem,
+    HistoricalTransactionItem,
     PendingOrderItem,
     PortfolioData,
     PositionItem,
 )
+from src.engine.deployment_gate.triggers import _today_external_inflow
 from src.engine.deployment_gate import (
     PENDING_CORE_ETF_BUY,
     PENDING_NEW_EQUITY_BUY,
@@ -4106,6 +4108,55 @@ class TestV559M3P1BundlePrefilter(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(md.calls, [])
         self.assertNotIn("AVGO", out)
+
+
+class TestTodayExternalInflowSigns(unittest.TestCase):
+    """v5.5.10: the C trigger must treat a real (negative) WITHDRAW as an outflow."""
+
+    def test_negative_withdraw_reduces_net_inflow(self) -> None:
+        now_uk = datetime(2026, 11, 17, 15, 0, tzinfo=ZoneInfo("Europe/London"))
+        today_start_ms = int(now_uk.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        isa = AccountSnapshot(
+            ok=True,
+            account_label="ISA",
+            total_account_value=20000.0,
+            recent_transactions=[
+                HistoricalTransactionItem(
+                    id="dep-1",
+                    account="ISA",
+                    tx_type="DEPOSIT",
+                    amount=1000.0,
+                    currency="GBP",
+                    date_time="2026-11-17T09:00:00Z",
+                    date_time_ms=today_start_ms + 9 * 3_600_000,
+                    uk_time_str="2026-11-17 09:00",
+                ),
+                HistoricalTransactionItem(
+                    id="wd-1",
+                    account="ISA",
+                    tx_type="WITHDRAW",
+                    amount=-600.0,  # T212 already normalises withdrawals negative
+                    currency="GBP",
+                    date_time="2026-11-17T10:00:00Z",
+                    date_time_ms=today_start_ms + 10 * 3_600_000,
+                    uk_time_str="2026-11-17 10:00",
+                ),
+            ],
+        )
+        portfolio = PortfolioData(
+            fetched_at_uk="2026-11-17 15:00",
+            fetched_at_ms=today_start_ms + 15 * 3_600_000,
+            total_combined_value=20000.0,
+            isa=isa,
+            invest=AccountSnapshot(ok=True, account_label="Invest", total_account_value=1000.0),
+        )
+        info = _today_external_inflow(
+            portfolio,
+            StrategySection(inflow_trigger_min_gbp=100.0, inflow_trigger_pct=1.0),
+            now_uk,
+        )
+        self.assertAlmostEqual(info["per_account_net_gbp"]["ISA"], 400.0, places=2)
+        self.assertEqual(info["triggered_accounts"], ["ISA"])
 
 
 if __name__ == "__main__":

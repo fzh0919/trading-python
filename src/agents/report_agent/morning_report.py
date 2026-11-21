@@ -335,7 +335,17 @@ async def _persist_morning_report_and_audit(
                 close_col = "Adj Close" if "Adj Close" in bench_hist.columns else "Close"
                 if close_col in bench_hist.columns:
                     bench_close = float(bench_hist[close_col].dropna().iloc[-1])
-            await db.upsert_nav_history(build_nav_row(portfolio, benchmark_close=bench_close))
+            nav_row = build_nav_row(portfolio, benchmark_close=bench_close)
+            today_uk = str(nav_row.get("uk_date") or "")
+            prev_row = await db.get_previous_nav_row(today_uk) if today_uk else None
+            if prev_row is not None:
+                nav_row = build_nav_row(
+                    portfolio,
+                    benchmark_close=bench_close,
+                    prev_snapshot_ms=int(prev_row.get("created_at_ms") or 0),
+                    prev_uk_date=str(prev_row.get("uk_date") or ""),
+                )
+            await db.upsert_nav_history(nav_row)
         except Exception as exc:  # never break /report on a performance-ledger hiccup
             logger.warning("nav_history upsert skipped: %s", exc)
     else:

@@ -2,6 +2,34 @@
 
 > 仅维护当前活跃版本（`v5.5.0+`）以便快速追加；`IMP-01 ~ IMP-22` 施工详录与 `v5.0.1 ~ v5.4.2` 历史版本已归档至 [`docs/CHANGELOG_ARCHIVE.md`](./docs/CHANGELOG_ARCHIVE.md)。
 
+### `v5.5.10`（2026-11-21 · 关闭周五自动 /pick + 外部资金流核算修复与周六体检纠偏，`src/version.py` 与 `pyproject.toml` 同步升至 `5.5.10`）
+
+施工计划见 [`docs/plans/2026-11-21-5.5.10-weekly-audit-nav-cashflow-plan.md`](./docs/plans/2026-11-21-5.5.10-weekly-audit-nav-cashflow-plan.md)。本版仅修实盘资金流口径与调度开关，不新增出网域名、不改凭据/`base_url`/灾备链、不改风控护栏开关。
+
+1. **停用周五收盘后自动 `/pick`**（`config.yaml`/`src/config.py`）：`schedule.enable_weekly_radar` 默认改为 `false`，同时关闭 `prewarm_weekly_radar` 与 `weekly_radar`；手动 `/pick` 完全不受影响，显式配置 `true` 时仍按原半日市逻辑触发。
+2. **外部资金流符号与时间窗修复**（`src/data_providers/analytics/performance.py`）：
+   - 新增 `_collect_external_flows_gbp`：`DEPOSIT` 恒 `+abs`、`WITHDRAW/WITHDRAWAL` 恒 `-abs`，彻底免疫 T212 已负数化的提现；支持 `(after_ms, until_ms]` 窗口，周末/节假日/22:00 后出入金自动滚入下一交易日；
+   - `build_nav_row` 接收前序行边界 `prev_snapshot_ms/prev_uk_date`，同日 07:30→21:40 覆写严格幂等，并输出 `created_at_ms` 与 T212 抓取时刻对齐；
+   - `compute_account_split_performance` 修复分账户净值 `value + flow` 双计外部流（改为 `value`），消除入金日假暴涨与次日假回撤；
+   - 新增 `reconcile_recent_nav_flows`（近 30 天安全窗、按账户校验 `transactions_supported`、分页上限疑似截断即跳过、仅提议三列流量修正）与 `compute_window_nav_performance`（`twr_7d` 优先、Modified Dietz 兜底、流水不可验证时显式 `flows_unverified`）。
+3. **持久化与写入接线**（`src/storage/db/portfolio_repo.py`/`morning_report.py`/`settlement_mixin.py`）：`upsert_nav_history` 优先使用行内 `created_at_ms`；`get_nav_history` 透出 `created_at_ms`；新增 `get_previous_nav_row` 与单写锁内 `update_nav_history_flows`（仅改 `net_flow_gbp`/`isa_net_flow_gbp`/`invest_net_flow_gbp`）。`/report` 与盘后 NAV 快照写入前查前序行；盘后快照完成后执行幂等流水校准，异常静默记日志、绝不阻断主流程。
+4. **周六策略体检纠偏**（`src/bot/scheduler/weekly_audit_mixin.py`）：体检周报改用剔入金 7 日 TWR/Dietz 对比 VWRP，新增 `account_change_method`/`net_flow_7d_gbp`/`net_pnl_7d_gbp`/`flows_unverified`，摘要展示「账户7日TWR x%（净盈亏 £ / 剔净入金 £）」；流水 403 时明确提示「出入金流水不可用，暂不计算跑赢基准超额」，杜绝假 Alpha。AI 诊断上限 `450→600` 字并强制完整收尾，防末尾半句截断。
+5. **单测与验收**：补齐周五雷达默认关闭/显式开启、负数提现、周末与周五 22:30 入金归集、同日覆写幂等、分账户大额入金平滑、近 30 天流水自愈（403 跳过、二次零变更、不动净值列）、周报 TWR 与假 Alpha 拦截、451~600 字诊断完整输出、C 触发器负数提现净额；`compileall`、全量离线单测与 `scripts/audit_egress.py` 均通过。
+
+**Phase 2：盘后 0-Token 执行账单 + T+5/20 过程复盘增强与周六诊断闭环**（施工计划见 [`docs/plans/2026-11-21-5.5.10-phase2-postmarket-review-plan.md`](./docs/plans/2026-11-21-5.5.10-phase2-postmarket-review-plan.md)；与 Phase 1 合并发版，版本维持 `5.5.10`）：
+
+6. **配置与幂等存储扩展**（`config.yaml`/`src/config.py`/`src/storage/db/{schema,recommendations_repo,portfolio_repo,memory_and_wallet_repo,ops_and_chat_repo}.py`）：新增 `postmarket_review_enabled`/`postmarket_push_on_alert_only`/`postmarket_event_search_enabled`/`postmarket_anomaly_min_move_pct`/`postmarket_max_search_symbols` 五个可独立降级开关；`pick_recommendations` 幂等补 `process_quadrant`/`holding_catalyst` 两列；新增 `daily_postmarket_reviews` 表（`uk_date` 主键）并纳入 90 天清理（保留最新 1 条）；新增 `get_snapshot_for_cycle_date`、`upsert_daily_postmarket_review`、`get_latest_postmarket_review`、`get_recent_postmarket_reviews`，`get_recommendation_stats` 增补严格排除 `SHADOW_*` 的 `quadrant_counts`。
+7. **纯确定性盘后账单与 2x2 过程分类**（新增 `src/data_providers/analytics/postmarket_review.py` 并导出）：按 `(account, yahoo_symbol)` 对齐早盘/EOD 快照，股数不变仓位拆出本地股价 P&L £ vs FX 影响 £；股数变动仓位统一走 `intraday_traded` 并从当日成交提取明细，绝不伪造未实现盈亏差；内置 `GBp/GBP` 100 倍与币种一致性保护。Plan vs Actual 扫描覆盖 `HIGH_SLIPPAGE`（>+1.0%）、核心宽基豁免的 `UNPLANNED_TRADE`、Invest `MISSING_BREAKEVEN_STOP` 与 `UNPROTECTED_LOSS`；硬门控异动候选（`>=3.5%`、`>=2×ATR%`、相对基准超额 `>=2.5%` 或当日买入后回撤 `<=-3.0%`）平静日为空。`format_postmarket_review_text`（<=900 字）与 `format_postmarket_alert_text`（<=250 字）纯文本输出，自动剔除 `#`/`**`。
+8. **结算反思升级与 Flash Lite 催化检索**（`src/bot/scheduler/{settlement_mixin,postmarket_mixin,core}.py`）：T+5/T+20 反思 Prompt 注入 `regime`、`MFE/MAE`、实盘成交滑点、2x2 象限与客观催化，并强制 `GOOD_LOSS` 不得建议放宽止损、`BAD_WIN` 必须警示运气陷阱；新增 `_fetch_catalyst_with_flash_lite` 复用既有 `gemini-3.5-flash-lite` + Google Search + `grounding_news_cache`（3h TTL），单次 `round_timeout_seconds=30.0`、无公告强制原样返回「无明确基本面公告，属市场/板块波动」，整段 `try/except` 静默降级；全晚共享 `postmarket_max_search_symbols` 检索预算（默认 3），异常单仅在 `|raw|>=8%` / `|alpha|>=6%` / `MAE<=-8%` 时消耗配额。修复反思 LLM 临时失败导致结算滞留 `PENDING`：改为 `reflection_lesson=""` 继续数值落库（T+20 仍可补写）。盘后账单在 NAV 兜底之后、90 天清理之前挂入同一 `22:00 UK daily_settlement`，降级/零净值组合直接跳过且不写库；仅纪律偏离或实质公告异动时附带一条 `<=250` 字静默提醒。
+9. **周六诊断与下游标签闭链**（`src/bot/scheduler/weekly_audit_mixin.py`/`src/agents/report_agent/fact_sheet.py`/`src/agents/pick_agent.py`/`src/bot/handlers.py`）：周六 `_generate_weekly_diagnosis` 原始输入补齐 `shadow_stats`、`exit_rule_ab`、`adoption_stats + quadrant_counts` 与近 5 日盘后账单汇总，维持 `<=600` 字纯文本上限；`/report` 与 `/pick` 教训标签增补 `regime`、`MFE/MAE`、`process_quadrant`（旧记录平滑省略）；新增 0-Token 无锁 `/review` 指令并在 `_is_heavy_ai_command` 排除、`/help` 补说明，`/stats` 增补 2x2 过程分布行。
+10. **单测与验收**：新增 `tests/test_v5510_phase2_postmarket_review.py` 覆盖本地股价/FX 拆解、`intraday_traded` 隔离、币种 100 倍保护、Plan vs Actual 四类告警、核心宽基豁免、异动三重门控与平静日 0 搜索、3 次检索硬上限、开关关闭 0 搜索、2x2 四象限、Prompt 注入、Flash Lite 超时/缓存、反思失败仍结算、旧库幂等补列、账单幂等覆写/90 天清理保留最新、影子隔离、周六诊断断层闭合、`/review` 无锁纯文本与降级快照不写库；`compileall`、全量离线单测与 `scripts/audit_egress.py` 均通过。本阶段零新增出网域名、零新增凭据环境变量、未改动既有风控护栏开关与 `.agents/skills`。
+11. **发版前全量复检收口（P1 / P2）**：
+    - **P1（周末重复账单与重推告警）**：`settlement_mixin.py` 与 `postmarket_mixin.py` 增补 `weekday() < 5` 工作日门控（与 `nav_snapshot` 同口径），杜绝周六/周日 22:00 `daily_settlement` 回放周五收盘价连写 3 条重复账单、连推 3 晚告警及污染周六 5 日汇总；
+    - **P2-1（催化缓存隔离与日期窗）**：`_fetch_catalyst_with_flash_lite` 缓存键按 `uk_date + cache_scope + symbol` 隔离结算窗口与盘后异动窗口，结算检索 `window_label` 明确携带 `[rec_date to exit_date]` 起止日期；
+    - **P2-2（无早盘基线防自减）**：`postmarket_mixin.py` 回退 `get_previous_snapshot(6.0)` 后二次校验 `morning.fetched_at_ms < portfolio.fetched_at_ms`，杜绝单快照库自减落伪 £0.00 账单；
+    - **P2-3（账单口径对齐）**：`postmarket_review.py` 保本止损改用 `_round_trip_friction_pct` 按量加权校验（与 `ledgers.py` / `models_and_friction.py` 1-to-1 对齐）、保留 `GBp` vs `GBP` 大小写区分、同日往返交易净股数不变亦归入 `intraday_traded`；
+    - **P2-4（周六 7 日 TWR 锚点对齐）**：`performance.py::compute_window_nav_performance` 在周末 `start_date` 无行时向前 3 天桥接上周五收盘锚点，与 `VWRP.L` 近 5 交易日基准完整对齐（含周一开盘跳空）。
+
 ### `v5.5.9`（2026-11-20 · M1→M6 全部落地，`src/version.py` 与 `pyproject.toml` 同步升至 `5.5.9`）
 
 进攻引擎模块化升级：四态形态切换 + 右侧动量解耦 + 双通道猎物 + 右尾释放 + 资本效率与可观测闭环（施工总计划见 [`docs/plans/2026-11-20-5.5.9-offense-upgrade-plan.md`](./docs/plans/2026-11-20-5.5.9-offense-upgrade-plan.md)）。全版本六大模块（M1→M6）按序合入并严守全部既有防守红线：

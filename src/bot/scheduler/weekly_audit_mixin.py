@@ -14,6 +14,7 @@ from src.bot.scheduler.settlement_math import LONDON_TZ
 from src.data_providers.analytics import (
     _CORE_POLICY_BENCHMARK_WEIGHTS,
     compute_core_policy_benchmark_comparison,
+    compute_window_nav_performance,
     compute_window_return_pct,
 )
 from src.data_providers.t212_client import (
@@ -31,6 +32,19 @@ def _facade_attr(name: str, default: Any) -> Any:
     return getattr(facade, name, default) if facade is not None else default
 
 
+def _clamp_complete_text(text: str, max_chars: int) -> str:
+    """Clamp to the character budget without chopping a thought mid-sentence."""
+    body = str(text or "").strip()
+    limit = max(0, int(max_chars))
+    if len(body) <= limit:
+        return body
+    head = body[:limit]
+    cut = max(head.rfind(ch) for ch in "。！？；\n")
+    if cut >= 20:
+        return head[: cut + 1].strip()
+    return head.rstrip()
+
+
 class WeeklyAuditJobMixin:
     def _has_audit_universe(self) -> bool:
         return bool(
@@ -46,9 +60,10 @@ class WeeklyAuditJobMixin:
         histories: dict[str, pd.DataFrame],
         *,
         previous_snapshot: PortfolioData | None = None,
+        nav_rows: list[dict[str, Any]] | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """VWRP 7d/30d benchmark returns vs account net value, realised P/L and fee drag."""
+        """VWRP 7d/30d benchmark returns vs flow-adjusted account TWR, realised P/L and fee drag."""
         symbol = self.cfg.strategy.benchmark_symbol
         hist = histories.get(symbol)
         if hist is None or getattr(hist, "empty", True):
@@ -71,19 +86,27 @@ class WeeklyAuditJobMixin:
             ccy = str(o.wallet_currency or "GBP").strip().upper() or "GBP"
             realized_by_ccy[ccy] = realized_by_ccy.get(ccy, 0.0) + float(o.realised_pnl or 0.0)
 
-        account_change_pct: float | None = None
+        window = compute_window_nav_performance(
+            nav_rows or [],
+            portfolio,
+            lookback_days=7,
+            previous_snapshot=previous_snapshot,
+            now_ms=now,
+        )
+        account_change_pct = window.get("account_change_pct")
+        flows_unverified = bool(window.get("flows_unverified"))
         baseline_age_days: float | None = None
         if previous_snapshot is not None:
-            prev_val = float(previous_snapshot.total_combined_value or 0.0)
-            cur_val = float(portfolio.total_combined_value or 0.0)
-            if prev_val > 0 and cur_val > 0:
-                account_change_pct = ((cur_val - prev_val) / prev_val) * 100.0
             base_ms = int(previous_snapshot.fetched_at_ms or 0)
             if base_ms > 0:
                 baseline_age_days = round((now - base_ms) / 86400000.0, 1)
 
-        if ret_7 is not None and account_change_pct is not None:
-            alpha = account_change_pct - ret_7
+        if flows_unverified:
+            # Never hand DeepSeek a fake Alpha when the deposit/withdrawal feed is
+            # unavailable (403 or unsupported history endpoint).
+            verdict = "出入金流水不可用，暂不计算跑赢基准超额"
+        elif ret_7 is not None and account_change_pct is not None:
+            alpha = float(account_change_pct) - ret_7
             verdict = f"近7天{'跑赢' if alpha >= 0 else '跑输'}基准 {alpha:+.1f}pct"
         elif ret_7 is not None:
             verdict = f"近7天基准 {ret_7:+.1f}%（缺少账户基线快照，暂无法算超额）"
@@ -95,7 +118,15 @@ class WeeklyAuditJobMixin:
             "benchmark_ret_7d_pct": round(ret_7, 2) if ret_7 is not None else None,
             "benchmark_ret_30d_pct": round(ret_30, 2) if ret_30 is not None else None,
             "account_total_value_gbp": round(float(portfolio.total_combined_value or 0.0), 2),
-            "account_change_pct": round(account_change_pct, 2) if account_change_pct is not None else None,
+            "account_change_pct": round(float(account_change_pct), 2) if account_change_pct is not None else None,
+            "account_change_method": str(window.get("method") or "unverified"),
+            "net_flow_7d_gbp": round(float(window.get("net_flow_gbp") or 0.0), 2),
+            "net_pnl_7d_gbp": (
+                round(float(window["net_pnl_gbp"]), 2)
+                if window.get("net_pnl_gbp") is not None
+                else None
+            ),
+            "flows_unverified": flows_unverified,
             "baseline_age_days": baseline_age_days,
             "realized_pnl_by_currency": {k: round(v, 2) for k, v in realized_by_ccy.items() if abs(v) >= 0.01},
             "fees_pct_of_turnover_30d": behavior.get("fees_pct_of_turnover"),
@@ -121,8 +152,22 @@ class WeeklyAuditJobMixin:
             f"近30天 {ret_30:+.1f}%" if ret_30 is not None else "近30天 N/A",
         ]
         change = dash.get("account_change_pct")
+        method = str(dash.get("account_change_method") or "")
         if change is not None:
-            parts.append(f"账户净值 {float(change):+.1f}%")
+            label = "账户7日Dietz" if method == "modified_dietz" else "账户7日TWR"
+            line = f"{label} {float(change):+.1f}%"
+            detail: list[str] = []
+            pnl = dash.get("net_pnl_7d_gbp")
+            flow = dash.get("net_flow_7d_gbp")
+            if pnl is not None:
+                detail.append(f"净盈亏 £{float(pnl):+.0f}")
+            if flow is not None and abs(float(flow)) >= 0.01:
+                detail.append(f"剔净入金 £{float(flow):+.0f}")
+            if detail:
+                line += f"（{' / '.join(detail)}）"
+            parts.append(line)
+        elif dash.get("flows_unverified"):
+            parts.append("账户7日TWR N/A（流水不可验证）")
         realized = dash.get("realized_pnl_by_currency") or {}
         if realized:
             parts.append("已实现 " + " ".join(f"{ccy} {float(amt):+.0f}" for ccy, amt in sorted(realized.items())))
@@ -154,6 +199,11 @@ class WeeklyAuditJobMixin:
         try:
             stats = await self.db.get_recommendation_stats()
             lessons = await self.db.get_recent_lessons(limit=8)
+            postmarket_rows = (
+                await self.db.get_recent_postmarket_reviews(limit=5)
+                if hasattr(self.db, "get_recent_postmarket_reviews")
+                else []
+            )
         except Exception as exc:
             logger.warning("Weekly diagnosis could not load settlement stats: %s", exc)
             return ""
@@ -183,6 +233,61 @@ class WeeklyAuditJobMixin:
             if quality
             else "N/A"
         )
+        shadow = audit.get("shadow_stats") or {}
+        shadow_n = int(shadow.get("settled") or 0)
+        shadow_line = (
+            f"样本 {shadow_n} | 避雷率 {shadow.get('avoided_loser_rate_pct')} | "
+            f"错杀率 {shadow.get('missed_winner_rate_pct')} | "
+            f"避雷 {int(shadow.get('avoided_loser') or 0)} / 错杀 {int(shadow.get('missed_winner') or 0)}"
+            + ("（n<30 仅参考）" if shadow.get("small_sample") else "")
+        )
+        ab = audit.get("exit_rule_ab") or {}
+        ab_n = int(ab.get("sample_count") or 0)
+        if ab_n > 0:
+            baseline = ab.get("baseline") or {}
+            ladder = ab.get("v559_ladder") or {}
+
+            def _ab_metric(item: dict[str, Any], key: str) -> str:
+                raw = item.get(key)
+                if raw is None:
+                    return "N/A"
+                return f"{float(raw):+.2f}%" if key == "avg_return_pct" else f"{float(raw):.1f}%"
+
+            ab_line = (
+                f"样本 {ab_n} | 基线 胜率 {_ab_metric(baseline, 'win_rate_pct')} "
+                f"均收益 {_ab_metric(baseline, 'avg_return_pct')} "
+                f"最大单亏 {_ab_metric(baseline, 'max_single_loss_pct')} vs "
+                f"阶梯 胜率 {_ab_metric(ladder, 'win_rate_pct')} "
+                f"均收益 {_ab_metric(ladder, 'avg_return_pct')} "
+                f"最大单亏 {_ab_metric(ladder, 'max_single_loss_pct')}"
+                + ("（n<30 仅参考）" if ab.get("small_sample") else "")
+            )
+        else:
+            ab_line = "本地样本不足，暂无对比"
+        adoption = stats.get("adoption_stats") or {}
+        quadrant = stats.get("quadrant_counts") or {}
+        exec_line = (
+            f"实盘采纳 {int(adoption.get('filled_count') or 0)}/{int(adoption.get('checked_count') or 0)} 条 "
+            f"（{float(adoption.get('adoption_rate_pct') or 0.0):.1f}%） | "
+            f"平均滑点 {adoption.get('avg_slippage_pct')} | "
+            "过程 2x2 "
+            + " / ".join(
+                f"{label} {int(quadrant.get(label) or 0)}"
+                for label in ("GOOD_WIN", "GOOD_LOSS", "BAD_WIN", "BAD_LOSS")
+            )
+        )
+        pm_days = len(postmarket_rows or [])
+        pm_local = sum(float(r.get("local_pnl_gbp") or 0.0) for r in postmarket_rows or [])
+        pm_fx = sum(float(r.get("fx_pnl_gbp") or 0.0) for r in postmarket_rows or [])
+        pm_alerts = sum(int(r.get("discipline_alert_count") or 0) for r in postmarket_rows or [])
+        pm_events = sum(
+            len((r.get("payload") or {}).get("event_cards") or [])
+            for r in postmarket_rows or []
+        )
+        pm_line = (
+            f"{pm_days} 天 | 股价贡献 £{pm_local:+,.2f} | FX 影响 £{pm_fx:+,.2f} | "
+            f"纪律偏离 {pm_alerts} 次 | 实质异动催化 {pm_events} 条"
+        )
         lines = [
             f"【本周体检 {uk_date}】池 {audit.get('universe_count', 0)} 只 | "
             f"重叠 {len(audit.get('overlap_candidates') or [])} | "
@@ -195,6 +300,10 @@ class WeeklyAuditJobMixin:
             f"原始胜率 {stats.get('win_rate_pct')} | Alpha 胜率 {stats.get('alpha_win_rate_pct')} | "
             f"T+10 Alpha {stats.get('avg_t10_alpha_pct')} | T+20 Alpha {stats.get('avg_t20_alpha_pct')} | "
             f"MFE {stats.get('avg_mfe_pct')} | MAE {stats.get('avg_mae_pct')}",
+            f"【影子护栏反事实统计】{shadow_line}",
+            f"【退出规则离线 A/B 对照】{ab_line}",
+            f"【实盘执行采纳与 2x2 过程分布】{exec_line}",
+            f"【近 5 日盘后账单汇总】{pm_line}",
             "【近期已结算原话教训】",
         ]
         for row in lessons or []:
@@ -213,14 +322,16 @@ class WeeklyAuditJobMixin:
             system_instruction=(
                 "你是量化策略诊断官（只读）。根据原始回测、T+5/10/20 后验与基准对照数字，输出 3 条以内中文诊断："
                 "①相对 VWRP 基准是跑赢还是跑输及主因（仓位/择时/摩擦）②参数/阈值与胜率结构建议 ③下周关注。"
-                "禁止编造未给出的数字，禁止 Markdown # 与 **，总长 <=450 字。"
+                "账户收益口径为剔除外部出入金的 TWR；禁止编造未给出的数字，禁止 Markdown # 与 **，"
+                "总长 <=600 字，每条诊断必须完整收尾，不得半句截断。"
                 '仅输出严格 JSON：{"diagnosis": "..."}'
             ),
             usage_label="weekly_quant_diagnosis",
         )
         if not payload:
             return ""
-        text = sanitize_plain_text(str(payload.get("diagnosis") or ""), 450)
+        raw = str(payload.get("diagnosis") or "")
+        text = _clamp_complete_text(sanitize_plain_text(raw, len(raw) + 1), 600)
         if len(text) < 20:
             return ""
         return text
@@ -323,6 +434,11 @@ class WeeklyAuditJobMixin:
             previous_snapshot = await self.db.get_previous_snapshot(min_age_hours=24 * 6)
         except Exception as exc:
             logger.debug("Weekly benchmark baseline snapshot unavailable: %s", exc)
+        nav_rows: list[dict[str, Any]] = []
+        try:
+            nav_rows = await self.db.get_nav_history(limit=30)
+        except Exception as exc:
+            logger.debug("Weekly benchmark nav_history unavailable: %s", exc)
         # Make sure all four core-policy sleeves are present before the comparison runs.
         missing_core_syms = [s for s in _CORE_POLICY_BENCHMARK_WEIGHTS if s not in histories]
         if missing_core_syms:
@@ -335,6 +451,7 @@ class WeeklyAuditJobMixin:
             portfolio,
             histories,
             previous_snapshot=previous_snapshot,
+            nav_rows=nav_rows,
             now_ms=int(base.timestamp() * 1000),
         )
         # v5.5.9 M6: shadow counterfactual scoreboard rides the weekly audit payload
